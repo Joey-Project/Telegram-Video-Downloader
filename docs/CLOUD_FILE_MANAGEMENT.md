@@ -15,7 +15,14 @@ The local service initiates every cloud connection and sends Telegram replies di
 3. Rust obtains the authenticated database epoch before opening its local inbox, validates the envelope and JavaScript-safe sequence number, and durably writes the full request under that epoch. It sends `POST /api/local/ack` only after that write succeeds. WebSocket delivery uses this same HTTPS receipt; the WebSocket itself has no ACK frame.
 4. Within one epoch, the inbox deduplicates by exact sequence and envelope, not by a maximum-sequence watermark. An unseen lower sequence is accepted. Re-delivery of an identical sequence wakes recovery without creating another local record.
 5. Local receipt and operation completion are separate. Pending management work survives restart; a confirmed file batch uses its persisted preview and move journal to resume unfinished steps. An interrupted Telegram update whose external side effect is uncertain is surfaced as uncertain rather than blindly replayed.
-6. Rust separately publishes operation results and snapshots through HTTPS. The client fetches the oldest pending batch at startup, on reconnect, and on a low-frequency fallback poll (30 seconds by default, configurable no lower than 5 seconds). WebSocket reconnect uses bounded backoff.
+6. Rust publishes time snapshots through HTTPS on an explicit Mini App refresh, a relevant change while a foreground user awaits operation results, or hourly expiry. Ordinary local state changes remain local. Successful snapshot publication moves the snapshot deadline forward. Authoritative inbox reconciliation retains its own maximum one-hour gap and is coalesced with refresh work where possible; publishing progress cannot indefinitely defer a missing-command check. Startup and reconnect still fetch the oldest pending batch immediately. WebSocket reconnect uses bounded backoff.
+
+Failed background inbox reads use exponential retry backoff, capped at one hour,
+without advancing the last successful-read deadline. New command hints and
+explicit user refreshes can still reconcile immediately; an unavailable database
+does not turn the hourly idle path into a permanent five-second request loop.
+
+Mini App snapshot refresh is distinct from reading the saved cloud snapshot. Bounded, authenticated control frames on the existing hibernating WebSocket carry refresh requests, foreground interest and correlated publication results without creating durable business commands. Business execution returns its refreshed reference data and result through one publication. Pure UI interactions and idle page timers do not request Mac data; file-index scan times remain visible separately. See the [on-demand snapshot contract](project_journal/2026/10/2026-10-25-on-demand-cloud-snapshots-ocs01.md).
 
 Startup dispatch remains paused until authoritative reconciliation succeeds. REST polls and WebSocket reconciliation share one gate, drain acknowledged pages in sequence order, and leave dispatch paused after a failed fetch or receipt. A notification absent from both the REST backlog and the exact local durable inbox is not dispatched.
 
@@ -66,22 +73,25 @@ Local service requests carry the fixed shared secret in their `Authorization: Be
 ### Mini App subscriptions
 
 The two Mini Apps use separate viewer connections to the same hibernating notification
-object as the desktop. A viewer receives only readiness and epoch/version invalidation
-hints. Inbox request envelopes remain restricted to the desktop role. The browser supplies
+object as the desktop. A viewer receives readiness, epoch/version invalidation hints and
+correlated read-only refresh results. Inbox request envelopes remain restricted to the desktop role. The browser supplies
 its automatic connection ticket in WebSocket subprotocol headers; neither Telegram
 `initData` nor the desktop secret is included in the WebSocket URL. Viewer authorization
 cannot extend beyond the original Telegram authorization deadline.
 
-The Worker explicitly notifies viewers after a successful snapshot commit, request enqueue,
-acknowledgment or epoch rotation. D1 writes do not wake the object on their own. Individual
-staged snapshot chunks do not trigger notifications. Notification failure does not undo
-the durable write.
+The Worker can notify interested viewers after a successful snapshot commit, request enqueue,
+acknowledgment or epoch rotation. Unobserved background publications suppress the notification
+call; epoch changes remain visible for authorization recovery. D1 writes do not wake the object
+on their own. Individual staged snapshot chunks do not trigger notifications. Notification
+failure does not undo the durable write.
 
-The browser subscribes before catch-up and fetches the existing owner-authorized HTTP
-snapshot after a hint. It coalesces bursts while retaining hints received during a read.
-Reconnection and foreground recovery reconcile again; low-frequency reads cover failed
-notifications or unavailable WebSockets. Hidden pages pause unnecessary retries and reads.
-The previous twelve-second status polling is removed. See [runtime behavior](../cloud/README.md#live-mini-app-updates).
+The browser shows the saved owner-authorized HTTP snapshot before requesting current Mac
+data once on visible open. It reloads published data for a pending refresh or active operation
+interest, coalescing bursts while retaining hints received during a read. Reconnection restores
+interest without automatically requesting another Mac refresh. Authorization and epoch
+recovery can reverify the saved view; idle pages have no periodic network reads. Hidden pages
+pause unnecessary retries and reads.
+The previous twelve-second status polling is removed. See [runtime behavior](../cloud/README.md#on-demand-time-snapshots).
 
 ### Snapshot preparation and retry
 
@@ -91,6 +101,12 @@ The state partition contains `revision` when present, `previews`, `operations`,
 `tasks`, and `settings`. Each chunk is addressed by its SHA-256 and database epoch.
 The Worker verifies the bounded chunk's actual bytes before durable storage;
 acknowledged chunks can be reused without uploading them on every heartbeat.
+The Mac also retains a bounded in-memory set of chunk hashes from its latest
+acknowledged manifest, scoped to database epoch and state version. Those active
+references are exempt from server orphan cleanup and can be reused after the
+staged ACK cache expires. A missing-chunk response invalidates both caches and
+uses the existing reupload/retry path; failed or older manifest commits cannot
+replace a newer confirmed set.
 
 A small `chunked-v1` request commits the ordered chunk descriptors, partition
 byte counts, library revision, state version, and report timestamp. The Worker
@@ -196,7 +212,7 @@ Legacy text can supply YouTube source IDs through supported YouTube URLs. URL re
 
 Title-only legacy lines also produce hints. They can match present media by normalized title or be explicitly associated by the owner; empty lines and HTTP(S)-URL-only text without a supported source ID do not create title hints.
 
-The state payload uses a locally persisted, increasing, JavaScript-safe `state_version`. A content retry reuses its version and content; D1 rejects lower versions and treats identical same-version content idempotently. `reported_at` is excluded from the content hash so retries and heartbeats can refresh contact time without changing that version. `created_at` and `reported_at` are Unix milliseconds; `library.scanned_at` is Unix seconds. Before the first successful scan, Rust reports a `ready: false` placeholder rather than an empty library.
+The state payload uses a locally persisted, increasing, JavaScript-safe `state_version`. Every newly admitted publication allocates a fresh version; a content retry reuses its version and content. D1 rejects lower versions and treats identical same-version content idempotently. `reported_at` is excluded from the content hash so retries and legacy same-version heartbeats can refresh contact time without changing that version. `created_at` and `reported_at` are Unix milliseconds; `library.scanned_at` is Unix seconds. Before the first successful scan, Rust reports a `ready: false` placeholder rather than an empty library.
 
 The bounded active-task summary is selected from one queue snapshot under the queue operation lock. Progress updates cannot reorder independent offset pages while a summary is being collected.
 
@@ -210,7 +226,7 @@ Operation history and active previews have separate encoded-byte budgets. The ne
 
 Upload reduction also bounds warning text and category paths, including snapshots with zero or one media item. Omitted categories are reported in warnings; shortened paths are never offered as real destinations. The uploaded snapshot is marked incomplete, while the full local library remains available.
 
-If even one media item exceeds the upload budget, reduction can omit every item from the uploaded library while preserving the remaining state. A warning reports the omitted item count and the snapshot remains explicitly incomplete. This changes only the upload copy; the full local index is retained, and an accepted reduced upload remains available for heartbeats and later state updates.
+If even one media item exceeds the upload budget, reduction can omit every item from the uploaded library while preserving the remaining state. A warning reports the omitted item count and the snapshot remains explicitly incomplete. This changes only the upload copy; the full local index is retained, and an accepted reduced upload remains available for later admitted publications.
 
 Authenticated, validated snapshot canonicalization permits up to 1,000,000 nodes while retaining the depth limit of 48. A snapshot complexity failure returns 413 so the same reduction path can recover; ordinary actions and webhook requests keep their 100,000-node limit and 400 response. The request-body and stored-chunk byte limits remain independent bounds.
 
@@ -220,9 +236,9 @@ Every successful online state refresh can resume saved actions after owner verif
 
 Selection controls and preview submission share the 100-item request limit. Bulk selection preserves existing selections, adds only the available capacity, and reports when another batch is needed.
 
-Snapshot commits and inbox changes notify Mini App viewers after the durable D1 write. A five-minute heartbeat republishes the cached library snapshot and does not scan the filesystem. A scan runs at startup, on an explicit library-scan request, after a newly published download completes, or after a local management operation changes the library. Scan failures preserve the prior snapshot and report a sanitized warning. The UI shows report and scan times; absence of the first scan means waiting for synchronization, not an empty library. The UI considers the local service stale after ten minutes without a report.
+Snapshot commits notify interested Mini App viewers after the durable D1 write; an unobserved hourly publication skips that notification. Inbox changes retain durable-command notifications. A scan runs at startup, on an explicit library refresh or scan request, after a newly published download completes, or after a local management operation changes the library. Scan failures preserve the prior snapshot and record a sanitized warning. The UI shows report and scan times separately; absence of the first scan means waiting for synchronization, not an empty library. Saved snapshots become outdated after one hour; their timestamps are not proof that the Mac is currently online.
 
-A failed refresh publishes its warning with the preserved library without waiting for a heartbeat. Its item list, revision, and original scan time remain intact. A subsequent successful scan clears the warning and publishes the recovered state.
+A requested refresh can publish its warning with the preserved library. Its item list, revision, and original scan time remain intact. A subsequent successful scan clears the local warning; the recovered state is included in the next admitted publication.
 
 Initial, publication, and management scans share one local gate held from before the blocking scan through snapshot and warning publication. A delayed older scan cannot overwrite a newer scan result; failure warnings follow the same ordering.
 
@@ -232,7 +248,7 @@ Cloud preview construction checks the complete prospective inbox receipt before 
 
 After a file batch executes, a failed refresh does not discard its execution result or change a completed batch into a failure. The operation result retains a refresh warning, while cloud publication preserves the prior library snapshot and reports the scan failure separately. A later successful scan replaces that snapshot and clears the scan warning.
 
-Task status and progress use a separate notification, coalesced over two seconds, to refresh cloud summaries without scanning the media library. Active-task summaries include up to 100 tasks across queue pages. The local inbox indexes pending sequences and recent management state so dispatch ticks and progress reports do not deserialize the full terminal history. Durable terminal receipts remain available for exact-sequence deduplication. A queued Telegram update becomes processing only after acquiring its execution permit.
+Task status and progress use a separate local notification. Relevant changes can update cloud summaries while a foreground viewer watches operations, without scanning the media library; unobserved updates wait for a requested or expired refresh. Capacity-only changes do not trigger watched updates. Active-task summaries include up to 100 tasks across queue pages. The local inbox indexes pending sequences and recent management state so dispatch ticks and progress reports do not deserialize the full terminal history. Durable terminal receipts remain available for exact-sequence deduplication. A queued Telegram update becomes processing only after acquiring its execution permit.
 
 ## Local library and scan boundaries
 
@@ -283,7 +299,7 @@ Task status and progress use a separate notification, coalesced over two seconds
 
 ## Configuration and production handoff
 
-The optional local `[cloud]` configuration contains `worker_url`, `shared_secret`, and `fallback_poll_seconds`. `worker_url` must be an HTTPS origin without a path prefix because the Worker and Mini App serve root-relative routes. `TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET` can supply the shared secret without placing it in a tracked configuration. Secret values are omitted from serialization and redacted in `Debug` output. Cloud mode requires HTTPS, `allow_all_chats = false`, and exactly one positive private-chat ID; it must match the Worker's `OWNER_USER_ID`.
+The optional local `[cloud]` configuration contains `worker_url`, `shared_secret`, and the legacy `fallback_poll_seconds` field. The latter remains accepted for compatibility and defaults to 3600; the effective idle reconciliation interval is fixed at one hour, including installations that explicitly configured the former 30-second default. Startup logs show configured and effective intervals separately. `worker_url` must be an HTTPS origin without a path prefix because the Worker and Mini App serve root-relative routes. `TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET` can supply the shared secret without placing it in a tracked configuration. Secret values are omitted from serialization and redacted in `Debug` output. Cloud mode requires HTTPS, `allow_all_chats = false`, and exactly one positive private-chat ID; it must match the Worker's `OWNER_USER_ID`.
 
 For a Cloud-mode macOS service install, the installer forwards a non-empty named shared-secret environment variable to the LaunchAgent. When the configuration supplies a non-empty secret and the installer has no non-empty environment override, it removes any previously persisted shared-secret environment entry so the service uses the configured value. Without a configured secret or a replacement environment value, the existing entry is retained. Other environment entries are preserved, and secret values are never printed in plans, arguments, or errors. A plist containing the shared-secret variable is written with mode `0600`; the secret is therefore stored privately on disk for launchd to use after the installer exits.
 

@@ -1,4 +1,4 @@
-import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, actionBelongsToSurface, actionReplayStatus, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { buildMetadataRecoveryPreviewPayload, buildOrganizationStatusPatch, groupMetadataRecoveryItems, metadataRecoveryOperationId, parseMetadataRecoveryReport } from "./metadata-recovery.js";
@@ -33,14 +33,33 @@ const loadOwnerSnapshot = createOwnerSnapshotLoader();
 const CACHE_KEY = "file-manager.snapshot.v1";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const MAX_LEGACY_BYTES = 256 * 1024;
+const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
+const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import"]);
+const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "retryable"]);
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
+let snapshotRefreshPending = false;
+let snapshotRefreshMessage = "";
+const snapshotRefreshRequests = new Map();
+let snapshotReadInFlight = null;
+let snapshotReadInFlightGeneration = -1;
+let snapshotReadInFlightEpoch = null;
+let snapshotReadAbortController = null;
+let snapshotReadSerial = 0;
+let snapshotReadActiveToken = 0;
+let epochVerificationPending = false;
+let epochVerificationGeneration = 0;
+let epochVerificationExpectedDatabaseEpoch = null;
+let advertisedDatabaseEpoch = null;
 let privateAccessExpired = false;
+let applicationDisposed = false;
+let applicationGeneration = 0;
+let snapshotFreshnessTimer = 0;
 let metadataRecoveryPreviewRestoreAttempted = false;
 let previewCancellationRestoreAttempted = false;
 
@@ -80,7 +99,7 @@ const libraryItems = () => Array.isArray(activeLibrarySnapshot()?.items) ? activ
 const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, library: null, previews: [], operations: [], tasks: [], settings: {} };
 
 function libraryCanOperate(libraryId = activeLibraryId()) {
-  return canOperateOnRegisteredMediaLibrary(state.snapshot, libraryId);
+  return !epochVerificationPending && canOperateOnRegisteredMediaLibrary(state.snapshot, libraryId);
 }
 
 function selectionLibraryReadOnlyReason() {
@@ -852,7 +871,28 @@ function updateDownloadFormOptions() {
   renderDownloadStatus();
 }
 
-function openDownloadForm({ updateUrl = true } = {}) {
+function updateOpenDownloadFormReferences() {
+  const dialog = byId("download-dialog");
+  if (!dialog?.open) return;
+  const librarySelect = byId("download-library-select");
+  const categoryInput = byId("download-category");
+  const selectedId = librarySelect?.value || activeLibraryId();
+  const categoryValue = categoryInput.value;
+  const categoryEdited = categoryInput.dataset.userEdited === "true";
+  const categoryInUrl = new URLSearchParams(window.location.search).has("category");
+  updateDownloadFormOptions();
+  if (!categoryEdited && !categoryInUrl) {
+    const descriptor = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === selectedId);
+    categoryInput.value = selectedId === activeLibraryId()
+      ? byId("category-filter").value || String(descriptor?.default_category ?? "")
+      : String(descriptor?.default_category ?? "");
+  } else {
+    categoryInput.value = categoryValue;
+  }
+  renderDownloadStatus();
+}
+
+function openDownloadForm({ updateUrl = true, requestFreshReferences = true } = {}) {
   if (!state.ownerVerified) return;
   const dialog = byId("download-dialog");
   updateDownloadFormOptions();
@@ -880,6 +920,9 @@ function openDownloadForm({ updateUrl = true } = {}) {
     window.history.replaceState(null, "", url.toString());
   }
   if (!dialog.open) dialog.showModal();
+  if (requestFreshReferences) {
+    void refreshState({ reason: "reference", scope: "download", libraryId: selectedId, quiet: true });
+  }
 }
 
 function closeDownloadForm() {
@@ -888,7 +931,9 @@ function closeDownloadForm() {
 }
 
 function showToast(message) {
+  if (applicationDisposed) return;
   const toast = byId("toast");
+  if (!toast) return;
   toast.textContent = message;
   toast.classList.remove("hidden");
   clearTimeout(state.toastTimer);
@@ -897,44 +942,37 @@ function showToast(message) {
 
 function setConnection(mode, label) {
   const dot = byId("connection-dot");
-  dot.className = `connection-dot${mode === "live" ? " live" : mode === "stale" ? " stale" : ""}`;
-  byId("connection-label").textContent = label;
+  if (dot) dot.className = `connection-dot${mode === "live" ? " live" : mode === "stale" ? " stale" : ""}`;
+  const connectionLabel = byId("connection-label");
+  if (connectionLabel) connectionLabel.textContent = label;
 }
 
 function updateSnapshotUpdateStatus(status) {
   snapshotUpdateStatus = status;
   if (status === "expired") return;
-  if (status === "offline") {
-    setConnection("stale", "Offline · showing saved library");
-    return;
+  const age = snapshotAgeLabel(state.snapshot);
+  if (snapshotRefreshPending) {
+    setConnection("", "Refreshing desktop snapshot…");
+  } else if (status === "offline") {
+    setConnection("stale", state.snapshot ? `Offline · saved ${age}` : "Offline · no saved snapshot");
+  } else if (status === "fallback" || status === "unavailable") {
+    setConnection("stale", state.snapshot ? `Saved snapshot · ${age}` : "Snapshot refresh unavailable");
+  } else {
+    setConnection(state.snapshot?.stale === true ? "stale" : "", state.snapshot ? `Saved snapshot · ${age}` : "Loading saved snapshot");
   }
-  if (status === "paused") {
-    setConnection("", "Updates paused");
-    return;
-  }
-  if (status === "fallback") {
-    setConnection("", "Periodic refresh");
-    return;
-  }
-  if (status === "connecting") {
-    setConnection("", state.snapshot ? "Reconnecting for updates" : "Connecting for updates");
-    return;
-  }
-  const synced = state.snapshot?.synced === true;
-  const stale = state.snapshot?.stale === true;
-  setConnection(synced && !stale ? "live" : stale ? "stale" : "", !synced ? "Waiting for computer" : stale ? "Contact is overdue" : "Computer connected");
 }
 
 function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
+  if (applicationDisposed) return;
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const now = Date.now();
-  const freshnessTime = Number.isSafeInteger(snapshot.last_seen) ? snapshot.last_seen : snapshot.reported_at;
-  const stale = snapshot.synced !== true
-    || !Number.isSafeInteger(freshnessTime)
+  const freshnessTime = Number.isSafeInteger(snapshot.reported_at) ? snapshot.reported_at : 0;
+  const stale = epochVerificationPending
+    || snapshot.synced !== true
     || freshnessTime <= 0
     || freshnessTime > now
-    || now - freshnessTime > RECENT_SNAPSHOT_MAX_AGE_MS;
+    || now - freshnessTime > MAX_DISPLAY_SNAPSHOT_AGE_MS;
   const changed = snapshot.stale !== stale;
   if (changed) state.snapshot = { ...snapshot, stale };
   if (mayUsePrivateSnapshot(state)) {
@@ -942,6 +980,122 @@ function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
     else renderSync();
   }
   updateSnapshotUpdateStatus(snapshotUpdateStatus);
+}
+
+function snapshotAgeLabel(snapshot) {
+  const publishedAt = Number.isSafeInteger(snapshot?.reported_at) ? snapshot.reported_at : 0;
+  return publishedAt > 0 ? timeAgo(publishedAt) : "age unavailable";
+}
+
+function setSnapshotRefreshStatus(message, mode = "") {
+  snapshotRefreshMessage = message;
+  const status = byId("snapshot-refresh-status");
+  if (status) {
+    status.textContent = snapshotRefreshMessage;
+    status.className = `snapshot-refresh-status${mode ? ` ${mode}` : ""}`;
+  }
+  const button = byId("refresh-button");
+  if (button) button.disabled = snapshotRefreshPending;
+}
+
+function updateSnapshotInterest() {
+  if (applicationDisposed || !snapshotUpdates) return;
+  restoreAwaitingOperationResults();
+  const pendingQueuedAction = readActionQueue().some((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE)
+    && action.delivery_outcome !== "outcome_unknown");
+  const visibleResultView = state.view === "waiting" || state.view === "organizing";
+  const downloadHistory = state.downloadSubmission
+    ? inspectDownloadSubmissionHistory(state.downloadSubmission, state.snapshot)
+    : { kind: "unaccepted" };
+  const downloadAwaitingResult = Boolean(state.downloadSubmission?.request_id)
+    && state.downloadSubmission.rejected !== true
+    && state.downloadSubmission.outcomeUnknown !== true
+    && (downloadHistory.kind === "unaccepted" || downloadHistory.kind === "pending"
+      || downloadHistory.kind === "recorded"
+        && !["completed", "failed", "stale", "uncertain", "rejected"].includes(String(downloadHistory.operation?.status)));
+  const cancellationAwaitingResult = [...state.previewCancellations.values()].some((tracker) =>
+    ["queued", "submitted"].includes(String(tracker?.status ?? "").toLowerCase()));
+  const recovery = state.metadataRecovery;
+  const recoveryOperation = recovery?.requestId
+    ? recoveryOperationsForLibrary(recovery.libraryId).find((operation) => recoveryOperationMatches(operation, recovery))
+    : null;
+  const recoveryAwaitingResult = Boolean(recovery?.requestId)
+    && recovery.deliveryUnknown !== true
+    && !recovery.error
+    && recovery.invalidated !== true
+    && !["completed", "complete", "succeeded", "failed", "stale", "rejected", "uncertain"].includes(String(recoveryOperation?.status ?? ""));
+  const awaitedLocalResult = downloadAwaitingResult
+    || cancellationAwaitingResult
+    || recoveryAwaitingResult
+    || state.awaitingOperationResults.size > 0
+    || activeSnapshotOperationAwaitingResult()
+    || activeCloudOperationAwaitingLocalWork()
+    || [...state.previewCancellationAttempts].length > 0;
+  snapshotUpdates.setWatch(pendingQueuedAction || visibleResultView || awaitedLocalResult);
+}
+
+function restoreAwaitingOperationResults() {
+  const queue = readActionQueue().filter((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE));
+  const queuedById = new Map(queue.map((action) => [action.request_id, action]));
+  for (const [requestId, tracker] of state.awaitingOperationResults) {
+    if (Number.isSafeInteger(tracker.seq)) continue;
+    const action = queuedById.get(requestId);
+    if (!action || state.quarantinedActionIds.has(requestId)
+        || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
+        || actionReplayStatus(action).status !== "valid") {
+      state.awaitingOperationResults.delete(requestId);
+    }
+  }
+  for (const action of queue) {
+    if (!["library_scan", "legacy_import"].includes(action.kind)
+        || state.quarantinedActionIds.has(action.request_id)
+        || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
+        || actionReplayStatus(action).status !== "valid"
+        || state.awaitingOperationResults.has(action.request_id)) continue;
+    state.awaitingOperationResults.set(action.request_id, {
+      kind: action.kind,
+      seq: null,
+    });
+  }
+}
+
+function activeSnapshotOperationAwaitingResult() {
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  return operations.some((operation) => RELOAD_PENDING_OPERATION_KINDS.has(operation?.kind)
+    && SNAPSHOT_PENDING_OPERATION_STATUSES.has(String(operation?.status ?? "").toLowerCase()));
+}
+
+function activeCloudOperationAwaitingLocalWork() {
+  const requests = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
+  return requests.some((request) => RELOAD_PENDING_OPERATION_KINDS.has(request?.kind)
+    && request?.status === "waiting_for_local");
+}
+
+function reconcileAwaitingOperationResults(snapshot) {
+  if (!snapshot || state.awaitingOperationResults.size === 0) return false;
+  const operations = Array.isArray(snapshot.operations) ? snapshot.operations : [];
+  let changed = false;
+  for (const [requestId, tracker] of state.awaitingOperationResults) {
+    if (!Number.isSafeInteger(tracker.seq)) continue;
+    const operation = operations.find((entry) => entry?.seq === tracker.seq && entry?.kind === tracker.kind);
+    if (!operation || !SETTLED_OPERATION_STATUSES.has(String(operation.status ?? "").toLowerCase())) continue;
+    state.awaitingOperationResults.delete(requestId);
+    changed = true;
+  }
+  return changed;
+}
+
+function updateAwaitingOperationResultReceipt(action, receipt) {
+  const tracker = state.awaitingOperationResults.get(action?.request_id);
+  if (!tracker || action?.kind !== tracker.kind) return;
+  if (receipt?.outcome === "rejected") {
+    state.awaitingOperationResults.delete(action.request_id);
+    return;
+  }
+  if (Number.isSafeInteger(receipt?.seq) && receipt.seq > 0) {
+    tracker.seq = receipt.seq;
+    reconcileAwaitingOperationResults(state.snapshot);
+  }
 }
 
 function clearCachedSnapshot() {
@@ -1002,12 +1156,18 @@ function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
 }
 
 function acceptFreshSnapshot(snapshot) {
+  if (typeof state.snapshot?.database_epoch === "string"
+      && typeof snapshot?.database_epoch === "string"
+      && state.snapshot.database_epoch !== snapshot.database_epoch) {
+    state.awaitingOperationResults.clear();
+  }
   const identityChanged = clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
   const recoveryChanged = invalidateMetadataRecoveryForSnapshot(state.snapshot, snapshot);
   if (identityChanged || recoveryChanged) {
     state.groupSelectionLimitNotice = null;
   }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
+  reconcileAwaitingOperationResults(state.snapshot);
   restoreMetadataRecoveryPreviewRequest(state.snapshot);
   reconcileMetadataRecoveryPreviewRequest(state.snapshot);
   settleMigrationConflictRefreshes();
@@ -1021,8 +1181,9 @@ function acceptFreshSnapshot(snapshot) {
   const params = new URLSearchParams(window.location.search);
   if (params.get("download") === "1" && !state.downloadFormOpened) {
     state.downloadFormOpened = true;
-    openDownloadForm({ updateUrl: false });
+    openDownloadForm({ updateUrl: false, requestFreshReferences: false });
   }
+  updateOpenDownloadFormReferences();
 }
 
 function applySnapshotFailure(status) {
@@ -1030,7 +1191,6 @@ function applySnapshotFailure(status) {
   Object.assign(state, transition);
   if (transition.clearCache) clearCachedSnapshot();
   if (transition.authorizationRejected) {
-    state.refreshAfterDrain = false;
     if (state.retryTimer) window.clearTimeout(state.retryTimer);
     state.retryTimer = 0;
   }
@@ -1055,28 +1215,168 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function performRefreshState({ quiet = false } = {}) {
-  if (!initData || privateAccessExpired || state.loading) return;
+function markEpochVerificationPending(databaseEpoch = null) {
+  if (applicationDisposed) return;
+  const expectedEpoch = typeof databaseEpoch === "string" ? databaseEpoch : null;
+  if (epochVerificationPending && epochVerificationExpectedDatabaseEpoch === expectedEpoch) return;
+  epochVerificationPending = true;
+  epochVerificationExpectedDatabaseEpoch = expectedEpoch;
+  epochVerificationGeneration += 1;
+  state.canDispatchActions = false;
+  if (state.snapshot) state.snapshot = { ...state.snapshot, stale: true };
+  if (mayUsePrivateSnapshot(state)) render();
+}
+
+function linkSnapshotReadAbort(signal) {
+  if (!signal || !snapshotReadAbortController) return () => {};
+  const controller = snapshotReadAbortController;
+  const abort = () => controller.abort();
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
+}
+
+function createSnapshotReadAbortController() {
+  const Controller = window.AbortController ?? globalThis.AbortController;
+  return typeof Controller === "function" ? new Controller() : null;
+}
+
+function settleSnapshotReadOnAbort(read, signal, onAbort = () => {}) {
+  if (!signal) return read;
+  if (signal.aborted) {
+    onAbort();
+    return Promise.resolve(state.snapshot);
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => {
+      if (settled) return;
+      onAbort();
+      finish(resolve, state.snapshot);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    Promise.resolve(read).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+function performRefreshState(options = {}) {
+  if (options.epochChanged === true) markEpochVerificationPending(options.expectedDatabaseEpoch);
+  const generation = epochVerificationGeneration;
+  const minimumVersion = Number.isSafeInteger(options.minimumVersion) ? options.minimumVersion : 0;
+  const expectedDatabaseEpoch = typeof options.expectedDatabaseEpoch === "string"
+    ? options.expectedDatabaseEpoch
+    : epochVerificationPending ? epochVerificationExpectedDatabaseEpoch : null;
+  if (snapshotReadInFlight) {
+    const inFlight = snapshotReadInFlight;
+    const inFlightGeneration = snapshotReadInFlightGeneration;
+    const inFlightEpoch = snapshotReadInFlightEpoch;
+    const unlinkAbort = linkSnapshotReadAbort(options.signal);
+    return inFlight.then((snapshot) => {
+      if (applicationDisposed || options.signal?.aborted) return state.snapshot;
+      const version = Number.isSafeInteger(snapshot?.state_version) ? snapshot.state_version : 0;
+      const epochReadRequired = epochVerificationPending && (
+        inFlightGeneration !== epochVerificationGeneration
+        || expectedDatabaseEpoch !== null && (inFlightEpoch !== expectedDatabaseEpoch || snapshot?.database_epoch !== expectedDatabaseEpoch)
+      );
+      const sameEpoch = !expectedDatabaseEpoch || snapshot?.database_epoch === expectedDatabaseEpoch;
+      return minimumVersion > version && sameEpoch || epochReadRequired
+        ? performRefreshState({ ...options, epochChanged: false, ...(expectedDatabaseEpoch ? { expectedDatabaseEpoch } : {}) })
+        : snapshot;
+    }).finally(unlinkAbort);
+  }
+  const readController = createSnapshotReadAbortController();
+  snapshotReadAbortController = readController;
+  const unlinkAbort = linkSnapshotReadAbort(options.signal);
+  const readSignal = readController?.signal ?? options.signal ?? null;
+  const read = performRefreshStateOnce({ ...options, signal: readSignal, epochGeneration: generation, expectedDatabaseEpoch });
+  const readToken = snapshotReadActiveToken;
+  const inFlight = settleSnapshotReadOnAbort(read, readSignal, () => {
+    if (snapshotReadActiveToken !== readToken) return;
+    snapshotReadActiveToken = 0;
+    state.loading = false;
+    if (!applicationDisposed) byId("app-content")?.setAttribute("aria-busy", "false");
+  });
+  const trackedRead = inFlight.finally(() => {
+    unlinkAbort();
+    if (snapshotReadInFlight === trackedRead) {
+      snapshotReadInFlight = null;
+      snapshotReadInFlightGeneration = -1;
+      snapshotReadInFlightEpoch = null;
+      snapshotReadAbortController = null;
+    }
+  });
+  snapshotReadInFlight = trackedRead;
+  snapshotReadInFlightGeneration = generation;
+  snapshotReadInFlightEpoch = expectedDatabaseEpoch;
+  return trackedRead;
+}
+
+async function performRefreshStateOnce({ quiet = false, minimumVersion = 0, epochGeneration = -1, expectedDatabaseEpoch = null, signal = null } = {}) {
+  if (!initData || privateAccessExpired || applicationDisposed || signal?.aborted) return state.snapshot;
+  const pageGeneration = applicationGeneration;
+  const readToken = ++snapshotReadSerial;
+  snapshotReadActiveToken = readToken;
   recoverFileActionReceipts();
   state.loading = true;
-  byId("app-content").setAttribute("aria-busy", "true");
+  byId("app-content")?.setAttribute("aria-busy", "true");
   try {
-    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
+    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers, signal }), { signal });
+    if (signal?.aborted) return state.snapshot;
+    if (applicationDisposed || pageGeneration !== applicationGeneration || epochGeneration !== epochVerificationGeneration) return state.snapshot;
     if (privateAccessExpired) return;
+    if (expectedDatabaseEpoch && fresh.database_epoch !== expectedDatabaseEpoch) {
+      throw new Error("The owner snapshot belongs to a different database epoch.");
+    }
+    if (!epochVerificationPending && advertisedDatabaseEpoch && fresh.database_epoch !== advertisedDatabaseEpoch) {
+      markEpochVerificationPending(advertisedDatabaseEpoch);
+    }
+    const sameEpoch = !state.snapshot || fresh.database_epoch === state.snapshot.database_epoch;
+    const currentVersion = sameEpoch && Number.isSafeInteger(state.snapshot?.state_version) ? state.snapshot.state_version : 0;
+    if (minimumVersion > 0 && fresh.state_version < minimumVersion) throw new Error("The published snapshot is behind the desktop refresh result.");
+    if (sameEpoch && fresh.state_version < currentVersion) return state.snapshot;
+    if (epochVerificationPending && epochGeneration === epochVerificationGeneration
+        && (!epochVerificationExpectedDatabaseEpoch || fresh.database_epoch === epochVerificationExpectedDatabaseEpoch)) {
+      epochVerificationPending = false;
+      epochVerificationExpectedDatabaseEpoch = null;
+    }
     acceptFreshSnapshot(fresh);
+    if (epochVerificationPending) {
+      state.canDispatchActions = false;
+      if (state.snapshot) state.snapshot = { ...state.snapshot, stale: true };
+    }
     refreshLocalSnapshotFreshness({ renderContent: false });
     render();
     updateSnapshotUpdateStatus(snapshotUpdateStatus);
-    await drainActionsAfterSnapshotRefresh(
+    updateSnapshotInterest();
+    // Snapshot verification completes independently of queue delivery. A held POST receipt
+    // must not make a later correlated publication reread wait behind that action.
+    void drainActionsAfterSnapshotRefresh(
       state,
       navigator.onLine,
       () => drainActionQueue({ quiet }),
-    );
+    ).catch(() => {});
+    return fresh;
   } catch (error) {
+    if (signal?.aborted) return state.snapshot;
+    if (applicationDisposed || pageGeneration !== applicationGeneration || epochGeneration !== epochVerificationGeneration) return state.snapshot;
     const transition = applySnapshotFailure(error?.status);
     if (transition.authorizationRejected) {
       privateAccessExpired = true;
       snapshotUpdates?.stop();
+    }
+    if (epochVerificationPending && !transition.authorizationRejected) {
+      state.canDispatchActions = false;
+      if (state.snapshot) state.snapshot = { ...state.snapshot, stale: true };
     }
     if (mayUsePrivateSnapshot(state)) {
       setConnection("stale", "Showing saved library");
@@ -1092,19 +1392,83 @@ async function performRefreshState({ quiet = false } = {}) {
     if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
     throw error;
   } finally {
-    state.loading = false;
-    byId("app-content").setAttribute("aria-busy", "false");
-    if (state.refreshAfterDrain) {
-      state.refreshAfterDrain = false;
-      window.setTimeout(() => refreshState({ quiet: true }), 0);
+    if (snapshotReadActiveToken === readToken) {
+      snapshotReadActiveToken = 0;
+      state.loading = false;
+      if (!applicationDisposed && pageGeneration === applicationGeneration) byId("app-content")?.setAttribute("aria-busy", "false");
     }
   }
 }
 
-function refreshState(options = {}) {
-  const refresh = snapshotUpdates ? snapshotUpdates.refresh(options) : performRefreshState(options);
-  // The transport observes callback failures for retry; UI callers rely on the toast above.
-  return refresh.catch(() => {});
+function refreshScopeForCurrentPage() {
+  if (byId("download-dialog")?.open) {
+    return { scope: "download", libraryId: byId("download-library-select")?.value || activeLibraryId() };
+  }
+  if (["waiting", "organizing", "history"].includes(state.view)) return { scope: "operations" };
+  return { scope: "library", ...(activeLibraryId() ? { libraryId: activeLibraryId() } : {}) };
+}
+
+function refreshErrorMessage(errorCode) {
+  if (errorCode === "offline") return "Offline · showing the saved snapshot. Reconnect to request a desktop refresh.";
+  if (errorCode === "unsupported") return "Desktop refresh is unavailable on this connection. Showing the saved snapshot.";
+  if (errorCode === "hidden" || errorCode === "not_visible" || errorCode === "viewer_not_visible") return "The page is hidden; the saved snapshot remains available.";
+  if (errorCode === "timeout" || errorCode === "refresh_timeout") return "No desktop refresh result arrived within two minutes. Showing the saved snapshot.";
+  if (errorCode === "local_unavailable") return "No desktop app is connected to refresh now. Showing the saved snapshot.";
+  if (errorCode === "cloud_unavailable") return "The cloud could not check the desktop connection. Showing the saved snapshot.";
+  if (errorCode === "unavailable" || errorCode === "transport_unavailable") return "The desktop is unavailable. Showing the saved snapshot.";
+  return "Desktop refresh failed. Showing the saved snapshot.";
+}
+
+function refreshState({ reason = "manual", scope, libraryId, quiet = false } = {}) {
+  const target = scope ? { scope, ...(libraryId ? { libraryId } : {}) } : refreshScopeForCurrentPage();
+  const key = `${target.scope}:${target.libraryId ?? ""}`;
+  const existing = snapshotRefreshRequests.get(key);
+  if (existing) {
+    if (!quiet) existing.notifyUser = true;
+    return existing.promise;
+  }
+  const request = { reason, ...target };
+  const entry = { notifyUser: !quiet, promise: null };
+  snapshotRefreshPending = true;
+  setSnapshotRefreshStatus("Requesting a current snapshot from the desktop…", "pending");
+  updateSnapshotUpdateStatus(snapshotUpdateStatus);
+  entry.promise = (async () => {
+    let result;
+    let mode = "warning";
+    try {
+      result = await snapshotUpdates?.requestMacRefresh(request) ?? { status: "unavailable", error_code: "transport_unavailable" };
+      if (applicationDisposed) return result;
+      if (result.status === "published") {
+        if (result.cache_read_failed) {
+          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at)}; the displayed saved view could not be reloaded.`, "warning");
+          if (entry.notifyUser) showToast("The desktop published a snapshot, but this view could not reload it. The saved view remains visible.");
+        } else {
+          mode = "success";
+          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at)}.`, mode);
+          if (entry.notifyUser) showToast(`Snapshot refreshed from the desktop at ${formatTime(result.reported_at)}.`);
+        }
+      } else {
+        const message = refreshErrorMessage(result.error_code);
+        setSnapshotRefreshStatus(message, "warning");
+        if (entry.notifyUser) showToast(message);
+      }
+      return result;
+    } catch (error) {
+      if (applicationDisposed) return { status: "failed", error_code: "request_failed" };
+      const message = refreshErrorMessage(error?.error_code ?? error?.code);
+      setSnapshotRefreshStatus(message, "warning");
+      if (entry.notifyUser) showToast(message);
+      return { status: "failed", error_code: "request_failed" };
+    } finally {
+      snapshotRefreshRequests.delete(key);
+      snapshotRefreshPending = snapshotRefreshRequests.size > 0;
+      updateSnapshotUpdateStatus(snapshotUpdateStatus);
+      setSnapshotRefreshStatus(snapshotRefreshMessage, mode);
+      if (!snapshotRefreshMessage) setSnapshotRefreshStatus("", "");
+    }
+  })();
+  snapshotRefreshRequests.set(key, entry);
+  return entry.promise;
 }
 
 function readActionQueue() {
@@ -1315,6 +1679,7 @@ function acknowledgeFileActionReceipt(action, _receipt, applied) {
 
 function settleRejectedFileAction(rejection, queueRemoved) {
   if (!rejection || typeof rejection.request_id !== "string") return;
+  state.awaitingOperationResults.delete(rejection.request_id);
   if (queueRemoved) state.quarantinedActionIds.delete(rejection.request_id);
   const message = typeof rejection.error === "string" ? rejection.error : "The request was rejected.";
   if (rejection.kind === "download_submit" && state.downloadSubmission?.request_id === rejection.request_id) {
@@ -1354,14 +1719,21 @@ function writeActionQueue(actions) {
 }
 
 function renderQueueCount() {
+  if (applicationDisposed) return;
   const count = readActionQueue().filter((action) => !state.quarantinedActionIds.has(action.request_id)
     && !isUnknownDeliveryAction(action, state.unknownActionOutcomes)).length;
-  byId("queued-actions").textContent = count ? `${count} action${count === 1 ? "" : "s"} waiting to send` : "";
+  const queueCount = byId("queued-actions");
+  if (queueCount) queueCount.textContent = count ? `${count} action${count === 1 ? "" : "s"} waiting to send` : "";
 }
 
 async function drainActionQueue({ quiet = false } = {}) {
-  if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
-  if (state.draining) return state.draining;
+  if (!initData || applicationDisposed || !mayDispatchActions(state) || !navigator.onLine) return false;
+  const pageGeneration = applicationGeneration;
+  while (state.draining) {
+    const activeDrain = state.draining;
+    await activeDrain;
+    if (!initData || applicationDisposed || pageGeneration !== applicationGeneration || !mayDispatchActions(state) || !navigator.onLine) return false;
+  }
   recoverFileActionReceipts();
   for (const action of readActionQueue()) {
     if (action.delivery_outcome === "outcome_unknown") {
@@ -1383,7 +1755,7 @@ async function drainActionQueue({ quiet = false } = {}) {
     let removalFailed = false;
     let receiptRecoveryMessage = "";
     const permanentRejections = [];
-    while (navigator.onLine) {
+    while (navigator.onLine && !applicationDisposed && pageGeneration === applicationGeneration) {
       const outcome = await dispatchNextOwnedAction({
         surface: ACTION_SURFACE_FILE,
         readQueue: readActionQueue,
@@ -1398,6 +1770,8 @@ async function drainActionQueue({ quiet = false } = {}) {
             surface: resolvedSurface,
             beforeAcknowledge: acknowledgeFileActionReceipt,
           });
+          if (applicationDisposed || pageGeneration !== applicationGeneration) return recorded;
+          updateAwaitingOperationResultReceipt(action, receipt);
           if (action?.kind === "preview_cancel" && recorded.acknowledgementBlocked) {
             state.quarantinedActionIds.add(action.request_id);
             renderQueueCount();
@@ -1418,6 +1792,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           return recorded;
         },
       });
+      if (applicationDisposed || pageGeneration !== applicationGeneration) break;
       const receiptUpdate = outcome.receiptUpdate ?? {};
       if (receiptUpdate.downloadSubmission) renderDownloadStatus();
       if (receiptUpdate.migrationConflictDrafts > 0) renderMigrations();
@@ -1480,6 +1855,9 @@ async function drainActionQueue({ quiet = false } = {}) {
           ? action
           : { ...action, delivery_outcome: "outcome_unknown", delivery_error_code: code, delivery_error: error };
         const updates = markUnknownFileAction(state, marked);
+        if (!Number.isSafeInteger(state.awaitingOperationResults.get(action?.request_id)?.seq)) {
+          state.awaitingOperationResults.delete(action?.request_id);
+        }
         if (action?.kind === "preview_cancel") persistPreviewCancellations();
         if (action?.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
           state.metadataRecovery.deliveryUnknown = true;
@@ -1495,6 +1873,7 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (outcome.status === "rejected") {
         const { action, rejection, receiptUpdate } = outcome;
+        state.awaitingOperationResults.delete(action.request_id);
         if (receiptUpdate?.rejectedRequestIds?.includes(action.request_id)) {
           settleRejectedFileAction({ request_id: action.request_id, kind: action.kind, ...rejection }, true);
         }
@@ -1509,6 +1888,13 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (outcome.status === "sent") {
         sentAny = true;
+        if (outcome.action?.kind === "file_preview") {
+          updateMetadataRecoveryPreviewRequest(outcome.action, {
+            status: "submitted",
+            seq: outcome.receipt?.seq,
+            error: outcome.receipt?.error,
+          });
+        }
         continue;
       }
 
@@ -1521,6 +1907,7 @@ async function drainActionQueue({ quiet = false } = {}) {
         state.quarantinedActionIds.add(action.request_id);
         const latestQueue = readActionQueue();
         if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
+        state.awaitingOperationResults.delete(action.request_id);
         if (state.downloadSubmission?.request_id === action.request_id) {
           state.downloadSubmission = null;
           state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
@@ -1562,6 +1949,7 @@ async function drainActionQueue({ quiet = false } = {}) {
       connectionInterrupted = true;
       break;
     }
+    if (applicationDisposed || pageGeneration !== applicationGeneration) return sentAny;
     if (sentAny) state.retryDelay = 1500;
     if (permanentRejections.length) {
       const count = permanentRejections.length;
@@ -1579,15 +1967,13 @@ async function drainActionQueue({ quiet = false } = {}) {
   let sentAny = false;
   try { sentAny = await state.draining; }
   finally { state.draining = null; }
-  if (sentAny && state.ownerVerified) {
-    if (state.loading) state.refreshAfterDrain = true;
-    else await refreshState({ quiet: true });
-  }
+  if (applicationDisposed || pageGeneration !== applicationGeneration) return sentAny;
+  updateSnapshotInterest();
   return sentAny;
 }
 
 async function submitAction(kind, payload, { onQueued, requestId: suppliedRequestId } = {}) {
-  if (!mayDispatchActions(state)) return false;
+  if (applicationDisposed || !mayDispatchActions(state)) return false;
   if (kind === "download_submit" && unknownFileActionForKind(readActionQueue(), kind, state.unknownActionOutcomes)) {
     state.downloadMessage = "A previous download has an unknown delivery outcome. Check your computer and dismiss its notice before adding another request.";
     renderDownloadStatus();
@@ -1655,6 +2041,9 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     writeQueue: writeActionQueue,
     onQueued: (queuedAction) => {
       onQueued?.(queuedAction);
+      if (["library_scan", "legacy_import"].includes(kind)) {
+        state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
+      }
       if (["file_preview", "library_migration_preview"].includes(kind) && state.view !== "waiting") {
         state.view = "waiting";
         render();
@@ -1673,12 +2062,14 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
         replay_expires_at_ms: action.replay_expires_at_ms,
       };
       renderDownloadStatus();
+      updateSnapshotInterest();
     },
     isOnline: () => navigator.onLine,
     onOffline: () => showToast("Saved offline. It will send when this device reconnects."),
     onSending: () => showToast("Sending the saved request"),
     drain: drainActionQueue,
   });
+  if (applicationDisposed) return false;
   if (queued.status === "queue_full") {
     showToast("The offline queue is full. Reconnect and send its saved requests first.");
     return false;
@@ -1687,6 +2078,7 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     showToast("This browser could not save the action, so it was not sent.");
     return false;
   }
+  updateSnapshotInterest();
   return true;
 }
 
@@ -2011,7 +2403,7 @@ function statusText(value) {
 }
 
 const SETTLED_OPERATION_STATUSES = new Set([
-  "completed", "failed", "cancelled", "confirmed", "expired", "stale", "rejected",
+  "completed", "complete", "succeeded", "failed", "cancelled", "confirmed", "expired", "stale", "rejected",
   "uncertain", "partial_failure", "partial", "stopped", "superseded",
 ]);
 
@@ -3101,18 +3493,21 @@ function renderSync() {
   const badge = byId("sync-badge");
   badge.className = `badge${synced && !snapshot.stale ? " good" : synced ? " warning" : ""}`;
   if (!synced) {
-    title.textContent = "Waiting for your computer";
-    detail.textContent = state.snapshot?.cached_at ? "Showing your last saved view while we reconnect." : "Your library appears here after the desktop app connects.";
+    title.textContent = "No saved library snapshot yet";
+    detail.textContent = "Your library appears here after the desktop publishes a snapshot.";
     badge.textContent = "Not synced";
+    setSnapshotRefreshStatus(snapshotRefreshMessage, snapshotRefreshPending ? "pending" : "");
     return;
   }
   const firstScanPending = !librarySnapshot || librarySnapshot.ready === false || Number(librarySnapshot.scanned_at) === 0;
+  const snapshotAge = snapshotAgeLabel(snapshot);
   title.textContent = localAvailability === "offline"
     ? "This media root is offline"
-    : savedLibraryView ? "Showing a saved scan while this root refreshes"
-      : snapshot.stale ? "No recent computer contact" : firstScanPending ? "Connected · first scan pending" : "Your library is synced";
-  detail.textContent = `Root: ${localLibrary.descriptor?.root || "not reported"} · Last contact ${timeAgo(snapshot.last_seen)} · Last scan ${firstScanPending ? "not completed" : formatTime(librarySnapshot?.scanned_at, "seconds")}${savedLibraryView ? " · Cached items are read-only until this root scans again." : ""}`;
-  badge.textContent = localAvailability === "offline" ? "Drive offline" : savedLibraryView ? "Saved scan" : snapshot.stale ? "Contact overdue" : "Up to date";
+    : savedLibraryView ? "Showing the last saved library scan"
+      : snapshot.stale ? "This saved snapshot may be outdated" : firstScanPending ? "Saved snapshot · first scan pending" : "Saved library snapshot";
+  detail.textContent = `Root: ${localLibrary.descriptor?.root || "not reported"} · Snapshot published ${snapshotAge} · Last scan ${firstScanPending ? "not completed" : formatTime(librarySnapshot?.scanned_at, "seconds")}${savedLibraryView ? " · Cached items are read-only until this root scans again." : ""}`;
+  badge.textContent = localAvailability === "offline" ? "Drive offline" : savedLibraryView ? "Saved scan" : snapshot.stale ? "Snapshot outdated" : "Saved snapshot";
+  setSnapshotRefreshStatus(snapshotRefreshMessage, snapshotRefreshPending ? "pending" : "");
 }
 
 function renderDetail() {
@@ -3188,6 +3583,7 @@ function render() {
   }
   for (const panel of document.querySelectorAll(".view-panel")) panel.classList.toggle("hidden", panel.id !== `view-${state.view}`);
   renderDetail();
+  updateSnapshotInterest();
 }
 
 function previewSelectedLegacy() {
@@ -3808,11 +4204,13 @@ function bindEvents() {
         showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
         return;
       }
+      state.awaitingOperationResults.delete(requestId);
       if (state.metadataRecoveryPreviewRequest?.requestId === requestId) setMetadataRecoveryPreviewRequest(null);
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();
       renderPreviewReviewCards();
+      updateSnapshotInterest();
       showToast("The delivery outcome is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
       return;
     }
@@ -4062,12 +4460,11 @@ function bindEvents() {
       return;
     }
     if (state.ownerVerified) {
-      if (state.loading) state.refreshAfterDrain = true;
-      else refreshState({ quiet: true });
+      if (!state.loading) void performRefreshState({ quiet: true }).catch(() => {});
     }
     if (orphaned) render();
   });
-  window.addEventListener("online", () => { showToast("Connection restored. Sending saved actions."); drainActionQueue(); refreshState({ quiet: true }); });
+  window.addEventListener("online", () => { showToast("Connection restored. Sending saved actions."); drainActionQueue(); });
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.detailId) { state.detailId = null; renderDetail(); } });
 }
 
@@ -4088,12 +4485,49 @@ function start() {
   setConnection("", "Verifying owner access");
   snapshotUpdates = createSnapshotUpdates({
     api,
-    refresh: performRefreshState,
+    readSnapshot: performRefreshState,
+    surface: "file",
     onAuthorizationExpired: () => handleAuthorizationFailure({ status: 401 }),
+    onReady: ({ databaseEpoch }) => {
+      advertisedDatabaseEpoch = databaseEpoch;
+      if (state.snapshot && state.snapshot.database_epoch !== databaseEpoch) {
+        markEpochVerificationPending(databaseEpoch);
+        void performRefreshState({ quiet: true, expectedDatabaseEpoch: databaseEpoch }).catch(() => {});
+      }
+    },
+    onEpochChanged: ({ databaseEpoch }) => {
+      advertisedDatabaseEpoch = databaseEpoch;
+      markEpochVerificationPending(databaseEpoch);
+    },
     onStatus: updateSnapshotUpdateStatus,
   });
-  window.setInterval(refreshLocalSnapshotFreshness, 60_000);
+  snapshotFreshnessTimer = window.setInterval(refreshLocalSnapshotFreshness, 60_000);
+  window.addEventListener("pagehide", disposeApplication, { once: true });
   snapshotUpdates.start();
+  const requestOpenSnapshot = () => {
+    if (privateAccessExpired || applicationDisposed) return;
+    const route = new URLSearchParams(window.location.search);
+    if (route.get("download") === "1") {
+      void refreshState({ reason: "open", scope: "download", libraryId: route.get("library_id") || activeLibraryId(), quiet: true });
+      return;
+    }
+    void refreshState({ reason: "open", scope: "library", ...(activeLibraryId() ? { libraryId: activeLibraryId() } : {}), quiet: true });
+  };
+  void performRefreshState({ quiet: true }).then(requestOpenSnapshot).catch(() => {
+    // A transient cache read failure does not cancel the one explicit refresh for this open.
+    // The correlated desktop result retries the owner-checked read; 401 stops this path.
+    requestOpenSnapshot();
+  });
+}
+
+function disposeApplication(event) {
+  if (event?.persisted === true) return;
+  if (applicationDisposed) return;
+  applicationDisposed = true;
+  applicationGeneration += 1;
+  snapshotUpdates?.stop();
+  if (snapshotFreshnessTimer) window.clearInterval(snapshotFreshnessTimer);
+  snapshotFreshnessTimer = 0;
 }
 
 start();

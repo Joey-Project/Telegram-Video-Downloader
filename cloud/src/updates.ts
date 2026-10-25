@@ -6,8 +6,13 @@ export const MINIAPP_UPDATES_SESSION_PATH = "/api/updates/session";
 export const MINIAPP_UPDATES_SOCKET_PATH = "/api/updates/ws";
 export const MINIAPP_UPDATES_TICKET_TTL_MS = 60_000;
 export const MINIAPP_UPDATES_MAX_VIEWERS = 32;
+export const SNAPSHOT_CONTROL_HEADER = "X-Cloud-Snapshot-Control";
+export const SNAPSHOT_CONTROL_VERSION = "v1";
+export const SNAPSHOT_NOTIFY_VIEWERS_HEADER = "X-Snapshot-Notify-Viewers";
 
 export const NOTIFIER_ROLE_HEADER = "x-tvd-notifier-role";
+export const NOTIFIER_LOCAL_EPOCH_HEADER = "x-tvd-local-epoch";
+export const NOTIFIER_LOCAL_CONTROL_HEADER = "x-tvd-local-control";
 export const NOTIFIER_VIEWER_OWNER_HEADER = "x-tvd-viewer-owner";
 export const NOTIFIER_VIEWER_EPOCH_HEADER = "x-tvd-viewer-epoch";
 export const NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER = "x-tvd-viewer-ticket-expiry";

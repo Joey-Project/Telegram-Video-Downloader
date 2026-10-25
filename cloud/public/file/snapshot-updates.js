@@ -5,12 +5,15 @@ const MAX_TICKET_LENGTH = 2_048;
 const MAX_MESSAGE_LENGTH = 16 * 1_024;
 const CONNECT_TIMEOUT_MS = 10_000;
 const READY_TIMEOUT_MS = 10_000;
-const FALLBACK_INTERVAL_MS = 60_000;
-const RECONCILE_INTERVAL_MS = 5 * 60_000;
-const MIN_REFRESH_INTERVAL_MS = 1_000;
+const REFRESH_TIMEOUT_MS = 125_000;
+const REFRESH_QUEUE_TIMEOUT_MS = 125_000;
+const PUBLISHED_CACHE_READ_TIMEOUT_MS = 25_000;
 const MAX_RETRY_MS = 60_000;
-const MAX_REFRESH_WAITERS = 32;
+const MAX_PENDING_REFRESHES = 32;
 const DATABASE_EPOCH_PATTERN = /^[0-9a-f]{32}$/u;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const REFRESH_REASONS = new Set(["open", "manual", "reference"]);
+const REFRESH_SCOPES = new Set(["library", "settings", "operations", "download"]);
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -44,13 +47,30 @@ function parseMessage(data) {
   try { value = JSON.parse(data); } catch { return null; }
   if (!isRecord(value)) return null;
   if (value.type === "ready") {
-    return validEpoch(value.database_epoch) ? value : null;
+    if (!validEpoch(value.database_epoch)
+        || Object.hasOwn(value, "snapshot_control") && value.snapshot_control !== "v1") return null;
+    return value;
   }
   if (value.type === "invalidate") {
     if (!validEpoch(value.database_epoch)
         || !["state", "inbox", "epoch"].includes(value.reason)
         || Object.hasOwn(value, "state_version")
           && (!Number.isSafeInteger(value.state_version) || value.state_version < 0)) return null;
+    return value;
+  }
+  if (value.type === "refresh_result") {
+    if (!validEpoch(value.database_epoch)
+        || typeof value.request_id !== "string" || !UUID_PATTERN.test(value.request_id)
+        || !["published", "failed", "unavailable"].includes(value.status)
+        || Object.hasOwn(value, "state_version")
+          && (!Number.isSafeInteger(value.state_version) || value.state_version < 1)
+        || Object.hasOwn(value, "reported_at")
+          && (!Number.isSafeInteger(value.reported_at) || value.reported_at < 1)
+        || Object.hasOwn(value, "error_code")
+          && (typeof value.error_code !== "string" || !/^[a-z0-9_-]{1,64}$/iu.test(value.error_code))) return null;
+    if (value.status === "published"
+        && (!Number.isSafeInteger(value.state_version) || value.state_version < 1
+          || !Number.isSafeInteger(value.reported_at) || value.reported_at < 1)) return null;
     return value;
   }
   return null;
@@ -68,13 +88,29 @@ function websocketUrl(path, location) {
   return url.href;
 }
 
+function unavailableResult(errorCode = "unavailable") {
+  return { status: "unavailable", error_code: errorCode };
+}
+
 /**
- * Own the authenticated update socket, bounded fallback polling, and refresh coalescing.
- * The API callback must retain the Mini App's existing authenticated fetch behavior.
+ * Own the authenticated notification socket, viewer interest, and on-demand
+ * refresh requests. `readSnapshot` must only read the published Cloudflare cache.
  */
-export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthorizationExpired, onStatus, environment = {} }) {
-  if (typeof api !== "function" || typeof refreshSnapshot !== "function") {
-    throw new TypeError("Snapshot updates require API and refresh callbacks.");
+export function createSnapshotUpdates({
+  api,
+  readSnapshot,
+  surface,
+  onAuthorizationExpired,
+  onReady,
+  onEpochChanged,
+  onStatus,
+  environment = {},
+}) {
+  if (typeof api !== "function" || typeof readSnapshot !== "function") {
+    throw new TypeError("Snapshot updates require API and published-snapshot callbacks.");
+  }
+  if (surface !== "file" && surface !== "settings") {
+    throw new TypeError("Snapshot updates require a Mini App surface.");
   }
 
   const win = environment.window ?? globalThis.window ?? null;
@@ -86,6 +122,7 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
   const telegram = environment.telegram ?? win?.Telegram?.WebApp ?? null;
   const now = environment.now ?? Date.now;
   const random = environment.random ?? Math.random;
+  const randomUUID = environment.randomUUID ?? (() => globalThis.crypto.randomUUID());
   const setTimer = environment.setTimeout ?? win?.setTimeout?.bind(win) ?? globalThis.setTimeout.bind(globalThis);
   const clearTimerFn = environment.clearTimeout ?? win?.clearTimeout?.bind(win) ?? globalThis.clearTimeout.bind(globalThis);
 
@@ -94,31 +131,34 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
   let unsupported = false;
   let telegramActive = true;
   let lifecyclePaused = false;
-  let needsCatchup = true;
   let status = "paused";
   let socket = null;
   let connecting = false;
   let connectionSequence = 0;
   let sessionController = null;
   let authExpiresAt = null;
+  let databaseEpoch = null;
+  let epochVerificationPending = false;
+  let snapshotControlV1 = false;
+  let lastInterestKey = null;
+  let epochReverification = false;
   let retryDelay = 1_000;
-  let lastRefreshStartedAt = -Infinity;
-  let refreshRetryDelay = 1_000;
-  let refreshDirty = false;
-  let refreshQuiet = true;
-  let refreshTimer = 0;
-  let refreshRetryTimer = 0;
-  let refreshPromise = null;
-  let refreshWaiters = [];
-  let activeRefreshWaiters = [];
+  let desiredWatch = false;
+  let snapshotReadPromise = null;
+  let snapshotReadController = null;
+  let snapshotReadDeadlineTimer = 0;
+  let snapshotReadAgain = false;
+  let snapshotReadMinimumVersion = 0;
+  let snapshotReadEpochChanged = false;
+  let snapshotReadExpectedEpoch = null;
   let connectionTimer = 0;
   let readyTimer = 0;
   let expiryTimer = 0;
   let retryTimer = 0;
-  let fallbackTimer = 0;
-  let reconcileTimer = 0;
-  const intentionallyClosedSockets = new WeakSet();
   let listenersAttached = false;
+  let pendingRefreshes = new Map();
+  let coalescedRefreshes = new Map();
+  const intentionallyClosedSockets = new WeakSet();
 
   function emitStatus(next) {
     if (status === next) return;
@@ -130,13 +170,37 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     return nav?.onLine !== false;
   }
 
-  function isPaused() {
-    return !isOnline() || doc?.visibilityState === "hidden" || doc?.hidden === true || telegramActive === false;
+  function isVisible() {
+    return isOnline()
+      && doc?.visibilityState !== "hidden"
+      && doc?.hidden !== true
+      && telegramActive !== false;
   }
 
-  function clearTimer(name) {
-    if (!name) return;
-    clearTimerFn(name);
+  function isPaused() {
+    return !isVisible();
+  }
+
+  function clearTimer(timer) {
+    if (timer) clearTimerFn(timer);
+  }
+
+  function clearSnapshotReadDeadline() {
+    clearTimer(snapshotReadDeadlineTimer);
+    snapshotReadDeadlineTimer = 0;
+  }
+
+  function abortSnapshotRead() {
+    clearSnapshotReadDeadline();
+    snapshotReadController?.abort();
+  }
+
+  function boundPublishedCacheRead() {
+    if (!snapshotReadController || snapshotReadDeadlineTimer) return;
+    snapshotReadDeadlineTimer = setTimer(() => {
+      snapshotReadDeadlineTimer = 0;
+      snapshotReadController?.abort();
+    }, PUBLISHED_CACHE_READ_TIMEOUT_MS);
   }
 
   function clearConnectionTimers() {
@@ -146,121 +210,230 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     readyTimer = 0;
   }
 
-  function settleWaiters(waiters, error) {
-    for (const waiter of waiters) {
-      if (error) waiter.reject(error);
-      else waiter.resolve();
+  function clearReconnectTimer() {
+    clearTimer(retryTimer);
+    retryTimer = 0;
+  }
+
+  function settleRefresh(entry, result) {
+    if (!pendingRefreshes.has(entry.requestId)) return;
+    pendingRefreshes.delete(entry.requestId);
+    if (coalescedRefreshes.get(entry.coalesceKey) === entry) coalescedRefreshes.delete(entry.coalesceKey);
+    clearTimer(entry.queueTimeout);
+    clearTimer(entry.responseTimeout);
+    entry.resolve(result);
+  }
+
+  function settleAllRefreshes(result) {
+    for (const entry of pendingRefreshes.values()) settleRefresh(entry, result);
+  }
+
+  function sendFrame(value) {
+    if (!socket || socket.readyState !== 1) return false;
+    try {
+      socket.send(JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
     }
   }
 
-  function settleRefreshWaiters(error) {
-    const waiters = [...activeRefreshWaiters, ...refreshWaiters];
-    activeRefreshWaiters = [];
-    refreshWaiters = [];
-    settleWaiters(waiters, error);
+  function sendInterest(visible = isVisible(), force = false) {
+    if (!snapshotControlV1 || !databaseEpoch) return;
+    const watch = visible && desiredWatch;
+    const key = `${databaseEpoch}:${visible ? "1" : "0"}:${surface}:${watch ? "1" : "0"}`;
+    if (!force && key === lastInterestKey) return;
+    if (!sendFrame({
+      type: "interest",
+      database_epoch: databaseEpoch,
+      visible,
+      surface,
+      watch,
+    })) return;
+    lastInterestKey = key;
   }
 
-  function clearRefreshRetryTimer() {
-    clearTimer(refreshRetryTimer);
-    refreshRetryTimer = 0;
+  function refreshFrame(entry) {
+    return {
+      type: "refresh_request",
+      database_epoch: databaseEpoch,
+      request_id: entry.requestId,
+      reason: entry.reason,
+      scope: entry.scope,
+      ...(entry.libraryId ? { library_id: entry.libraryId } : {}),
+    };
   }
 
-  function scheduleRefresh(delay = 0) {
-    if (!started || expired || !refreshDirty || refreshTimer || refreshPromise || isPaused()) return;
-    const throttle = Math.max(0, MIN_REFRESH_INTERVAL_MS - (now() - lastRefreshStartedAt));
-    refreshTimer = setTimer(runRefresh, Math.max(delay, throttle));
+  function flushUnsentRefreshes() {
+    if (!snapshotControlV1 || !databaseEpoch || isPaused()) return;
+    for (const entry of pendingRefreshes.values()) {
+      if (entry.sent || entry.epoch !== null && entry.epoch !== databaseEpoch) continue;
+      if (!sendFrame(refreshFrame(entry))) continue;
+      entry.epoch = databaseEpoch;
+      entry.sent = true;
+      clearTimer(entry.queueTimeout);
+      entry.queueTimeout = 0;
+      entry.responseTimeout = setTimer(
+        () => settleRefresh(entry, { status: "failed", error_code: "timeout" }),
+        REFRESH_TIMEOUT_MS,
+      );
+    }
   }
 
-  function requestRefresh(quiet) {
-    if (!started || expired) return;
-    clearRefreshRetryTimer();
-    refreshDirty = true;
-    refreshQuiet = refreshQuiet && quiet;
-    scheduleRefresh();
-  }
-
-  function scheduleRefreshRetry() {
-    if (!started || expired || isPaused() || refreshRetryTimer) return;
-    const delay = refreshRetryDelay;
-    refreshRetryDelay = Math.min(MAX_RETRY_MS, refreshRetryDelay * 2);
-    refreshRetryTimer = setTimer(() => {
-      refreshRetryTimer = 0;
-      if (!started || expired || isPaused()) return;
-      refreshDirty = true;
-      scheduleRefresh();
-    }, delay);
-  }
-
-  async function runRefresh() {
-    refreshTimer = 0;
-    if (!started || expired || !refreshDirty) return;
-    if (isPaused()) return;
-    refreshDirty = false;
-    const quiet = refreshQuiet;
-    refreshQuiet = true;
-    const attemptWaiters = refreshWaiters;
-    refreshWaiters = [];
-    activeRefreshWaiters = attemptWaiters;
-    lastRefreshStartedAt = now();
-    refreshPromise = Promise.resolve().then(() => refreshSnapshot({ quiet }));
-    let failure = null;
-    try {
-      await refreshPromise;
-    } catch (error) {
-      failure = error;
-    } finally {
-      refreshPromise = null;
-      if (activeRefreshWaiters === attemptWaiters) activeRefreshWaiters = [];
-      if (failure) {
-        settleWaiters(attemptWaiters, failure);
-        if (started && !expired && !isPaused()) {
-          if (!refreshDirty) {
-            refreshDirty = true;
-            refreshQuiet = true;
-          }
-          scheduleRefreshRetry();
-        }
-      } else {
-        settleWaiters(attemptWaiters);
-        refreshRetryDelay = 1_000;
-        clearRefreshRetryTimer();
-        if (refreshDirty && started && !expired && !isPaused()) {
-          scheduleRefresh();
-        }
+  function settleSentRefreshesOnDisconnect() {
+    for (const entry of pendingRefreshes.values()) {
+      if (entry.sent && !entry.resultReceived) {
+        settleRefresh(entry, unavailableResult("transport_disconnected"));
       }
     }
   }
 
-  function refresh(options = {}) {
-    if (expired || !started) return Promise.resolve();
-    requestRefresh(options.quiet === true);
-    if (refreshWaiters.length + activeRefreshWaiters.length >= MAX_REFRESH_WAITERS) return Promise.resolve();
-    const promise = new Promise((resolve, reject) => refreshWaiters.push({ resolve, reject }));
-    return promise;
+  function requestSnapshotRead(minimumVersion = 0, { epochChanged = false, expectedEpoch = databaseEpoch, publishedResult = false } = {}) {
+    const requestedEpoch = typeof expectedEpoch === "string" ? expectedEpoch : null;
+    if (snapshotReadExpectedEpoch !== requestedEpoch) {
+      snapshotReadExpectedEpoch = requestedEpoch;
+      snapshotReadMinimumVersion = minimumVersion;
+    } else {
+      snapshotReadMinimumVersion = Math.max(snapshotReadMinimumVersion, minimumVersion);
+    }
+    snapshotReadAgain = true;
+    snapshotReadEpochChanged ||= epochChanged;
+    if (snapshotReadPromise) {
+      if (publishedResult) boundPublishedCacheRead();
+      return snapshotReadPromise;
+    }
+
+    const readController = new AbortControllerConstructor();
+    snapshotReadController = readController;
+    let rejectAbortedRead;
+    const abortedRead = new Promise((_, reject) => { rejectAbortedRead = reject; });
+    const rejectOnAbort = () => rejectAbortedRead(new Error("The published snapshot read was cancelled."));
+    readController.signal.addEventListener("abort", rejectOnAbort, { once: true });
+    if (publishedResult) boundPublishedCacheRead();
+
+    snapshotReadPromise = (async () => {
+      let snapshot;
+      let attempts = 0;
+      while (snapshotReadAgain && started && !expired && !isPaused()) {
+        snapshotReadAgain = false;
+        const readEpoch = snapshotReadExpectedEpoch;
+        const minimum = snapshotReadMinimumVersion;
+        snapshotReadMinimumVersion = 0;
+        const reverifyEpoch = snapshotReadEpochChanged;
+        snapshotReadEpochChanged = false;
+        snapshot = await Promise.race([readSnapshot({
+          quiet: true,
+          minimumVersion: minimum,
+          signal: readController.signal,
+          ...(readEpoch ? { expectedDatabaseEpoch: readEpoch } : {}),
+          ...(reverifyEpoch ? { epochChanged: true } : {}),
+        }), abortedRead]);
+        if (readController.signal.aborted) throw new Error("The published snapshot read was cancelled.");
+        const latestExpectedEpoch = snapshotReadExpectedEpoch;
+        if (readEpoch !== latestExpectedEpoch && snapshot?.database_epoch !== latestExpectedEpoch) {
+          snapshotReadAgain = true;
+          continue;
+        }
+        if (latestExpectedEpoch && snapshot?.database_epoch !== latestExpectedEpoch) {
+          snapshotReadAgain = false;
+          snapshotReadMinimumVersion = 0;
+          throw new Error("The owner snapshot belongs to a different database epoch.");
+        }
+        if (reverifyEpoch || snapshotReadEpochChanged) {
+          snapshotReadEpochChanged = false;
+          epochVerificationPending = false;
+        }
+        attempts += 1;
+        const version = Number.isSafeInteger(snapshot?.state_version) ? snapshot.state_version : 0;
+        const epochMatchesRead = readEpoch === latestExpectedEpoch;
+        const requiredVersion = Math.max(epochMatchesRead ? minimum : 0, snapshotReadMinimumVersion);
+        if (version < requiredVersion && attempts < 2) {
+          snapshotReadAgain = true;
+          snapshotReadMinimumVersion = requiredVersion;
+          continue;
+        }
+        if (version < requiredVersion) {
+          snapshotReadAgain = false;
+          snapshotReadMinimumVersion = 0;
+          throw new Error("The published snapshot is behind the desktop refresh result.");
+        }
+        if (snapshotReadAgain && snapshotReadMinimumVersion <= version && !snapshotReadEpochChanged) {
+          snapshotReadAgain = false;
+          snapshotReadMinimumVersion = 0;
+        }
+      }
+      return snapshot;
+    })().finally(() => {
+      readController.signal.removeEventListener("abort", rejectOnAbort);
+      clearSnapshotReadDeadline();
+      if (snapshotReadController === readController) snapshotReadController = null;
+      snapshotReadPromise = null;
+    });
+    return snapshotReadPromise;
   }
 
-  function queueQuietRefresh() {
-    requestRefresh(true);
+  async function finishPublishedRefresh(entry, message) {
+    try {
+      const snapshot = await requestSnapshotRead(message.state_version, { publishedResult: true });
+      settleRefresh(entry, { ...message, snapshot });
+    } catch {
+      // Publication is independently confirmed by the correlated Mac result.
+      settleRefresh(entry, { ...message, cache_read_failed: true });
+    }
   }
 
-  function clearFallbackTimer() {
-    clearTimer(fallbackTimer);
-    fallbackTimer = 0;
+  function handleRefreshResult(message) {
+    if (!snapshotControlV1 || message.database_epoch !== databaseEpoch) return;
+    const entry = pendingRefreshes.get(message.request_id);
+    if (!entry || entry.epoch !== message.database_epoch || !entry.sent) return;
+    if (message.status === "published") {
+      entry.resultReceived = true;
+      clearTimer(entry.responseTimeout);
+      entry.responseTimeout = 0;
+      void finishPublishedRefresh(entry, message);
+      return;
+    }
+    settleRefresh(entry, message);
   }
 
-  function scheduleFallback() {
-    if (!started || expired || isPaused() || status === "live" || fallbackTimer) return;
-    fallbackTimer = setTimer(() => {
-      fallbackTimer = 0;
-      if (!started || expired || isPaused() || status === "live") return;
-      queueQuietRefresh();
-      scheduleFallback();
-    }, FALLBACK_INTERVAL_MS);
+  async function reverifyEpoch() {
+    if (epochReverification || !epochVerificationPending || !started || expired || isPaused()) return;
+    epochReverification = true;
+    try {
+      const snapshot = await requestSnapshotRead(0, { epochChanged: true, expectedEpoch: databaseEpoch });
+      if (snapshot !== undefined) epochVerificationPending = false;
+    } catch {
+      epochVerificationPending = true;
+    } finally {
+      epochReverification = false;
+      if (started && !expired && !isPaused()) {
+        if (!socket && !connecting) connect();
+        else if (!epochVerificationPending) flushUnsentRefreshes();
+      }
+    }
   }
 
-  function clearReconnectTimer() {
-    clearTimer(retryTimer);
-    retryTimer = 0;
+  function handleInvalidate(message) {
+    if (message.reason === "epoch") {
+      if (message.database_epoch === databaseEpoch && epochVerificationPending) return;
+      epochVerificationPending = true;
+      databaseEpoch = message.database_epoch;
+      try { onEpochChanged?.({ databaseEpoch: message.database_epoch }); } catch { /* Epoch fencing must not break transport recovery. */ }
+      cancelPendingRefreshes("database_epoch_changed");
+      snapshotControlV1 = false;
+      snapshotReadMinimumVersion = 0;
+      snapshotReadExpectedEpoch = databaseEpoch;
+      snapshotReadEpochChanged = true;
+      snapshotReadAgain = true;
+      lastInterestKey = null;
+      stopTransport();
+      void reverifyEpoch();
+      return;
+    }
+    if (message.database_epoch !== databaseEpoch) return;
+    if (!isVisible() || !desiredWatch && pendingRefreshes.size === 0) return;
+    const minimumVersion = Number.isSafeInteger(message.state_version) ? message.state_version : 0;
+    void requestSnapshotRead(minimumVersion).catch(() => {});
   }
 
   function scheduleReconnect() {
@@ -273,29 +446,13 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     }, jitteredDelay);
   }
 
-  function scheduleReconciliation() {
-    clearTimer(reconcileTimer);
-    reconcileTimer = 0;
-    if (!started || expired || isPaused() || status !== "live") return;
-    reconcileTimer = setTimer(() => {
-      reconcileTimer = 0;
-      if (!started || expired || isPaused() || status !== "live") return;
-      queueQuietRefresh();
-      scheduleReconciliation();
-    }, RECONCILE_INTERVAL_MS);
-  }
-
   function closeSocket(code = 1000, reason = "Mini App paused") {
     const current = socket;
-    socket = null;
     if (!current) return;
+    sendInterest(false);
+    socket = null;
     intentionallyClosedSockets.add(current);
     try { current.close(code, reason); } catch { /* The socket may already be closed. */ }
-  }
-
-  function clearExpiryTimer() {
-    clearTimer(expiryTimer);
-    expiryTimer = 0;
   }
 
   function stopTransport() {
@@ -303,15 +460,14 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     sessionController?.abort();
     sessionController = null;
     connecting = false;
-    clearTimer(refreshTimer);
-    refreshTimer = 0;
-    clearRefreshRetryTimer();
     clearConnectionTimers();
     clearReconnectTimer();
-    clearFallbackTimer();
-    clearTimer(reconcileTimer);
-    reconcileTimer = 0;
     closeSocket();
+  }
+
+  function clearExpiryTimer() {
+    clearTimer(expiryTimer);
+    expiryTimer = 0;
   }
 
   function removeLifecycleListeners() {
@@ -324,29 +480,31 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     telegram?.offEvent?.("deactivated", handleTelegramDeactivated);
   }
 
+  function cancelPendingRefreshes(errorCode = "unavailable") {
+    settleAllRefreshes(unavailableResult(errorCode));
+  }
+
   function stop() {
     if (!started) return;
+    sendInterest(false);
     started = false;
     stopTransport();
+    abortSnapshotRead();
     clearExpiryTimer();
-    clearTimer(refreshTimer);
-    refreshTimer = 0;
-    refreshDirty = false;
-    settleRefreshWaiters();
+    cancelPendingRefreshes("stopped");
     removeLifecycleListeners();
     if (!expired) emitStatus("paused");
   }
 
   function expireAuthorization() {
     if (expired) return;
+    sendInterest(false);
     expired = true;
     started = false;
     stopTransport();
+    abortSnapshotRead();
     clearExpiryTimer();
-    clearTimer(refreshTimer);
-    refreshTimer = 0;
-    refreshDirty = false;
-    settleRefreshWaiters();
+    cancelPendingRefreshes("authorization_expired");
     removeLifecycleListeners();
     emitStatus("expired");
     try { onAuthorizationExpired?.(); } catch { /* Access gating must not restart transport. */ }
@@ -367,151 +525,12 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     }, remaining);
   }
 
-  function enterFallback({ reconnect = true, immediateCatchup = false } = {}) {
-    if (!started || expired) return;
-    if (isPaused()) {
-      handleLifecyclePause();
-      return;
-    }
-    emitStatus("fallback");
-    clearTimer(reconcileTimer);
-    reconcileTimer = 0;
-    if (immediateCatchup && needsCatchup) {
-      needsCatchup = false;
-      queueQuietRefresh();
-    }
-    scheduleFallback();
-    if (reconnect) scheduleReconnect();
-  }
-
-  function finishConnectionFailure(sequence, { unsupportedRoute = false, immediateCatchup = false } = {}) {
-    if (sequence !== connectionSequence || !started || expired) return;
-    connectionSequence += 1;
-    sessionController?.abort();
-    sessionController = null;
-    connecting = false;
-    clearConnectionTimers();
-    closeSocket();
-    if (unsupportedRoute) unsupported = true;
-    if (status === "live") needsCatchup = true;
-    enterFallback({ reconnect: !unsupported, immediateCatchup: immediateCatchup || needsCatchup });
-  }
-
-  function handleSocketFailure(current, { authExpired = false } = {}) {
-    const wasCurrent = socket === current;
-    const intentionallyClosed = intentionallyClosedSockets.has(current);
-    if (authExpired) {
-      expireAuthorization();
-      return;
-    }
-    if (intentionallyClosed || !wasCurrent) return;
-    if (status === "live") needsCatchup = true;
-    socket = null;
-    connecting = false;
-    clearConnectionTimers();
-    enterFallback({ immediateCatchup: needsCatchup });
-  }
-
-  function attachSocketHandlers(current, sequence) {
-    current.addEventListener("open", () => {
-      if (!started || sequence !== connectionSequence || socket !== current) return;
-      clearTimer(connectionTimer);
-      connectionTimer = 0;
-      if (current.protocol !== PROTOCOL) {
-        finishConnectionFailure(sequence, { unsupportedRoute: true, immediateCatchup: true });
-        return;
-      }
-      readyTimer = setTimer(() => {
-        readyTimer = 0;
-        finishConnectionFailure(sequence, { immediateCatchup: true });
-      }, READY_TIMEOUT_MS);
-    });
-    current.addEventListener("message", (event) => {
-      if (!started || sequence !== connectionSequence || socket !== current) return;
-      const message = parseMessage(event.data);
-      if (!message) {
-        finishConnectionFailure(sequence, { immediateCatchup: true });
-        return;
-      }
-      if (message.type === "ready") {
-        if (status === "live") return;
-        clearTimer(readyTimer);
-        readyTimer = 0;
-        connecting = false;
-        retryDelay = 1_000;
-        clearReconnectTimer();
-        clearFallbackTimer();
-        emitStatus("live");
-        needsCatchup = false;
-        queueQuietRefresh();
-        scheduleReconciliation();
-        return;
-      }
-      scheduleReconciliation();
-      queueQuietRefresh();
-    });
-    current.addEventListener("error", () => {
-      if (socket === current) finishConnectionFailure(sequence, { immediateCatchup: status === "live" });
-    });
-    current.addEventListener("close", (event) => {
-      handleSocketFailure(current, { authExpired: event.code === 4401 });
-    });
-  }
-
-  async function connect() {
-    if (!started || expired || unsupported || isPaused() || connecting || socket) return;
-    if (typeof WebSocketConstructor !== "function") {
-      unsupported = true;
-      enterFallback({ reconnect: false, immediateCatchup: true });
-      return;
-    }
-
-    connecting = true;
-    const sequence = ++connectionSequence;
-    emitStatus("connecting");
-    const controller = typeof AbortControllerConstructor === "function" ? new AbortControllerConstructor() : null;
-    sessionController = controller;
-    connectionTimer = setTimer(() => {
-      connectionTimer = 0;
-      if (sequence !== connectionSequence) return;
-      controller?.abort();
-      finishConnectionFailure(sequence, { immediateCatchup: true });
-    }, CONNECT_TIMEOUT_MS);
-
-    try {
-      const session = validateSession(
-        await api(SESSION_PATH, { method: "POST", ...(controller ? { signal: controller.signal } : {}) }),
-        now(),
-      );
-      if (!started || expired || sequence !== connectionSequence) return;
-      authExpiresAt = authExpiresAt === null ? session.expires_at : Math.min(authExpiresAt, session.expires_at);
-      scheduleAuthorizationExpiry();
-      if (expired) return;
-      const url = websocketUrl(session.websocket_path, location);
-      const current = new WebSocketConstructor(url, [PROTOCOL, session.ticket]);
-      socket = current;
-      attachSocketHandlers(current, sequence);
-    } catch (error) {
-      if (!started || expired || sequence !== connectionSequence) return;
-      const statusCode = responseStatus(error);
-      if (statusCode === 401 || statusCode === 403) {
-        expireAuthorization();
-        return;
-      }
-      const unsupportedRoute = [404, 405, 501].includes(statusCode)
-        || /session response is invalid|unsafe WebSocket URL|does not support WebSocket/u.test(String(error?.message ?? ""));
-      finishConnectionFailure(sequence, { unsupportedRoute, immediateCatchup: true });
-    }
-  }
-
   function handleLifecyclePause() {
     if (!started || expired) return;
     lifecyclePaused = true;
-    needsCatchup = true;
+    sendInterest(false);
     stopTransport();
-    refreshDirty = false;
-    refreshQuiet = true;
-    settleRefreshWaiters(new Error("Snapshot refresh was paused."));
+    cancelPendingRefreshes(isOnline() ? "hidden" : "offline");
     emitStatus(!isOnline() ? "offline" : "paused");
   }
 
@@ -521,24 +540,16 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
       handleLifecyclePause();
       return;
     }
-    if (lifecyclePaused) needsCatchup = true;
     lifecyclePaused = false;
     clearReconnectTimer();
-    clearFallbackTimer();
     if (unsupported || typeof WebSocketConstructor !== "function") {
-      enterFallback({ reconnect: false, immediateCatchup: true });
-      return;
-    }
-    if (status === "live" && socket) {
-      queueQuietRefresh();
-      scheduleReconciliation();
+      emitStatus("unavailable");
       return;
     }
     connect();
   }
 
   function handleOnline() {
-    needsCatchup = true;
     resumeFromLifecycle();
   }
 
@@ -571,6 +582,211 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     telegram?.onEvent?.("deactivated", handleTelegramDeactivated);
   }
 
+  function finishConnectionFailure(sequence, { unsupportedRoute = false, authExpired = false } = {}) {
+    if (sequence !== connectionSequence || !started || expired) return;
+    if (authExpired) {
+      expireAuthorization();
+      return;
+    }
+    connectionSequence += 1;
+    sessionController?.abort();
+    sessionController = null;
+    connecting = false;
+    clearConnectionTimers();
+    settleSentRefreshesOnDisconnect();
+    closeSocket();
+    if (unsupportedRoute) {
+      unsupported = true;
+      cancelPendingRefreshes("transport_unavailable");
+      emitStatus("unavailable");
+      return;
+    }
+    emitStatus("fallback");
+    scheduleReconnect();
+  }
+
+  function handleSocketFailure(current, { authExpired = false } = {}) {
+    const wasCurrent = socket === current;
+    const intentionallyClosed = intentionallyClosedSockets.has(current);
+    if (authExpired) {
+      expireAuthorization();
+      return;
+    }
+    if (intentionallyClosed || !wasCurrent) return;
+    settleSentRefreshesOnDisconnect();
+    socket = null;
+    connecting = false;
+    clearConnectionTimers();
+    snapshotControlV1 = false;
+    emitStatus("fallback");
+    scheduleReconnect();
+  }
+
+  function attachSocketHandlers(current, sequence) {
+    current.addEventListener("open", () => {
+      if (!started || sequence !== connectionSequence || socket !== current) return;
+      clearTimer(connectionTimer);
+      connectionTimer = 0;
+      if (current.protocol !== PROTOCOL) {
+        finishConnectionFailure(sequence, { unsupportedRoute: true });
+        return;
+      }
+      readyTimer = setTimer(() => {
+        readyTimer = 0;
+        finishConnectionFailure(sequence);
+      }, READY_TIMEOUT_MS);
+    });
+    current.addEventListener("message", (event) => {
+      if (!started || sequence !== connectionSequence || socket !== current) return;
+      const message = parseMessage(event.data);
+      if (!message) {
+        finishConnectionFailure(sequence, { unsupportedRoute: true });
+        return;
+      }
+      if (message.type === "ready") {
+        clearTimer(readyTimer);
+        readyTimer = 0;
+        connecting = false;
+        retryDelay = 1_000;
+        clearReconnectTimer();
+        const epochChanged = databaseEpoch !== null && databaseEpoch !== message.database_epoch;
+        databaseEpoch = message.database_epoch;
+        snapshotControlV1 = message.snapshot_control === "v1";
+        try { onReady?.({ databaseEpoch, snapshotControl: snapshotControlV1 ? "v1" : null }); } catch { /* Readiness observers must not interrupt transport recovery. */ }
+        lastInterestKey = null;
+        if (epochChanged) {
+          epochVerificationPending = true;
+          cancelPendingRefreshes("database_epoch_changed");
+          try { onEpochChanged?.({ databaseEpoch: message.database_epoch }); } catch { /* Epoch fencing must not break transport recovery. */ }
+          snapshotReadMinimumVersion = 0;
+          snapshotReadExpectedEpoch = databaseEpoch;
+          snapshotReadEpochChanged = true;
+          snapshotReadAgain = true;
+        }
+        emitStatus("live");
+        sendInterest(isVisible(), true);
+        if (!snapshotControlV1) cancelPendingRefreshes("unsupported");
+        if (epochVerificationPending) void reverifyEpoch();
+        flushUnsentRefreshes();
+        return;
+      }
+      if (message.type === "invalidate") {
+        handleInvalidate(message);
+        return;
+      }
+      handleRefreshResult(message);
+    });
+    current.addEventListener("error", () => {
+      if (socket === current) finishConnectionFailure(sequence);
+    });
+    current.addEventListener("close", (event) => {
+      handleSocketFailure(current, { authExpired: event.code === 4401 });
+    });
+  }
+
+  async function connect() {
+    if (!started || expired || unsupported || isPaused() || connecting || socket) return;
+    if (typeof WebSocketConstructor !== "function") {
+      unsupported = true;
+      emitStatus("unavailable");
+      cancelPendingRefreshes("transport_unavailable");
+      return;
+    }
+
+    connecting = true;
+    const sequence = ++connectionSequence;
+    emitStatus("connecting");
+    const controller = typeof AbortControllerConstructor === "function" ? new AbortControllerConstructor() : null;
+    sessionController = controller;
+    connectionTimer = setTimer(() => {
+      connectionTimer = 0;
+      if (sequence !== connectionSequence) return;
+      controller?.abort();
+      finishConnectionFailure(sequence);
+    }, CONNECT_TIMEOUT_MS);
+
+    try {
+      const session = validateSession(
+        await api(SESSION_PATH, { method: "POST", ...(controller ? { signal: controller.signal } : {}) }),
+        now(),
+      );
+      if (!started || expired || sequence !== connectionSequence) return;
+      authExpiresAt = authExpiresAt === null ? session.expires_at : Math.min(authExpiresAt, session.expires_at);
+      scheduleAuthorizationExpiry();
+      if (expired) return;
+      const url = websocketUrl(session.websocket_path, location);
+      const current = new WebSocketConstructor(url, [PROTOCOL, session.ticket]);
+      socket = current;
+      attachSocketHandlers(current, sequence);
+    } catch (error) {
+      if (!started || expired || sequence !== connectionSequence) return;
+      const statusCode = responseStatus(error);
+      if (statusCode === 401 || statusCode === 403) {
+        expireAuthorization();
+        return;
+      }
+      const unsupportedRoute = [404, 405, 501].includes(statusCode)
+        || /session response is invalid|unsafe WebSocket URL|does not support WebSocket/u.test(String(error?.message ?? ""));
+      finishConnectionFailure(sequence, { unsupportedRoute });
+    }
+  }
+
+  function refreshCoalesceKey({ scope, libraryId }) {
+    return `${scope}:${libraryId ?? ""}`;
+  }
+
+  function requestMacRefresh({ reason, scope, libraryId } = {}) {
+    if (!REFRESH_REASONS.has(reason) || !REFRESH_SCOPES.has(scope)
+        || libraryId !== undefined && (typeof libraryId !== "string" || new TextEncoder().encode(libraryId).byteLength > 256
+          || /[\u0000-\u001f\u007f]/u.test(libraryId))
+        || libraryId !== undefined && !["library", "download"].includes(scope)) {
+      return Promise.reject(new TypeError("The Mini App snapshot refresh request is invalid."));
+    }
+    if (!started || expired || isPaused()) return Promise.resolve(unavailableResult(isOnline() ? "not_visible" : "offline"));
+    if (unsupported || typeof WebSocketConstructor !== "function") return Promise.resolve(unavailableResult("transport_unavailable"));
+    if (socket && status === "live" && !snapshotControlV1) return Promise.resolve(unavailableResult("unsupported"));
+
+    const coalesceKey = refreshCoalesceKey({ scope, libraryId });
+    const existing = coalescedRefreshes.get(coalesceKey);
+    if (existing) return existing.promise;
+    if (pendingRefreshes.size >= MAX_PENDING_REFRESHES) return Promise.resolve(unavailableResult("too_many_requests"));
+
+    const requestId = randomUUID();
+    if (typeof requestId !== "string" || !UUID_PATTERN.test(requestId)) {
+      return Promise.reject(new Error("The Mini App could not create a valid refresh request ID."));
+    }
+    let resolve;
+    const promise = new Promise((settle) => { resolve = settle; });
+    const entry = {
+      requestId,
+      reason,
+      scope,
+      libraryId,
+      coalesceKey,
+      epoch: null,
+      sent: false,
+      resultReceived: false,
+      resolve,
+      promise,
+      queueTimeout: 0,
+      responseTimeout: 0,
+    };
+    entry.queueTimeout = setTimer(
+      () => settleRefresh(entry, { status: "failed", error_code: "timeout" }),
+      REFRESH_QUEUE_TIMEOUT_MS,
+    );
+    pendingRefreshes.set(requestId, entry);
+    coalescedRefreshes.set(coalesceKey, entry);
+    if (status === "live" && snapshotControlV1) flushUnsentRefreshes();
+    else if (!connecting && !socket) connect();
+    return promise;
+  }
+
+  function setWatch(watch) {
+    desiredWatch = watch === true;
+    sendInterest();
+  }
+
   function start() {
     if (started || expired) return;
     started = true;
@@ -579,13 +795,8 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
       handleLifecyclePause();
       return;
     }
-    if (typeof WebSocketConstructor !== "function") {
-      unsupported = true;
-      enterFallback({ reconnect: false, immediateCatchup: true });
-      return;
-    }
     connect();
   }
 
-  return { start, stop, refresh };
+  return { start, stop, setWatch, requestMacRefresh };
 }

@@ -1588,6 +1588,7 @@ struct FailOnceOnPathProvider {
     path: PathBuf,
     armed: AtomicBool,
     failures: AtomicUsize,
+    root_reads: AtomicUsize,
 }
 
 impl FailOnceOnPathProvider {
@@ -1596,6 +1597,7 @@ impl FailOnceOnPathProvider {
             path: fs::canonicalize(&path).unwrap_or(path),
             armed: AtomicBool::new(false),
             failures: AtomicUsize::new(0),
+            root_reads: AtomicUsize::new(0),
         }
     }
 
@@ -1611,14 +1613,17 @@ impl QueueFileProvider for FailOnceOnPathProvider {
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
         let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if normalized_path == self.path && self.armed.swap(false, Ordering::SeqCst) {
-            self.failures.fetch_add(1, Ordering::SeqCst);
-            return Err(FileProviderAccessError::new(
-                path,
-                "read",
-                "synthetic media-library root open failure",
-            )
-            .into());
+        if normalized_path == self.path {
+            self.root_reads.fetch_add(1, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(FileProviderAccessError::new(
+                    path,
+                    "read",
+                    "synthetic media-library root open failure",
+                )
+                .into());
+            }
         }
         accessor(path)
     }
@@ -1642,7 +1647,7 @@ impl QueueFileProvider for FailOnceOnPathProvider {
 }
 
 #[tokio::test]
-async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_recovery() {
+async fn failed_non_default_library_open_recovers_from_binding_refresh_without_scanning() {
     let root = temp_cloud_bot_dir("library-snapshot-scoped-open-recovery");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -1652,7 +1657,9 @@ async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_re
         .ensure_runtime_dirs()
         .expect("snapshot fixture roots should create");
     let archive_root = root.join("archive");
+    let offline_root = root.join("offline");
     fs::create_dir_all(&archive_root).expect("archive root should create");
+    fs::create_dir_all(&offline_root).expect("offline root should create");
     let child_media = archive_root.join("clip.mp4");
     fs::write(&child_media, b"synthetic media bytes").expect("child media should write");
     fs::write(
@@ -1668,6 +1675,9 @@ async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_re
     let archive = queue
         .register_video_library("Archive", &archive_root, None, false, false)
         .expect("archive library should register");
+    let offline = queue
+        .register_video_library("Offline", &offline_root, None, false, false)
+        .expect("offline library should register");
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -1792,15 +1802,42 @@ async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_re
         "unavailable"
     );
 
-    let recovered = scan(Arc::clone(&provider))
+    fs::remove_dir_all(&offline_root).expect("offline root should become unavailable");
+    queue
+        .refresh_video_library(&offline.id)
+        .expect("offline root should update its availability status");
+    assert!(
+        !queue
+            .video_library_statuses()
+            .expect("queue availability should load")
+            .get(&offline.id)
+            .expect("offline library should retain a status")
+            .available
+    );
+    runtime.library_unavailable.lock().await.insert(
+        offline.id.clone(),
+        "offline library remains unavailable".to_string(),
+    );
+
+    let provider_root_reads_before_binding_refresh = provider.root_reads.load(Ordering::SeqCst);
+    media_library_bot::refresh_library_binding(&runtime, &archive.id)
         .await
-        .expect("the next non-default scan should recover");
+        .expect("selected binding refresh should recover the available archive");
     assert_eq!(
         provider.failures.load(Ordering::SeqCst),
         1,
-        "the healthy recovery scan should not trigger another denial"
+        "the binding refresh should not repeat the injected denial"
     );
-    assert_eq!(recovered.items[0].presence, Presence::Present);
+    assert_eq!(
+        provider.root_reads.load(Ordering::SeqCst),
+        provider_root_reads_before_binding_refresh,
+        "binding-only recovery must not reopen the scan provider or run a full scan"
+    );
+    assert_eq!(
+        runtime.library_snapshots.lock().await.get(&archive.id),
+        Some(&cached),
+        "binding-only recovery must preserve the last-good snapshot without rewriting it"
+    );
     assert!(
         !runtime
             .library_unavailable
@@ -1815,11 +1852,74 @@ async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_re
             .lock()
             .await
             .contains_key(&default_id),
-        "recovery in another library must preserve the default library warning"
+        "selected archive recovery must preserve the unselected default warning"
     );
     assert_eq!(
         runtime.library_scan_warning.lock().await.as_deref(),
         Some(default_warning.as_str())
+    );
+    assert_eq!(
+        runtime
+            .library_unavailable
+            .lock()
+            .await
+            .get(&offline.id)
+            .map(String::as_str),
+        Some("offline library remains unavailable"),
+        "selected refresh must preserve warnings for unselected unavailable roots"
+    );
+
+    let recovered_projection = media_library_bot::attach_library_views(
+        &runtime,
+        &applied,
+        serde_json::to_value(empty_cloud_test_library_snapshot("legacy"))
+            .expect("legacy snapshot should encode"),
+    )
+    .await
+    .expect("scoped library views should publish the binding recovery");
+    let recovered_archive_view = snapshot_library_view(&recovered_projection, &archive.id);
+    assert_eq!(recovered_archive_view["availability"], "available");
+    assert_eq!(
+        recovered_archive_view["snapshot"]["revision"],
+        cached.revision
+    );
+    assert_eq!(
+        recovered_archive_view["snapshot"]["items"][0]["presence"], "present",
+        "the cached item should become accessible after availability recovers"
+    );
+
+    let provider_root_reads_before_all_refresh = provider.root_reads.load(Ordering::SeqCst);
+    media_library_bot::refresh_library_bindings(&runtime)
+        .await
+        .expect("all-library binding refresh should complete");
+    assert_eq!(
+        provider.root_reads.load(Ordering::SeqCst),
+        provider_root_reads_before_all_refresh,
+        "all-library binding refresh must not invoke the full-scan provider"
+    );
+    assert_eq!(
+        runtime.library_snapshots.lock().await.get(&archive.id),
+        Some(&cached),
+        "all-library binding refresh must preserve the last-good snapshot"
+    );
+    assert!(
+        !runtime
+            .library_unavailable
+            .lock()
+            .await
+            .contains_key(&default_id),
+        "all-library refresh should clear a verified available default warning"
+    );
+    assert_eq!(runtime.library_scan_warning.lock().await.as_deref(), None);
+    assert_eq!(
+        runtime
+            .library_unavailable
+            .lock()
+            .await
+            .get(&offline.id)
+            .map(String::as_str),
+        Some("offline library remains unavailable"),
+        "all-library refresh must preserve warnings for roots still unavailable"
     );
 
     drop(runtime);
@@ -1999,6 +2099,11 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         .expect("failed scan should mark the archive unavailable");
     let global_before_failed_remove = runtime.library_snapshot.lock().await.clone();
     let warning_before_failed_remove = runtime.library_scan_warning.lock().await.clone();
+    assert_eq!(
+        warning_before_failed_remove.as_deref(),
+        Some(archive_warning.as_str()),
+        "a failed default scan should populate the legacy warning before refresh"
+    );
 
     let failed_remove = run_library_management_test_request(
         &runtime,
@@ -2017,10 +2122,13 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
             .is_some_and(|snapshot| snapshot == &old_cached),
         "a failed removal must preserve the cached library snapshot"
     );
-    assert_eq!(
-        runtime.library_unavailable.lock().await.get(&archive.id),
-        Some(&archive_warning),
-        "a failed removal must preserve its scoped unavailable marker"
+    assert!(
+        !runtime
+            .library_unavailable
+            .lock()
+            .await
+            .contains_key(&archive.id),
+        "the pre-dispatch binding refresh should clear a stale marker for the available root"
     );
     assert_eq!(
         runtime.library_snapshot.lock().await.as_ref(),
@@ -2029,8 +2137,8 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     );
     assert_eq!(
         runtime.library_scan_warning.lock().await.as_ref(),
-        warning_before_failed_remove.as_ref(),
-        "a failed removal must not alter the global warning"
+        None,
+        "the pre-dispatch binding refresh should clear the stale default warning"
     );
 
     let restore_source_default = run_library_management_test_request(

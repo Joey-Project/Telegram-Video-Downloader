@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
-import { setImmediate as waitForEventLoopTurn } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSnapshotUpdates } from "../public/file/snapshot-updates.js";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
@@ -30,18 +29,21 @@ function ownerSnapshot({
   title = "Alpha video",
   category = "Films",
   stateVersion = 1,
+  reportedAt,
   pendingRequests = [],
   operations = [],
 }: {
   title?: string;
   category?: string;
   stateVersion?: number;
+  reportedAt?: number;
   pendingRequests?: unknown[];
   operations?: unknown[];
 } = {}) {
   return {
     synced: true,
     stale: false,
+    reported_at: reportedAt,
     state_version: stateVersion,
     last_seen: Math.floor(Date.now() / 1_000),
     settings: {
@@ -87,13 +89,13 @@ function jsonResponse(data: unknown, status = 200): Response {
   return { ok: status >= 200 && status < 300, status, json: async () => data } as Response;
 }
 
-function sessionResponse() {
+function sessionResponse(databaseEpoch = TEST_DATABASE_EPOCH) {
   return {
     ticket: syntheticCredentials.localSharedSecret.value,
     websocket_path: "/api/updates/ws",
     protocol: UPDATE_PROTOCOL,
     expires_at: Date.now() + 6 * 60 * 60 * 1_000,
-    database_epoch: TEST_DATABASE_EPOCH,
+    database_epoch: databaseEpoch,
   };
 }
 
@@ -166,7 +168,7 @@ class MockWebSocket extends EventTarget {
   }
 }
 
-function addMockWebSocket({ autoReady = true } = {}) {
+function addMockWebSocket({ autoReady = true, snapshotControl = "v1" }: { autoReady?: boolean; snapshotControl?: "v1" | null } = {}) {
   const sockets: MockWebSocket[] = [];
   let failuresRemaining = 0;
   let shouldAutoReady = autoReady;
@@ -184,7 +186,7 @@ function addMockWebSocket({ autoReady = true } = {}) {
           return;
         }
         this.open();
-        if (sendReady) this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+        if (sendReady) this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, ...(snapshotControl ? { snapshot_control: snapshotControl } : {}) });
       });
     }
   }
@@ -208,10 +210,11 @@ function createSnapshotServer(initial: SnapshotBundle) {
   let current = initial;
   const queued: SnapshotBundle[] = [];
   const bundles = new Map<string, string>();
-  const counts = { sessions: 0, states: 0, chunks: 0, actions: 0 };
+  const counts = { sessions: 0, states: 0, chunks: 0, actions: 0, actionReplies: 0 };
   let sessionGate: ReturnType<typeof deferred> | null = null;
   let stateGate: ReturnType<typeof deferred> | null = null;
   let sessionStatus = 200;
+  let nextStateStatus = 200;
   let actionHandler: ((action: Record<string, unknown>) => void | Promise<void>) | null = null;
 
   function register(bundle: SnapshotBundle) {
@@ -239,6 +242,11 @@ function createSnapshotServer(initial: SnapshotBundle) {
     if (path === "/api/state") {
       counts.states += 1;
       expect(headers.get("X-Snapshot-Format")).toBe("chunked-v1");
+      if (nextStateStatus !== 200) {
+        const status = nextStateStatus;
+        nextStateStatus = 200;
+        return jsonResponse({ error: "Snapshot unavailable" }, status);
+      }
       const bundle = queued.shift() ?? current;
       if (stateGate) {
         const gate = stateGate;
@@ -259,6 +267,7 @@ function createSnapshotServer(initial: SnapshotBundle) {
       counts.actions += 1;
       const action = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
       await actionHandler?.(action);
+      counts.actionReplies += 1;
       return jsonResponse({ seq: 7 });
     }
     throw new Error(`Unexpected request ${path}`);
@@ -280,6 +289,7 @@ function createSnapshotServer(initial: SnapshotBundle) {
       return gate;
     },
     setSessionStatus(status: number) { sessionStatus = status; },
+    failNextState(status = 503) { nextStateStatus = status; },
     setActionHandler(handler: (action: Record<string, unknown>) => void | Promise<void>) { actionHandler = handler; },
   };
 }
@@ -288,6 +298,25 @@ function element<T extends Element>(selector: string): T {
   const found = document.querySelector<T>(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
   return found;
+}
+
+function sentFrames(socket: MockWebSocket): Record<string, unknown>[] {
+  return socket.sent.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+}
+
+function sentFramesOfType(socket: MockWebSocket, type: string): Record<string, unknown>[] {
+  return sentFrames(socket).filter((frame) => frame.type === type);
+}
+
+function publishRefreshResult(socket: MockWebSocket, request: Record<string, unknown>, stateVersion: number) {
+  socket.receive({
+    type: "refresh_result",
+    request_id: request.request_id,
+    database_epoch: TEST_DATABASE_EPOCH,
+    status: "published",
+    state_version: stateVersion,
+    reported_at: Date.now(),
+  });
 }
 
 async function loadPageBody(path: string) {
@@ -319,6 +348,7 @@ function installBrowserMocks({ telegramEvents = false } = {}) {
 }
 
 afterEach(async () => {
+  window.dispatchEvent(new Event("pagehide"));
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -336,10 +366,10 @@ afterEach(async () => {
 });
 
 describe("snapshot updates browser flows", () => {
-  it("uses ready and invalidation for file snapshots, skips the 12-second poll, coalesces hints, and keeps a late response private after 4401", async () => {
+  it("loads the published snapshot before one correlated open refresh and keeps local/idle work request-free", async () => {
     vi.useFakeTimers();
-    const { manifest: initialManifest, chunks: initialChunks } = await makeChunkedSnapshot(ownerSnapshot());
-    const server = createSnapshotServer({ manifest: initialManifest, chunks: initialChunks });
+    const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot());
+    const server = createSnapshotServer({ manifest, chunks });
     const mockSockets = addMockWebSocket({ autoReady: false });
     const { localStorage } = installBrowserMocks();
     await loadPageBody("public/file/index.html");
@@ -350,74 +380,92 @@ describe("snapshot updates browser flows", () => {
     // The browser entry intentionally has no declarations because it is executed for its side effects.
     // @ts-expect-error The JavaScript browser entry is declaration-free.
     await import("../public/file/app.js");
+    await vi.waitFor(() => expect(server.counts.states).toBe(1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Alpha video");
+    expect(sentFramesOfType(mockSockets.sockets[0]!, "refresh_request")).toHaveLength(0);
+
     await vi.waitFor(() => expect(server.counts.sessions).toBe(1));
-    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
     const socket = mockSockets.sockets[0]!;
     await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
-    expect(socket.url).toBe("ws://localhost/api/updates/ws");
     expect(socket.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
-    expect(server.counts.states).toBe(0);
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const openRequest = sentFramesOfType(socket, "refresh_request")[0]!;
+    expect(openRequest).toMatchObject({ reason: "open", scope: "library", library_id: LIBRARY_ID });
+    expect(openRequest.request_id).toMatch(/^[0-9a-f-]{36}$/iu);
+    expect(server.counts.states).toBe(1);
 
-    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+    const openedSnapshot = await makeChunkedSnapshot(ownerSnapshot({ title: "Beta from desktop", stateVersion: 2 }));
+    server.setCurrent(openedSnapshot);
+    publishRefreshResult(socket, openRequest, 2);
+    await vi.waitFor(() => expect(server.counts.states).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from desktop"));
+    expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop snapshot published");
+
+    const sentBeforeLocalViewChange = socket.sent.length;
+    const search = element<HTMLInputElement>("#search-input");
+    search.value = "Alpha";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    search.value = "";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    element<HTMLButtonElement>('[data-view="history"]').click();
     await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    await vi.waitFor(() => expect(server.counts.states).toBe(1));
-    expect(element<HTMLElement>("#library-list").textContent).toContain("Alpha video");
+    expect(socket.sent).toHaveLength(sentBeforeLocalViewChange);
+    expect(server.counts.states).toBe(2);
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain("Snapshot published");
 
-    const healthyStateCount = server.counts.states;
-    await vi.advanceTimersByTimeAsync(12_000);
-    expect(server.counts.states).toBe(healthyStateCount);
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(2));
+    const manualRequest = sentFramesOfType(socket, "refresh_request")[1]!;
+    expect(manualRequest).toMatchObject({ reason: "manual", scope: "operations" });
+    socket.receive({
+      type: "refresh_result",
+      request_id: manualRequest.request_id,
+      database_epoch: TEST_DATABASE_EPOCH,
+      status: "failed",
+      error_code: "desktop_busy",
+    });
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop refresh failed"));
+    expect(server.counts.states).toBe(2);
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from desktop");
 
-    const pushed = await makeChunkedSnapshot(ownerSnapshot({ title: "Beta from WS", stateVersion: 2 }));
-    server.setCurrent(pushed);
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(server.counts.states).toBe(healthyStateCount + 1));
-    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from WS"));
+    const cacheReadFailureSnapshot = await makeChunkedSnapshot(ownerSnapshot({ title: "Unreloaded desktop snapshot", stateVersion: 3 }));
+    server.setCurrent(cacheReadFailureSnapshot);
+    server.failNextState();
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(3));
+    const cacheReadFailureRequest = sentFramesOfType(socket, "refresh_request")[2]!;
+    publishRefreshResult(socket, cacheReadFailureRequest, 3);
+    await vi.waitFor(() => expect(server.counts.states).toBe(3));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("displayed saved view could not be reloaded"));
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from desktop");
 
-    const staleDuringRead = await makeChunkedSnapshot(ownerSnapshot({ title: "Stale in-flight response", stateVersion: 3 }));
-    const latestAfterHints = await makeChunkedSnapshot(ownerSnapshot({ title: "Latest coalesced snapshot", stateVersion: 4 }));
-    server.queueSnapshot(staleDuringRead);
-    server.queueSnapshot(latestAfterHints);
-    const readGate = server.holdNextState();
-    const beforeCoalescedRead = server.counts.states;
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 3, reason: "state" });
-    // Invalidation refreshes are throttled to one per second; advance that scheduled window
-    // so the held-state gate, rather than an immediate-request assumption, signals the read.
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(server.counts.states).toBe(beforeCoalescedRead + 1));
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 4, reason: "inbox" });
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 5, reason: "state" });
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 5, reason: "state" });
-    expect(server.counts.states).toBe(beforeCoalescedRead + 1);
-    readGate.resolve();
-    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Stale in-flight response"));
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(server.counts.states).toBe(beforeCoalescedRead + 2));
-    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Latest coalesced snapshot"));
+    element<HTMLButtonElement>("#download-here").click();
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(4));
+    const referenceRequest = sentFramesOfType(socket, "refresh_request")[3]!;
+    expect(referenceRequest).toMatchObject({ reason: "reference", scope: "download", library_id: LIBRARY_ID });
+    const referenceSnapshot = await makeChunkedSnapshot(ownerSnapshot({ title: "Download references refreshed", stateVersion: 4 }));
+    server.setCurrent(referenceSnapshot);
+    publishRefreshResult(socket, referenceRequest, 4);
+    await vi.waitFor(() => expect(server.counts.states).toBe(4));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop snapshot published"));
+
+    const serverRequestsBeforeIdle = socket.sent.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(server.counts.states).toBe(4);
+    expect(server.counts.sessions).toBe(1);
+    expect(socket.sent).toHaveLength(serverRequestsBeforeIdle);
+    expect(element<HTMLElement>("#connection-label").textContent).toContain("Saved snapshot");
 
     localStorage.setItem("file-manager.snapshot.v1", "private cached snapshot");
-    const latePrivateSnapshot = await makeChunkedSnapshot(ownerSnapshot({ title: "Late private response", stateVersion: 6 }));
-    server.queueSnapshot(latePrivateSnapshot);
-    const lateReadGate = server.holdNextState();
-    const beforeLateRead = server.counts.states;
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 6, reason: "state" });
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(server.counts.states).toBe(beforeLateRead + 1));
     socket.serverClose(4401, "Owner authorization expired");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true));
     expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
     expect(localStorage.getItem("file-manager.snapshot.v1")).toBeNull();
-    lateReadGate.resolve();
-    await lateReadGate.settled;
-    for (let index = 0; index < 12; index += 1) await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true);
-    expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
-    expect(element<HTMLElement>("#library-list").textContent).not.toContain("Late private response");
   });
 
-  it("refreshes a pending settings action from an invalidation, catches up on resume, and hides settings on 4401", async () => {
+  it("watches a pending settings result, reads only its invalidations, and resumes without an automatic refresh", async () => {
     vi.useFakeTimers();
     const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot());
     const server = createSnapshotServer({ manifest, chunks });
@@ -438,8 +486,15 @@ describe("snapshot updates browser flows", () => {
     // @ts-expect-error The JavaScript browser entry is declaration-free.
     await import("../public/settings/app.js");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    await vi.waitFor(() => expect(mockSockets.sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
-    expect(server.counts.states).toBeGreaterThanOrEqual(1);
+    await vi.waitFor(() => expect(sentFramesOfType(mockSockets.sockets[0]!, "refresh_request")).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    const openRequest = sentFramesOfType(socket, "refresh_request")[0]!;
+    expect(openRequest).toMatchObject({ reason: "open", scope: "settings" });
+    const initial = await makeChunkedSnapshot(ownerSnapshot());
+    server.setCurrent(initial);
+    publishRefreshResult(socket, openRequest, 1);
+    await vi.waitFor(() => expect(server.counts.states).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop settings published"));
 
     server.setActionHandler(async () => {
       server.setCurrent(await makeChunkedSnapshot(ownerSnapshot({
@@ -448,45 +503,278 @@ describe("snapshot updates browser flows", () => {
       })));
     });
     element<HTMLButtonElement>('[data-settings-action="library_scan"]').click();
-    await vi.waitFor(() => expect(server.counts.actions).toBe(1));
-    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-list").textContent).toContain("Waiting · #7"));
+    await vi.waitFor(() => expect(server.counts.actionReplies).toBe(1));
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "interest").some((frame) => frame.watch === true)).toBe(true));
+    expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1);
 
-    const completed = await makeChunkedSnapshot(ownerSnapshot({
-      stateVersion: 3,
-      operations: [{ seq: 7, kind: "library_scan", status: "completed", updated_at: Math.floor(Date.now() / 1_000), result: { message: "Desktop scan finished." } }],
-    }));
-    server.setCurrent(completed);
-    const socket = mockSockets.sockets[0]!;
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 3, reason: "inbox" });
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(element<HTMLElement>("#operations-list").textContent).toContain("Desktop scan finished."));
-    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("was applied by the desktop"));
+    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "inbox" });
+    await vi.waitFor(() => expect(server.counts.states).toBe(3));
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-list").textContent).toContain("Waiting · #7"));
 
     const statesBeforePause = server.counts.states;
     const sessionsBeforePause = server.counts.sessions;
     eventHandlers.get("deactivated")?.();
     expect(socket.readyState).toBe(MockWebSocket.CLOSED);
-    const resumedSnapshot = await makeChunkedSnapshot(ownerSnapshot({ category: "Shows", stateVersion: 4 }));
-    server.setCurrent(resumedSnapshot);
+    const completed = await makeChunkedSnapshot(ownerSnapshot({
+      stateVersion: 3,
+      operations: [{ seq: 7, kind: "library_scan", status: "completed", updated_at: Math.floor(Date.now() / 1_000), result: { message: "Desktop scan finished." } }],
+    }));
+    server.setCurrent(completed);
     eventHandlers.get("activated")?.();
     await vi.waitFor(() => expect(server.counts.sessions).toBe(sessionsBeforePause + 1));
     await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(2));
-    await vi.waitFor(() => expect((element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]')).value).toBe("Shows"));
-    expect(server.counts.states).toBeGreaterThan(statesBeforePause);
+    const resumedSocket = mockSockets.sockets[1]!;
+    await vi.waitFor(() => expect(sentFramesOfType(resumedSocket, "interest").some((frame) => frame.watch === true)).toBe(true));
+    expect(server.counts.states).toBe(statesBeforePause);
+    expect(sentFramesOfType(resumedSocket, "refresh_request")).toHaveLength(0);
 
-    mockSockets.sockets[1]!.serverClose(4401, "Owner authorization expired");
+    resumedSocket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 3, reason: "inbox" });
+    await vi.waitFor(() => expect(server.counts.states).toBe(statesBeforePause + 1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#operations-list").textContent).toContain("Desktop scan finished."));
+    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("was applied by the desktop"));
+    expect(sentFramesOfType(resumedSocket, "refresh_request")).toHaveLength(0);
+
+    resumedSocket.serverClose(4401, "Owner authorization expired");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true));
     expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
   });
 
-  it("backs off reconnects, uses the 60-second HTTP fallback, and does not resume after controller expiry", async () => {
+  it("does not keep a watch for a completed restored recovery report while browsing locally", async () => {
+    vi.useFakeTimers();
+    const historicalOperation = {
+      seq: 9,
+      request_id: "completed-recovery-request",
+      kind: "metadata_recover",
+      status: "completed",
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      scope: "library",
+      result: {
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        scope: "library",
+        recovery: { revision: "revision-1", items: [], total: 0, remaining: 0, next_cursor: null },
+      },
+    };
+    const initial = await makeChunkedSnapshot(ownerSnapshot({
+      reportedAt: Date.now(),
+      operations: [historicalOperation],
+    }));
+    const server = createSnapshotServer(initial);
+    const mockSockets = addMockWebSocket();
+    installBrowserMocks();
+    await loadPageBody("public/file/index.html");
+    vi.stubGlobal("fetch", server.fetchMock);
+    window.fetch = server.fetchMock as typeof window.fetch;
+
+    vi.resetModules();
+    // The browser entry intentionally has no declarations because it is executed for its side effects.
+    // @ts-expect-error The JavaScript browser entry is declaration-free.
+    await import("../public/file/app.js");
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const openRequest = sentFramesOfType(socket, "refresh_request")[0]!;
+    expect(sentFramesOfType(socket, "interest").every((frame) => frame.watch === false)).toBe(true);
+    server.setCurrent(initial);
+    publishRefreshResult(socket, openRequest, 1);
+    await vi.waitFor(() => expect(server.counts.states).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#recovery-status").textContent).toContain("Analysis revision revision-1"));
+
+    const sentBeforeLocalWork = socket.sent.length;
+    const search = element<HTMLInputElement>("#search-input");
+    search.value = "Alpha";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(socket.sent).toHaveLength(sentBeforeLocalWork);
+    expect(server.counts.states).toBe(2);
+    expect(sentFramesOfType(socket, "interest").every((frame) => frame.watch === false)).toBe(true);
+  });
+
+  it("deduplicates interest frames and coalesces invalidation plus publication cache reads", async () => {
     vi.useFakeTimers();
     const mockSockets = addMockWebSocket({ autoReady: false });
     const api = vi.fn(async () => sessionResponse());
-    const refresh = vi.fn(async () => {});
+    let resolveRead!: (value: { state_version: number; database_epoch: string }) => void;
+    const readGate = new Promise<{ state_version: number; database_epoch: string }>((resolve) => { resolveRead = resolve; });
+    const readSnapshot = vi.fn(async () => await readGate);
     const controller = createSnapshotUpdates({
       api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
-      refresh,
+      readSnapshot,
+      surface: "file",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, randomUUID: () => "8c2fda7e-8198-4192-8c02-0e746a711491", random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    expect(sentFramesOfType(socket, "interest")).toHaveLength(1);
+    controller.setWatch(false);
+    controller.setWatch(false);
+    expect(sentFramesOfType(socket, "interest")).toHaveLength(1);
+    controller.setWatch(true);
+    controller.setWatch(true);
+    expect(sentFramesOfType(socket, "interest")).toHaveLength(2);
+    controller.setWatch(false);
+    expect(sentFramesOfType(socket, "interest")).toHaveLength(3);
+
+    const openRefresh = controller.requestMacRefresh({ reason: "open", scope: "library", libraryId: LIBRARY_ID });
+    const manualRefresh = controller.requestMacRefresh({ reason: "manual", scope: "library", libraryId: LIBRARY_ID });
+    expect(manualRefresh).toBe(openRefresh);
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const request = sentFramesOfType(socket, "refresh_request")[0]!;
+    expect(request).toMatchObject({ reason: "open", scope: "library", library_id: LIBRARY_ID });
+    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    publishRefreshResult(socket, request, 2);
+    resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
+    const result = await openRefresh;
+    expect(result).toMatchObject({ status: "published", state_version: 2, snapshot: { state_version: 2 } });
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    controller.stop();
+  });
+
+  it("settles a sent refresh when its viewer disconnects and does not replay it after reconnect", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket();
+    const api = vi.fn(async () => sessionResponse());
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot: vi.fn(async () => ({ state_version: 1, database_epoch: TEST_DATABASE_EPOCH })),
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const firstSocket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(sentFramesOfType(firstSocket, "interest")).toHaveLength(1));
+
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "operations" });
+    await vi.waitFor(() => expect(sentFramesOfType(firstSocket, "refresh_request")).toHaveLength(1));
+    firstSocket.serverClose(1006, "Mock network interruption");
+
+    await expect(refresh).resolves.toMatchObject({
+      status: "unavailable",
+      error_code: "transport_disconnected",
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(2));
+    const reconnectedSocket = mockSockets.sockets[1]!;
+    await vi.waitFor(() => expect(sentFramesOfType(reconnectedSocket, "interest")).toHaveLength(1));
+    expect(sentFramesOfType(firstSocket, "refresh_request")).toHaveLength(1);
+    expect(sentFramesOfType(reconnectedSocket, "refresh_request")).toHaveLength(0);
+    controller.stop();
+  });
+
+  it("starts the response timeout after send and accepts a result near the 120-second server window", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false });
+    const sessionGate = deferred();
+    const api = vi.fn(async () => {
+      await sessionGate.promise;
+      sessionGate.markSettled();
+      return sessionResponse();
+    });
+    let resolveRead!: (value: { state_version: number; database_epoch: string }) => void;
+    const readGate = new Promise<{ state_version: number; database_epoch: string }>((resolve) => { resolveRead = resolve; });
+    const readSnapshot = vi.fn(async () => await readGate);
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot,
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "operations" });
+    let refreshSettled = false;
+    void refresh.then(() => { refreshSettled = true; });
+
+    await vi.advanceTimersByTimeAsync(9_000);
+    sessionGate.resolve();
+    await sessionGate.settled;
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    await vi.advanceTimersByTimeAsync(9_000);
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const request = sentFramesOfType(socket, "refresh_request")[0]!;
+
+    await vi.advanceTimersByTimeAsync(119_900);
+    expect(refreshSettled).toBe(false);
+    publishRefreshResult(socket, request, 2);
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(refreshSettled).toBe(false);
+    resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
+    await expect(refresh).resolves.toMatchObject({ status: "published", state_version: 2 });
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    controller.stop();
+  });
+
+  it("bounds a published cache read, aborts it, and ignores a late cache result", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false });
+    const api = vi.fn(async () => sessionResponse());
+    let resolveRead!: (value: { state_version: number; database_epoch: string }) => void;
+    let readSignal: AbortSignal | undefined;
+    let readStartedAt = 0;
+    const readGate = new Promise<{ state_version: number; database_epoch: string }>((resolve) => { resolveRead = resolve; });
+    const readSnapshot = vi.fn(async ({ signal }: { signal?: AbortSignal }) => {
+      readStartedAt = Date.now();
+      readSignal = signal;
+      return await readGate;
+    });
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot,
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "settings" });
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const request = sentFramesOfType(socket, "refresh_request")[0]!;
+    publishRefreshResult(socket, request, 2);
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    expect(readSignal?.aborted).toBe(false);
+    let settled: unknown;
+    void refresh.then((value) => { settled = value; });
+
+    await vi.advanceTimersByTimeAsync(Math.max(0, 24_999 - (Date.now() - readStartedAt)));
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(refresh).resolves.toMatchObject({
+      status: "published",
+      state_version: 2,
+      cache_read_failed: true,
+    });
+    expect(readSignal?.aborted).toBe(true);
+
+    resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
+    await Promise.resolve();
+    expect(readSignal?.aborted).toBe(true);
+    controller.stop();
+  });
+
+  it("keeps old viewers compatible and performs no idle reads for 24 hours", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false, snapshotControl: null });
+    const api = vi.fn(async () => sessionResponse());
+    const readSnapshot = vi.fn(async () => ({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH }));
+    const onAuthorizationExpired = vi.fn();
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot,
+      surface: "settings",
+      onAuthorizationExpired,
       environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
     });
     controller.start();
@@ -494,45 +782,41 @@ describe("snapshot updates browser flows", () => {
     const socket = mockSockets.sockets[0]!;
     await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
     socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(sentFramesOfType(socket, "interest")).toHaveLength(0);
+    expect(await controller.requestMacRefresh({ reason: "open", scope: "settings" }))
+      .toMatchObject({ status: "unavailable", error_code: "unsupported" });
 
-    mockSockets.failNextConnections(20);
-    const baselineSessions = api.mock.calls.length;
-    const refreshesBeforeDisconnect = refresh.mock.calls.length;
-    socket.serverClose(1006, "Connection lost");
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(api).toHaveBeenCalledTimes(baselineSessions + 1);
-    expect(refresh).toHaveBeenCalledTimes(refreshesBeforeDisconnect + 1);
-    await vi.advanceTimersByTimeAsync(1_999);
-    expect(api).toHaveBeenCalledTimes(baselineSessions + 1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(api).toHaveBeenCalledTimes(baselineSessions + 2);
-    await vi.advanceTimersByTimeAsync(56_999);
-    expect(refresh).toHaveBeenCalledTimes(refreshesBeforeDisconnect + 1);
-    await vi.advanceTimersByTimeAsync(1_001);
-    expect(refresh).toHaveBeenCalledTimes(refreshesBeforeDisconnect + 2);
+    controller.setWatch(true);
+    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    controller.setWatch(false);
+    const sentBeforeIdle = socket.sent.length;
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1_000);
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    expect(api).toHaveBeenCalledTimes(1);
+    expect(socket.sent).toHaveLength(sentBeforeIdle);
+    expect(onAuthorizationExpired).toHaveBeenCalledTimes(1);
     controller.stop();
   });
 
-  it("does not restart or refresh after 4401 even when a held controller read completes and an old resume callback fires", async () => {
+  it("keeps a late watched cache read private after 4401 and ignores an old resume callback", async () => {
     vi.useFakeTimers();
     const mockSockets = addMockWebSocket({ autoReady: false });
     const handlers = new Map<string, () => void>();
     const telegram = {
-      onEvent: (_event: "activated" | "deactivated", handler: () => void) => { handlers.set(_event, handler); },
-      offEvent: (_event: "activated" | "deactivated", handler: () => void) => {
-        if (handlers.get(_event) === handler) handlers.delete(_event);
+      onEvent: (event: "activated" | "deactivated", handler: () => void) => { handlers.set(event, handler); },
+      offEvent: (event: "activated" | "deactivated", handler: () => void) => {
+        if (handlers.get(event) === handler) handlers.delete(event);
       },
     };
     const api = vi.fn(async () => sessionResponse());
     const heldRead = deferred();
-    let holdNextRefresh = false;
-    const refresh = vi.fn(() => holdNextRefresh ? heldRead.promise : Promise.resolve());
+    const readSnapshot = vi.fn(() => heldRead.promise.then(() => ({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH, private_title: "Late private snapshot" })));
     const onAuthorizationExpired = vi.fn();
     const controller = createSnapshotUpdates({
       api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
-      refresh,
+      readSnapshot,
+      surface: "file",
       onAuthorizationExpired,
       environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, telegram, random: () => 0.5 },
     });
@@ -540,182 +824,61 @@ describe("snapshot updates browser flows", () => {
     await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
     const socket = mockSockets.sockets[0]!;
     await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
-    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
-    // The mock callback is called before createSnapshotUpdates finishes its async refresh cleanup.
-    // Let that promise chain settle before the invalidation under test arrives.
-    await waitForEventLoopTurn();
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    controller.setWatch(true);
+    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
 
     const staleResume = handlers.get("activated");
     expect(staleResume).toBeDefined();
-    holdNextRefresh = true;
-    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
     socket.serverClose(4401, "Owner authorization expired");
     expect(onAuthorizationExpired).toHaveBeenCalledTimes(1);
-
-    const sessionCallsAfterExpiry = api.mock.calls.length;
     heldRead.resolve();
+    await heldRead.promise;
     for (let index = 0; index < 12; index += 1) await Promise.resolve();
     staleResume?.();
     controller.start();
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(refresh).toHaveBeenCalledTimes(2);
-    expect(api).toHaveBeenCalledTimes(sessionCallsAfterExpiry);
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    expect(api).toHaveBeenCalledTimes(1);
     expect(mockSockets.sockets).toHaveLength(1);
   });
 
-  it("backs off failed live refreshes and preserves a queued explicit refresh", async () => {
+  it("revalidates after an epoch hint without requesting a Mac refresh and stops after 4401", async () => {
     vi.useFakeTimers();
-    const mockSockets = addMockWebSocket({ autoReady: false });
-    const heldRefresh = deferred();
-    const quietValues: boolean[] = [];
-    const refreshStartedAt: number[] = [];
-    let calls = 0;
-    const refresh = vi.fn(async ({ quiet }: { quiet: boolean }) => {
-      calls += 1;
-      quietValues.push(quiet);
-      refreshStartedAt.push(Date.now());
-      if (calls === 1) {
-        await heldRefresh.promise;
-        heldRefresh.markSettled();
-      }
-      if ([1, 2, 4].includes(calls)) throw new Error("temporary refresh failure");
-    });
-    const api = vi.fn(async () => sessionResponse());
+    const mockSockets = addMockWebSocket();
+    const newEpoch = "1".repeat(32);
+    let currentEpoch = TEST_DATABASE_EPOCH;
+    const api = vi.fn(async () => sessionResponse(currentEpoch));
+    const readSnapshot = vi.fn(async (options: { expectedDatabaseEpoch?: string } = {}) => ({ state_version: 1, database_epoch: options.expectedDatabaseEpoch ?? currentEpoch }));
+    const onAuthorizationExpired = vi.fn();
+    const onEpochChanged = vi.fn();
     const controller = createSnapshotUpdates({
       api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
-      refresh,
+      readSnapshot,
+      surface: "file",
+      onAuthorizationExpired,
+      onEpochChanged,
       environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
     });
     controller.start();
     await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
     const socket = mockSockets.sockets[0]!;
-    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
-    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
-
-    const queuedManualRefresh = controller.refresh();
-    const queuedManualOutcome = queuedManualRefresh.then(
-      () => ({ error: null }),
-      (error: unknown) => ({ error }),
-    );
-    let queuedManualSettled = false;
-    void queuedManualRefresh.then(() => { queuedManualSettled = true; }, () => { queuedManualSettled = true; });
-    heldRefresh.resolve();
-    await heldRefresh.settled;
-    const elapsedSinceFirstAttempt = Date.now() - refreshStartedAt[0]!;
-    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceFirstAttempt));
-    if (Date.now() - refreshStartedAt[0]! < 1_000) {
-      expect(refresh).toHaveBeenCalledTimes(1);
-      expect(queuedManualSettled).toBe(false);
-    }
-    await vi.advanceTimersByTimeAsync(10);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
-    expect(quietValues).toEqual([true, false]);
-    expect(refreshStartedAt[1]! - refreshStartedAt[0]!).toBeGreaterThanOrEqual(1_000);
-    const queuedManualResult = await queuedManualOutcome;
-    expect(queuedManualResult.error).toBeInstanceOf(Error);
-    expect((queuedManualResult.error as Error).message).toBe("temporary refresh failure");
-
-    for (let index = 0; index < 12; index += 1) await Promise.resolve();
-    const elapsedSinceSecondAttempt = Date.now() - refreshStartedAt[1]!;
-    await vi.advanceTimersByTimeAsync(Math.max(0, 1_999 - elapsedSinceSecondAttempt));
-    if (Date.now() - refreshStartedAt[1]! < 2_000) expect(refresh).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(10);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
-    expect(quietValues[2]).toBe(true);
-    expect(refreshStartedAt[2]! - refreshStartedAt[1]!).toBeGreaterThanOrEqual(2_000);
-
-    const explicitRefreshAfterSuccess = controller.refresh();
-    const explicitRefreshOutcome = explicitRefreshAfterSuccess.then(
-      () => ({ error: null }),
-      (error: unknown) => ({ error }),
-    );
-    const elapsedSinceThirdAttempt = Date.now() - refreshStartedAt[2]!;
-    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceThirdAttempt));
-    if (Date.now() - refreshStartedAt[2]! < 1_000) expect(refresh).toHaveBeenCalledTimes(3);
-    await vi.advanceTimersByTimeAsync(10);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(4));
-    expect(quietValues[3]).toBe(false);
-    expect(refreshStartedAt[3]! - refreshStartedAt[2]!).toBeGreaterThanOrEqual(1_000);
-    const explicitRefreshResult = await explicitRefreshOutcome;
-    expect(explicitRefreshResult.error).toBeInstanceOf(Error);
-    expect((explicitRefreshResult.error as Error).message).toBe("temporary refresh failure");
-
-    for (let index = 0; index < 12; index += 1) await Promise.resolve();
-    const elapsedSinceFourthAttempt = Date.now() - refreshStartedAt[3]!;
-    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceFourthAttempt));
-    if (Date.now() - refreshStartedAt[3]! < 1_000) expect(refresh).toHaveBeenCalledTimes(4);
-    await vi.advanceTimersByTimeAsync(10);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(5));
-    expect(quietValues[4]).toBe(true);
-    expect(refreshStartedAt[4]! - refreshStartedAt[3]!).toBeGreaterThanOrEqual(1_000);
-    controller.stop();
-  });
-
-  it("clears failed-refresh retries on hidden lifecycle pauses and 4401 expiry", async () => {
-    vi.useFakeTimers();
-    const mockSockets = addMockWebSocket({ autoReady: true });
-    const lifecycleHandlers = new Map<string, () => void>();
-    const mutableDocumentMock = {
-      visibilityState: "visible" as DocumentVisibilityState,
-      hidden: false,
-      addEventListener: (type: string, handler: () => void) => lifecycleHandlers.set(type, handler),
-      removeEventListener: (type: string, handler: () => void) => {
-        if (lifecycleHandlers.get(type) === handler) lifecycleHandlers.delete(type);
-      },
-    };
-    const documentMock = mutableDocumentMock as unknown as Document;
-    const api = vi.fn(async () => sessionResponse());
-    let failuresRemaining = 1;
-    const refresh = vi.fn(async () => {
-      if (failuresRemaining > 0) {
-        failuresRemaining -= 1;
-        throw new Error("temporary refresh failure");
-      }
-    });
-    const controller = createSnapshotUpdates({
-      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
-      refresh,
-      environment: {
-        WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket,
-        document: documentMock,
-        navigator: { onLine: true } as Navigator,
-        random: () => 0.5,
-      },
-    });
-    controller.start();
-    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
-
-    mutableDocumentMock.visibilityState = "hidden";
-    mutableDocumentMock.hidden = true;
-    lifecycleHandlers.get("visibilitychange")?.();
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(refresh).toHaveBeenCalledTimes(1);
-
-    mutableDocumentMock.visibilityState = "visible";
-    mutableDocumentMock.hidden = false;
-    lifecycleHandlers.get("visibilitychange")?.();
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    currentEpoch = newEpoch;
+    socket.receive({ type: "invalidate", database_epoch: newEpoch, state_version: 1, reason: "epoch" });
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    expect(readSnapshot).toHaveBeenCalledWith(expect.objectContaining({ expectedDatabaseEpoch: newEpoch, epochChanged: true }));
+    expect(onEpochChanged).toHaveBeenCalledWith({ databaseEpoch: newEpoch });
     await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(2));
-    await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
-    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    expect(sentFramesOfType(mockSockets.sockets[1]!, "refresh_request")).toHaveLength(0);
+    expect(api).toHaveBeenCalledTimes(2);
 
-    failuresRemaining = 1;
-    const resumedSocket = mockSockets.sockets[1]!;
-    resumedSocket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
-    await vi.advanceTimersByTimeAsync(0);
-    resumedSocket.serverClose(4401, "Owner authorization expired");
+    mockSockets.sockets[1]!.serverClose(4401, "Owner authorization expired");
+    expect(onAuthorizationExpired).toHaveBeenCalledTimes(1);
+    controller.start();
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(mockSockets.sockets).toHaveLength(2);
     expect(api).toHaveBeenCalledTimes(2);
   });
 });

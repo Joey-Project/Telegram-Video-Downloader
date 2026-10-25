@@ -3,7 +3,7 @@ import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { Event as HappyDOMEvent } from "happy-dom";
 import type { HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RECOVERY_PREVIEW_STORAGE_KEY } from "../public/file/metadata-recovery-preview-state.js";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
@@ -16,7 +16,26 @@ const REPLACEMENT_ROOT_BINDING = `v1:${"c".repeat(64)}`;
 const OTHER_LIBRARY_REVISION = "secondary-ui-r1";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "metadata-recovery-ui", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
+const MOCK_REPORTED_AT_MS = Date.now();
 let originalWindowWebSocket: PropertyDescriptor | undefined;
+let mockDatabaseEpoch = TEST_DATABASE_EPOCH;
+const activeMockSockets: MockWebSocket[] = [];
+const mountedSnapshotUpdates: Array<{ stop(): void }> = [];
+const pendingTestReleases: Array<() => void> = [];
+
+function installSnapshotUpdatesFactoryCapture() {
+  vi.doMock("../public/file/snapshot-updates.js", async (importOriginal) => {
+    const original = await importOriginal<typeof import("../public/file/snapshot-updates.js")>();
+    return {
+      ...original,
+      createSnapshotUpdates: (...args: Parameters<typeof original.createSnapshotUpdates>) => {
+        const updates = original.createSnapshotUpdates(...args);
+        mountedSnapshotUpdates.push(updates);
+        return updates;
+      },
+    };
+  });
+}
 
 function makeMemoryStorage() {
   const values = new Map<string, string>();
@@ -36,6 +55,9 @@ class MockWebSocket extends EventTarget {
   readonly protocols: string[];
   readonly protocol: string;
   readyState = MockWebSocket.CONNECTING;
+  watch = false;
+  pendingSnapshotVersion = 0;
+  currentStateVersion: () => number = () => 1;
 
   constructor(_url: string | URL, protocols?: string | string[]) {
     super();
@@ -46,7 +68,33 @@ class MockWebSocket extends EventTarget {
   openAndReady() {
     this.readyState = MockWebSocket.OPEN;
     this.dispatchEvent(new Event("open"));
-    this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+    this.receive({ type: "ready", database_epoch: mockDatabaseEpoch, snapshot_control: "v1" });
+  }
+
+  send(data: string) {
+    const message = JSON.parse(data) as Record<string, any>;
+    if (message.type === "interest") {
+      this.watch = message.watch === true && message.visible === true;
+      if (this.watch && this.pendingSnapshotVersion > 0) {
+        const stateVersion = this.pendingSnapshotVersion;
+        this.pendingSnapshotVersion = 0;
+        this.receive({ type: "invalidate", database_epoch: mockDatabaseEpoch, state_version: stateVersion, reason: "state" });
+      }
+    } else if (message.type === "refresh_request") {
+      queueMicrotask(() => this.receive({
+        type: "refresh_result",
+        request_id: message.request_id,
+        database_epoch: mockDatabaseEpoch,
+        status: "published",
+        state_version: this.currentStateVersion(),
+        reported_at: MOCK_REPORTED_AT_MS,
+      }));
+    }
+  }
+
+  publishSnapshot(stateVersion: number) {
+    if (this.watch) this.receive({ type: "invalidate", database_epoch: mockDatabaseEpoch, state_version: stateVersion, reason: "state" });
+    else this.pendingSnapshotVersion = Math.max(this.pendingSnapshotVersion, stateVersion);
   }
 
   receive(message: Record<string, unknown>) {
@@ -57,21 +105,29 @@ class MockWebSocket extends EventTarget {
 }
 
 function installMockWebSocket() {
+  const sockets: MockWebSocket[] = [];
   class AutoReadyWebSocket extends MockWebSocket {
     constructor(url: string | URL, protocols?: string | string[]) {
       super(url, protocols);
+      sockets.push(this);
+      activeMockSockets.push(this);
       queueMicrotask(() => this.openAndReady());
     }
   }
   originalWindowWebSocket ??= Object.getOwnPropertyDescriptor(window, "WebSocket");
   vi.stubGlobal("WebSocket", AutoReadyWebSocket as unknown as typeof WebSocket);
   Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: AutoReadyWebSocket });
+  return sockets;
+}
+
+function publishMockSnapshot(stateVersion: number) {
+  for (const socket of activeMockSockets) socket.publishSnapshot(stateVersion);
 }
 
 const ownerSnapshot = {
   synced: true,
   stale: false,
-  last_seen: Math.floor(Date.now() / 1000),
+  last_seen: Date.now(),
   settings: {
     download_dir: "/srv/media",
     applied: {
@@ -269,7 +325,7 @@ async function mountApp(options: {
   } = options;
   vi.useFakeTimers();
   vi.stubGlobal("crypto", webcrypto);
-  installMockWebSocket();
+  const sockets = installMockWebSocket();
   const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
   const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
   if (!body) throw new Error("File manager body was not found");
@@ -288,8 +344,12 @@ async function mountApp(options: {
   let currentManifest: Record<string, any>;
   let currentSnapshotStatus = snapshotStatus;
   const responseChunks = new Map<string, string>();
+  const knownEpochs = new Set<string>();
   const initial = await makeChunkedSnapshot(initialSnapshot);
   currentManifest = initial.manifest;
+  mockDatabaseEpoch = initial.manifest.database_epoch;
+  knownEpochs.add(mockDatabaseEpoch);
+  for (const socket of sockets) socket.currentStateVersion = () => currentManifest.state_version ?? 0;
   for (const [digest, data] of initial.chunks) responseChunks.set(digest, data);
   const sentActions: Array<Record<string, any>> = [];
   let actionSeq = 1;
@@ -305,11 +365,20 @@ async function mountApp(options: {
   const thirdStateResponseGate = blockThirdStateResponse
     ? new Promise<void>((resolveGate) => { releaseThirdStateResponse = resolveGate; })
     : Promise.resolve();
+  if (holdMetadataResponse) pendingTestReleases.push(() => releaseMetadataResponse?.());
+  if (blockThirdStateResponse) pendingTestReleases.push(() => releaseThirdStateResponse?.());
 
-  async function replaceSnapshot(snapshot: Record<string, any>) {
-    const next = await makeChunkedSnapshot(snapshot);
+  async function replaceSnapshot(snapshot: Record<string, any>, databaseEpoch?: string) {
+    const next = await makeChunkedSnapshot(snapshot, { databaseEpoch: databaseEpoch ?? currentManifest.database_epoch });
     currentManifest = next.manifest;
+    mockDatabaseEpoch = next.manifest.database_epoch;
+    knownEpochs.add(mockDatabaseEpoch);
     for (const [digest, data] of next.chunks) responseChunks.set(digest, data);
+  }
+
+  async function publishActionSnapshot(snapshot: Record<string, any>) {
+    await replaceSnapshot(snapshot);
+    publishMockSnapshot(currentManifest.state_version ?? 0);
   }
 
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -320,20 +389,21 @@ async function mountApp(options: {
         websocket_path: "/api/updates/ws",
         protocol: UPDATE_PROTOCOL,
         expires_at: Date.now() + 60 * 60 * 1_000,
-        database_epoch: TEST_DATABASE_EPOCH,
+        database_epoch: mockDatabaseEpoch,
       }) } as Response;
     }
     if (String(input) === "/api/state") {
       expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
       stateRequests += 1;
+      const responseManifest = currentManifest;
       if (blockThirdStateResponse && stateRequests === 3) await thirdStateResponseGate;
       if (stateRequests === 1 && firstSnapshotStatus > 0) return { ok: false, status: firstSnapshotStatus, json: async () => ({ error: "The owner snapshot could not be loaded." }) } as Response;
       if (currentSnapshotStatus > 0) return { ok: false, status: currentSnapshotStatus, json: async () => ({ error: "The owner snapshot could not be loaded." }) } as Response;
-      return { ok: true, status: 200, json: async () => currentManifest } as Response;
+      return { ok: true, status: 200, json: async () => responseManifest } as Response;
     }
     const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
     if (chunkPath) {
-      expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+      expect(knownEpochs.has(new Headers(init?.headers).get("X-Cloud-Database-Epoch") ?? "")).toBe(true);
       const digest = chunkPath[1]!;
       return { ok: true, status: 200, json: async () => ({ sha256: digest, data: responseChunks.get(digest) }) } as Response;
     }
@@ -358,7 +428,7 @@ async function mountApp(options: {
           },
           result: { scope: action.payload.scope, library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery },
         };
-        await replaceSnapshot({
+        await publishActionSnapshot({
           ...ownerSnapshot,
           state_version: actionSeq + 1,
           operations: [
@@ -373,7 +443,7 @@ async function mountApp(options: {
       }
       if (action.kind === "file_preview") {
         if (!deferRecoveryPreviewSnapshot || !action.payload.expected_revision) {
-          await replaceSnapshot({
+          await publishActionSnapshot({
             ...ownerSnapshot,
             state_version: actionSeq + 1,
             operations: [
@@ -426,6 +496,7 @@ async function mountApp(options: {
   return {
     sentActions,
     replaceSnapshot,
+    setMockDatabaseEpoch: (epoch: string) => { mockDatabaseEpoch = epoch; },
     storage,
     get stateRequests() { return stateRequests; },
     setSnapshotStatus: (status: number) => { currentSnapshotStatus = status; },
@@ -523,7 +594,17 @@ function readyRecoverySnapshot(primaryRootBinding = ROOT_BINDING) {
   return twoLibrarySnapshot({ primaryRootBinding, operations: [recovery] });
 }
 
+beforeEach(() => {
+  mockDatabaseEpoch = TEST_DATABASE_EPOCH;
+  installSnapshotUpdatesFactoryCapture();
+});
+
 afterEach(async () => {
+  window.dispatchEvent(new Event("pagehide"));
+  for (const updates of mountedSnapshotUpdates.splice(0)) updates.stop();
+  for (const release of pendingTestReleases.splice(0)) release();
+  mockDatabaseEpoch = TEST_DATABASE_EPOCH;
+  activeMockSockets.length = 0;
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -541,6 +622,8 @@ afterEach(async () => {
 describe("metadata recovery Mini App flow", () => {
   it("analyzes grouped results, previews chosen candidates at the report revision, and follows the next cursor", async () => {
     const { sentActions } = await mountApp();
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    expect(element<HTMLElement>("#connection-label").textContent).toContain("Saved snapshot · Just now");
     element<HTMLButtonElement>('[data-view="needs"]').click();
     element<HTMLButtonElement>("#recover-library").click();
     await waitForRecoveryResult("Choose a match");
@@ -1307,19 +1390,17 @@ describe("metadata recovery Mini App flow", () => {
   });
 
   it("applies a cached result as soon as the accepted action receipt binds its sequence", async () => {
-    const app = await mountApp({
-      holdMetadataResponse: true,
-      blockThirdStateResponse: true,
-    });
-    const { sentActions, releaseMetadataActionResponse, releaseThirdStateResponse } = app;
+    const app = await mountApp({ holdMetadataResponse: true });
+    const { sentActions, releaseMetadataActionResponse } = app;
     element<HTMLButtonElement>('[data-view="needs"]').click();
     element<HTMLButtonElement>("#recover-library").click();
     await waitForSubmittedAction(sentActions, "metadata_recover");
     await app.waitForMetadataSnapshotPrepared();
 
+    const readsBeforeManualRefresh = app.stateRequests;
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(app.stateRequests).toBe(2));
+    await vi.waitFor(() => expect(app.stateRequests).toBe(readsBeforeManualRefresh + 1));
     // A started `/api/state` fetch is not enough: wait until the refreshed snapshot has
     // been verified, accepted, and rendered before returning the held action receipt.
     await vi.waitFor(() => expect(element<HTMLElement>("#operation-list").textContent).toContain("Snapshot applied marker"));
@@ -1328,8 +1409,95 @@ describe("metadata recovery Mini App flow", () => {
 
     releaseMetadataActionResponse();
     await vi.waitFor(() => expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Recovered title"));
-    await vi.waitFor(() => expect(app.stateRequests).toBe(3));
-    releaseThirdStateResponse();
+    await vi.waitFor(() => expect(app.stateRequests).toBe(readsBeforeManualRefresh + 1));
     await waitForLocalActionQueueEmpty();
+  });
+
+  it("accepts a verified new database epoch when its state version restarts lower", async () => {
+    const oldEpoch = "a".repeat(32);
+    const newEpoch = "c".repeat(32);
+    const app = await mountApp({
+      initialSnapshot: {
+        ...ownerSnapshot,
+        database_epoch: oldEpoch,
+        state_version: 34_936,
+        library: { ...ownerSnapshot.library, items: [{ ...ownerSnapshot.library.items[0], title: "Old epoch title" }] },
+      },
+    });
+    await vi.waitFor(() => expect(app.stateRequests).toBe(2));
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Old epoch title");
+
+    await app.replaceSnapshot({
+      ...ownerSnapshot,
+      database_epoch: newEpoch,
+      state_version: 1,
+      library: { ...ownerSnapshot.library, items: [{ ...ownerSnapshot.library.items[0], title: "New epoch title" }] },
+    }, newEpoch);
+    activeMockSockets[0]!.receive({ type: "invalidate", database_epoch: newEpoch, state_version: 1, reason: "epoch" });
+    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("New epoch title"));
+    expect(app.stateRequests).toBeGreaterThanOrEqual(3);
+
+    element<HTMLButtonElement>("[data-view=\"needs\"]").click();
+    element<HTMLButtonElement>("#recover-library").click();
+    await waitForSubmittedAction(app.sentActions, "metadata_recover");
+  });
+
+  it("keeps the old snapshot outdated and blocks actions when epoch revalidation still returns the old epoch", async () => {
+    const oldEpoch = "a".repeat(32);
+    const newEpoch = "c".repeat(32);
+    const app = await mountApp({
+      initialSnapshot: {
+        ...ownerSnapshot,
+        database_epoch: oldEpoch,
+        state_version: 34_936,
+        library: { ...ownerSnapshot.library, items: [{ ...ownerSnapshot.library.items[0], title: "Saved old epoch title" }] },
+      },
+    });
+    await vi.waitFor(() => expect(app.stateRequests).toBe(2));
+    app.setMockDatabaseEpoch(newEpoch);
+    activeMockSockets[0]!.receive({ type: "invalidate", database_epoch: newEpoch, state_version: 1, reason: "epoch" });
+    await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThanOrEqual(3));
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Saved old epoch title");
+    expect(element<HTMLElement>("#connection-label").textContent).toContain("Saved snapshot");
+
+    element<HTMLButtonElement>("[data-view=\"needs\"]").click();
+    const recoverButton = element<HTMLButtonElement>("#recover-library");
+    expect(recoverButton.disabled).toBe(true);
+    recoverButton.click();
+    expect(app.sentActions.some((action) => action.kind === "metadata_recover")).toBe(false);
+  });
+
+  it("ignores a delayed old-epoch read after a newer page has verified its lower-version snapshot", async () => {
+    const oldEpoch = "a".repeat(32);
+    const newEpoch = "c".repeat(32);
+    const oldApp = await mountApp({
+      initialSnapshot: {
+        ...ownerSnapshot,
+        database_epoch: oldEpoch,
+        state_version: 34_936,
+        library: { ...ownerSnapshot.library, items: [{ ...ownerSnapshot.library.items[0], title: "Held old page" }] },
+      },
+      blockThirdStateResponse: true,
+    });
+    await vi.waitFor(() => expect(oldApp.stateRequests).toBe(2));
+    element<HTMLButtonElement>("[data-view=\"waiting\"]").click();
+    activeMockSockets[0]!.publishSnapshot(34_937);
+    await vi.waitFor(() => expect(oldApp.stateRequests).toBe(3));
+
+    window.dispatchEvent(new Event("pagehide"));
+    const newApp = await mountApp({
+      initialSnapshot: {
+        ...ownerSnapshot,
+        database_epoch: newEpoch,
+        state_version: 1,
+        library: { ...ownerSnapshot.library, items: [{ ...ownerSnapshot.library.items[0], title: "Verified new page" }] },
+      },
+    });
+    await vi.waitFor(() => expect(newApp.stateRequests).toBe(2));
+    expect(element<HTMLElement>("#library-list").textContent).toContain("Verified new page");
+
+    oldApp.releaseThirdStateResponse();
+    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Verified new page"));
+    expect(element<HTMLElement>("#library-list").textContent).not.toContain("Held old page");
   });
 });

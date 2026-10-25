@@ -420,16 +420,62 @@ pub(super) fn same_root(left: &Path, right: &Path) -> bool {
 }
 
 pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
+    refresh_libraries_selected(runtime, None).await
+}
+
+pub(super) async fn refresh_library(
+    runtime: &CloudBotRuntime,
+    library_id: Option<&str>,
+) -> Result<()> {
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let selected_id = library_id
+        .unwrap_or(&settings.default_library_id)
+        .to_string();
+    refresh_libraries_selected(runtime, Some(vec![selected_id])).await
+}
+
+async fn refresh_libraries_selected(
+    runtime: &CloudBotRuntime,
+    selected_library_ids: Option<Vec<String>>,
+) -> Result<()> {
+    let propagate_scan_errors = selected_library_ids.is_some();
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; media-library refresh is stopped");
     }
-    refresh_library_bindings(runtime).await?;
+    match selected_library_ids.as_deref() {
+        Some(ids) => {
+            for id in ids {
+                refresh_library_binding(runtime, id).await?;
+            }
+        }
+        None => refresh_library_bindings(runtime).await?,
+    }
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; media-library refresh is stopped");
     }
     let settings = runtime.bot.queue.registry_snapshot()?;
     let default_id = settings.default_library_id.clone();
-    for library in settings.libraries {
+    let libraries = match selected_library_ids {
+        None => settings.libraries,
+        Some(selected_ids) => {
+            let mut selected =
+                Vec::<crate::media_libraries::MediaLibrary>::with_capacity(selected_ids.len());
+            for selected_id in selected_ids {
+                let library = settings
+                    .libraries
+                    .iter()
+                    .find(|library| library.id == selected_id)
+                    .with_context(|| {
+                        format!("media library {selected_id} is no longer registered")
+                    })?;
+                if !selected.iter().any(|existing| existing.id == library.id) {
+                    selected.push(library.clone());
+                }
+            }
+            selected
+        }
+    };
+    for library in libraries {
         if runtime.epoch_fatal.is_signaled() {
             bail!("cloud database epoch changed; media-library refresh is stopped");
         }
@@ -445,10 +491,22 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
         if runtime.epoch_fatal.is_signaled() {
             bail!("cloud database epoch changed; media-library refresh is stopped");
         }
+        #[cfg(test)]
+        let test_refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
         let result = run_cloud_library_refresh_operation(
             &scoped,
             "media-library refresh worker failed",
-            |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
+            move |context, inbox| {
+                #[cfg(test)]
+                if let Some(message) = test_refresh_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    bail!("{message}");
+                }
+                Ok(((), scan_cloud_library(&context, inbox)?))
+            },
         )
         .await;
         if let Err(error) = result {
@@ -456,6 +514,9 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
                 return Err(error);
             }
             warn!(library_id = %library.id, error = %redact_sensitive_text(&format!("{error:#}")), "media-library refresh failed");
+            if propagate_scan_errors {
+                return Err(error);
+            }
         }
     }
     *runtime.library_scan_warning.lock().await = runtime
@@ -470,9 +531,73 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
 
 pub(super) async fn refresh_library_bindings(runtime: &CloudBotRuntime) -> Result<()> {
     let queue = Arc::clone(&runtime.bot.queue);
-    tokio::task::spawn_blocking(move || queue.refresh_video_libraries())
-        .await
-        .context("media-library availability worker failed")?
+    let (library_ids, availability) = tokio::task::spawn_blocking(move || {
+        queue.refresh_video_libraries()?;
+        let library_ids = queue
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .map(|library| library.id)
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>((library_ids, queue.video_library_statuses()?))
+    })
+    .await
+    .context("media-library availability worker failed")??;
+    reconcile_refreshed_library_bindings(runtime, &library_ids, &availability).await
+}
+
+pub(super) async fn refresh_library_binding(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+) -> Result<()> {
+    let queue = Arc::clone(&runtime.bot.queue);
+    let library_id = library_id.to_string();
+    let (library_ids, availability) = tokio::task::spawn_blocking(move || {
+        queue.refresh_video_library(&library_id)?;
+        Ok::<_, anyhow::Error>((vec![library_id], queue.video_library_statuses()?))
+    })
+    .await
+    .context("selected media-library availability worker failed")??;
+    reconcile_refreshed_library_bindings(runtime, &library_ids, &availability).await
+}
+
+async fn reconcile_refreshed_library_bindings(
+    runtime: &CloudBotRuntime,
+    refreshed_library_ids: &[String],
+    availability: &BTreeMap<String, crate::media_libraries::MediaLibraryStatus>,
+) -> Result<()> {
+    let default_library_id = runtime.bot.queue.registry_snapshot()?.default_library_id;
+    let default_refreshed = refreshed_library_ids
+        .iter()
+        .any(|library_id| library_id == &default_library_id);
+    let mut unavailable = runtime.library_unavailable.lock().await;
+    for library_id in refreshed_library_ids {
+        if availability
+            .get(library_id)
+            .is_some_and(|status| status.available)
+        {
+            unavailable.remove(library_id);
+        }
+    }
+    let default_warning = if default_refreshed
+        && availability
+            .get(&default_library_id)
+            .is_some_and(|status| status.available)
+    {
+        Some(unavailable.get(&default_library_id).cloned())
+    } else {
+        None
+    };
+    drop(unavailable);
+
+    // The legacy warning belongs to the default library. A selected refresh of another
+    // library must not clear it, while a verified default-root refresh can clear a stale
+    // warning even when no per-library entry was retained for older state.
+    if let Some(default_warning) = default_warning {
+        *runtime.library_scan_warning.lock().await = default_warning;
+    }
+    runtime.state_notify.notify_one();
+    Ok(())
 }
 
 pub(super) async fn unconfirmable_previews(

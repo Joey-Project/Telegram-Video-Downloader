@@ -99,6 +99,78 @@ describe("owner snapshot loader", () => {
     expect(second.library.items[0]?.id).toBe("one");
   });
 
+  it("isolates an aborted loader generation from a late ignored response and permits a fresh read", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const lateSnapshot = {
+      ...ownerSnapshot,
+      library: {
+        ...ownerSnapshot.library,
+        items: [{ id: "late-old-item", relative_path: "Films/Late old.mkv" }],
+      },
+    };
+    const currentSnapshot = {
+      ...ownerSnapshot,
+      library: {
+        ...ownerSnapshot.library,
+        items: [{ id: "current-item", relative_path: "Films/Current.mkv" }],
+      },
+    };
+    const lateBundle = await makeChunkedSnapshot(lateSnapshot);
+    const currentBundle = await makeChunkedSnapshot(currentSnapshot);
+    const loader = createOwnerSnapshotLoader();
+    const readController = new AbortController();
+    let releaseLateManifest!: () => void;
+    let markLateStateStarted!: () => void;
+    let markLateManifestReturned!: () => void;
+    const lateManifestGate = new Promise<void>((resolve) => { releaseLateManifest = resolve; });
+    const lateStateStarted = new Promise<void>((resolve) => { markLateStateStarted = resolve; });
+    const lateManifestReturned = new Promise<void>((resolve) => { markLateManifestReturned = resolve; });
+    let lateChunkRequests = 0;
+    let currentChunkRequests = 0;
+    const lateFetch = vi.fn(async (path: string) => {
+      if (path === "/state") {
+        markLateStateStarted();
+        await lateManifestGate;
+        markLateManifestReturned();
+        return lateBundle.manifest;
+      }
+      lateChunkRequests += 1;
+      const hash = path.split("/").at(-1)!;
+      return { sha256: hash, data: lateBundle.chunks.get(hash) };
+    });
+    const currentFetch = vi.fn(async (path: string) => {
+      if (path === "/state") return currentBundle.manifest;
+      currentChunkRequests += 1;
+      const hash = path.split("/").at(-1)!;
+      return { sha256: hash, data: currentBundle.chunks.get(hash) };
+    });
+
+    const lateRead = loader(lateFetch, { signal: readController.signal });
+    await lateStateStarted;
+    readController.abort();
+    await expect(lateRead).rejects.toThrow("aborted");
+
+    const currentRead = await loader(currentFetch) as typeof ownerSnapshot;
+    expect(currentRead.library.items[0]?.id).toBe("current-item");
+    const chunksForCurrentManifest = new Set([
+      ...currentBundle.manifest.library.chunks,
+      ...currentBundle.manifest.state.chunks,
+    ]).size;
+    expect(currentChunkRequests).toBe(chunksForCurrentManifest);
+
+    releaseLateManifest();
+    await lateManifestReturned;
+    const chunksForLateManifest = new Set([
+      ...lateBundle.manifest.library.chunks,
+      ...lateBundle.manifest.state.chunks,
+    ]).size;
+    await vi.waitFor(() => expect(lateChunkRequests).toBe(chunksForLateManifest));
+    const currentChunkRequestsBeforeReuse = currentChunkRequests;
+    const currentAfterLateCompletion = await loader(currentFetch) as typeof ownerSnapshot;
+    expect(currentAfterLateCompletion.library.items[0]?.id).toBe("current-item");
+    expect(currentChunkRequests).toBe(currentChunkRequestsBeforeReuse);
+  });
+
   it("keeps chunk caches private to each loader instance", async () => {
     vi.stubGlobal("crypto", webcrypto);
     const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);

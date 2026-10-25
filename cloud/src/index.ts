@@ -42,11 +42,16 @@ import {
   MINIAPP_UPDATES_PROTOCOL,
   MINIAPP_UPDATES_SESSION_PATH,
   MINIAPP_UPDATES_SOCKET_PATH,
+  NOTIFIER_LOCAL_CONTROL_HEADER,
+  NOTIFIER_LOCAL_EPOCH_HEADER,
   NOTIFIER_ROLE_HEADER,
   NOTIFIER_VIEWER_AUTH_EXPIRY_HEADER,
   NOTIFIER_VIEWER_EPOCH_HEADER,
   NOTIFIER_VIEWER_OWNER_HEADER,
   NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER,
+  SNAPSHOT_CONTROL_HEADER,
+  SNAPSHOT_CONTROL_VERSION,
+  SNAPSHOT_NOTIFY_VIEWERS_HEADER,
   readMiniAppUpdatesTicketProtocol,
   verifyMiniAppUpdatesTicket,
 } from "./updates";
@@ -218,6 +223,11 @@ async function handleLocalSnapshotChunk(request: Request, env: Env, sha256: stri
 async function handleLocalState(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
   const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
+  const notificationHeader = request.headers.get(SNAPSHOT_NOTIFY_VIEWERS_HEADER);
+  if (notificationHeader !== null && notificationHeader !== "0" && notificationHeader !== "1") {
+    throw new HttpError(400, "Snapshot notification preference is invalid");
+  }
+  const notifyViewers = notificationHeader !== "0";
   const { value: body, byteLength } = await readJsonBodyWithByteLength(request, MAX_STATE_BODY_BYTES);
   if (isRecord(body) && body.format === "chunked-v1") {
     if (byteLength > MAX_CHUNKED_SNAPSHOT_MANIFEST_BODY_BYTES) {
@@ -227,7 +237,7 @@ async function handleLocalState(request: Request, env: Env): Promise<Response> {
     const now = Date.now();
     if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
     await storeChunkedSnapshot(env.DB, snapshot, databaseEpoch);
-    await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
+    if (notifyViewers) await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
     return json({ stored: true, last_seen: now });
   }
   const prepared = isRecord(body) && Object.hasOwn(body, "format") ? validatePreparedSnapshot(body) : undefined;
@@ -235,7 +245,7 @@ async function handleLocalState(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
   if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
   await storeSnapshot(env.DB, snapshot, databaseEpoch, prepared);
-  await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
+  if (notifyViewers) await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
   return json({ stored: true, last_seen: now });
 }
 
@@ -278,11 +288,21 @@ async function handleLocalEpochRotation(request: Request, env: Env): Promise<Res
 async function handleLocalWebSocket(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
   await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
+  const snapshotControl = request.headers.get(SNAPSHOT_CONTROL_HEADER);
+  if (snapshotControl !== null && snapshotControl !== SNAPSHOT_CONTROL_VERSION) {
+    return json({ error: "Snapshot control capability is unsupported" }, 400);
+  }
   if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "WebSocket upgrade required" }, 426);
   }
   const headers = new Headers(request.headers);
   headers.set(NOTIFIER_ROLE_HEADER, "local-client");
+  headers.set(NOTIFIER_LOCAL_EPOCH_HEADER, request.headers.get("X-Cloud-Database-Epoch") ?? "");
+  headers.delete(NOTIFIER_LOCAL_CONTROL_HEADER);
+  headers.delete(SNAPSHOT_CONTROL_HEADER);
+  if (snapshotControl === SNAPSHOT_CONTROL_VERSION) {
+    headers.set(NOTIFIER_LOCAL_CONTROL_HEADER, SNAPSHOT_CONTROL_VERSION);
+  }
   headers.delete(NOTIFIER_VIEWER_OWNER_HEADER);
   headers.delete(NOTIFIER_VIEWER_EPOCH_HEADER);
   headers.delete(NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER);
@@ -322,6 +342,8 @@ async function handleMiniAppUpdatesWebSocket(request: Request, env: Env): Promis
   headers.set(NOTIFIER_VIEWER_EPOCH_HEADER, claims.database_epoch);
   headers.set(NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER, String(claims.ticket_expires_at));
   headers.set(NOTIFIER_VIEWER_AUTH_EXPIRY_HEADER, String(claims.auth_expires_at));
+  headers.delete(NOTIFIER_LOCAL_EPOCH_HEADER);
+  headers.delete(NOTIFIER_LOCAL_CONTROL_HEADER);
   headers.delete("x-telegram-init-data");
   headers.delete("authorization");
   return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(new Request(request, { headers }));

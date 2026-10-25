@@ -290,3 +290,5 @@
     text-align: center;
   }
 }
+
+.snapshot-refresh-status{display:block;min-height:1em;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.45}.snapshot-refresh-status.warning{color:var(--amber)}.snapshot-refresh-status.success{color:var(--green)}

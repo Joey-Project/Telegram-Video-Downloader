@@ -40,8 +40,10 @@ const RECEIPT_FAILURE_PREVIEW_ID = "file-receipt-failure-preview";
 const RECEIPT_FAILURE_PREVIEW_REVISION = "file-receipt-failure-r1";
 const RECEIPT_FAILURE_PREVIEW_SEQ = 804;
 const SNAPSHOT_REFRESH_START_BUDGET_MS = 1_000;
+const MOCK_REPORTED_AT_MS = Date.now();
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
+const activeMockSockets: MockWebSocket[] = [];
 
 type MockActionResponse = { status: number; body: Record<string, unknown> };
 type MigrationPendingSnapshot = Record<string, any> & {
@@ -100,6 +102,12 @@ async function fixtureTaskBoundary() {
   const task = new Promise<void>((resolve) => window.setTimeout(resolve, 0));
   if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
   await task;
+}
+
+function deferredSignal() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
 }
 
 async function releaseMountedFixture() {
@@ -218,6 +226,11 @@ class MockWebSocket extends EventTarget {
   readonly protocols: string[];
   readonly protocol: string;
   readyState = MockWebSocket.CONNECTING;
+  sentFrames: Record<string, any>[] = [];
+  watch = false;
+  pendingSnapshotVersion = 0;
+  currentStateVersion: () => number = () => 1;
+  currentDatabaseEpoch: () => string = () => TEST_DATABASE_EPOCH;
 
   constructor(url: string | URL, protocols?: string | string[]) {
     super();
@@ -230,7 +243,39 @@ class MockWebSocket extends EventTarget {
     if (this.readyState !== MockWebSocket.CONNECTING) return;
     this.readyState = MockWebSocket.OPEN;
     this.emit("open");
-    this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+    this.receive({ type: "ready", database_epoch: this.currentDatabaseEpoch(), snapshot_control: "v1" });
+  }
+
+  send(data: string) {
+    const message = JSON.parse(data) as Record<string, any>;
+    this.sentFrames.push(message);
+    if (message.type === "interest") {
+      this.watch = message.watch === true && message.visible === true;
+      if (this.watch && this.pendingSnapshotVersion > 0) {
+        const stateVersion = this.pendingSnapshotVersion;
+        this.pendingSnapshotVersion = 0;
+        this.receive({ type: "invalidate", database_epoch: this.currentDatabaseEpoch(), state_version: stateVersion, reason: "state" });
+      }
+      return;
+    }
+    if (message.type === "refresh_request") {
+      queueMicrotask(() => this.receive({
+          type: "refresh_result",
+          request_id: message.request_id,
+          database_epoch: this.currentDatabaseEpoch(),
+          status: "published",
+          state_version: this.currentStateVersion(),
+          reported_at: MOCK_REPORTED_AT_MS,
+        }));
+    }
+  }
+
+  publishSnapshot(stateVersion: number) {
+    if (this.watch) {
+      this.receive({ type: "invalidate", database_epoch: this.currentDatabaseEpoch(), state_version: stateVersion, reason: "state" });
+    } else {
+      this.pendingSnapshotVersion = Math.max(this.pendingSnapshotVersion, stateVersion);
+    }
   }
 
   receive(message: Record<string, unknown>) {
@@ -262,12 +307,18 @@ function latestOpenSocket(sockets: MockWebSocket[]) {
   return [...sockets].reverse().find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
 }
 
-function installMockWebSocket() {
+function installMockWebSocket(
+  currentDatabaseEpoch: () => string = () => TEST_DATABASE_EPOCH,
+  currentStateVersion: () => number = () => 1,
+) {
   const sockets: MockWebSocket[] = [];
   class AutoReadyWebSocket extends MockWebSocket {
     constructor(url: string | URL, protocols?: string | string[]) {
       super(url, protocols);
+      this.currentDatabaseEpoch = currentDatabaseEpoch;
+      this.currentStateVersion = currentStateVersion;
       sockets.push(this);
+      activeMockSockets.push(this);
       queueMicrotask(() => this.openAndReady());
     }
   }
@@ -277,13 +328,17 @@ function installMockWebSocket() {
   return sockets;
 }
 
-function updateSession() {
+function publishMockSnapshot(stateVersion: number) {
+  for (const socket of activeMockSockets) socket.publishSnapshot(stateVersion);
+}
+
+function updateSession(databaseEpoch = TEST_DATABASE_EPOCH) {
   return {
     ticket: syntheticCredentials.localSharedSecret.value,
     websocket_path: "/api/updates/ws",
     protocol: UPDATE_PROTOCOL,
     expires_at: Date.now() + 60 * 60 * 1_000,
-    database_epoch: TEST_DATABASE_EPOCH,
+    database_epoch: databaseEpoch,
   };
 }
 
@@ -302,7 +357,7 @@ function controlledSnapshotClock() {
 const ownerSnapshot = {
   synced: true,
   stale: false,
-  last_seen: Math.floor(Date.now() / 1000),
+  last_seen: Date.now(),
   settings: {
     download_dir: "/srv/media",
     applied: {
@@ -617,28 +672,53 @@ async function mountFileManagerFixture(
   onAction?: (
     action: Record<string, any>,
     seq: number,
-    publishSnapshot: (snapshot: Record<string, any>) => Promise<void>,
+    publishSnapshot: (snapshot: Record<string, any>, databaseEpoch?: string) => Promise<void>,
   ) => Promise<MockActionResponse | void> | MockActionResponse | void,
 ) {
   await releaseMountedFixture();
   installFixtureWindowTimerTracking();
-  const sockets = installMockWebSocket();
+  let currentDatabaseEpoch = TEST_DATABASE_EPOCH;
   let currentManifest: Record<string, any>;
+  const sockets = installMockWebSocket(
+    () => currentDatabaseEpoch,
+    () => currentManifest?.state_version ?? 1,
+  );
   let stateRequests = 0;
+  let sessionRequests = 0;
+  let sessionStatus = 200;
+  let nextStateResponseGate: ReturnType<typeof deferredSignal> | null = null;
   const stateRequestVersions: number[] = [];
+  const stateRequestEpochs: string[] = [];
   let nextActionSeq = 901;
   const actions: Array<Record<string, any>> = [];
   let pendingActionResponseCount = 0;
   let currentSnapshot = initialSnapshot;
-  const initialBundle = await makeChunkedSnapshot(initialSnapshot);
+  const initialBundle = await makeChunkedSnapshot(initialSnapshot, { databaseEpoch: currentDatabaseEpoch });
   currentManifest = initialBundle.manifest;
   const responseChunks = new Map(initialBundle.chunks);
+  const chunkEpochs = new Map<string, Set<string>>();
 
-  async function publishSnapshot(snapshot: Record<string, any>) {
+  function registerBundle(bundle: Awaited<ReturnType<typeof makeChunkedSnapshot>>) {
+    for (const [sha256, data] of bundle.chunks) {
+      responseChunks.set(sha256, data);
+      const epochs = chunkEpochs.get(sha256) ?? new Set<string>();
+      epochs.add(bundle.manifest.database_epoch);
+      chunkEpochs.set(sha256, epochs);
+    }
+  }
+  registerBundle(initialBundle);
+
+  async function publishSnapshot(snapshot: Record<string, any>, databaseEpoch = currentDatabaseEpoch) {
+    currentDatabaseEpoch = databaseEpoch;
     currentSnapshot = snapshot;
-    const bundle = await makeChunkedSnapshot(snapshot);
+    const bundle = await makeChunkedSnapshot(snapshot, { databaseEpoch });
     currentManifest = bundle.manifest;
-    for (const [sha256, data] of bundle.chunks) responseChunks.set(sha256, data);
+    registerBundle(bundle);
+  }
+
+  async function publishActionSnapshot(snapshot: Record<string, any>) {
+    await publishSnapshot(snapshot);
+    publishMockSnapshot(currentManifest.state_version ?? 0);
   }
 
   const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
@@ -660,19 +740,32 @@ async function mountFileManagerFixture(
     expect(init?.cache).toBe("no-store");
     if (String(input) === "/api/updates/session") {
       expect(init?.method).toBe("POST");
-      return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      sessionRequests += 1;
+      return {
+        ok: sessionStatus >= 200 && sessionStatus < 300,
+        status: sessionStatus,
+        json: async () => sessionStatus >= 200 && sessionStatus < 300
+          ? updateSession(currentDatabaseEpoch)
+          : { error: "Update session unavailable" },
+      } as Response;
     }
     if (String(input) === "/api/state") {
       expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
       stateRequests += 1;
       const manifest = currentManifest;
       stateRequestVersions.push(manifest.state_version);
+      stateRequestEpochs.push(manifest.database_epoch);
+      const gate = nextStateResponseGate;
+      nextStateResponseGate = null;
+      if (gate) await gate.promise;
       return { ok: true, status: 200, json: async () => manifest } as Response;
     }
     const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
     if (chunkPath) {
-      expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
       const sha256 = chunkPath[1]!;
+      const requestEpoch = new Headers(init?.headers).get("X-Cloud-Database-Epoch");
+      expect(requestEpoch).toBeTruthy();
+      expect(chunkEpochs.get(sha256)?.has(requestEpoch!)).toBe(true);
       return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
     }
     if (String(input) === "/api/actions") {
@@ -681,13 +774,54 @@ async function mountFileManagerFixture(
         const action = JSON.parse(String(init?.body)) as Record<string, any>;
         actions.push(action);
         const seq = nextActionSeq++;
-        const customResponse = await onAction?.(action, seq, publishSnapshot);
+        let actionPublishedSnapshot = false;
+        const publishAcceptedSnapshot = async (snapshot: Record<string, any>) => {
+          actionPublishedSnapshot = true;
+          await publishActionSnapshot(snapshot);
+        };
+        const customResponse = await onAction?.(action, seq, publishAcceptedSnapshot);
         if (customResponse) {
+          if (customResponse.status >= 200 && customResponse.status < 300 && !actionPublishedSnapshot) {
+            const currentVersion = Number.isSafeInteger(currentSnapshot.state_version)
+              ? currentSnapshot.state_version
+              : currentManifest.state_version ?? 0;
+            const pending = {
+              seq,
+              request_id: action.request_id,
+              kind: action.kind,
+              status: "pending",
+              created_at: Math.floor(Date.now() / 1000),
+              payload: action.payload,
+            };
+            await publishAcceptedSnapshot({
+              ...currentSnapshot,
+              state_version: currentVersion + 1,
+              pending_requests: [...(Array.isArray(currentSnapshot.pending_requests) ? currentSnapshot.pending_requests : []), pending],
+            });
+          }
           return {
             ok: customResponse.status >= 200 && customResponse.status < 300,
             status: customResponse.status,
             json: async () => customResponse.body,
           } as Response;
+        }
+        if (!actionPublishedSnapshot) {
+          const currentVersion = Number.isSafeInteger(currentSnapshot.state_version)
+            ? currentSnapshot.state_version
+            : currentManifest.state_version ?? 0;
+          const pending = {
+            seq,
+            request_id: action.request_id,
+            kind: action.kind,
+            status: "pending",
+            created_at: Math.floor(Date.now() / 1000),
+            payload: action.payload,
+          };
+          await publishAcceptedSnapshot({
+            ...currentSnapshot,
+            state_version: currentVersion + 1,
+            pending_requests: [...(Array.isArray(currentSnapshot.pending_requests) ? currentSnapshot.pending_requests : []), pending],
+          });
         }
         return { ok: true, status: 202, json: async () => ({ seq, request_id: action.request_id }) } as Response;
       } finally {
@@ -725,7 +859,17 @@ async function mountFileManagerFixture(
     sockets,
     fetchMock,
     publishSnapshot,
+    setDatabaseEpoch(databaseEpoch: string) { currentDatabaseEpoch = databaseEpoch; },
+    setSessionStatus(status: number) { sessionStatus = status; },
+    holdNextStateResponse() {
+      if (nextStateResponseGate) throw new Error("A state response is already held.");
+      const gate = deferredSignal();
+      nextStateResponseGate = gate;
+      return gate.release;
+    },
     stateRequestVersions,
+    stateRequestEpochs,
+    get sessionRequests() { return sessionRequests; },
     get stateRequests() { return stateRequests; },
     get currentSnapshot() { return currentSnapshot; },
   };
@@ -737,7 +881,9 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  window.dispatchEvent(new Event("pagehide"));
   await releaseMountedFixture();
+  activeMockSockets.length = 0;
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -755,12 +901,50 @@ afterEach(async () => {
 });
 
 describe("file manager UI flow", () => {
+  it("watches cloud-pending scans and imports after reload, then stops at terminal state", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      pending_requests: [
+        { seq: 811, kind: "library_scan", status: "waiting_for_local", created_at: Math.floor(Date.now() / 1_000) },
+        { seq: 812, kind: "legacy_import", status: "waiting_for_local", created_at: Math.floor(Date.now() / 1_000) },
+      ],
+      operations: [],
+    };
+    const fixture = await mountFileManagerFixture(initialSnapshot, makeMemoryStorage());
+    const socket = latestOpenSocket(fixture.sockets);
+    expect(socket).toBeDefined();
+    await vi.waitFor(() => expect(socket?.sentFrames.some((frame) => frame.type === "interest" && frame.watch === true)).toBe(true));
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(socket?.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+
+    const requestsBeforeTerminal = fixture.stateRequests;
+    await fixture.publishSnapshot({
+      ...initialSnapshot,
+      state_version: 2,
+      pending_requests: [],
+      operations: [
+        { seq: 811, kind: "library_scan", status: "completed", updated_at: Math.floor(Date.now() / 1_000) },
+        { seq: 812, kind: "legacy_import", status: "failed", updated_at: Math.floor(Date.now() / 1_000), error: "The local import could not be applied." },
+      ],
+    });
+    socket?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBeforeTerminal + 1));
+    await vi.waitFor(() => expect(socket?.sentFrames.filter((frame) => frame.type === "interest").at(-1)?.watch).toBe(false));
+    expect(socket?.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
   it("shows and clears selected items, navigates to the move card, and exposes mobile Details", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);
     const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
     const sockets = installMockWebSocket();
     let currentManifest = manifest;
+    for (const socket of sockets) socket.currentStateVersion = () => currentManifest.state_version ?? 0;
     let stateRequests = 0;
     let failNextStateResponse = false;
     const responseChunks = new Map(chunks);
@@ -810,6 +994,7 @@ describe("file manager UI flow", () => {
     vi.stubGlobal("fetch", fetchMock);
     window.fetch = fetchMock as typeof window.fetch;
 
+    vi.resetModules();
     const firstReadAt = Date.now();
     // The browser entry has no declarations because it is executed for its side effects.
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
@@ -818,9 +1003,19 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true);
     expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
     await vi.advanceTimersByTimeAsync(1_000);
+    expect(sockets[0]?.sentFrames).toEqual(expect.arrayContaining([expect.objectContaining({ type: "refresh_request", reason: "open" })]));
     await vi.waitFor(() => expect(stateRequests).toBe(2));
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    const formattedReportTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(MOCK_REPORTED_AT_MS));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent)
+      .toBe(`Desktop snapshot published at ${formattedReportTime}.`));
     expect(Date.now() - firstReadAt).toBeLessThan(5 * 60 * 1_000);
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain("Snapshot published Just now");
+    const formattedScanTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(Number(ownerSnapshot.library.scanned_at) * 1_000));
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain(`Last scan ${formattedScanTime}`);
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
     expect(fetchMock).toHaveBeenCalledTimes(3 + manifest.library.chunks.length + manifest.state.chunks.length);
@@ -882,8 +1077,7 @@ describe("file manager UI flow", () => {
     currentManifest = pushedBundle.manifest;
     for (const [sha256, data] of pushedBundle.chunks) responseChunks.set(sha256, data);
     const stateRequestsBeforePush = stateRequests;
-    await vi.advanceTimersByTimeAsync(1_000);
-    sockets[0]?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    element<HTMLButtonElement>("#refresh-button").click();
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(stateRequestsBeforePush));
     await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from pushed update"));
@@ -892,7 +1086,7 @@ describe("file manager UI flow", () => {
     const statesBeforeManualFailure = stateRequests;
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.waitFor(() => expect(stateRequests).toBe(statesBeforeManualFailure + 1));
-    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("Request failed (503)"));
+    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("published a snapshot, but this view could not reload it"));
     await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
 
     element<HTMLButtonElement>("#clear-selection").click();
@@ -919,6 +1113,51 @@ describe("file manager UI flow", () => {
     expect(css).toContain("env(safe-area-inset-bottom");
     expect(css).toMatch(/\.media-details\s*\{[^}]*min-height:\s*36px/su);
   });
+
+  it.each(["library_scan", "legacy_import"] as const)(
+    "keeps the foreground update watch active for %s until its terminal snapshot",
+    async (kind) => {
+      const fixture = await mountFileManagerFixture(ownerSnapshot, makeMemoryStorage());
+      const socket = latestOpenSocket(fixture.sockets);
+      if (!socket) throw new Error("Expected the file manager update socket to be open.");
+
+      if (kind === "library_scan") {
+        element<HTMLButtonElement>("#scan-button").click();
+      } else {
+        element<HTMLTextAreaElement>("#legacy-text").value = "Legacy metadata entry";
+        element<HTMLButtonElement>("#import-legacy").click();
+      }
+
+      await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+      const action = fixture.actions[0]!;
+      expect(action.kind).toBe(kind);
+      await vi.waitFor(() => expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]));
+      await vi.waitFor(() => expect(socket.watch).toBe(true));
+      expect(socket.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+
+      const accepted = fixture.currentSnapshot.pending_requests.find((request: Record<string, any>) => request.request_id === action.request_id);
+      expect(accepted?.seq).toEqual(expect.any(Number));
+      const requestsBeforeTerminal = fixture.stateRequests;
+      const terminalSnapshot = {
+        ...fixture.currentSnapshot,
+        state_version: Number(fixture.currentSnapshot.state_version ?? 1) + 1,
+        operations: [{
+          seq: accepted.seq,
+          kind,
+          status: "completed",
+          result: kind === "legacy_import"
+            ? { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, revision: "legacy-import-r1" }
+            : { revision: "library-scan-r2", scanned_at: Math.floor(Date.now() / 1_000) },
+        }],
+        pending_requests: [],
+      };
+      await fixture.publishSnapshot(terminalSnapshot);
+      socket.publishSnapshot(terminalSnapshot.state_version);
+      await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBeforeTerminal + 1));
+      await vi.waitFor(() => expect(socket.watch).toBe(false));
+      expect(socket.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+    },
+  );
 
   it("keeps the verified library visible and stale after a snapshot-format upgrade response", async () => {
     vi.useFakeTimers();
@@ -979,17 +1218,99 @@ describe("file manager UI flow", () => {
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
     expect(element<HTMLButtonElement>('[data-details="item-alpha"]')).toBeDefined();
 
+    await vi.waitFor(() => expect(stateRequests).toBe(2)); // Initial cache read, then the one open refresh.
+    const requestsBeforeManualRefresh = stateRequests;
     element<HTMLButtonElement>("#refresh-button").click();
-    await vi.waitFor(() => expect(stateRequests).toBe(2));
-    await vi.waitFor(() => expect(element<HTMLElement>("#sync-title").textContent).toBe("No recent computer contact"));
+    await vi.waitFor(() => expect(stateRequests).toBe(requestsBeforeManualRefresh + 1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#sync-title").textContent?.toLowerCase()).toContain("saved snapshot"));
 
     expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
     expect(element<HTMLButtonElement>('[data-details="item-alpha"]')).toBeDefined();
     expect([...document.querySelectorAll<HTMLOptionElement>("#category-folders option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
-    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/state")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/state")).toHaveLength(requestsBeforeManualRefresh + 1);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/snapshot/chunks/"))).toHaveLength(
       new Set([...manifest.library.chunks, ...manifest.state.chunks].map((chunk: { sha256: string }) => chunk.sha256)).size,
     );
+  });
+
+  it("keeps queued actions fenced until a lower-version snapshot from the new database epoch verifies", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const oldEpoch = TEST_DATABASE_EPOCH;
+    const newEpoch = "c".repeat(32);
+    const previewId = "epoch-fenced-cancellation";
+    const revision = "epoch-fenced-cancellation-r1";
+    const preview = filePreviewFixture(949, LIBRARY_ID, ROOT_BINDING, previewId, revision);
+    const oldSnapshot = snapshotWithLibraryLabel({
+      ...ownerSnapshot,
+      state_version: 34_936,
+      last_seen: Date.now(),
+      operations: [preview],
+      pending_requests: [],
+      previews: [],
+    }, "Old epoch library");
+    const storage = makeMemoryStorage();
+    let actionSawVerifiedNewEpoch = false;
+    const fixture = await mountFileManagerFixture(oldSnapshot, storage, (action, seq) => {
+      actionSawVerifiedNewEpoch = element<HTMLElement>("#library-select").textContent?.includes("New epoch library") === true;
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop snapshot published"));
+    expect(fixture.currentSnapshot.state_version).toBe(34_936);
+    expect(fixture.stateRequestEpochs.every((epoch) => epoch === oldEpoch)).toBe(true);
+
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    element<HTMLButtonElement>(`[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="${previewId}"]`).click();
+    await vi.waitFor(() => expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]")).toHaveLength(1));
+    expect(fixture.actions).toHaveLength(0);
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+
+    const oldSocket = latestOpenSocket(fixture.sockets);
+    if (!oldSocket) throw new Error("Expected the old-epoch update socket to remain open.");
+    const requestsBefore = fixture.stateRequests;
+    const sessionsBefore = fixture.sessionRequests;
+    const releaseHeldOldRead = fixture.holdNextStateResponse();
+    try {
+      element<HTMLButtonElement>("#refresh-button").click();
+      await vi.waitFor(() => expect(oldSocket.sentFrames.some((frame) => frame.type === "refresh_request" && frame.reason === "manual")).toBe(true));
+      await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBefore + 1));
+
+      fixture.setSessionStatus(503);
+      fixture.setDatabaseEpoch(newEpoch);
+      oldSocket.receive({ type: "invalidate", database_epoch: newEpoch, reason: "epoch" });
+      releaseHeldOldRead();
+
+      await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBefore + 2));
+      await vi.waitFor(() => expect(fixture.sessionRequests).toBeGreaterThan(sessionsBefore));
+      expect(fixture.stateRequestVersions.slice(-2)).toEqual([34_936, 34_936]);
+      expect(fixture.stateRequestEpochs.slice(-2)).toEqual([oldEpoch, oldEpoch]);
+      await vi.waitFor(() => expect(element<HTMLElement>("#sync-badge").textContent).toBe("Snapshot outdated"));
+      expect(element<HTMLElement>("#library-select").textContent).toContain("Old epoch library");
+      expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]")).toHaveLength(1);
+      window.dispatchEvent(new Event("online"));
+      expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+      expect(fixture.actions).toHaveLength(0);
+
+      const newSnapshot = snapshotWithLibraryLabel({
+        ...oldSnapshot,
+        state_version: 1,
+        last_seen: Date.now(),
+      }, "New epoch library");
+      await fixture.publishSnapshot(newSnapshot, newEpoch);
+      fixture.setSessionStatus(200);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(element<HTMLElement>("#library-select").textContent).toContain("New epoch library"));
+      await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+      expect(fixture.stateRequestEpochs).toContain(newEpoch);
+      expect(fixture.stateRequestVersions).toContain(1);
+      expect(actionSawVerifiedNewEpoch).toBe(true);
+      expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+      expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    } finally {
+      releaseHeldOldRead();
+      fixture.setSessionStatus(200);
+    }
   });
 
   it("keeps review previews in Requests until terminal snapshots move them into searchable History", async () => {
@@ -1177,6 +1498,7 @@ describe("file manager UI flow", () => {
     let currentSnapshot = snapshot(initialOperations, [], 1);
     const initialBundle = await makeChunkedSnapshot(currentSnapshot);
     let currentManifest = initialBundle.manifest;
+    for (const socket of sockets) socket.currentStateVersion = () => currentManifest.state_version ?? 0;
     const responseChunks = new Map(initialBundle.chunks);
     const actions: Array<Record<string, any>> = [];
     const acceptedActions: Array<{ action: Record<string, any>; seq: number }> = [];
@@ -1188,6 +1510,7 @@ describe("file manager UI flow", () => {
       const nextBundle = await makeChunkedSnapshot(nextSnapshot);
       currentManifest = nextBundle.manifest;
       for (const [sha256, data] of nextBundle.chunks) responseChunks.set(sha256, data);
+      publishMockSnapshot(currentManifest.state_version ?? 0);
     }
 
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
@@ -1310,17 +1633,12 @@ describe("file manager UI flow", () => {
       currentSnapshot.pending_requests.filter((request) => request.seq !== failedCancelAccepted.seq),
       currentSnapshot.state_version + 1,
     );
-    await publishSnapshot(failedSnapshot);
     const requestsBeforeFailedSnapshot = stateRequests;
-    sockets[0]?.receive({
-      type: "invalidate",
-      database_epoch: TEST_DATABASE_EPOCH,
-      state_version: failedSnapshot.state_version,
-      reason: "state",
-    });
+    expect(sockets[0]?.watch).toBe(true);
+    await publishSnapshot(failedSnapshot);
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeFailedSnapshot));
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("The computer could not cancel this preview."));
     expect(document.querySelector('[data-preview-cancel-id="file-cancel-failure"]')).not.toBeNull();
-    expect(element<HTMLElement>("#preview-list").textContent).toContain("The computer could not cancel this preview.");
     expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').disabled).toBe(false);
     expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').textContent).toContain("Retry cancellation");
     expect(element<HTMLButtonElement>('[data-confirm="file-cancel-failure"]').disabled).toBe(false);
@@ -1355,16 +1673,11 @@ describe("file manager UI flow", () => {
       currentSnapshot.pending_requests.filter((request) => request.seq !== retiredCancelAccepted.seq),
       currentSnapshot.state_version + 1,
     );
-    await publishSnapshot(retiredSnapshot);
     const requestsBeforeRetiredSnapshot = stateRequests;
-    sockets[0]?.receive({
-      type: "invalidate",
-      database_epoch: TEST_DATABASE_EPOCH,
-      state_version: retiredSnapshot.state_version,
-      reason: "state",
-    });
+    expect(sockets[0]?.watch).toBe(true);
+    await publishSnapshot(retiredSnapshot);
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeRetiredSnapshot));
-    expect(document.querySelector('[data-preview-cancel-id="file-cancel-confirmed"]')).toBeNull();
+    await vi.waitFor(() => expect(document.querySelector('[data-preview-cancel-id="file-cancel-confirmed"]')).toBeNull());
     expect(element<HTMLElement>("#waiting-count").textContent).toBe(String(activeCountBeforeRetiredCancel - 1));
     const primaryPreviewCountsAfterRetirement = primaryPreviewCounts();
     expect(primaryPreviewCountsAfterRetirement.files).toBe(firstPrimaryCounts.files - 1);
@@ -1459,14 +1772,9 @@ describe("file manager UI flow", () => {
     settledOperations[0] = { ...settledOperations[0]!, status: "confirmed" };
     settledOperations[2] = { ...settledOperations[2]!, status: "confirmed" };
     const terminalSnapshot = snapshot(settledOperations, [], currentSnapshot.state_version + 1);
-    await publishSnapshot(terminalSnapshot);
     const requestsBeforeTerminalUpdate = stateRequests;
-    sockets[0]?.receive({
-      type: "invalidate",
-      database_epoch: TEST_DATABASE_EPOCH,
-      state_version: terminalSnapshot.state_version,
-      reason: "state",
-    });
+    expect(sockets[0]?.watch).toBe(true);
+    await publishSnapshot(terminalSnapshot);
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeTerminalUpdate));
     await vi.waitFor(() => expect(primaryPreviewCounts()).toEqual({ files: 0, migrations: 0 }));
     expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
@@ -1810,6 +2118,7 @@ describe("file manager UI flow", () => {
       ...snapshotWithLibraryLabel(snapshot, "Stale cancellation snapshot applied"),
       state_version: 2,
       stale: true,
+      reported_at: Date.now() - 61 * 60 * 1_000,
       last_seen: Date.now() - 11 * 60 * 1_000,
     };
     const stateRequestsBeforeStale = fixture.stateRequests;
@@ -1971,6 +2280,7 @@ describe("file manager UI flow", () => {
       state_version: 4,
       synced: true,
       stale: true,
+      reported_at: Date.now() - 61 * 60 * 1_000,
       last_seen: Date.now() - 11 * 60 * 1_000,
       operations: newerHistoryOperations(1_000, 4),
       pending_requests: [],
@@ -2635,6 +2945,7 @@ describe("file manager UI flow", () => {
     };
     if (blocker === "stale owner snapshot") {
       snapshot.stale = true;
+      snapshot.reported_at = Date.now() - 61 * 60 * 1_000;
       snapshot.last_seen = Date.now() - 11 * 60 * 1_000;
     } else if (blocker === "exact pending cancellation") {
       snapshot.pending_requests = [{
@@ -2732,8 +3043,8 @@ describe("file manager UI flow", () => {
       await vi.waitFor(() => {
         const fetchedVersions = fixture.stateRequestVersions.slice(manifestVersionsBefore);
         expect(fetchedVersions).toContain(nextSnapshot.state_version);
-        // Snapshot rendering is already applied; aria-busy stays true while this deliberately held POST drains.
-        expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("true");
+        // The cache read completes while this deliberately held POST remains unresolved.
+        expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
         expect(element<HTMLElement>("#library-select").textContent).toContain("No review target after in-flight cancellation");
       });
       const fetchedVersions = fixture.stateRequestVersions.slice(manifestVersionsBefore);
@@ -2745,6 +3056,7 @@ describe("file manager UI flow", () => {
         tracker: expect.objectContaining({ requestId, seq: null }),
       });
       expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+      expect(storage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`)).toBeNull();
 
       releaseAction();
       released = true;
@@ -3072,7 +3384,7 @@ describe("file manager UI flow", () => {
       expect(actionQueueWriteAttempts).toBeGreaterThan(1);
     });
     await vi.waitFor(() => {
-      expect(element<HTMLElement>("#toast").textContent).toContain("paused until the receipt can be recovered");
+      expect(element<HTMLElement>("#toast").textContent.toLowerCase()).toContain("could not save the action queue");
       expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
     });
     const acceptedAction = firstPage.actions[0]!;

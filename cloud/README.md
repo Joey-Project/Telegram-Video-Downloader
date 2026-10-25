@@ -51,28 +51,48 @@ acknowledgments, and sequence history. Install and verify the matching desktop R
 service before deploying the new Worker and Mini App assets. Existing action kinds
 remain supported throughout this order; rolling back code does not roll back D1 data.
 
-## Live Mini App updates
+## On-demand time snapshots
 
-Both Mini Apps subscribe to lightweight state-change hints instead of polling every twelve
-seconds. A successful snapshot commit or inbox change triggers notification only after its
-D1 write. Uploading an individual staged content chunk does not publish a new snapshot.
-The desktop and browser use separate subscription roles: browsers never receive the
-desktop's inbox envelopes or its shared secret.
+The Mac stores authoritative local state. Cloudflare stores a snapshot from a particular
+time, rather than a continuously mirrored view. Local disk-capacity changes, task progress
+and background scans do not by themselves publish another cloud snapshot. The idle
+refresh expires one hour after the last successful publication; user-requested publication
+moves that deadline forward, while cache reads and failed uploads do not. The deadline
+survives restart alongside the existing local state-version metadata.
+An hourly background refresh checks availability/capacity and publishes the latest
+local index; it does not start another full file scan or metadata backfill.
 
-The browser subscribes before reconciling its current state, and reads the existing
-`chunked-v1` HTTP manifest and verified content chunks after a notification. Notifications
-are hints, not durable state or permission to act. Refreshes are coalesced without dropping
-changes received during a read. Reconnection, returning to the foreground and low-frequency
-fallback reads recover changes missed during disconnection or failed notification delivery.
-Failed snapshot reads retry after one second, doubling the delay up to one minute until
-a read succeeds. These retries are quiet; explicit refreshes retain user-visible errors.
-Inactive pages pause unnecessary connection retries and refreshes. Connection authorization
-expires with the original Telegram authorization; reconnecting does not extend that deadline.
+Both Mini Apps display the saved snapshot and its time before requesting current Mac
+data once on open. The refresh button requests an actual Mac refresh. Searching, sorting,
+pagination and selection use already loaded data; idle pages do not poll for snapshots.
+Reference-data requests refresh the required scope, and business operations return their
+current references and results in the same publication instead of requiring a separate
+pre-refresh exchange. File-index scan times stay distinct from snapshot publication times.
 
-The Durable Object accepts both client roles through the Hibernation WebSocket API. Idle
-connections do not require a running JavaScript timer or a permanently active object. The
-object uses an alarm for viewer authorization expiry. Mobile page suspension remains a
-separate lifecycle concern and is handled by reconnection and reconciliation.
+The existing owner-authenticated viewer WebSocket carries bounded ephemeral refresh
+requests and foreground operation interest. The Mac returns a correlated refresh result
+only after its snapshot upload succeeds. An unavailable or failed refresh leaves the saved
+snapshot visible. These read-only control frames never enter the durable business inbox;
+commands retain their existing request IDs, receipt acknowledgments and recovery rules.
+Hidden/closed pages stop live interest. Active operation results may notify interested
+viewers; unobserved progress stays local until the next requested or expired refresh.
+
+Published-result hints allow coalesced reads of the existing `chunked-v1` manifest and
+verified content chunks. They are not permission to act: the Mac revalidates every actual
+file operation. Uploading a staged chunk alone does not publish a snapshot. The authenticated
+local state API accepts `X-Snapshot-Notify-Viewers: 0` to avoid waking the notification
+object for an unobserved background publication; an absent header preserves legacy behavior.
+The Mac reuses hashes confirmed by its latest successfully committed manifest, so an
+hourly refresh does not reupload unchanged active chunks merely because a staging cache
+expired. This bounded cache stays in memory and is scoped to epoch/version. Every commit
+still checks its chunk references; a missing-chunk response clears the cache and retries
+the existing upload path.
+
+The Durable Object uses the Hibernation WebSocket API for both roles, with bounded
+attachments and authorization-expiry alarms. No periodic presence heartbeat or separate
+credential is required. Browser authorization retains its original deadline across reconnects;
+viewer sockets never receive the Mac's business envelopes or shared secret. See the
+[implementation contract and validation journal](../docs/project_journal/2026/10/2026-10-25-on-demand-cloud-snapshots-ocs01.md).
 
 An action envelope requires `request_id`, `kind`, `payload`, `queued_at_ms` and
 `replay_expires_at_ms`. Create the UUID and Unix-millisecond timestamps once for a new action;

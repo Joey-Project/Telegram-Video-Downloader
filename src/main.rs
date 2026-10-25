@@ -30,7 +30,7 @@ mod router;
 mod safe_fs;
 mod telegram;
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::RandomState};
 use std::future::Future;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -48,8 +48,11 @@ use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
     CredentialKind, CredentialSource, Input, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
-use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
+use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
 use crate::bilibili_attempt::{
@@ -58,10 +61,11 @@ use crate::bilibili_attempt::{
 };
 use crate::cloud::{
     CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudDatabaseEpochChanged, CloudInbox,
-    CloudInboxRecoveryIncomplete, CloudInboxSequenceConflict, CloudRequest, CloudSettings,
-    CloudState, CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus,
-    MAX_CLOUD_STATE_VERSION, is_state_version_exhausted, next_websocket_request, now_millis,
-    now_seconds,
+    CloudInboxRecoveryIncomplete, CloudInboxSequenceConflict, CloudRefreshResult, CloudRequest,
+    CloudSettings, CloudSnapshotControl, CloudState, CloudStatePostError, CloudViewerInterest,
+    CloudWebSocket, CloudWebSocketMessage, InboxRecord, InboxStatus, MAX_CLOUD_CONTROL_VIEWERS,
+    MAX_CLOUD_STATE_VERSION, SnapshotRefreshRequest, SnapshotRefreshScope,
+    decode_cloud_websocket_json, is_state_version_exhausted, now_millis, now_seconds,
 };
 use crate::config::{AppConfig, CloudConfig};
 use crate::downloader::{
@@ -122,6 +126,13 @@ const CLOUD_TASK_SUMMARY_ERROR_LIMIT_BYTES: usize = 2 * 1024;
 const CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES: usize = 8 * 1024;
 const CLOUD_TASK_SUMMARIES_LIMIT_BYTES: usize = 1024 * 1024;
 const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
+const CLOUD_PUBLICATION_COALESCE: Duration = Duration::from_millis(80);
+const CLOUD_IDLE_PUBLICATION_EXPIRY: Duration = Duration::from_secs(60 * 60);
+const CLOUD_IDLE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CLOUD_REFRESH_RESULT_RETENTION_MILLIS: u64 = 5 * 60 * 1000;
+const MAX_PENDING_SNAPSHOT_REFRESHES: usize = 64;
+const MAX_RETAINED_SNAPSHOT_REFRESHES: usize = 128;
+const CLOUD_WEBSOCKET_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const CLOUD_LIBRARY_WARNING_COUNT_LIMIT: usize = 64;
 const CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES: usize = 1024;
 const CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES: usize = 24 * 1024;
@@ -446,6 +457,13 @@ struct CloudBotRuntime {
     inbox: Arc<CloudInbox>,
     request_notify: Arc<Notify>,
     state_notify: Arc<Notify>,
+    snapshot_refreshes: Arc<Mutex<SnapshotRefreshQueue>>,
+    viewer_interests: Arc<Mutex<BTreeMap<String, CloudViewerInterest>>>,
+    websocket_writer: Arc<Mutex<Option<mpsc::Sender<serde_json::Value>>>>,
+    last_backlog_reconciled_at: Arc<Mutex<Option<Instant>>>,
+    last_backlog_reconciled_notify: Arc<Notify>,
+    initial_library_scan_complete: Arc<AtomicBool>,
+    initial_library_scan_notify: Arc<Notify>,
     library_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
     library_snapshots: Arc<Mutex<BTreeMap<String, LibrarySnapshot>>>,
     library_unavailable: Arc<Mutex<BTreeMap<String, String>>>,
@@ -476,6 +494,91 @@ struct CloudBotRuntime {
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(test)]
     test_cloud_ready_marker_emissions: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct SeenSnapshotRefresh {
+    request: SnapshotRefreshRequest,
+    result: Option<CloudRefreshResult>,
+    retain_until: u64,
+}
+
+#[derive(Default)]
+struct SnapshotRefreshQueue {
+    pending: VecDeque<SnapshotRefreshRequest>,
+    seen: HashMap<(String, String), SeenSnapshotRefresh>,
+}
+
+enum SnapshotRefreshEnqueue {
+    Queued,
+    DuplicatePending,
+    Replay(CloudRefreshResult),
+    Conflict,
+    Busy,
+}
+
+impl SnapshotRefreshQueue {
+    fn enqueue(&mut self, request: SnapshotRefreshRequest, now: u64) -> SnapshotRefreshEnqueue {
+        self.pending.retain(|pending| pending.expires_at > now);
+        self.seen.retain(|_, seen| seen.retain_until > now);
+        let key = (request.viewer_id.clone(), request.request_id.clone());
+        if let Some(seen) = self.seen.get(&key) {
+            if seen.request != request {
+                return SnapshotRefreshEnqueue::Conflict;
+            }
+            return seen.result.clone().map_or(
+                SnapshotRefreshEnqueue::DuplicatePending,
+                SnapshotRefreshEnqueue::Replay,
+            );
+        }
+        if self.pending.len() >= MAX_PENDING_SNAPSHOT_REFRESHES
+            || self.seen.len() >= MAX_RETAINED_SNAPSHOT_REFRESHES
+        {
+            return SnapshotRefreshEnqueue::Busy;
+        }
+        self.seen.insert(
+            key,
+            SeenSnapshotRefresh {
+                retain_until: request
+                    .expires_at
+                    .saturating_add(CLOUD_REFRESH_RESULT_RETENTION_MILLIS),
+                request: request.clone(),
+                result: None,
+            },
+        );
+        self.pending.push_back(request);
+        SnapshotRefreshEnqueue::Queued
+    }
+
+    fn take_pending(&mut self, now: u64) -> Vec<SnapshotRefreshRequest> {
+        self.pending.retain(|request| request.expires_at > now);
+        self.pending.drain(..).collect()
+    }
+
+    fn remember_result(&mut self, result: CloudRefreshResult, now: u64) {
+        let key = (result.viewer_id.clone(), result.request_id.clone());
+        if let Some(seen) = self.seen.get_mut(&key) {
+            seen.result = Some(result);
+            seen.retain_until = seen.retain_until.max(now.saturating_add(1_000));
+        }
+    }
+
+    fn cancel_invisible(
+        &mut self,
+        visible_viewers: &HashSet<String>,
+        now: u64,
+    ) -> Vec<SnapshotRefreshRequest> {
+        let mut cancelled = Vec::new();
+        self.pending.retain(|request| {
+            if request.expires_at <= now || !visible_viewers.contains(&request.viewer_id) {
+                cancelled.push(request.clone());
+                false
+            } else {
+                true
+            }
+        });
+        cancelled
+    }
 }
 
 #[derive(Default)]
@@ -634,7 +737,9 @@ where
     run_cloud_library_operation_with_snapshot_update_and_policy(
         runtime,
         failure_context,
-        CloudLibraryFailurePolicy::MarkUnavailable,
+        // The availability probe runs before the scan. If the scan itself fails, retain the
+        // last known snapshot and let an explicit refresh report the failure to its viewer.
+        CloudLibraryFailurePolicy::PreserveAvailability,
         CloudLibraryAdmission::WaitManagement,
         None,
         move |context, inbox, _root| {
@@ -1083,6 +1188,15 @@ impl CloudStateSnapshot {
         .context("failed to fingerprint local cloud state")
     }
 
+    fn watch_fingerprint(&self) -> Result<String> {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "operations": self.operations,
+            "tasks": self.tasks,
+        }))
+        .context("failed to fingerprint watched cloud operations")?;
+        Ok(format!("{:x}", Sha256::digest(payload)))
+    }
+
     fn encoded_size(&self, state_version: u64) -> Result<usize> {
         let state = CloudState {
             state_version,
@@ -1414,11 +1528,13 @@ impl CloudStateSnapshot {
         &self,
         runtime: &CloudBotRuntime,
         state_version: u64,
-    ) -> std::result::Result<(), CloudStatePostError> {
+        notify_viewers: bool,
+    ) -> std::result::Result<u64, CloudStatePostError> {
+        let reported_at = now_millis();
         let state = CloudState {
             state_version,
             revision: Some(&self.revision),
-            reported_at: now_millis(),
+            reported_at,
             library: &self.library,
             previews: &self.previews,
             operations: &self.operations,
@@ -1428,7 +1544,11 @@ impl CloudStateSnapshot {
                 applied: Some(&self.settings_applied),
             },
         };
-        runtime.client.post_state(&state).await
+        runtime
+            .client
+            .post_state_with_notify_viewers(&state, Some(notify_viewers))
+            .await?;
+        Ok(reported_at)
     }
 }
 
@@ -1727,6 +1847,27 @@ struct PendingCloudState {
     fingerprint: Vec<u8>,
     state_version: u64,
     rejected_fingerprint: Option<Vec<u8>>,
+    watch_fingerprint: String,
+    trigger: CloudPublicationTrigger,
+    failed_refreshes: HashSet<SnapshotRefreshKey>,
+}
+
+#[derive(Clone, Default)]
+struct CloudPublicationTrigger {
+    bootstrap: bool,
+    idle_expiry: bool,
+    refreshes: Vec<SnapshotRefreshRequest>,
+    watched_operation: bool,
+}
+
+impl CloudPublicationTrigger {
+    fn is_forced(&self) -> bool {
+        self.bootstrap || self.idle_expiry || !self.refreshes.is_empty()
+    }
+
+    fn is_admitted(&self) -> bool {
+        self.is_forced() || self.watched_operation
+    }
 }
 
 async fn run_cloud_bot(
@@ -1782,6 +1923,13 @@ async fn run_cloud_bot(
         inbox: Arc::new(inbox),
         request_notify: Arc::new(Notify::new()),
         state_notify: Arc::new(Notify::new()),
+        snapshot_refreshes: Arc::new(Mutex::new(SnapshotRefreshQueue::default())),
+        viewer_interests: Arc::new(Mutex::new(BTreeMap::new())),
+        websocket_writer: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_at: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_notify: Arc::new(Notify::new()),
+        initial_library_scan_complete: Arc::new(AtomicBool::new(false)),
+        initial_library_scan_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
         library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1818,7 +1966,9 @@ async fn run_cloud_bot(
 
     emit_cloud_startup_readiness(runtime.bot.config.bot.concurrency);
     info!(
-        fallback_poll_seconds = cloud_config.fallback_poll_seconds,
+        configured_fallback_poll_seconds = cloud_config.fallback_poll_seconds,
+        effective_max_idle_reconciliation_seconds = CLOUD_IDLE_RECONCILIATION_INTERVAL.as_secs(),
+        idle_snapshot_expiry_seconds = CLOUD_IDLE_PUBLICATION_EXPIRY.as_secs(),
         "telegram local cloud ingress started"
     );
     tokio::spawn(cloud_initial_library_scan(runtime.clone()));
@@ -1831,7 +1981,6 @@ async fn run_cloud_bot(
     ));
     tokio::spawn(cloud_websocket_receiver(runtime.clone()));
     tokio::spawn(cloud_request_dispatcher(runtime.clone()));
-    runtime.state_notify.notify_one();
     tokio::spawn(cloud_state_reporter(runtime.clone()));
 
     tokio::select! {
@@ -1851,6 +2000,11 @@ async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
     if let Err(error) = media_library_bot::refresh_libraries(&runtime).await {
         warn!(error = %format!("{error:#}"), "initial media-library scan failed");
     }
+    runtime
+        .initial_library_scan_complete
+        .store(true, Ordering::Release);
+    runtime.initial_library_scan_notify.notify_waiters();
+    runtime.state_notify.notify_one();
 }
 
 async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
@@ -1912,13 +2066,13 @@ async fn cloud_queue_state_watcher_with_debounce(runtime: CloudBotRuntime, debou
 }
 
 async fn cloud_state_reporter(runtime: CloudBotRuntime) {
-    cloud_state_reporter_with_heartbeat(runtime, Duration::from_secs(5 * 60)).await;
+    cloud_state_reporter_with_heartbeat(runtime, CLOUD_IDLE_PUBLICATION_EXPIRY).await;
 }
 
-async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: Duration) {
+async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, expiry: Duration) {
     cloud_state_reporter_with_retry_policy(
         runtime,
-        period,
+        expiry,
         Duration::from_secs(5),
         Duration::from_secs(60),
     )
@@ -1927,18 +2081,38 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
 
 async fn cloud_state_reporter_with_retry_policy(
     runtime: CloudBotRuntime,
-    period: Duration,
+    expiry: Duration,
     retry_backoff_base: Duration,
     version_exhausted_backoff: Duration,
 ) {
-    let mut heartbeat = interval(period);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    heartbeat.tick().await;
-    let mut published_fingerprint: Option<Vec<u8>> = None;
-    let mut published_version: Option<u64> = None;
+    wait_for_initial_library_scan(&runtime).await;
+    let last_successful_publication = match last_successful_cloud_publication_at(&runtime).await {
+        Ok(last_successful_publication) => last_successful_publication,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not read persisted cloud publication expiry; scheduling a bootstrap snapshot");
+            None
+        }
+    };
+    let mut bootstrap_due = last_successful_publication.is_none();
+    let expiry_millis = u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX);
+    let mut idle_deadline =
+        last_successful_publication.map_or_else(Instant::now, |last_successful_publication| {
+            let elapsed = now_millis().saturating_sub(last_successful_publication);
+            let remaining = expiry_millis.saturating_sub(elapsed);
+            Instant::now() + Duration::from_millis(remaining)
+        });
+    let mut published_watch_fingerprint = match last_successful_cloud_watch_fingerprint(&runtime)
+        .await
+    {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not read persisted watched-operation fingerprint; allowing one baseline watch publication");
+            None
+        }
+    };
     let mut permanently_rejected_fingerprint: Option<Vec<u8>> = None;
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
-    let mut published_oversized_snapshot: Option<CloudStateSnapshot> = None;
+    let mut failure_retry_not_before: Option<Instant> = None;
     let mut pending: Option<PendingCloudState> = None;
     let mut retry_backoff =
         CloudStateRetryBackoff::new(retry_backoff_base, CLOUD_STATE_RETRY_BACKOFF_MAX);
@@ -1948,11 +2122,56 @@ async fn cloud_state_reporter_with_retry_policy(
             return;
         }
         if pending.is_none() {
-            let heartbeat_due = tokio::select! {
-                _ = runtime.epoch_fatal.notified() => return,
-                _ = runtime.state_notify.notified() => false,
-                _ = heartbeat.tick() => true,
+            let mut trigger = if bootstrap_due {
+                CloudPublicationTrigger {
+                    bootstrap: true,
+                    ..CloudPublicationTrigger::default()
+                }
+            } else {
+                let publication_deadline = failure_retry_not_before
+                    .map_or(idle_deadline, |retry| idle_deadline.max(retry));
+                tokio::select! {
+                    _ = runtime.epoch_fatal.notified() => return,
+                    _ = runtime.state_notify.notified() => CloudPublicationTrigger::default(),
+                    _ = tokio::time::sleep_until(publication_deadline) => CloudPublicationTrigger {
+                        idle_expiry: true,
+                        ..CloudPublicationTrigger::default()
+                    },
+                }
             };
+            if !trigger.bootstrap {
+                tokio::select! {
+                    _ = runtime.epoch_fatal.notified() => return,
+                    _ = sleep(CLOUD_PUBLICATION_COALESCE) => {},
+                }
+                trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
+                trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
+            } else {
+                trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
+                trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
+            }
+
+            let bootstrap_attempt = trigger.bootstrap;
+            let mut failed_refreshes = HashSet::new();
+            if (trigger.idle_expiry || !trigger.refreshes.is_empty())
+                && let Err(error) = sync_cloud_backlog_if_idle_due(&runtime).await
+            {
+                warn!(error = %format!("{error:#}"), "cloud inbox reconciliation failed before snapshot publication");
+            }
+            if !trigger.refreshes.is_empty() {
+                failed_refreshes = refresh_snapshot_references(&runtime, &trigger.refreshes).await;
+            } else if trigger.idle_expiry {
+                // The cached local index is the source of truth for idle snapshots. Reconcile
+                // only current root availability here; full scans and metadata backfills remain
+                // attached to explicit library actions and the existing operation watchers.
+                if let Err(error) = media_library_bot::refresh_library_bindings(&runtime).await {
+                    warn!(error = %format!("{error:#}"), "hourly media-library availability refresh failed before snapshot expiry publication");
+                }
+            }
+            prune_publication_trigger(&runtime, &mut trigger, &failed_refreshes).await;
+            if !trigger.is_admitted() {
+                continue;
+            }
             match build_cloud_state_snapshot(&runtime).await {
                 Ok(Some(snapshot)) => {
                     if runtime.epoch_fatal.is_signaled() {
@@ -1965,78 +2184,84 @@ async fn cloud_state_reporter_with_retry_policy(
                             continue;
                         }
                     };
-                    if published_oversized_source_fingerprint.as_ref() == Some(&fingerprint) {
-                        if !heartbeat_due {
+                    let watch_fingerprint = match snapshot.watch_fingerprint() {
+                        Ok(fingerprint) => fingerprint,
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "failed to fingerprint watched cloud operations");
                             continue;
                         }
-                        let Some(state_version) = published_version else {
-                            continue;
-                        };
-                        let Some(heartbeat_snapshot) = published_oversized_snapshot.clone() else {
-                            continue;
-                        };
-                        let heartbeat_fingerprint = match heartbeat_snapshot.fingerprint() {
-                            Ok(fingerprint) => fingerprint,
-                            Err(error) => {
-                                warn!(error = %format!("{error:#}"), "failed to fingerprint the accepted incomplete heartbeat snapshot");
-                                continue;
-                            }
-                        };
-                        if published_fingerprint.as_ref() != Some(&heartbeat_fingerprint) {
-                            warn!(
-                                state_version,
-                                "skipping heartbeat because the cached incomplete snapshot differs from the published state"
-                            );
-                            continue;
-                        }
-                        pending = Some(PendingCloudState {
-                            snapshot: heartbeat_snapshot,
-                            fingerprint: heartbeat_fingerprint,
-                            state_version,
-                            rejected_fingerprint: Some(fingerprint),
-                        });
-                        continue;
-                    }
-                    if permanently_rejected_fingerprint.as_ref() == Some(&fingerprint) {
-                        continue;
-                    }
-                    let changed = published_fingerprint.as_ref() != Some(&fingerprint);
-                    if !changed && !heartbeat_due {
-                        continue;
-                    }
-                    let state_version = match (changed, published_version) {
-                        (false, Some(version)) => version,
-                        _ => match next_cloud_state_version(&runtime).await {
-                            Ok(version) => version,
-                            Err(error) => {
-                                let exhausted = is_state_version_exhausted(&error);
-                                warn!(
-                                    exhausted,
-                                    max_state_version = MAX_CLOUD_STATE_VERSION,
-                                    error = %format!("{error:#}"),
-                                    "failed to allocate local cloud state version; reconcile the local counter or remote snapshot version if exhausted"
-                                );
-                                sleep(if exhausted {
-                                    version_exhausted_backoff
-                                } else {
-                                    retry_backoff.next_delay()
-                                })
-                                .await;
-                                runtime.state_notify.notify_one();
-                                continue;
-                            }
-                        },
                     };
+                    let watched_change = trigger.watched_operation
+                        && published_watch_fingerprint.as_ref() != Some(&watch_fingerprint);
+                    let forced = trigger.is_forced();
+                    if !forced && !watched_change {
+                        continue;
+                    }
+                    if published_oversized_source_fingerprint.as_ref() == Some(&fingerprint) {
+                        if !forced {
+                            continue;
+                        }
+                        published_oversized_source_fingerprint = None;
+                    }
+                    if !forced && permanently_rejected_fingerprint.as_ref() == Some(&fingerprint) {
+                        continue;
+                    }
+                    let state_version = match next_cloud_state_version(&runtime).await {
+                        Ok(version) => version,
+                        Err(error) => {
+                            let exhausted = is_state_version_exhausted(&error);
+                            warn!(
+                                exhausted,
+                                max_state_version = MAX_CLOUD_STATE_VERSION,
+                                error = %format!("{error:#}"),
+                                "failed to allocate local cloud state version; reconcile the local counter or remote snapshot version if exhausted"
+                            );
+                            fail_snapshot_refresh_requests(
+                                &runtime,
+                                &trigger,
+                                if exhausted {
+                                    "state_version_exhausted"
+                                } else {
+                                    "state_version_unavailable"
+                                },
+                            )
+                            .await;
+                            sleep(if exhausted {
+                                version_exhausted_backoff
+                            } else {
+                                retry_backoff.next_delay()
+                            })
+                            .await;
+                            runtime.state_notify.notify_one();
+                            continue;
+                        }
+                    };
+                    if bootstrap_attempt {
+                        // Consume bootstrap only after snapshot assembly and version allocation
+                        // succeed. A later permanent/irreducible post failure uses its own
+                        // retry cooldown without claiming a successful publication.
+                        bootstrap_due = false;
+                        idle_deadline = Instant::now() + expiry;
+                    }
                     pending = Some(PendingCloudState {
                         snapshot,
                         fingerprint,
                         state_version,
                         rejected_fingerprint: None,
+                        watch_fingerprint,
+                        trigger,
+                        failed_refreshes,
                     });
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    fail_snapshot_refresh_requests(&runtime, &trigger, "snapshot_unavailable")
+                        .await;
+                    continue;
+                }
                 Err(error) => {
                     warn!(error = %format!("{error:#}"), "failed to assemble local cloud state");
+                    fail_snapshot_refresh_requests(&runtime, &trigger, "snapshot_build_failed")
+                        .await;
                     sleep(retry_backoff.next_delay()).await;
                     runtime.state_notify.notify_one();
                     continue;
@@ -2047,22 +2272,65 @@ async fn cloud_state_reporter_with_retry_policy(
         let Some(state) = pending.as_ref() else {
             continue;
         };
+        let mut current_trigger = state.trigger.clone();
+        prune_publication_trigger(&runtime, &mut current_trigger, &state.failed_refreshes).await;
+        if !current_trigger.is_admitted() {
+            pending = None;
+            continue;
+        }
+        if let Some(state) = pending.as_mut() {
+            state.trigger = current_trigger;
+        }
+        let state = pending
+            .as_ref()
+            .expect("pending cloud state remains present");
         let failed_fingerprint = state.fingerprint.clone();
         let failed_version = state.state_version;
+        let state_version = state.state_version;
+        let notify_viewers = !state.trigger.refreshes.is_empty() || state.trigger.watched_operation;
         let post_result = tokio::select! {
             _ = runtime.epoch_fatal.notified() => return,
-            result = state.snapshot.post(&runtime, state.state_version) => result,
+            result = state.snapshot.post(&runtime, state_version, notify_viewers) => result,
         };
         match post_result {
-            Ok(()) => {
-                published_fingerprint = Some(state.fingerprint.clone());
-                published_version = Some(state.state_version);
-                permanently_rejected_fingerprint = state.rejected_fingerprint.clone();
-                published_oversized_source_fingerprint = state.rejected_fingerprint.clone();
-                published_oversized_snapshot = state
-                    .rejected_fingerprint
-                    .as_ref()
-                    .map(|_| state.snapshot.clone());
+            Ok(reported_at) => {
+                let published_state = pending.as_ref().expect(
+                    "successful post keeps its pending snapshot until bookkeeping finishes",
+                );
+                let state_version = published_state.state_version;
+                let watch_fingerprint = published_state.watch_fingerprint.clone();
+                let trigger = published_state.trigger.clone();
+                let failed_refreshes = published_state.failed_refreshes.clone();
+                let rejected_fingerprint = published_state.rejected_fingerprint.clone();
+                published_watch_fingerprint = Some(watch_fingerprint.clone());
+                permanently_rejected_fingerprint = rejected_fingerprint.clone();
+                published_oversized_source_fingerprint = rejected_fingerprint.clone();
+                bootstrap_due = false;
+                failure_retry_not_before = None;
+                idle_deadline = Instant::now() + expiry;
+                if let Err(error) = record_successful_cloud_publication_at(
+                    &runtime,
+                    reported_at,
+                    &watch_fingerprint,
+                )
+                .await
+                {
+                    warn!(
+                        reported_at,
+                        error = %format!("{error:#}"),
+                        "snapshot was acknowledged by Cloudflare but its local expiry timestamp could not be persisted"
+                    );
+                }
+                let mut trigger = trigger;
+                prune_publication_trigger(&runtime, &mut trigger, &failed_refreshes).await;
+                complete_snapshot_refresh_requests(
+                    &runtime,
+                    &trigger,
+                    &failed_refreshes,
+                    state_version,
+                    reported_at,
+                )
+                .await;
                 pending = None;
                 retry_backoff.reset();
             }
@@ -2074,7 +2342,9 @@ async fn cloud_state_reporter_with_retry_policy(
                     .rejected_fingerprint
                     .clone()
                     .unwrap_or_else(|| rejected.fingerprint.clone());
-                let mut trimmed = rejected.snapshot;
+                let trigger = rejected.trigger.clone();
+                let failed_refreshes = rejected.failed_refreshes.clone();
+                let mut trimmed = rejected.snapshot.clone();
                 match trimmed.reduce_after_payload_too_large(
                     rejected.state_version,
                     CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES,
@@ -2095,6 +2365,16 @@ async fn cloud_state_reporter_with_retry_policy(
                                         error = %format!("{version_error:#}"),
                                         "failed to allocate a new version for the reduced cloud snapshot; reconcile the local counter or remote snapshot version if exhausted"
                                     );
+                                    fail_pending_snapshot_refreshes(
+                                        &runtime,
+                                        &rejected,
+                                        if exhausted {
+                                            "state_version_exhausted"
+                                        } else {
+                                            "state_version_unavailable"
+                                        },
+                                    )
+                                    .await;
                                     sleep(if exhausted {
                                         version_exhausted_backoff
                                     } else {
@@ -2113,10 +2393,15 @@ async fn cloud_state_reporter_with_retry_policy(
                                 "cloud rejected an oversized state; retrying a smaller operation receipt or explicitly incomplete library snapshot"
                             );
                             pending = Some(PendingCloudState {
+                                // The admission baseline is the semantic source state, not the
+                                // compacted wire representation accepted after a 413 retry.
+                                watch_fingerprint: rejected.watch_fingerprint.clone(),
                                 snapshot: trimmed,
                                 fingerprint,
                                 state_version: next_version,
                                 rejected_fingerprint: Some(rejected_fingerprint),
+                                trigger,
+                                failed_refreshes,
                             });
                         }
                         Ok(_) => {
@@ -2126,7 +2411,16 @@ async fn cloud_state_reporter_with_retry_policy(
                             );
                             permanently_rejected_fingerprint = Some(rejected_fingerprint);
                             published_oversized_source_fingerprint = None;
-                            published_oversized_snapshot = None;
+                            // A permanent 413 is retried only at the next bounded admission
+                            // window (or by an explicit request). Keep this separate from the
+                            // successful-publication expiry, which must advance only on ACK.
+                            failure_retry_not_before = Some(Instant::now() + expiry);
+                            fail_pending_snapshot_refreshes(
+                                &runtime,
+                                &rejected,
+                                "payload_too_large",
+                            )
+                            .await;
                         }
                         Err(fingerprint_error) => {
                             warn!(
@@ -2135,7 +2429,13 @@ async fn cloud_state_reporter_with_retry_policy(
                             );
                             permanently_rejected_fingerprint = Some(rejected_fingerprint);
                             published_oversized_source_fingerprint = None;
-                            published_oversized_snapshot = None;
+                            failure_retry_not_before = Some(Instant::now() + expiry);
+                            fail_pending_snapshot_refreshes(
+                                &runtime,
+                                &rejected,
+                                "payload_too_large",
+                            )
+                            .await;
                         }
                     },
                     Ok(false) => {
@@ -2145,7 +2445,9 @@ async fn cloud_state_reporter_with_retry_policy(
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
-                        published_oversized_snapshot = None;
+                        failure_retry_not_before = Some(Instant::now() + expiry);
+                        fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
+                            .await;
                     }
                     Err(trim_error) => {
                         warn!(
@@ -2154,7 +2456,9 @@ async fn cloud_state_reporter_with_retry_policy(
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
-                        published_oversized_snapshot = None;
+                        failure_retry_not_before = Some(Instant::now() + expiry);
+                        fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
+                            .await;
                     }
                 }
             }
@@ -2230,6 +2534,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 return;
             }
             Err(error) if !error.is_retryable() => {
+                let failed_trigger = state.trigger.clone();
                 warn!(
                     state_version = failed_version,
                     error = %error,
@@ -2242,8 +2547,11 @@ async fn cloud_state_reporter_with_retry_policy(
                         .unwrap_or(failed_fingerprint),
                 );
                 published_oversized_source_fingerprint = None;
-                published_oversized_snapshot = None;
+                // Permanent server rejection is an admission cooldown, not a successful
+                // snapshot refresh. Explicit user refreshes still wake the reporter directly.
+                failure_retry_not_before = Some(Instant::now() + expiry);
                 pending = None;
+                fail_snapshot_refresh_requests(&runtime, &failed_trigger, "publish_rejected").await;
             }
             Err(error) => {
                 warn!(
@@ -2274,6 +2582,334 @@ async fn next_cloud_state_version_after(
     tokio::task::spawn_blocking(move || inbox.next_state_version_after(observed_version))
         .await
         .context("cloud state-version persistence worker failed")?
+}
+
+async fn last_successful_cloud_publication_at(runtime: &CloudBotRuntime) -> Result<Option<u64>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.last_successful_publication_at())
+        .await
+        .context("cloud publication-time read worker failed")?
+}
+
+async fn last_successful_cloud_watch_fingerprint(
+    runtime: &CloudBotRuntime,
+) -> Result<Option<String>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.last_successful_watch_fingerprint())
+        .await
+        .context("cloud watch-fingerprint read worker failed")?
+}
+
+async fn record_successful_cloud_publication_at(
+    runtime: &CloudBotRuntime,
+    published_at: u64,
+    watch_fingerprint: &str,
+) -> Result<()> {
+    let inbox = Arc::clone(&runtime.inbox);
+    let watch_fingerprint = watch_fingerprint.to_string();
+    tokio::task::spawn_blocking(move || {
+        inbox.record_successful_publication_at(published_at, &watch_fingerprint)
+    })
+    .await
+    .context("cloud publication-time persistence worker failed")?
+}
+
+async fn wait_for_initial_library_scan(runtime: &CloudBotRuntime) {
+    loop {
+        let notified = runtime.initial_library_scan_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if runtime
+            .initial_library_scan_complete
+            .load(Ordering::Acquire)
+        {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn active_cloud_viewers(runtime: &CloudBotRuntime) -> Vec<CloudViewerInterest> {
+    let now = now_millis();
+    let mut interests = runtime.viewer_interests.lock().await;
+    interests.retain(|_, interest| interest.expires_at > now);
+    interests.values().cloned().collect()
+}
+
+async fn active_cloud_operation_watch(runtime: &CloudBotRuntime) -> bool {
+    active_cloud_viewers(runtime)
+        .await
+        .iter()
+        .any(|viewer| viewer.watch)
+}
+
+async fn take_live_snapshot_refreshes(runtime: &CloudBotRuntime) -> Vec<SnapshotRefreshRequest> {
+    let now = now_millis();
+    let visible = runtime
+        .viewer_interests
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, viewer)| viewer.expires_at > now)
+        .map(|(viewer_id, _)| viewer_id.clone())
+        .collect::<HashSet<_>>();
+    let mut queue = runtime.snapshot_refreshes.lock().await;
+    let requests = queue.take_pending(now);
+    let (live, cancelled): (Vec<_>, Vec<_>) = requests
+        .into_iter()
+        .partition(|request| visible.contains(&request.viewer_id));
+    drop(queue);
+    for request in cancelled {
+        finish_snapshot_refresh(
+            runtime,
+            &request,
+            CloudRefreshResult::new(
+                &request,
+                "unavailable",
+                None,
+                None,
+                Some(if request.expires_at <= now {
+                    "expired"
+                } else {
+                    "viewer_closed"
+                }),
+            ),
+        )
+        .await;
+    }
+    live
+}
+
+type SnapshotRefreshKey = (String, String);
+
+fn snapshot_refresh_key(request: &SnapshotRefreshRequest) -> SnapshotRefreshKey {
+    (request.viewer_id.clone(), request.request_id.clone())
+}
+
+async fn refresh_snapshot_references(
+    runtime: &CloudBotRuntime,
+    requests: &[SnapshotRefreshRequest],
+) -> HashSet<SnapshotRefreshKey> {
+    if requests.is_empty() {
+        return HashSet::new();
+    }
+    let mut live_requests = Vec::new();
+    let now = now_millis();
+    for request in requests {
+        if refresh_request_is_live(runtime, request, now).await {
+            live_requests.push(request);
+        }
+    }
+    if live_requests.is_empty() {
+        return HashSet::new();
+    }
+    let mut failed = HashSet::new();
+    if let Err(error) = sync_cloud_backlog(runtime).await {
+        warn!(error = %format!("{error:#}"), "authoritative inbox refresh failed before an explicit snapshot refresh");
+        failed.extend(
+            live_requests
+                .iter()
+                .map(|request| snapshot_refresh_key(request)),
+        );
+    }
+
+    let settings = match runtime.bot.queue.registry_snapshot() {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not read media-library settings for snapshot refresh");
+            None
+        }
+    };
+    let Some(settings) = settings else {
+        failed.extend(
+            live_requests
+                .iter()
+                .map(|request| snapshot_refresh_key(request)),
+        );
+        return failed;
+    };
+    let default_library_id = settings.default_library_id.clone();
+    let registered = settings
+        .libraries
+        .iter()
+        .map(|library| library.id.clone())
+        .collect::<HashSet<_>>();
+    let mut library_scans = HashMap::<String, Result<()>>::new();
+    let mut availability_refreshes = HashMap::<String, Result<()>>::new();
+    let mut settings_refresh = None;
+
+    for request in requests {
+        if !refresh_request_is_live(runtime, request, now_millis()).await {
+            continue;
+        }
+        let outcome = match request.scope {
+            SnapshotRefreshScope::Library => {
+                let library_id = request
+                    .library_id
+                    .as_deref()
+                    .unwrap_or(default_library_id.as_str())
+                    .to_string();
+                if !registered.contains(&library_id) {
+                    Err(anyhow::anyhow!("requested media library is not registered"))
+                } else {
+                    if !library_scans.contains_key(&library_id) {
+                        let result =
+                            media_library_bot::refresh_library(runtime, Some(&library_id)).await;
+                        library_scans.insert(library_id.clone(), result);
+                    }
+                    library_scans
+                        .get(&library_id)
+                        .expect("selected library scan result should be stored")
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))
+                }
+            }
+            SnapshotRefreshScope::Download => {
+                let library_id = request
+                    .library_id
+                    .as_deref()
+                    .unwrap_or(default_library_id.as_str())
+                    .to_string();
+                if !registered.contains(&library_id) {
+                    Err(anyhow::anyhow!("requested media library is not registered"))
+                } else {
+                    if !availability_refreshes.contains_key(&library_id) {
+                        let result =
+                            media_library_bot::refresh_library_binding(runtime, &library_id).await;
+                        availability_refreshes.insert(library_id.clone(), result);
+                    }
+                    availability_refreshes
+                        .get(&library_id)
+                        .expect("selected availability refresh should be stored")
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))
+                }
+            }
+            SnapshotRefreshScope::Settings => {
+                if settings_refresh.is_none() {
+                    settings_refresh =
+                        Some(media_library_bot::refresh_library_bindings(runtime).await);
+                }
+                settings_refresh
+                    .as_ref()
+                    .expect("settings refresh result should be stored")
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))
+            }
+            SnapshotRefreshScope::Operations => Ok(()),
+        };
+        if let Err(error) = outcome {
+            warn!(request_id = %request.request_id, error = %error, "snapshot reference refresh failed");
+            failed.insert(snapshot_refresh_key(request));
+        }
+    }
+    failed
+}
+
+async fn refresh_request_is_live(
+    runtime: &CloudBotRuntime,
+    request: &SnapshotRefreshRequest,
+    now: u64,
+) -> bool {
+    request.expires_at > now
+        && runtime
+            .viewer_interests
+            .lock()
+            .await
+            .get(&request.viewer_id)
+            .is_some_and(|viewer| viewer.expires_at > now)
+}
+
+async fn prune_publication_trigger(
+    runtime: &CloudBotRuntime,
+    trigger: &mut CloudPublicationTrigger,
+    failed_requests: &HashSet<SnapshotRefreshKey>,
+) {
+    let now = now_millis();
+    let mut keep = Vec::new();
+    let mut unavailable = Vec::new();
+    for request in trigger.refreshes.drain(..) {
+        if refresh_request_is_live(runtime, &request, now).await {
+            keep.push(request);
+        } else {
+            unavailable.push(request);
+        }
+    }
+    trigger.refreshes = keep;
+    trigger.watched_operation &= active_cloud_operation_watch(runtime).await;
+    for request in unavailable {
+        finish_snapshot_refresh(
+            runtime,
+            &request,
+            CloudRefreshResult::new(
+                &request,
+                "unavailable",
+                None,
+                None,
+                Some(
+                    if failed_requests.contains(&snapshot_refresh_key(&request)) {
+                        "viewer_closed"
+                    } else {
+                        "expired"
+                    },
+                ),
+            ),
+        )
+        .await;
+    }
+}
+
+async fn complete_snapshot_refresh_requests(
+    runtime: &CloudBotRuntime,
+    trigger: &CloudPublicationTrigger,
+    failed_requests: &HashSet<SnapshotRefreshKey>,
+    state_version: u64,
+    reported_at: u64,
+) {
+    for request in &trigger.refreshes {
+        let failed = failed_requests.contains(&snapshot_refresh_key(request));
+        finish_snapshot_refresh(
+            runtime,
+            request,
+            CloudRefreshResult::new(
+                request,
+                if failed { "failed" } else { "published" },
+                (!failed).then_some(state_version),
+                (!failed).then_some(reported_at),
+                failed.then_some("reference_refresh_failed"),
+            ),
+        )
+        .await;
+    }
+}
+
+async fn fail_snapshot_refresh_requests(
+    runtime: &CloudBotRuntime,
+    trigger: &CloudPublicationTrigger,
+    error_code: &str,
+) {
+    for request in &trigger.refreshes {
+        if !refresh_request_is_live(runtime, request, now_millis()).await {
+            continue;
+        }
+        finish_snapshot_refresh(
+            runtime,
+            request,
+            CloudRefreshResult::new(request, "failed", None, None, Some(error_code)),
+        )
+        .await;
+    }
+}
+
+async fn fail_pending_snapshot_refreshes(
+    runtime: &CloudBotRuntime,
+    pending: &PendingCloudState,
+    error_code: &str,
+) {
+    fail_snapshot_refresh_requests(runtime, &pending.trigger, error_code).await;
 }
 
 fn merge_cloud_library_scan_warning(library: &mut serde_json::Value, warning: &str) {
@@ -2598,22 +3234,73 @@ fn bounded_cloud_task_text(value: &str, max_bytes: usize) -> (String, bool) {
     (output, truncated)
 }
 
-async fn cloud_rest_fallback(runtime: CloudBotRuntime, poll_seconds: u64) {
+async fn cloud_rest_fallback(runtime: CloudBotRuntime, _configured_poll_seconds: u64) {
+    cloud_rest_fallback_with_retry_policy(
+        runtime,
+        Duration::from_secs(5),
+        Duration::from_secs(60 * 60),
+    )
+    .await;
+}
+
+async fn cloud_rest_fallback_with_retry_policy(
+    runtime: CloudBotRuntime,
+    retry_backoff_base: Duration,
+    retry_backoff_max: Duration,
+) {
+    let mut retry_backoff = CloudStateRetryBackoff::new(retry_backoff_base, retry_backoff_max);
+    let mut deadline = cloud_backlog_reconciliation_deadline(&runtime).await;
     loop {
-        if runtime.epoch_fatal.is_signaled() {
-            return;
-        }
-        if let Err(error) = sync_cloud_backlog(&runtime).await {
-            warn!(error = %format!("{error:#}"), "local cloud HTTPS fallback poll failed");
-        }
         if runtime.epoch_fatal.is_signaled() {
             return;
         }
         tokio::select! {
             _ = runtime.epoch_fatal.notified() => return,
-            _ = sleep(Duration::from_secs(poll_seconds)) => {},
+            _ = runtime.last_backlog_reconciled_notify.notified() => {
+                retry_backoff.reset();
+                deadline = cloud_backlog_reconciliation_deadline(&runtime).await;
+            },
+            _ = tokio::time::sleep_until(deadline) => {
+                loop {
+                    match sync_cloud_backlog_if_idle_due(&runtime).await {
+                        Ok(_) => {
+                            retry_backoff.reset();
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "local cloud HTTPS fallback reconciliation failed");
+                            tokio::select! {
+                                _ = runtime.epoch_fatal.notified() => return,
+                                _ = runtime.last_backlog_reconciled_notify.notified() => {
+                                    retry_backoff.reset();
+                                    break;
+                                },
+                                _ = sleep(retry_backoff.next_delay()) => {},
+                            }
+                        }
+                    }
+                }
+                deadline = cloud_backlog_reconciliation_deadline(&runtime).await;
+            },
         }
     }
+}
+
+async fn cloud_backlog_reconciliation_deadline(runtime: &CloudBotRuntime) -> Instant {
+    let last_successful = *runtime.last_backlog_reconciled_at.lock().await;
+    let remaining = remaining_cloud_reconciliation_delay(last_successful, Instant::now());
+    Instant::now() + remaining
+}
+
+fn remaining_cloud_reconciliation_delay(
+    last_successful: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    let Some(last_successful) = last_successful else {
+        return Duration::ZERO;
+    };
+    CLOUD_IDLE_RECONCILIATION_INTERVAL
+        .saturating_sub(now.saturating_duration_since(last_successful))
 }
 
 async fn cloud_websocket_receiver(runtime: CloudBotRuntime) {
@@ -2671,25 +3358,291 @@ async fn receive_cloud_websocket_session(
     socket: &mut CloudWebSocket,
     waiting: Option<Arc<Notify>>,
 ) -> Result<()> {
-    loop {
-        let next = next_websocket_request(socket);
-        // The test hook marks that the production receive loop is waiting on this socket. It
-        // lets the regression test advance virtual time without introducing a polling timer.
-        if let Some(waiting) = &waiting {
-            waiting.notify_one();
-        }
-        let next = tokio::select! {
-            _ = runtime.epoch_fatal.notified() => return Ok(()),
-            result = next => result?,
-        };
-        match next {
-            Some(request) => {
-                let seq = request.seq;
-                sync_cloud_backlog_through(runtime, &request)
-                    .await
-                    .with_context(|| format!("failed to reconcile WebSocket request {seq}"))?;
+    suspend_cloud_viewers(runtime).await;
+    let (mut writer, mut reader) = socket.split();
+    let (outbound, mut outbound_receiver) =
+        mpsc::channel::<serde_json::Value>(CLOUD_WEBSOCKET_OUTBOUND_QUEUE_CAPACITY);
+    *runtime.websocket_writer.lock().await = Some(outbound.clone());
+    let result = async {
+        replay_retained_refresh_results(runtime).await;
+        loop {
+            if let Some(waiting) = &waiting {
+                waiting.notify_one();
             }
-            None => return Ok(()),
+            tokio::select! {
+                _ = runtime.epoch_fatal.notified() => return Ok(()),
+                outbound_message = outbound_receiver.recv() => {
+                    let Some(outbound_message) = outbound_message else {
+                        return Ok(());
+                    };
+                    let text = serde_json::to_string(&outbound_message)
+                        .context("failed to encode local cloud WebSocket control response")?;
+                    writer.send(WsMessage::Text(text.into()))
+                        .await
+                        .context("failed to write local cloud WebSocket control response")?;
+                }
+                message = reader.next() => {
+                    match message {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            handle_cloud_websocket_payload(runtime, text.as_bytes()).await?;
+                        }
+                        Some(Ok(WsMessage::Binary(bytes))) => {
+                            handle_cloud_websocket_payload(runtime, &bytes).await?;
+                        }
+                        Some(Ok(WsMessage::Ping(payload))) => {
+                            writer.send(WsMessage::Pong(payload))
+                                .await
+                                .context("failed to answer local cloud WebSocket ping")?;
+                        }
+                        Some(Ok(WsMessage::Pong(_))) => {}
+                        Some(Ok(WsMessage::Close(_))) | None => return Ok(()),
+                        Some(Ok(WsMessage::Frame(_))) => {}
+                        Some(Err(error)) => {
+                            return Err(anyhow::anyhow!(error).context("local cloud WebSocket failed"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .await;
+    *runtime.websocket_writer.lock().await = None;
+    suspend_cloud_viewers(runtime).await;
+    result
+}
+
+async fn handle_cloud_websocket_payload(runtime: &CloudBotRuntime, payload: &[u8]) -> Result<()> {
+    match decode_cloud_websocket_json(payload)? {
+        CloudWebSocketMessage::Request(request) => {
+            let seq = request.seq;
+            sync_cloud_backlog_through(runtime, &request)
+                .await
+                .with_context(|| format!("failed to reconcile WebSocket request {seq}"))?;
+        }
+        CloudWebSocketMessage::Control(CloudSnapshotControl::ViewerInterest {
+            database_epoch,
+            viewers,
+        }) => apply_viewer_interest(runtime, &database_epoch, viewers).await?,
+        CloudWebSocketMessage::Control(CloudSnapshotControl::SnapshotRefresh(request)) => {
+            enqueue_snapshot_refresh(runtime, request).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_viewer_interest(
+    runtime: &CloudBotRuntime,
+    database_epoch: &str,
+    viewers: Vec<CloudViewerInterest>,
+) -> Result<()> {
+    if database_epoch != runtime.inbox.database_epoch() {
+        warn!("ignoring stale cloud viewer-interest epoch");
+        return Ok(());
+    }
+    if viewers.len() > MAX_CLOUD_CONTROL_VIEWERS {
+        bail!("cloud viewer-interest set exceeds the bounded viewer limit");
+    }
+    let now = now_millis();
+    let mut current = BTreeMap::new();
+    for viewer in viewers {
+        if viewer.validate_at(now)? {
+            current.insert(viewer.viewer_id.clone(), viewer);
+        }
+    }
+    let visible_viewers = current.keys().cloned().collect::<HashSet<_>>();
+    *runtime.viewer_interests.lock().await = current;
+    let cancelled = runtime
+        .snapshot_refreshes
+        .lock()
+        .await
+        .cancel_invisible(&visible_viewers, now);
+    for request in cancelled {
+        let error_code = if request.expires_at <= now {
+            "expired"
+        } else {
+            "viewer_closed"
+        };
+        finish_snapshot_refresh(
+            runtime,
+            &request,
+            CloudRefreshResult::new(&request, "unavailable", None, None, Some(error_code)),
+        )
+        .await;
+    }
+    runtime.state_notify.notify_one();
+    replay_retained_refresh_results(runtime).await;
+    Ok(())
+}
+
+async fn suspend_cloud_viewers(runtime: &CloudBotRuntime) {
+    runtime.viewer_interests.lock().await.clear();
+    let cancelled = runtime
+        .snapshot_refreshes
+        .lock()
+        .await
+        .cancel_invisible(&HashSet::new(), now_millis());
+    for request in cancelled {
+        finish_snapshot_refresh(
+            runtime,
+            &request,
+            CloudRefreshResult::new(
+                &request,
+                "unavailable",
+                None,
+                None,
+                Some("transport_disconnected"),
+            ),
+        )
+        .await;
+    }
+    runtime.state_notify.notify_one();
+}
+
+async fn enqueue_snapshot_refresh(
+    runtime: &CloudBotRuntime,
+    request: SnapshotRefreshRequest,
+) -> Result<()> {
+    let now = now_millis();
+    if request.database_epoch != runtime.inbox.database_epoch() {
+        warn!(request_id = %request.request_id, "ignoring snapshot refresh from a stale cloud database epoch");
+        return Ok(());
+    }
+    if let Err(error) = request.validate_at(runtime.inbox.database_epoch(), now) {
+        let code = if request.expires_at <= now {
+            "expired"
+        } else {
+            "invalid_request"
+        };
+        send_cloud_websocket_json(
+            runtime,
+            &CloudRefreshResult::new(&request, "unavailable", None, None, Some(code)),
+        )
+        .await?;
+        warn!(request_id = %request.request_id, error = %error, "rejected cloud snapshot refresh control frame");
+        return Ok(());
+    }
+    let visible = runtime
+        .viewer_interests
+        .lock()
+        .await
+        .get(&request.viewer_id)
+        .is_some_and(|viewer| viewer.expires_at > now);
+    if !visible {
+        send_cloud_websocket_json(
+            runtime,
+            &CloudRefreshResult::new(
+                &request,
+                "unavailable",
+                None,
+                None,
+                Some("viewer_not_visible"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let outcome = runtime
+        .snapshot_refreshes
+        .lock()
+        .await
+        .enqueue(request.clone(), now);
+    match outcome {
+        SnapshotRefreshEnqueue::Queued => runtime.state_notify.notify_one(),
+        SnapshotRefreshEnqueue::DuplicatePending => {}
+        SnapshotRefreshEnqueue::Replay(result) => {
+            send_cloud_websocket_json(runtime, &result).await?
+        }
+        SnapshotRefreshEnqueue::Conflict => {
+            send_cloud_websocket_json(
+                runtime,
+                &CloudRefreshResult::new(
+                    &request,
+                    "failed",
+                    None,
+                    None,
+                    Some("request_id_conflict"),
+                ),
+            )
+            .await?;
+        }
+        SnapshotRefreshEnqueue::Busy => {
+            send_cloud_websocket_json(
+                runtime,
+                &CloudRefreshResult::new(&request, "unavailable", None, None, Some("busy")),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn finish_snapshot_refresh(
+    runtime: &CloudBotRuntime,
+    request: &SnapshotRefreshRequest,
+    result: CloudRefreshResult,
+) {
+    runtime
+        .snapshot_refreshes
+        .lock()
+        .await
+        .remember_result(result.clone(), now_millis());
+    if let Err(error) = send_cloud_websocket_json(runtime, &result).await {
+        warn!(request_id = %request.request_id, error = %error, "could not return local cloud refresh result");
+    }
+}
+
+async fn send_cloud_websocket_json(
+    runtime: &CloudBotRuntime,
+    message: &impl serde::Serialize,
+) -> Result<()> {
+    let sender = runtime.websocket_writer.lock().await.clone();
+    let sender = sender.context("local cloud WebSocket is not connected")?;
+    let value = serde_json::to_value(message).context("failed to encode cloud control response")?;
+    sender.try_send(value).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => {
+            anyhow::anyhow!("local cloud WebSocket outbound queue is full")
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            anyhow::anyhow!("local cloud WebSocket writer is closed")
+        }
+    })
+}
+
+async fn replay_retained_refresh_results(runtime: &CloudBotRuntime) {
+    let now = now_millis();
+    let visible = runtime
+        .viewer_interests
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, interest)| interest.expires_at > now)
+        .map(|(viewer_id, _)| viewer_id.clone())
+        .collect::<HashSet<_>>();
+    let results = {
+        let mut state = runtime.snapshot_refreshes.lock().await;
+        state.seen.retain(|_, seen| seen.retain_until > now);
+        state
+            .seen
+            .values()
+            .filter(|seen| visible.contains(&seen.request.viewer_id))
+            .filter_map(|seen| seen.result.clone())
+            .collect::<Vec<_>>()
+    };
+    for result in results {
+        let message = match serde_json::to_value(&result) {
+            Ok(message) => message,
+            Err(error) => {
+                warn!(request_id = %result.request_id, error = %error, "could not encode retained local cloud refresh result");
+                break;
+            }
+        };
+        let sender = runtime.websocket_writer.lock().await.clone();
+        let Some(sender) = sender else {
+            break;
+        };
+        if let Err(error) = sender.try_send(message) {
+            warn!(request_id = %result.request_id, error = %error, "could not replay local cloud refresh result");
+            break;
         }
     }
 }
@@ -2713,6 +3666,29 @@ async fn sync_cloud_backlog_inner(
         bail!("cloud database epoch changed; reconciliation is stopped");
     }
     let _gate = runtime.backlog_sync_gate.lock().await;
+    sync_cloud_backlog_while_locked(runtime, websocket_request).await
+}
+
+async fn sync_cloud_backlog_if_idle_due(runtime: &CloudBotRuntime) -> Result<bool> {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; reconciliation is stopped");
+    }
+    let _gate = runtime.backlog_sync_gate.lock().await;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; reconciliation is stopped");
+    }
+    let last_successful = *runtime.last_backlog_reconciled_at.lock().await;
+    if remaining_cloud_reconciliation_delay(last_successful, Instant::now()) > Duration::ZERO {
+        return Ok(false);
+    }
+    sync_cloud_backlog_while_locked(runtime, None).await?;
+    Ok(true)
+}
+
+async fn sync_cloud_backlog_while_locked(
+    runtime: &CloudBotRuntime,
+    websocket_request: Option<&CloudRequest>,
+) -> Result<()> {
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; reconciliation is stopped");
     }
@@ -2736,6 +3712,10 @@ async fn sync_cloud_backlog_inner(
             Err(error) => Err(error),
             Ok(()) => bail!("cloud database epoch changed during reconciliation"),
         };
+    }
+    if result.is_ok() {
+        *runtime.last_backlog_reconciled_at.lock().await = Some(Instant::now());
+        runtime.last_backlog_reconciled_notify.notify_one();
     }
     result
 }

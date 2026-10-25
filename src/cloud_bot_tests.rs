@@ -38,6 +38,7 @@ pub(super) struct FakeTelegramRequest {
     body: serde_json::Value,
     authorization: Option<String>,
     database_epoch: Option<String>,
+    snapshot_notify_viewers: Option<String>,
 }
 
 pub(super) fn take_cloud_test_telegram_requests(
@@ -56,6 +57,8 @@ struct FakeCloudApiState {
     rotate_epoch_to: StdMutex<Option<String>>,
     epoch_recovery_requests: StdMutex<Vec<serde_json::Value>>,
     fetch_count: AtomicUsize,
+    fetch_statuses: StdMutex<Vec<u16>>,
+    fetch_times: StdMutex<Vec<std::time::Instant>>,
     ack_count: AtomicUsize,
     ack_request_bodies: StdMutex<Vec<serde_json::Value>>,
     replace_pending_before_ack: StdMutex<Option<CloudRequest>>,
@@ -65,6 +68,7 @@ struct FakeCloudApiState {
     state_posts: StdMutex<Vec<serde_json::Value>>,
     state_post_statuses: StdMutex<Vec<u16>>,
     state_post_response_headers: StdMutex<Vec<Vec<(String, String)>>>,
+    state_post_pause: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     state_chunks: StdMutex<HashMap<(String, String), String>>,
     state_chunk_posts: AtomicUsize,
     state_chunk_statuses: StdMutex<Vec<u16>>,
@@ -322,6 +326,11 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         name.eq_ignore_ascii_case("x-cloud-database-epoch")
             .then_some(value.trim().to_string())
     });
+    let snapshot_notify_viewers = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("x-snapshot-notify-viewers")
+            .then_some(value.trim().to_string())
+    });
     let body_end = header_end.saturating_add(content_length);
     while bytes.len() < body_end {
         let mut chunk = [0_u8; 4_096];
@@ -352,6 +361,7 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         body,
         authorization,
         database_epoch,
+        snapshot_notify_viewers,
     }))
 }
 
@@ -494,6 +504,8 @@ async fn spawn_fake_cloud_api_with_epoch(
         rotate_epoch_to: StdMutex::new(None),
         epoch_recovery_requests: StdMutex::new(Vec::new()),
         fetch_count: AtomicUsize::new(0),
+        fetch_statuses: StdMutex::new(Vec::new()),
+        fetch_times: StdMutex::new(Vec::new()),
         ack_count: AtomicUsize::new(0),
         ack_request_bodies: StdMutex::new(Vec::new()),
         replace_pending_before_ack: StdMutex::new(None),
@@ -503,6 +515,7 @@ async fn spawn_fake_cloud_api_with_epoch(
         state_posts: StdMutex::new(Vec::new()),
         state_post_statuses: StdMutex::new(Vec::new()),
         state_post_response_headers: StdMutex::new(Vec::new()),
+        state_post_pause: StdMutex::new(None),
         state_chunks: StdMutex::new(HashMap::new()),
         state_chunk_posts: AtomicUsize::new(0),
         state_chunk_statuses: StdMutex::new(Vec::new()),
@@ -571,12 +584,32 @@ async fn spawn_fake_cloud_api_with_epoch(
                         }
                         "requests" => {
                             task_state.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
+                            task_state
+                                .fetch_times
+                                .lock()
+                                .expect("fake fetch-time lock should not poison")
+                                .push(std::time::Instant::now());
+                            let status = {
+                                let mut statuses = task_state
+                                    .fetch_statuses
+                                    .lock()
+                                    .expect("fake fetch-status lock should not poison");
+                                if statuses.is_empty() {
+                                    200
+                                } else {
+                                    statuses.remove(0)
+                                }
+                            };
                             let pending = task_state.pending.lock().expect("fake cloud state lock should not poison").clone();
                             let database_epoch = task_state.database_epoch
                                 .lock()
                                 .expect("fake database epoch lock should not poison")
                                 .clone();
-                            (200, serde_json::json!({"database_epoch": database_epoch, "requests": pending}))
+                            if (200..300).contains(&status) {
+                                (status, serde_json::json!({"database_epoch": database_epoch, "requests": pending}))
+                            } else {
+                                (status, serde_json::json!({"error":"simulated backlog fetch failure"}))
+                            }
                         }
                         "ack" => {
                             task_state.ack_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -800,6 +833,7 @@ async fn spawn_fake_cloud_api_with_epoch(
                             };
                             let summary = serde_json::json!({
                                 "status": status,
+                                "snapshot_notify_viewers": request.snapshot_notify_viewers,
                                 "wire_format": wire_format,
                                 "state_version": state_body["state_version"],
                                 "reported_at": state_body["reported_at"],
@@ -844,6 +878,17 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 .lock()
                                 .expect("fake state post lock should not poison")
                                 .push(summary);
+                            let pause = task_state
+                                .state_post_pause
+                                .lock()
+                                .expect("fake state pause lock should not poison")
+                                .take();
+                            if let Some((observed_tx, resume_rx)) = pause {
+                                let _ = observed_tx.send(());
+                                resume_rx
+                                    .await
+                                    .context("test should release the paused fake state post")?;
+                            }
                             let payload = if (200..300).contains(&status) {
                                 serde_json::json!({"ok":true})
                             } else {
@@ -1021,6 +1066,7 @@ async fn fake_http_parser_rejects_nonempty_truncated_headers_and_bodies() {
     assert!(format!("{body_error:#}").contains("ended before body"));
 }
 
+#[allow(clippy::result_large_err)]
 async fn spawn_fake_cloud_websocket_api(
     inbox_root: PathBuf,
     websocket_request: CloudRequest,
@@ -1049,9 +1095,33 @@ async fn spawn_fake_cloud_websocket_api(
             .accept()
             .await
             .context("fake cloud WebSocket accept failed")?;
-        let mut socket = accept_async(websocket_stream)
+        let control_header = Arc::new(StdMutex::new(None));
+        let observed_header = Arc::clone(&control_header);
+        let mut socket =
+            tokio_tungstenite::accept_hdr_async(
+                websocket_stream,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                *observed_header
+                    .lock()
+                    .expect("WebSocket header capture should not poison") = request
+                    .headers()
+                    .get("X-Cloud-Snapshot-Control")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok(response)
+                },
+            )
             .await
             .context("fake cloud WebSocket handshake failed")?;
+        anyhow::ensure!(
+            control_header
+                .lock()
+                .expect("WebSocket header capture should not poison")
+                .as_deref()
+                == Some("v1"),
+            "Mac WebSocket must opt in to snapshot control frames"
+        );
         server_events
             .lock()
             .expect("fake cloud event lock should not poison")
@@ -1198,21 +1268,29 @@ async fn wait_for_state_posts(
     state: &Arc<FakeCloudApiState>,
     count: usize,
 ) -> Vec<serde_json::Value> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_during_wait = Arc::clone(&observed);
+    let result = tokio::time::timeout(Duration::from_secs(30), async move {
         loop {
             let posts = state
                 .state_posts
                 .lock()
                 .expect("fake state post lock should not poison")
                 .clone();
+            observed_during_wait.store(posts.len(), AtomicOrdering::SeqCst);
             if posts.len() >= count {
                 return posts;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("fake cloud API should receive the expected state posts")
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "fake cloud API should receive {count} state posts; observed {}",
+            observed.load(AtomicOrdering::SeqCst)
+        )
+    })
 }
 
 fn empty_cloud_test_library_snapshot(revision: &str) -> LibrarySnapshot {
@@ -1434,6 +1512,13 @@ pub(super) fn make_runtime(
         inbox,
         request_notify: Arc::new(Notify::new()),
         state_notify: Arc::new(Notify::new()),
+        snapshot_refreshes: Arc::new(Mutex::new(SnapshotRefreshQueue::default())),
+        viewer_interests: Arc::new(Mutex::new(BTreeMap::new())),
+        websocket_writer: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_at: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_notify: Arc::new(Notify::new()),
+        initial_library_scan_complete: Arc::new(AtomicBool::new(true)),
+        initial_library_scan_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
         library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),
@@ -7896,6 +7981,268 @@ async fn coalesced_queue_progress_publishes_final_state_without_library_rescan()
     let _ = state_reporter.await;
     let _ = queue_state_watcher.await;
     let _ = publication_watcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn snapshot_refresh_fails_promptly_on_state_version_error_and_recovers_after_repair() {
+    let root = temp_cloud_bot_dir("snapshot-refresh-state-version-recovery");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let watch_fingerprint = "a".repeat(64);
+    inbox
+        .record_successful_publication_at(now_millis(), &watch_fingerprint)
+        .expect("baseline publication metadata should persist");
+    let version_path = runtime_test_inbox_directory(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+    )
+    .join(".state-version.json");
+    fs::write(&version_path, b"{invalid state version")
+        .expect("state-version record should become unreadable");
+
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("state-version-recovery"));
+    let (result_tx, mut result_rx) = mpsc::channel(8);
+    *runtime.websocket_writer.lock().await = Some(result_tx);
+
+    let viewer_id = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1".to_string();
+    let expires_at = now_millis() + 60_000;
+    runtime.viewer_interests.lock().await.insert(
+        viewer_id.clone(),
+        CloudViewerInterest {
+            viewer_id: viewer_id.clone(),
+            surface: crate::cloud::CloudViewerSurface::File,
+            watch: false,
+            expires_at,
+        },
+    );
+    let failed_request = SnapshotRefreshRequest {
+        viewer_id: viewer_id.clone(),
+        request_id: "b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2".to_string(),
+        database_epoch: crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+        reason: crate::cloud::SnapshotRefreshReason::Manual,
+        scope: SnapshotRefreshScope::Operations,
+        library_id: None,
+        expires_at,
+    };
+    enqueue_snapshot_refresh(&runtime, failed_request.clone())
+        .await
+        .expect("first refresh request should queue");
+
+    let state_reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(60),
+        Duration::from_millis(25),
+        Duration::from_millis(100),
+    ));
+    let failed_result = tokio::time::timeout(Duration::from_secs(5), result_rx.recv())
+        .await
+        .expect("allocation failure should return before the Durable Object deadline")
+        .expect("reporter result channel should remain open");
+    assert_eq!(failed_result["type"], "refresh_result");
+    assert_eq!(failed_result["viewer_id"], viewer_id);
+    assert_eq!(failed_result["request_id"], failed_request.request_id);
+    assert_eq!(
+        failed_result["database_epoch"],
+        crate::cloud::TEST_DATABASE_EPOCH
+    );
+    assert_eq!(failed_result["status"], "failed");
+    assert_eq!(failed_result["state_version"], serde_json::Value::Null);
+    assert_eq!(failed_result["error_code"], "state_version_unavailable");
+    assert!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .is_empty(),
+        "a state version must be allocated before attempting an HTTP publication"
+    );
+
+    fs::remove_file(&version_path).expect("invalid state-version record should be removed");
+    assert_eq!(
+        inbox
+            .next_state_version()
+            .expect("state version should repair"),
+        1
+    );
+    let recovered_request = SnapshotRefreshRequest {
+        request_id: "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3".to_string(),
+        ..failed_request.clone()
+    };
+    enqueue_snapshot_refresh(&runtime, recovered_request.clone())
+        .await
+        .expect("recovery refresh request should queue");
+    let recovered_result = tokio::time::timeout(Duration::from_secs(10), result_rx.recv())
+        .await
+        .expect("repaired state-version record should allow a later refresh")
+        .expect("reporter result channel should remain open");
+    assert_eq!(recovered_result["type"], "refresh_result");
+    assert_eq!(recovered_result["viewer_id"], viewer_id);
+    assert_eq!(recovered_result["request_id"], recovered_request.request_id);
+    assert_eq!(recovered_result["status"], "published");
+    let recovered_version = recovered_result["state_version"]
+        .as_u64()
+        .expect("published refresh should include its allocated version");
+    let state_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake state post lock should not poison")
+        .clone();
+    let recovered_post = state_posts
+        .iter()
+        .find(|post| post["state_version"].as_u64() == Some(recovered_version))
+        .expect("recovered refresh should reach the mock cloud HTTP API");
+    assert_eq!(recovered_post["status"], 200);
+    assert_eq!(recovered_post["snapshot_notify_viewers"], "1");
+
+    let last_successful_publication = inbox
+        .last_successful_publication_at()
+        .expect("last publication time should remain readable")
+        .expect("recovered refresh should persist its publication time");
+    let last_successful_watch_fingerprint = inbox
+        .last_successful_watch_fingerprint()
+        .expect("last watch fingerprint should remain readable")
+        .expect("recovered refresh should persist its watch fingerprint");
+    let mut large_snapshot = empty_cloud_test_library_snapshot("state-version-413-recovery");
+    large_snapshot.items = (0..32)
+        .map(|index| LibraryItem {
+            id: format!("item-{index:02}"),
+            title: "x".repeat(1_024),
+            relative_path: format!("item-{index:02}.mp4"),
+            bytes: 1,
+            width: None,
+            height: None,
+            codec: None,
+            source_ids: Vec::new(),
+            collection: None,
+            organization_status: None,
+            attachments: Vec::new(),
+            authoritative_nfo_path: None,
+            confidence: Confidence::High,
+            metadata_status: MetadataStatus::Complete,
+            integrity_status: IntegrityStatus::Unverified,
+            physical_identity: None,
+            presence: Presence::Present,
+        })
+        .collect();
+    *runtime.library_snapshot.lock().await = Some(large_snapshot);
+
+    let (state_post_seen_tx, state_post_seen_rx) = oneshot::channel();
+    let (release_state_post_tx, release_state_post_rx) = oneshot::channel();
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .push(413);
+    *cloud_state
+        .state_post_pause
+        .lock()
+        .expect("fake state pause lock should not poison") =
+        Some((state_post_seen_tx, release_state_post_rx));
+    let rejected_request = SnapshotRefreshRequest {
+        request_id: "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4".to_string(),
+        ..failed_request.clone()
+    };
+    enqueue_snapshot_refresh(&runtime, rejected_request.clone())
+        .await
+        .expect("413 refresh request should queue");
+    tokio::time::timeout(Duration::from_secs(5), state_post_seen_rx)
+        .await
+        .expect("mock cloud API should observe the 413 state post")
+        .expect("mock state post observer should remain open");
+    fs::write(&version_path, b"{invalid state version")
+        .expect("state-version record should become unreadable during 413 retry");
+    release_state_post_tx
+        .send(())
+        .expect("mock cloud API should release the 413 response");
+
+    let rejected_result = tokio::time::timeout(Duration::from_secs(5), result_rx.recv())
+        .await
+        .expect("413 reallocation failure should return promptly")
+        .expect("reporter result channel should remain open");
+    assert_eq!(rejected_result["type"], "refresh_result");
+    assert_eq!(rejected_result["viewer_id"], viewer_id);
+    assert_eq!(rejected_result["request_id"], rejected_request.request_id);
+    assert_eq!(rejected_result["status"], "failed");
+    assert_eq!(rejected_result["error_code"], "state_version_unavailable");
+
+    let rejected_version = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake state post lock should not poison")
+        .iter()
+        .find(|post| post["status"] == 413)
+        .and_then(|post| post["state_version"].as_u64())
+        .expect("mock API should retain the rejected state version");
+    fs::remove_file(&version_path).expect("invalid state-version record should be removed");
+    assert_eq!(
+        inbox
+            .next_state_version_after(rejected_version)
+            .expect("counter repair should remain above the rejected attempt"),
+        rejected_version + 1
+    );
+    inbox
+        .record_successful_publication_at(
+            last_successful_publication,
+            &last_successful_watch_fingerprint,
+        )
+        .expect("counter repair should preserve prior successful-publication metadata");
+
+    let final_request = SnapshotRefreshRequest {
+        request_id: "e5e5e5e5-e5e5-4e5e-8e5e-e5e5e5e5e5e5".to_string(),
+        ..failed_request
+    };
+    enqueue_snapshot_refresh(&runtime, final_request.clone())
+        .await
+        .expect("post-413 recovery refresh should queue");
+    let final_result = tokio::time::timeout(Duration::from_secs(10), result_rx.recv())
+        .await
+        .expect("repaired counter should allow a later refresh")
+        .expect("reporter result channel should remain open");
+    assert_eq!(final_result["request_id"], final_request.request_id);
+    assert_eq!(final_result["status"], "published");
+    let final_version = final_result["state_version"]
+        .as_u64()
+        .expect("recovered refresh should include a state version");
+    let state_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake state post lock should not poison")
+        .clone();
+    let final_post = state_posts
+        .iter()
+        .find(|post| post["state_version"].as_u64() == Some(final_version))
+        .expect("post-413 refresh should reach the mock cloud HTTP API");
+    assert_eq!(final_post["status"], 200);
+
+    state_reporter.abort();
+    let _ = state_reporter.await;
     drop(runtime);
     drop(inbox);
     drop(queue);

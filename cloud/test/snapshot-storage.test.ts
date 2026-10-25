@@ -8,6 +8,8 @@ import {
   readSnapshot,
   readSnapshotContentChunk,
   rotateDatabaseEpochOnSequenceConflict,
+  storeChunkedSnapshot,
+  storeSnapshotContentChunk,
   storeSnapshot,
 } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
@@ -92,6 +94,74 @@ async function uploadChunk(data: string): Promise<{ sha256: string; bytes: numbe
   const response = await postContentChunk(bytes, sha256);
   if (response.status !== 200) throw new Error(`Chunk upload failed with HTTP ${response.status}`);
   return { sha256, bytes: bytes.byteLength };
+}
+
+function observeD1RowsWritten(source: D1Database): { db: D1Database; read: () => number; reset: () => number } {
+  let rowsWritten = 0;
+  const wrapStatement = (statement: D1PreparedStatement): D1PreparedStatement => new Proxy(statement, {
+    get(target, property) {
+      if (property === "bind") {
+        return (...values: unknown[]) => wrapStatement(target.bind(...values));
+      }
+      if (property === "run") {
+        return async (...args: unknown[]) => {
+          const run = Reflect.get(target, property, target) as (...runArgs: unknown[]) => Promise<D1Result>;
+          const result = await run.apply(target, args);
+          rowsWritten += result.meta.rows_written ?? 0;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const db = new Proxy(source, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => wrapStatement(target.prepare(query));
+      }
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          const batch = Reflect.get(target, property, target) as (items: D1PreparedStatement[]) => Promise<D1Result[]>;
+          const results = await batch.call(target, statements);
+          for (const result of results) rowsWritten += result.meta.rows_written ?? 0;
+          return results;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    db,
+    read: () => rowsWritten,
+    reset: () => {
+      const observed = rowsWritten;
+      rowsWritten = 0;
+      return observed;
+    },
+  };
+}
+
+async function ownerInitData(): Promise<string> {
+  const params = new URLSearchParams();
+  params.set("auth_date", String(Math.floor(Date.now() / 1000)));
+  params.set("chat_type", "private");
+  params.set("user", JSON.stringify({ id: 123456789, is_bot: false, first_name: "Owner" }));
+  const checkString = [...params.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+  const derivationKey = await crypto.subtle.importKey(
+    "raw", encoder.encode("WebAppData"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  const secret = await crypto.subtle.sign("HMAC", derivationKey, encoder.encode(syntheticCredentials.botToken.value));
+  const verificationKey = await crypto.subtle.importKey(
+    "raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  const digest = new Uint8Array(await crypto.subtle.sign("HMAC", verificationKey, encoder.encode(checkString)));
+  params.set("hash", [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join(""));
+  return params.toString();
 }
 
 async function seedOldOrphanChunks(epoch: string, count: number, createdAt: number, label: string): Promise<void> {
@@ -365,6 +435,71 @@ describe("snapshot storage", () => {
     ).bind(await getDatabaseEpoch(testEnv.DB), stateChunks[0]!.sha256).run();
     const missingHeartbeatChunk = await postState(chunkedEnvelope(2, libraryChunks, stateChunks));
     expect(missingHeartbeatChunk.status).toBe(428);
+  });
+
+  it("keeps snapshot reads and a one-chunk publication within a local D1 write budget", async () => {
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const libraryText = '{"revision":"write-budget-library","items":[]}';
+    const stateText = '{"settings":{"download_dir":"/Videos"},"tasks":[]}';
+    const libraryChunk = await uploadChunk(libraryText);
+    const stateChunk = await uploadChunk(stateText);
+    expect((await postState(chunkedEnvelope(
+      1, [libraryChunk], [stateChunk], Date.now(), "write-budget-library",
+    ))).status).toBe(200);
+
+    const beforeGet = await testEnv.DB.prepare(
+      "SELECT state_version, reported_at, received_at, library_hash, state_hash FROM snapshot_meta WHERE id = 1",
+    ).first<Record<string, number | string>>();
+    const getResponse = await SELF.fetch(new Request(`${workerUrl}/api/library`, {
+      headers: {
+        "x-telegram-init-data": await ownerInitData(),
+        "X-Snapshot-Format": "chunked-v1",
+      },
+    }));
+    expect(getResponse.status).toBe(200);
+    expect((await getResponse.json() as { synced: boolean }).synced).toBe(true);
+    const afterGet = await testEnv.DB.prepare(
+      "SELECT state_version, reported_at, received_at, library_hash, state_hash FROM snapshot_meta WHERE id = 1",
+    ).first<Record<string, number | string>>();
+    expect(afterGet).toEqual(beforeGet);
+
+    const observed = observeD1RowsWritten(testEnv.DB);
+    expect((await readSnapshot(observed.db))?.state_version).toBe(1);
+    expect((await readSnapshot(observed.db))?.state_version).toBe(1);
+    expect(observed.read()).toBe(0);
+
+    const chunkRowsBefore = await testEnv.DB.prepare(
+      "SELECT sha256, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
+    ).bind(epoch).all<{ sha256: string; created_at: number }>();
+    await storeChunkedSnapshot(observed.db, {
+      state_version: 1,
+      reported_at: Date.now(),
+      library_revision: "write-budget-library",
+      library: chunkManifest([libraryChunk]),
+      state: chunkManifest([stateChunk]),
+    }, epoch);
+    // A due heartbeat may update snapshot_meta, but must not rewrite content chunks.
+    expect(observed.reset()).toBeLessThanOrEqual(1);
+    const chunkRowsAfter = await testEnv.DB.prepare(
+      "SELECT sha256, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
+    ).bind(epoch).all<{ sha256: string; created_at: number }>();
+    expect(chunkRowsAfter).toEqual(chunkRowsBefore);
+
+    const changedStateText = '{"settings":{"download_dir":"/Videos","changed":true},"tasks":[]}';
+    const changedBytes = encoder.encode(changedStateText);
+    const changedStateChunk = { sha256: await sha256Hex(changedStateText), bytes: changedBytes.byteLength };
+    await storeSnapshotContentChunk(observed.db, epoch, changedStateChunk.sha256, changedBytes, changedStateText);
+    await storeChunkedSnapshot(observed.db, {
+      state_version: 2,
+      reported_at: Date.now(),
+      library_revision: "write-budget-library",
+      library: chunkManifest([libraryChunk]),
+      state: chunkManifest([changedStateChunk]),
+    }, epoch);
+    const oneChunkChangeRowsWritten = observed.reset();
+    // A generous Miniflare-local ceiling; this is not a production billing contract.
+    expect(oneChunkChangeRowsWritten).toBeGreaterThan(0);
+    expect(oneChunkChangeRowsWritten).toBeLessThanOrEqual(8);
   });
 
   it("drains bounded old orphans on identical heartbeats while preserving active chunks", async () => {

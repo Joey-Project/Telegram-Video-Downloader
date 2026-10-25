@@ -33,14 +33,16 @@ export async function makeChunkedSnapshot(
   if (chunkBytes < 4 || chunkBytes > 32 * 1024) throw new Error("Test chunk size is outside the allowed range");
   const {
     library,
+    database_epoch: snapshotDatabaseEpoch,
     state_version: stateVersion = 1,
-    reported_at: reportedAt = 1_800_000_001,
+    reported_at: reportedAt = Date.now(),
     synced = true,
-    last_seen: lastSeen = 1_800_000_000,
+    last_seen: lastSeen = Date.now(),
     stale = false,
     pending_requests: pendingRequests = [],
     ...state
   } = snapshot;
+  if (typeof snapshotDatabaseEpoch === "string") databaseEpoch = snapshotDatabaseEpoch;
   const parts = new Map<string, string>();
   const describe = async (value: unknown) => {
     const json = JSON.stringify(value);

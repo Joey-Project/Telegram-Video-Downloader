@@ -266,6 +266,7 @@ async function loadOwnerSnapshotWithCache(fetchJson, cache) {
 
   const snapshot = {
     ...state,
+    database_epoch: manifest.databaseEpoch,
     synced: manifest.synced,
     state_version: manifest.stateVersion,
     reported_at: manifest.reportedAt,
@@ -286,24 +287,63 @@ export async function loadOwnerSnapshot(fetchJson) {
   return loadOwnerSnapshotWithCache(fetchJson, null);
 }
 
+function createSnapshotLoaderGeneration() {
+  return { cache: createChunkCache(), pending: Promise.resolve() };
+}
+
+function abortableSnapshotLoad(read, signal, onAbort) {
+  if (!signal) return read;
+  const abortError = () => new Error("The owner snapshot load was aborted.");
+  if (signal.aborted) {
+    onAbort();
+    return Promise.reject(abortError());
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => {
+      if (settled) return;
+      onAbort();
+      finish(reject, abortError());
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    Promise.resolve(read).then(
+      (snapshot) => finish(resolve, snapshot),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
 /**
  * Create a page-local snapshot loader that reuses verified raw chunks in memory.
  * Each call still fetches the authenticated manifest and parses fresh objects.
  */
 export function createOwnerSnapshotLoader() {
-  const cache = createChunkCache();
-  let pending = Promise.resolve();
+  let generation = createSnapshotLoaderGeneration();
 
-  return (fetchJson) => {
-    const result = pending.then(async () => {
+  return (fetchJson, { signal } = {}) => {
+    const reader = generation;
+    const read = reader.pending.then(async () => {
+      if (signal?.aborted) throw new Error("The owner snapshot load was aborted.");
       try {
-        return await loadOwnerSnapshotWithCache(fetchJson, cache);
+        return await loadOwnerSnapshotWithCache(fetchJson, reader.cache);
       } catch (error) {
-        cache.clear();
+        reader.cache.clear();
         throw error;
       }
     });
-    pending = result.catch(() => undefined);
-    return result;
+    reader.pending = read.catch(() => undefined);
+    const abandon = () => {
+      if (generation !== reader) return;
+      reader.cache.clear();
+      generation = createSnapshotLoaderGeneration();
+    };
+    return abortableSnapshotLoad(read, signal, abandon);
   };
 }
