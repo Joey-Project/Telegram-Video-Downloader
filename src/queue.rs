@@ -207,6 +207,10 @@ pub struct PlanValidationSnapshot {
     pub bilibili_resolved_stream_ids: Vec<String>,
     #[serde(default)]
     pub bilibili_group_entries: Vec<BilibiliGroupEntryIdentity>,
+    /// Version of the output layout used for downloaded Bilibili collections. `None` denotes
+    /// legacy per-video output; version 1 writes collection media and sidecars flat together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bilibili_collection_output_layout_version: Option<u32>,
     #[serde(default)]
     pub bilibili_collection_directory: BilibiliCollectionDirectorySnapshot,
 }
@@ -275,6 +279,11 @@ impl PlanValidationSnapshot {
         }
         if self.bilibili_collection_directory != current.bilibili_collection_directory {
             differences.push("collection output directory");
+        }
+        if self.bilibili_collection_output_layout_version
+            != current.bilibili_collection_output_layout_version
+        {
+            differences.push("collection output layout");
         }
         differences
     }
@@ -10936,6 +10945,44 @@ mod tests {
         assert_eq!(snapshot.bilibili_publication_namespace, None);
         assert!(snapshot.bilibili_resolved_stream_ids.is_empty());
         assert!(snapshot.bilibili_group_entries.is_empty());
+        assert_eq!(snapshot.bilibili_collection_output_layout_version, None);
+        assert!(
+            serde_json::to_value(&snapshot)
+                .unwrap()
+                .get("bilibili_collection_output_layout_version")
+                .is_none(),
+            "legacy layout must stay omitted from serialized plans"
+        );
+    }
+
+    #[test]
+    fn collection_output_layout_version_roundtrips_for_flat_collection_plans() {
+        let flat = PlanValidationSnapshot {
+            bilibili_collection_output_layout_version: Some(1),
+            ..PlanValidationSnapshot::default()
+        };
+        let serialized = serde_json::to_value(&flat).unwrap();
+        assert_eq!(serialized["bilibili_collection_output_layout_version"], 1);
+        let roundtrip: PlanValidationSnapshot = serde_json::from_value(serialized).unwrap();
+        assert_eq!(roundtrip, flat);
+    }
+
+    #[test]
+    fn collection_output_layout_change_requires_plan_reconfirmation() {
+        let legacy = PlanValidationSnapshot::default();
+        let flat = PlanValidationSnapshot {
+            bilibili_collection_output_layout_version: Some(1),
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(
+            legacy.blocking_differences(&flat),
+            vec!["collection output layout"]
+        );
+        assert_eq!(
+            flat.blocking_differences(&legacy),
+            vec!["collection output layout"]
+        );
+        assert!(flat.blocking_differences(&flat).is_empty());
     }
 
     #[test]

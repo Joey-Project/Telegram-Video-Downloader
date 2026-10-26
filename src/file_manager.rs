@@ -16881,6 +16881,432 @@ mod tests {
         );
     }
 
+    fn write_organized_fixture_file(
+        root: &TemporaryRoot,
+        relative_path: &str,
+        contents: &[u8],
+    ) -> (Vec<u8>, u64, u64) {
+        let path = root.path().join(relative_path);
+        fs::create_dir_all(path.parent().expect("fixture path should have a parent"))
+            .expect("fixture parent directory should create");
+        fs::write(&path, contents).expect("fixture file should write");
+        let metadata = fs::metadata(&path).expect("fixture identity should be read");
+        (contents.to_vec(), metadata.dev(), metadata.ino())
+    }
+
+    fn assert_organized_fixture_file(path: &Path, expected: &(Vec<u8>, u64, u64)) {
+        let metadata = fs::metadata(path).expect("fixture file should stat");
+        assert_eq!(fs::read(path).unwrap().as_slice(), expected.0.as_slice());
+        assert_eq!(metadata.dev(), expected.1, "file should retain its device");
+        assert_eq!(metadata.ino(), expected.2, "file should retain its inode");
+    }
+
+    #[test]
+    fn nested_multi_part_collection_move_flattens_and_preserves_rich_sidecars() {
+        let root = TemporaryRoot::new("nested-multipart-flatten");
+        let parts = [
+            (
+                "legacy/collection/disc-one",
+                "clip_cid11",
+                "Episode One",
+                "cid11",
+                1,
+                "P1",
+            ),
+            (
+                "legacy/collection/disc-two",
+                "clip_cid22",
+                "Episode Two",
+                "cid22",
+                2,
+                "P2",
+            ),
+        ];
+        let mut original_files = HashMap::new();
+        for (directory, stem, title, _, _, _) in parts {
+            let files = [
+                (format!("{stem}.mp4"), format!("video-{title}").into_bytes()),
+                (
+                    format!("{stem}.nfo"),
+                    format!("<movie><title>{title}</title></movie>").into_bytes(),
+                ),
+                (
+                    format!("{stem}.en.srt"),
+                    format!("subtitle-{title}").into_bytes(),
+                ),
+                (
+                    format!("{stem}.xml"),
+                    format!("danmaku-{title}").into_bytes(),
+                ),
+                (
+                    format!("{stem}.ass"),
+                    format!("styled-danmaku-{title}").into_bytes(),
+                ),
+                (
+                    format!("{stem}.json"),
+                    format!("metadata-{title}").into_bytes(),
+                ),
+                (
+                    format!("{stem}.jpg"),
+                    format!("artwork-{title}").into_bytes(),
+                ),
+            ];
+            for (name, contents) in files {
+                let relative_path = format!("{directory}/{name}");
+                original_files.insert(
+                    relative_path.clone(),
+                    write_organized_fixture_file(&root, &relative_path, &contents),
+                );
+            }
+        }
+
+        let hints = [
+            queue_hint(
+                &["BV1abcdefgh", "cid11"],
+                CollectionMetadata {
+                    id: Some("BV1abcdefgh".to_string()),
+                    title: "Independent Series".to_string(),
+                    kind: "multi_part".to_string(),
+                    order: Some(1),
+                    part_id: Some("P1".to_string()),
+                },
+            ),
+            queue_hint(
+                &["BV1abcdefgh", "cid22"],
+                CollectionMetadata {
+                    id: Some("BV1abcdefgh".to_string()),
+                    title: "Independent Series".to_string(),
+                    kind: "multi_part".to_string(),
+                    order: Some(2),
+                    part_id: Some("P2".to_string()),
+                },
+            ),
+        ];
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&hints)
+            .expect("nested collection should scan with its multi-part hints");
+        let item_ids = snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                item.collection
+                    .as_ref()
+                    .is_some_and(|collection| collection.title == "Independent Series")
+            })
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(item_ids.len(), 2);
+
+        let preview = manager
+            .preview_with_hints_and_patches(
+                &item_ids,
+                Some("Organized"),
+                true,
+                ConflictPolicy::KeepBoth,
+                &hints,
+                &[],
+            )
+            .expect("nested collection should preview as one flat destination folder");
+        assert_eq!(preview.items.len(), 2);
+        for item in &preview.items {
+            assert!(
+                item.target_path
+                    .starts_with("Organized/Independent Series/"),
+                "primary target should be directly inside its collection folder: {}",
+                item.target_path
+            );
+            assert!(
+                item.target_path.contains("P01 - Episode One")
+                    || item.target_path.contains("P02 - Episode Two"),
+                "multi-part number should remain in the renamed media stem: {}",
+                item.target_path
+            );
+            assert_eq!(
+                item.files.len(),
+                7,
+                "media and all six sidecars should move together"
+            );
+            let primary_stem = Path::new(&item.target_path)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .expect("preview target should have a filename stem");
+            for file in &item.files {
+                assert_eq!(
+                    Path::new(&file.target_path).parent(),
+                    Some(Path::new("Organized/Independent Series")),
+                    "source subdirectories should not be retained in the target"
+                );
+                let target_stem = Path::new(&file.target_path)
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .expect("sidecar target should have a filename stem");
+                assert!(
+                    target_stem.starts_with(primary_stem),
+                    "sidecar should keep the selected media stem: {}",
+                    file.target_path
+                );
+            }
+        }
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed nested collection move should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        for item in &preview.items {
+            for file in &item.files {
+                let target = root.path().join(&file.target_path);
+                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                assert!(
+                    !root.path().join(&file.source_path).exists(),
+                    "approved source should no longer exist after move: {}",
+                    file.source_path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn colliding_nested_collection_groups_keep_sidecars_together_and_leave_unselected_item() {
+        let root = TemporaryRoot::new("nested-collection-collisions");
+        let collection = CollectionMetadata {
+            id: Some("series-id".to_string()),
+            title: "Series".to_string(),
+            kind: "series".to_string(),
+            order: None,
+            part_id: None,
+        };
+        let mut hints = Vec::new();
+        let mut original_files = HashMap::new();
+        for directory in ["legacy/one", "legacy/two", "legacy/three"] {
+            hints.push(SourceHint {
+                source_ids: Vec::new(),
+                title: None,
+                relative_path: Some(format!("{directory}/episode.mp4")),
+                collection: Some(collection.clone()),
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            });
+            let label = directory.rsplit('/').next().unwrap_or("unknown");
+            let files = [
+                (
+                    "episode.mp4".to_string(),
+                    format!("video-{label}").into_bytes(),
+                ),
+                (
+                    "episode.nfo".to_string(),
+                    b"<movie><title>Shared Episode</title></movie>".to_vec(),
+                ),
+                (
+                    "episode.en.srt".to_string(),
+                    format!("subtitle-{label}").into_bytes(),
+                ),
+                (
+                    "episode.xml".to_string(),
+                    format!("danmaku-{label}").into_bytes(),
+                ),
+                (
+                    "episode.jpg".to_string(),
+                    format!("artwork-{label}").into_bytes(),
+                ),
+            ];
+            for (name, contents) in files {
+                let relative_path = format!("{directory}/{name}");
+                original_files.insert(
+                    relative_path.clone(),
+                    write_organized_fixture_file(&root, &relative_path, &contents),
+                );
+            }
+        }
+
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&hints)
+            .expect("nested collection should scan with path-bound hints");
+        let selected_ids = [
+            item_at(&snapshot, "legacy/one/episode.mp4").id.clone(),
+            item_at(&snapshot, "legacy/two/episode.mp4").id.clone(),
+        ];
+        let preview = manager
+            .preview_with_hints_and_patches(
+                &selected_ids,
+                Some("Organized"),
+                true,
+                ConflictPolicy::KeepBoth,
+                &hints,
+                &[],
+            )
+            .expect("selected nested collection items should preview together");
+        assert_eq!(
+            preview.items.len(),
+            2,
+            "unselected collection members stay out of preview"
+        );
+        let target_stems = preview
+            .items
+            .iter()
+            .map(|item| {
+                Path::new(&item.target_path)
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .expect("preview primary should have a stem")
+                    .to_string()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            target_stems.len(),
+            2,
+            "KeepBoth should disambiguate duplicate stems"
+        );
+        assert!(
+            target_stems.iter().any(|stem| stem.ends_with(" (2)")),
+            "one independent sidecar group should receive the KeepBoth suffix: {target_stems:?}"
+        );
+
+        for item in &preview.items {
+            assert_eq!(
+                item.files.len(),
+                5,
+                "each media item should retain its four sidecars"
+            );
+            let source_directory = Path::new(&item.source_path)
+                .parent()
+                .expect("nested media should have a source directory")
+                .to_string_lossy()
+                .into_owned();
+            let primary_stem = Path::new(&item.target_path)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .expect("preview target should have a filename stem");
+            for file in &item.files {
+                assert!(
+                    file.source_path
+                        .starts_with(&format!("{source_directory}/")),
+                    "sidecar should remain associated with its source directory: {}",
+                    file.source_path
+                );
+                assert_eq!(
+                    Path::new(&file.target_path).parent(),
+                    Some(Path::new("Organized/Series")),
+                    "selected items should flatten into the shared collection directory"
+                );
+                let target_stem = Path::new(&file.target_path)
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .expect("sidecar target should have a filename stem");
+                assert!(
+                    target_stem.starts_with(primary_stem),
+                    "colliding sidecar should use its own primary stem: {}",
+                    file.target_path
+                );
+            }
+        }
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed selected-item move should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        for item in &preview.items {
+            for file in &item.files {
+                let target = root.path().join(&file.target_path);
+                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                assert!(!root.path().join(&file.source_path).exists());
+            }
+        }
+        for name in [
+            "episode.mp4",
+            "episode.nfo",
+            "episode.en.srt",
+            "episode.xml",
+            "episode.jpg",
+        ] {
+            let relative_path = format!("legacy/three/{name}");
+            let path = root.path().join(&relative_path);
+            assert_organized_fixture_file(&path, &original_files[&relative_path]);
+        }
+    }
+
+    #[test]
+    fn ambiguous_shared_sidecars_stay_put_when_only_one_nested_item_is_selected() {
+        let root = TemporaryRoot::new("nested-ambiguous-sidecars");
+        let source_dir = "legacy/series/part-one";
+        let files = [
+            ("episode.mp4", b"selected-media".as_slice()),
+            ("episode.mkv", b"unselected-media".as_slice()),
+            (
+                "episode.nfo",
+                b"<movie><title>Shared Episode</title></movie>".as_slice(),
+            ),
+            ("episode.en.srt", b"shared-subtitle".as_slice()),
+            ("episode.xml", b"shared-danmaku".as_slice()),
+            ("episode.json", b"shared-metadata".as_slice()),
+            ("episode.jpg", b"shared-artwork".as_slice()),
+        ];
+        let mut original_files = HashMap::new();
+        for (name, contents) in files {
+            let relative_path = format!("{source_dir}/{name}");
+            original_files.insert(
+                relative_path.clone(),
+                write_organized_fixture_file(&root, &relative_path, contents),
+            );
+        }
+
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&[])
+            .expect("nested ambiguous media should scan");
+        let selected = item_at(&snapshot, "legacy/series/part-one/episode.mp4");
+        let unselected = item_at(&snapshot, "legacy/series/part-one/episode.mkv");
+        assert!(selected.attachments.is_empty());
+        assert!(unselected.attachments.is_empty());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("left unattached")),
+            "scan should make ambiguous shared sidecars visible in its warnings"
+        );
+
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&selected.id),
+                "Organized",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("only the selected primary media should preview");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].files.len(), 1);
+        assert_eq!(
+            preview.items[0].files[0].source_path,
+            selected.relative_path
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("selected primary media move should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let selected_target = root.path().join(&preview.items[0].target_path);
+        assert_organized_fixture_file(&selected_target, &original_files[&selected.relative_path]);
+
+        for name in [
+            "episode.mkv",
+            "episode.nfo",
+            "episode.en.srt",
+            "episode.xml",
+            "episode.json",
+            "episode.jpg",
+        ] {
+            let relative_path = format!("{source_dir}/{name}");
+            let path = root.path().join(&relative_path);
+            assert_organized_fixture_file(&path, &original_files[&relative_path]);
+            assert!(
+                !root.path().join("Organized").join(name).exists(),
+                "unselected or ambiguous file must not be moved: {relative_path}"
+            );
+        }
+    }
+
     fn organized_collection_fixture(
         item_id: &str,
         title: &str,
