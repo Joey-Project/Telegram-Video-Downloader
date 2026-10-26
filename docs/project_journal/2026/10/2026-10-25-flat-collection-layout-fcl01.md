@@ -45,6 +45,10 @@ superseded_by: ""
 - New UGC and season group plans use layout version 1. Season folders use a
   bounded title and stable season ID, with the same reviewed directory witness
   and execution-time object binding as UGC collections.
+- New subtitle-only, danmaku-only and cover-only `All` plans use the same versioned
+  layout and reviewed directory binding through generic artifact publication.
+  Only explicit artifact-only plans may complete without primary media; their
+  files never become video-recovery evidence or primary-media receipts.
 - Preserve coherent KeepBoth names for media and sidecars when original or
   partial target groups already exist. NFO shares the exact media basename;
   other sidecars retain their distinct language or artwork variants.
@@ -87,11 +91,15 @@ superseded_by: ""
 ## Validation
 
 - Formatting, strict all-targets Clippy and isolated release build pass with Rust
-  1.99.1. Default-parallel all-targets tests pass: 1,339 passed, zero failures,
+  1.99.1. Default-parallel all-targets tests pass: 1,343 passed, zero failures,
   16 existing ignored tests. The 42 Rust/Cargo inputs remained byte-identical
   across the final gates.
-- Focused collection coverage passes 89 tests; the dedicated legacy season
+- Focused collection coverage passes 93 tests; the dedicated legacy season
   exact-evidence/tamper/namespace regression also passes.
+- Artifact coverage passes 10 tests, including six collection/season and
+  subtitle/danmaku/cover combinations with no primary media, normal video
+  rejection without primary output, SDK identity consistency, legacy and unknown
+  layout handling, directory replacement refusal and category-prefix binding.
 - The mock Telegram cloud flow scans nested media, previews and confirms moves,
   persists a partial failure, reopens the same-epoch inbox/runtime and a fresh
   file manager, then resumes without duplicate moves or changed media bytes.

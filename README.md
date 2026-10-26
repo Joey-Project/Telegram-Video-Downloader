@@ -24,6 +24,8 @@
 New Bilibili collection and season plans publish media and related files directly
 inside one collection folder. Ordered filenames retain the part number and stable
 source identity; NFO, subtitles, danmaku and artwork follow their media stem.
+Downloading all subtitles, danmaku or covers for a collection uses the same flat
+layout, including season folders.
 Previously approved tasks keep their legacy output recipe when resumed.
 
 To flatten an existing nested collection, open `/file`, select its videos, choose

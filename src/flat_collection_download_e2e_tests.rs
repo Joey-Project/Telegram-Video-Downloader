@@ -115,6 +115,7 @@ fn flat_collection_keep_both_publishes_one_coherent_sidecar_group() {
                 media_profile: TEST_MEDIA_PROFILE,
                 progress: None,
             }),
+            bilibili_collection_destination: None,
         },
         &staging_dir,
         &output_root,
@@ -282,6 +283,8 @@ fn sdk_entry_output_flattens_then_publishes_flat_collection_sidecars_together() 
         &plan,
         &mut report,
         Some(&expected_entry),
+        None,
+        false,
     )
     .expect("the production SDK-entry mapper should flatten the report output");
     assert_eq!(remapped.len(), sdk_files.len());
@@ -334,6 +337,7 @@ fn sdk_entry_output_flattens_then_publishes_flat_collection_sidecars_together() 
                 media_profile: TEST_MEDIA_PROFILE,
                 progress: None,
             }),
+            bilibili_collection_destination: None,
         },
         &output_dir,
         &output_root,
@@ -481,9 +485,16 @@ fn direct_collection_mapper_and_publication_keep_multiple_videos_flat() {
         entries: report_entries,
     };
 
-    let remapped =
-        flatten_bilibili_collection_staging_output(&root, &output_dir, &plan, &mut report, None)
-            .expect("the production direct-collection mapper should flatten every reported video");
+    let remapped = flatten_bilibili_collection_staging_output(
+        &root,
+        &output_dir,
+        &plan,
+        &mut report,
+        None,
+        None,
+        false,
+    )
+    .expect("the production direct-collection mapper should flatten every reported video");
     assert_eq!(remapped.len(), 6);
     assert_eq!(report.entries.len(), 2);
     assert!(
@@ -509,6 +520,7 @@ fn direct_collection_mapper_and_publication_keep_multiple_videos_flat() {
             root: &root,
             staging: Some(&staging),
             bilibili_group_receipt: None,
+            bilibili_collection_destination: None,
         },
         &output_dir,
         &output_root,
@@ -756,6 +768,8 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
         &plan,
         &mut report,
         Some(&expected_entry),
+        None,
+        false,
     )
     .expect("the production mapper should flatten all reported segments and sidecars");
     assert_eq!(remapped.len(), report.entries[0].files.len() + 1);
@@ -837,6 +851,7 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
                 media_profile: TEST_MEDIA_PROFILE,
                 progress: None,
             }),
+            bilibili_collection_destination: None,
         },
         &output_dir,
         &output_root,
@@ -1061,6 +1076,464 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
     fs::remove_dir_all(&output_root).expect("isolated fixture root should be removed");
 }
 
+#[test]
+fn generic_artifact_only_groups_flatten_and_publish_without_primary_media() {
+    let output_root = temp_root("flat-collection-artifact-only");
+    let _cleanup = TestDirectory(output_root.clone());
+    fs::create_dir_all(&output_root).expect("isolated output root should be created");
+    let root = RootedFs::new(&output_root).expect("output root should bind");
+    let source_cases = [
+        (
+            BilibiliGroupSource::Collection,
+            "UGC collection",
+            "UP-4242 Saved collection",
+            None,
+        ),
+        (
+            BilibiliGroupSource::Season,
+            "PGC season",
+            "Test season [season-71]",
+            Some(71),
+        ),
+    ];
+    #[derive(Clone, Copy)]
+    struct ArtifactFileFixture {
+        name: &'static str,
+        kind: &'static str,
+        bytes: &'static [u8],
+    }
+    #[derive(Clone, Copy)]
+    struct ArtifactModeFixture {
+        mode: &'static str,
+        files: &'static [ArtifactFileFixture],
+    }
+    let mode_cases = [
+        ArtifactModeFixture {
+            mode: "subtitle",
+            files: &[
+                ArtifactFileFixture {
+                    name: "subtitle-en-US-01-trackhash.srt",
+                    kind: "subtitle",
+                    bytes: b"English subtitle bytes",
+                },
+                ArtifactFileFixture {
+                    name: "subtitle-zh-CN-02-otherhash.ass",
+                    kind: "subtitle",
+                    bytes: b"Chinese subtitle bytes",
+                },
+            ],
+        },
+        ArtifactModeFixture {
+            mode: "danmaku",
+            files: &[
+                ArtifactFileFixture {
+                    name: "danmaku.xml",
+                    kind: "danmaku",
+                    bytes: b"XML danmaku bytes",
+                },
+                ArtifactFileFixture {
+                    name: "danmaku.ass",
+                    kind: "danmaku_ass",
+                    bytes: b"ASS danmaku bytes",
+                },
+            ],
+        },
+        ArtifactModeFixture {
+            mode: "cover",
+            files: &[ArtifactFileFixture {
+                name: "cover-image-deadbeef.jpg",
+                kind: "cover",
+                bytes: b"cover image bytes",
+            }],
+        },
+    ];
+    let mut case_index = 0_u32;
+    let mut flat_stems = BTreeSet::new();
+
+    for (source, source_label, folder, season_id) in source_cases {
+        let collection_dir = output_root.join(folder);
+        fs::create_dir_all(&collection_dir)
+            .expect("selected collection or season folder should be created");
+        let collection_identity = root
+            .entry_identity(&collection_dir)
+            .expect("selected output folder identity should be readable")
+            .expect("selected output folder should exist");
+
+        for mode_case in &mode_cases {
+            let mode = mode_case.mode;
+            case_index += 1;
+            let index = case_index;
+            let title = format!("{source_label} {mode} output");
+            let (bvid, aid, cid, epid) = if source == BilibiliGroupSource::Collection {
+                (
+                    Some(format!("BV{index}")),
+                    10_000 + u64::from(index),
+                    20_000 + u64::from(index),
+                    None,
+                )
+            } else {
+                (
+                    None,
+                    30_000 + u64::from(index),
+                    40_000 + u64::from(index),
+                    Some(50_000 + u64::from(index)),
+                )
+            };
+            let stable_media_id = bilibili_plan_stable_media_id(bvid.as_deref(), aid, cid, epid);
+            let download_entry = BilibiliDownloadEntry {
+                index,
+                aid,
+                bvid: bvid.clone(),
+                cid,
+                epid,
+                title: title.clone(),
+                ..BilibiliDownloadEntry::default()
+            };
+            let flat_stem = bilibili_collection_flat_stem(index, index, &stable_media_id, &title)
+                .expect("synthetic artifact identity should fit the flat filename budget");
+            assert!(
+                flat_stems.insert(flat_stem.clone()),
+                "entry stems should be unique"
+            );
+
+            let mut config = AppConfig::load(
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"),
+            )
+            .expect("example config should parse");
+            config.downloads.video_dir = output_root.clone();
+            config.set_video_storage_root(output_root.clone());
+            config.bilibili.download_args = vec!["--only".to_string(), mode.to_string()];
+            let options = bilibili_core::download_options(&config)
+                .expect("artifact-only download options should parse");
+            let media_profile = bilibili_group_media_profile(&options, &config);
+            let inventory = BilibiliEpisodeGroupInventory {
+                title: title.clone(),
+                source,
+                pgc_season_id: season_id,
+                entries: vec![BilibiliGroupEntry {
+                    download: download_entry.clone(),
+                    stable_media_id: stable_media_id.clone(),
+                }],
+                output_template: Some(folder.to_string()),
+                output_folder: Some(folder.to_string()),
+                storage_relative_output_folder: Some(folder.to_string()),
+                output_folder_identity: Some(collection_identity),
+                collection_output_layout_version: Some(1),
+            };
+            let reviewed_plan = inventory.validation_snapshot(media_profile.clone());
+            let reviewed_folder = match &reviewed_plan.bilibili_collection_directory {
+                BilibiliCollectionDirectorySnapshot::Existing {
+                    path,
+                    is_directory: true,
+                    ..
+                } => path.as_str(),
+                _ => panic!("generic v1 plan should retain its selected folder witness"),
+            };
+            assert_eq!(
+                reviewed_plan.bilibili_collection_output_layout_version,
+                Some(1)
+            );
+            assert_eq!(reviewed_folder, folder);
+            let job = JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV1".to_string(),
+                selection: Some(BilibiliSelection::All),
+            };
+            let allow_artifact_only_without_primary =
+                bilibili_downloads_artifacts_only(&config, &job)
+                    .expect("configured artifact mode should be recognized")
+                    && reviewed_plan.bilibili_collection_output_layout_version == Some(1)
+                    && reviewed_plan.media_profile.as_deref() == Some(media_profile.as_str());
+            assert!(allow_artifact_only_without_primary);
+            assert!(
+                !should_use_independent_bilibili_episode_group(&config, &job)
+                    .expect("generic artifact-only route should be selected")
+            );
+
+            let staging =
+                create_video_staging_dir(&root).expect("private staging folder should be created");
+            let output_dir = staging.path().to_path_buf();
+            let staged_collection_dir = output_dir.join(folder);
+            fs::create_dir_all(&staged_collection_dir)
+                .expect("staged collection folder should be created");
+            let sdk_entry_dir = staged_collection_dir.join(format!("P{index:03}-{title}"));
+            fs::create_dir(&sdk_entry_dir).expect("mock SDK entry folder should be created");
+
+            let plan = BilibiliDownloadPlan {
+                title: title.clone(),
+                entries: vec![download_entry],
+            };
+            let mut artifacts = Vec::new();
+            let mut source_bytes = BTreeMap::new();
+            for artifact in mode_case.files {
+                let path = sdk_entry_dir.join(artifact.name);
+                write_fixture(&path, artifact.bytes);
+                source_bytes.insert(path.clone(), artifact.bytes.to_vec());
+                artifacts.push(BilibiliDownloadedFile {
+                    kind: artifact.kind.to_string(),
+                    path,
+                });
+            }
+            let mut report = BilibiliDownloadReport {
+                title: title.clone(),
+                output_dir: output_dir.clone(),
+                entries: vec![BilibiliEntryDownloadReport {
+                    index,
+                    title: title.clone(),
+                    files: artifacts,
+                    mux: None,
+                }],
+            };
+
+            // Generic Selection::All has no per-entry expected_entry. The reviewed layout and
+            // destination folder permit flat sidecars without inventing primary media or a receipt.
+            let remapped = flatten_bilibili_collection_staging_output(
+                &root,
+                &output_dir,
+                &plan,
+                &mut report,
+                None,
+                Some(reviewed_folder),
+                allow_artifact_only_without_primary,
+            )
+            .expect(
+                "reviewed artifact-only collection output should flatten without primary media",
+            );
+            assert_eq!(remapped.len(), source_bytes.len());
+            assert!(remapped.values().all(|path| {
+                path.parent() == Some(staged_collection_dir.as_path())
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(&flat_stem) && !name.contains(".part-")
+                        })
+            }));
+            for (source, destination) in &remapped {
+                assert_eq!(fs::read(destination).unwrap(), source_bytes[source]);
+            }
+            let report_primary_paths = bilibili_report_primary_media(&output_dir, &report);
+            assert!(report_primary_paths.is_empty());
+            assert!(
+                report.entries[0]
+                    .files
+                    .iter()
+                    .all(|file| file.path.parent() == Some(staged_collection_dir.as_path()))
+            );
+
+            let mut prior_targets = BTreeMap::new();
+            let mut expected_published = BTreeMap::new();
+            for (source, staged_target) in &remapped {
+                let relative = staged_target
+                    .strip_prefix(&output_dir)
+                    .expect("flattened artifact should remain under staging");
+                let prior_target = output_root.join(relative);
+                let previous_bytes = format!("pre-existing {mode} artifact").into_bytes();
+                write_fixture(&prior_target, &previous_bytes);
+                prior_targets.insert(prior_target.clone(), previous_bytes);
+
+                let file_name = prior_target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("artifact filename should be UTF-8");
+                let (stem, extension) = file_name
+                    .rsplit_once('.')
+                    .expect("fixture artifact should include an extension");
+                let keep_both_target =
+                    prior_target.with_file_name(format!("{stem} (2).{extension}"));
+                expected_published.insert(keep_both_target, source_bytes[source].clone());
+            }
+
+            let duplicate = VideoDuplicate {
+                identity: VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: stable_media_id,
+                },
+                existing_videos: Vec::new(),
+                skip_summary: None,
+                overwrite_confirmation: None,
+            };
+            let destination_context = BilibiliCollectionDestinationContext {
+                output_folder: reviewed_folder,
+                collection_directory: &reviewed_plan.bilibili_collection_directory,
+            };
+            let moved = move_staged_artifact_files_with_root(
+                MoveExecutionContext {
+                    root: &root,
+                    staging: Some(&staging),
+                    bilibili_group_receipt: None,
+                    bilibili_collection_destination: Some(destination_context),
+                },
+                &output_dir,
+                &output_root,
+                &remapped.values().cloned().collect::<Vec<_>>(),
+                VideoDuplicateAction::KeepBoth,
+                &duplicate,
+                StagedPrimaryMediaKind::Video,
+            )
+            .expect("real artifact publication should preserve flat collection paths");
+            assert_eq!(
+                moved.iter().cloned().collect::<BTreeSet<_>>(),
+                expected_published.keys().cloned().collect::<BTreeSet<_>>()
+            );
+            assert!(
+                moved
+                    .iter()
+                    .all(|path| !is_primary_media_file(path, StagedPrimaryMediaKind::Video))
+            );
+            let primary_media_paths = reconstruct_published_primary_media_paths(
+                &root,
+                &output_dir,
+                &BTreeMap::new(),
+                &report_primary_paths,
+                StagedPrimaryMediaKind::Video,
+            )
+            .expect("artifact-only publication should reconstruct no primary media paths");
+            assert!(primary_media_paths.is_empty());
+            for (path, bytes) in expected_published {
+                assert_eq!(path.parent(), Some(collection_dir.as_path()));
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("published artifact filename should be UTF-8");
+                assert!(name.starts_with(&flat_stem));
+                assert!(!name.contains(".part-"));
+                assert!(name.contains(" (2)."));
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+            for (path, bytes) in prior_targets {
+                assert_eq!(
+                    fs::read(path).unwrap(),
+                    bytes,
+                    "KeepBoth must preserve prior bytes"
+                );
+            }
+            staging
+                .finish()
+                .expect("published artifact staging tree should be removed");
+        }
+    }
+    assert_eq!(flat_stems.len(), 6);
+
+    let negative_collection_folder = "UP-4242 Saved collection";
+    let negative_collection_dir = output_root.join(negative_collection_folder);
+    let negative_collection_identity = root
+        .entry_identity(&negative_collection_dir)
+        .expect("negative fixture output folder identity should be readable")
+        .expect("negative fixture output folder should exist");
+    let mut negative_reviewed_plan = PlanValidationSnapshot {
+        bilibili_collection_output_layout_version: Some(1),
+        bilibili_collection_directory: BilibiliCollectionDirectorySnapshot::Existing {
+            path: negative_collection_folder.to_string(),
+            device: negative_collection_identity.device(),
+            inode: negative_collection_identity.inode(),
+            is_directory: negative_collection_identity.is_dir(),
+        },
+        ..PlanValidationSnapshot::default()
+    };
+    let mut video_only_config = {
+        let mut config =
+            AppConfig::load(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
+                .expect("example config should parse");
+        config.bilibili.download_args = vec!["--only".to_string(), "video".to_string()];
+        config
+    };
+    let video_options = bilibili_core::download_options(&video_only_config)
+        .expect("video-only download options should parse");
+    let video_media_profile = bilibili_group_media_profile(&video_options, &video_only_config);
+    negative_reviewed_plan.media_profile = Some(video_media_profile.clone());
+    video_only_config.downloads.video_dir = output_root.clone();
+    video_only_config.set_video_storage_root(output_root.clone());
+    let video_job = JobRequest::Bilibili {
+        url: "https://www.bilibili.com/video/BV1".to_string(),
+        selection: Some(BilibiliSelection::All),
+    };
+    let allow_artifact_only_without_primary =
+        bilibili_downloads_artifacts_only(&video_only_config, &video_job)
+            .expect("video-only mode should require primary media")
+            && negative_reviewed_plan.bilibili_collection_output_layout_version == Some(1)
+            && negative_reviewed_plan.media_profile.as_deref()
+                == Some(video_media_profile.as_str());
+    assert!(!allow_artifact_only_without_primary);
+    assert!(
+        should_use_independent_bilibili_episode_group(&video_only_config, &video_job)
+            .expect("video-only group should retain primary-media execution")
+    );
+
+    let negative_staging =
+        create_video_staging_dir(&root).expect("negative fixture staging folder should be created");
+    let negative_output_dir = negative_staging.path().to_path_buf();
+    let negative_staged_collection = negative_output_dir.join(negative_collection_folder);
+    fs::create_dir_all(&negative_staged_collection)
+        .expect("negative staged collection folder should be created");
+    let negative_entry_dir = negative_staged_collection.join("P099-Video without primary");
+    fs::create_dir(&negative_entry_dir).expect("negative mock SDK entry should be created");
+    let negative_artifact = negative_entry_dir.join("subtitle-en-US-01-trackhash.srt");
+    write_fixture(&negative_artifact, b"not a primary video");
+    let negative_entry = BilibiliDownloadEntry {
+        index: 99,
+        aid: 99,
+        bvid: Some("BV99".to_string()),
+        cid: 99,
+        epid: None,
+        title: "Video without primary".to_string(),
+        ..BilibiliDownloadEntry::default()
+    };
+    let negative_plan = BilibiliDownloadPlan {
+        title: "Video without primary".to_string(),
+        entries: vec![negative_entry],
+    };
+    let mut negative_report = BilibiliDownloadReport {
+        title: "Video without primary".to_string(),
+        output_dir: negative_output_dir.clone(),
+        entries: vec![BilibiliEntryDownloadReport {
+            index: 99,
+            title: "Video without primary".to_string(),
+            files: vec![BilibiliDownloadedFile {
+                kind: "subtitle".to_string(),
+                path: negative_artifact.clone(),
+            }],
+            mux: None,
+        }],
+    };
+    let stable_negative_id = bilibili_plan_stable_media_id(Some("BV99"), 99, 99, None);
+    let negative_flat_stem =
+        bilibili_collection_flat_stem(99, 99, &stable_negative_id, "Video without primary")
+            .expect("negative fixture identity should fit the flat filename budget");
+    let negative_reviewed_folder = match &negative_reviewed_plan.bilibili_collection_directory {
+        BilibiliCollectionDirectorySnapshot::Existing { path, .. } => path.as_str(),
+        _ => panic!("negative video fixture should retain its selected folder witness"),
+    };
+    let error = flatten_bilibili_collection_staging_output(
+        &root,
+        &negative_output_dir,
+        &negative_plan,
+        &mut negative_report,
+        None,
+        Some(negative_reviewed_folder),
+        allow_artifact_only_without_primary,
+    )
+    .expect_err("a video plan without primary media must fail even with a sidecar");
+    assert!(error.to_string().contains("primary"));
+    assert!(
+        negative_artifact.exists(),
+        "rejected output should remain in staging"
+    );
+    assert!(
+        fs::read_dir(&negative_collection_dir)
+            .expect("negative output folder should remain readable")
+            .all(|entry| {
+                entry
+                    .expect("negative output entry should be readable")
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| !name.starts_with(&negative_flat_stem))
+            })
+    );
+    negative_staging
+        .finish()
+        .expect("rejected video fixture staging tree should be removed");
+}
+
 fn flat_test_group_entry(index: u32, bvid: &str, cid: u64, title: &str) -> BilibiliGroupEntry {
     let download = BilibiliDownloadEntry {
         index,
@@ -1215,6 +1688,8 @@ async fn collection_group_driver_publishes_two_mock_sdk_children_with_page_stems
                 &plan,
                 &mut report,
                 Some(&expected_entry),
+                None,
+                false,
             )?;
             let staged_files = remapped.values().cloned().collect::<Vec<_>>();
             let duplicate = VideoDuplicate {
@@ -1235,6 +1710,7 @@ async fn collection_group_driver_publishes_two_mock_sdk_children_with_page_stems
                         media_profile: TEST_MEDIA_PROFILE,
                         progress: None,
                     }),
+                    bilibili_collection_destination: None,
                 },
                 &output_dir,
                 &output_root,

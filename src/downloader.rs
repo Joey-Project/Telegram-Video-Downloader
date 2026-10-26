@@ -5941,6 +5941,24 @@ async fn inspect_job_plan_inner(
                 .await?
             };
             let mut snapshot = bilibili_plan_validation_snapshot(&plan, &options);
+            if matches!(selection, Some(BilibiliSelection::All))
+                && bilibili_mode_is_artifact_only(options.mode)
+            {
+                let inventory = resolve_bilibili_episode_group_inventory(config, url, true).await?;
+                if let Some(group_snapshot) = bilibili_collection_artifact_validation_snapshot(
+                    &plan, &inventory, &options, config,
+                )? {
+                    snapshot = group_snapshot;
+                }
+            }
+            if snapshot.bilibili_collection_output_layout_version
+                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+                && snapshot.bilibili_pgc_season_id != pgc_season_id
+            {
+                bail!(
+                    "Bilibili SDK plan season identity does not match its reviewed collection inventory; replan this task"
+                );
+            }
             if let Some(season_id) = pgc_season_id {
                 snapshot.bilibili_pgc_season_id = Some(season_id);
                 snapshot.bilibili_pgc_episode_orders = plan
@@ -6008,6 +6026,94 @@ fn bilibili_plan_validation_snapshot(
         }
     }
     snapshot
+}
+
+fn bilibili_mode_is_artifact_only(mode: DownloadMode) -> bool {
+    matches!(
+        mode,
+        DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly
+    )
+}
+
+fn bilibili_collection_artifact_validation_snapshot(
+    plan: &bbdown_core::DownloadPlan,
+    inventory: &BilibiliEpisodeGroupInventory,
+    options: &bbdown_core::DownloadOptions,
+    config: &AppConfig,
+) -> Result<Option<PlanValidationSnapshot>> {
+    if !bilibili_mode_is_artifact_only(options.mode) {
+        return Ok(None);
+    }
+    if !matches!(
+        inventory.source,
+        BilibiliGroupSource::Collection | BilibiliGroupSource::Season
+    ) {
+        return Ok(None);
+    }
+    if inventory.collection_output_layout_version != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+        || inventory.output_template.is_none()
+        || inventory.collection_directory_snapshot()
+            == BilibiliCollectionDirectorySnapshot::Untracked
+    {
+        bail!(
+            "Bilibili collection inventory omitted its reviewed flat output folder; replan this task"
+        );
+    }
+
+    let sdk_entries = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.index,
+                bilibili_plan_stable_media_id(
+                    entry.bvid.as_deref(),
+                    entry.aid,
+                    entry.cid,
+                    entry.epid,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let inventory_entries = inventory
+        .entries
+        .iter()
+        .map(|entry| (entry.download.index, entry.stable_media_id.clone()))
+        .collect::<Vec<_>>();
+    if sdk_entries != inventory_entries {
+        bail!(
+            "Bilibili SDK plan entries do not match the reviewed collection or season inventory; replan this task"
+        );
+    }
+
+    let sdk_snapshot = bilibili_plan_validation_snapshot(plan, options);
+    let mut snapshot = inventory.validation_snapshot(bilibili_group_media_profile(options, config));
+    snapshot.title = sdk_snapshot.title;
+    snapshot.selected_format_ids = sdk_snapshot.selected_format_ids;
+    snapshot.exact_sizes = sdk_snapshot.exact_sizes;
+    snapshot.approximate_sizes = sdk_snapshot.approximate_sizes;
+    snapshot.resolution_codecs = sdk_snapshot.resolution_codecs;
+    snapshot.bilibili_resolved_stream_ids = sdk_snapshot.bilibili_resolved_stream_ids;
+    Ok(Some(snapshot))
+}
+
+fn bilibili_collection_artifact_revalidation_snapshot(
+    inventory: &BilibiliEpisodeGroupInventory,
+    expected: &PlanValidationSnapshot,
+    options: &bbdown_core::DownloadOptions,
+    config: &AppConfig,
+) -> PlanValidationSnapshot {
+    let mut current = inventory.validation_snapshot(bilibili_group_media_profile(options, config));
+    // The inventory resolver validates the group source, stable IDs, numbering, and folder
+    // witness. Preserve SDK stream evidence here; the worker compares that evidence against its
+    // freshly prepared SDK plan before downloading.
+    current.title.clone_from(&expected.title);
+    current.selected_format_ids = expected.selected_format_ids.clone();
+    current.exact_sizes = expected.exact_sizes.clone();
+    current.approximate_sizes = expected.approximate_sizes.clone();
+    current.resolution_codecs = expected.resolution_codecs.clone();
+    current.bilibili_resolved_stream_ids = expected.bilibili_resolved_stream_ids.clone();
+    current
 }
 
 fn validate_missing_plan_snapshot(
@@ -9457,6 +9563,70 @@ fn send_bilibili_worker_entry_stage(
     });
 }
 
+fn bilibili_artifact_collection_worker_config(
+    config: &AppConfig,
+    final_output_root: &RootedFs,
+    expected_plan: &PlanValidationSnapshot,
+) -> Result<AppConfig> {
+    let BilibiliCollectionDirectorySnapshot::Existing {
+        path,
+        is_directory: true,
+        ..
+    } = &expected_plan.bilibili_collection_directory
+    else {
+        bail!(
+            "Bilibili artifact collection worker requires its reviewed Existing directory witness"
+        );
+    };
+    let relative = checked_storage_relative_path(
+        Path::new(path),
+        "Bilibili artifact collection output directory scope",
+        false,
+    )?;
+    let category = relative
+        .parent()
+        .context("Bilibili artifact collection witness has no directory component")?;
+    let mut scoped = config.clone();
+    scoped.set_video_storage_root(final_output_root.logical_root_path().to_path_buf());
+    scoped.downloads.video_dir = final_output_root.logical_root_path().join(category);
+    Ok(scoped)
+}
+
+fn validate_bilibili_collection_directory_witness(
+    root: &RootedFs,
+    snapshot: &BilibiliCollectionDirectorySnapshot,
+) -> Result<()> {
+    let BilibiliCollectionDirectorySnapshot::Existing {
+        path,
+        device,
+        inode,
+        is_directory,
+    } = snapshot
+    else {
+        bail!("Bilibili collection publication requires its reviewed Existing directory witness");
+    };
+    if !*is_directory {
+        bail!("Bilibili collection output witness is not a directory");
+    }
+    let path = bilibili_group_collection_output_folder_path(root, path)?;
+    root.validate_configured_root()?;
+    let entry = root.bind_entry(&path, false)?;
+    let current = root.bound_entry_identity(&entry)?.with_context(|| {
+        format!(
+            "Bilibili collection output directory is missing: {}",
+            path.display()
+        )
+    })?;
+    if !current.is_dir() || current.device() != *device || current.inode() != *inode {
+        bail!(
+            "Bilibili collection output directory identity changed: {}",
+            path.display()
+        );
+    }
+    root.validate_configured_root()?;
+    Ok(())
+}
+
 async fn run_bilibili_job_locked(
     config: &AppConfig,
     root: &RootedFs,
@@ -9490,6 +9660,79 @@ async fn run_bilibili_job_locked(
         options = options.with_output_template(output_template.clone());
     }
     let client = bilibili_core::client(config)?;
+    let mut artifact_collection_inventory = None;
+    let mut artifact_collection_config = None;
+    let mut artifact_collection_output_root = None;
+    if let Some(expected) = worker_context
+        .request
+        .expected_plan
+        .as_ref()
+        .filter(|plan| {
+            plan.bilibili_collection_output_layout_version
+                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+        })
+    {
+        if !matches!(selection, Some(BilibiliSelection::All))
+            || !bilibili_mode_is_artifact_only(options.mode)
+        {
+            bail!(
+                "flat Bilibili collection plans require an All artifact-only download; replan this task"
+            );
+        }
+        let expected_profile = bilibili_group_media_profile(&options, config);
+        if expected.media_profile.as_deref() != Some(expected_profile.as_str()) {
+            bail!(
+                "Bilibili artifact mode or requirements changed since the reviewed collection plan; replan this task"
+            );
+        }
+        let scoped_config = bilibili_artifact_collection_worker_config(
+            config,
+            worker_context.final_output_root,
+            expected,
+        )?;
+        let inventory = resolve_bilibili_episode_group_inventory(&scoped_config, url, true).await?;
+        if !matches!(
+            inventory.source,
+            BilibiliGroupSource::Collection | BilibiliGroupSource::Season
+        ) {
+            bail!(
+                "flat Bilibili artifact plan no longer resolves to a collection or season; replan this task"
+            );
+        }
+        let current = bilibili_collection_artifact_revalidation_snapshot(
+            &inventory,
+            expected,
+            &options,
+            &scoped_config,
+        );
+        let differences = expected.blocking_differences(&current);
+        if !differences.is_empty() {
+            bail!(
+                "Bilibili collection artifact plan changed since review ({}); replan this task before downloading",
+                differences.join(", ")
+            );
+        }
+        if inventory.collection_output_layout_version
+            != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+        {
+            bail!("Bilibili collection artifact plan has no supported flat output layout");
+        }
+        validate_bilibili_collection_directory_witness(
+            worker_context.final_output_root,
+            &expected.bilibili_collection_directory,
+        )?;
+        let template = inventory
+            .output_template
+            .as_deref()
+            .context("Bilibili artifact collection inventory omitted its output template")?;
+        options = options.with_output_template(template.to_string());
+        artifact_collection_output_root = Some(
+            RootedFs::new(&scoped_config.downloads.video_dir)
+                .context("failed to bind Bilibili artifact collection category root")?,
+        );
+        artifact_collection_config = Some(scoped_config);
+        artifact_collection_inventory = Some(inventory);
+    }
     let collection_download = if matches!(
         selection,
         Some(BilibiliSelection::All | BilibiliSelection::Missing)
@@ -9500,12 +9743,22 @@ async fn run_bilibili_job_locked(
             progress.as_ref(),
             "BBDown-rust: resolving Bilibili UGC collection inventory".to_string(),
         );
+        let collection_root = artifact_collection_output_root
+            .as_ref()
+            .unwrap_or(final_output_root);
         let collection =
-            prepare_bilibili_ugc_collection_download(&client, final_output_root, url, options.mode)
+            prepare_bilibili_ugc_collection_download(&client, collection_root, url, options.mode)
                 .await?;
+        if let Some(inventory) = artifact_collection_inventory.as_ref()
+            && inventory.output_folder.as_deref() != Some(collection.folder.as_str())
+        {
+            bail!(
+                "Bilibili UGC collection output directory changed while preparing artifact download"
+            );
+        }
         if let Some(outcome) = bilibili_collection_already_complete_outcome(
             &collection,
-            final_output_root,
+            collection_root,
             &options,
             progress.as_ref(),
         ) {
@@ -9671,6 +9924,26 @@ async fn run_bilibili_job_locked(
             &bilibili_plan_validation_snapshot(&core_plan, &options),
         )?;
     }
+    if let (Some(expected), Some(inventory), Some(scoped_config)) = (
+        worker_context.request.expected_plan.as_ref(),
+        artifact_collection_inventory.as_ref(),
+        artifact_collection_config.as_ref(),
+    ) {
+        let current = bilibili_collection_artifact_validation_snapshot(
+            &core_plan,
+            inventory,
+            &options,
+            scoped_config,
+        )?
+        .context("Bilibili SDK plan no longer resolves to its reviewed collection source")?;
+        let differences = expected.blocking_differences(&current);
+        if !differences.is_empty() {
+            bail!(
+                "Bilibili SDK prepared plan changed since artifact review ({}); replan this task before downloading",
+                differences.join(", ")
+            );
+        }
+    }
     let (resolved_metadata, metadata_warning) = match resolved_metadata {
         Ok(metadata) => (metadata, None),
         Err(err) => (
@@ -9745,6 +10018,7 @@ async fn run_bilibili_job_locked(
         peak_bytes,
         "episode download and temporary merge output",
     )?;
+    let artifact_only_mode = bilibili_mode_is_artifact_only(options.mode);
     let command_started_at = SystemTime::now();
     let core_report = client
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
@@ -9836,8 +10110,16 @@ async fn run_bilibili_job_locked(
             .expected_entry
             .as_ref()
             .is_some_and(|entry| entry.collection_output_layout_version == Some(1));
-    let flat_remap = if flat_collection_layout && collection_download.is_some()
-        || flat_collection_layout && worker_context.request.expected_entry.is_some()
+    let allow_artifact_only_without_primary = artifact_collection_inventory.is_some()
+        && worker_context.request.expected_entry.is_none()
+        && artifact_only_mode;
+    let artifact_output_template = artifact_collection_inventory
+        .as_ref()
+        .and_then(|inventory| inventory.output_template.as_deref());
+    let flat_remap = if flat_collection_layout
+        && (collection_download.is_some()
+            || worker_context.request.expected_entry.is_some()
+            || artifact_collection_inventory.is_some())
     {
         Some(flatten_bilibili_collection_staging_output(
             root,
@@ -9845,6 +10127,8 @@ async fn run_bilibili_job_locked(
             &plan,
             &mut report,
             worker_context.request.expected_entry.as_ref(),
+            artifact_output_template,
+            allow_artifact_only_without_primary,
         )?)
     } else {
         None
@@ -10324,6 +10608,8 @@ fn flatten_bilibili_collection_staging_output(
     plan: &BilibiliDownloadPlan,
     report: &mut BilibiliDownloadReport,
     expected_entry: Option<&BilibiliWorkerExpectedEntry>,
+    expected_output_template: Option<&str>,
+    allow_artifact_only_without_primary: bool,
 ) -> Result<BTreeMap<PathBuf, PathBuf>> {
     let selected_reports = report
         .entries
@@ -10415,11 +10701,26 @@ fn flatten_bilibili_collection_staging_output(
     if container == output_root || !container.starts_with(&output_root) {
         bail!("Bilibili collection output folder is outside the staged output directory");
     }
-    if let Some(template) = expected_entry.and_then(|entry| entry.output_template.as_deref()) {
+    let entry_template = expected_entry.and_then(|entry| entry.output_template.as_deref());
+    if entry_template.is_some()
+        && expected_output_template.is_some()
+        && entry_template != expected_output_template
+    {
+        bail!("Bilibili collection mapper received conflicting output folder bindings");
+    }
+    let expected_template = entry_template.or(expected_output_template);
+    if let Some(template) = expected_template {
         let literal = render_bilibili_output_template_literal(template)?;
         if container != output_root.join(literal) {
             bail!("Bilibili collection entry directory does not match its approved output folder");
         }
+    }
+    if allow_artifact_only_without_primary
+        && (expected_entry.is_some() || expected_template.is_none())
+    {
+        bail!(
+            "Bilibili artifact-only flattening requires a generic reviewed collection folder binding"
+        );
     }
     let mut remapped = BTreeMap::new();
     for (index, _, directory) in &selected {
@@ -10528,7 +10829,7 @@ fn flatten_bilibili_collection_staging_output(
         } else {
             video_media.clone()
         };
-        if primary_media.is_empty() {
+        if primary_media.is_empty() && !allow_artifact_only_without_primary {
             bail!(
                 "Bilibili collection entry {} has no complete primary media output",
                 plan_entry.index
@@ -13465,7 +13766,7 @@ async fn run_staged_video_job(
     job: &JobRequest,
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
-    expected_plan: Option<PlanValidationSnapshot>,
+    mut expected_plan: Option<PlanValidationSnapshot>,
     expected_bilibili_entry: Option<BilibiliWorkerExpectedEntry>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
@@ -13480,6 +13781,19 @@ async fn run_staged_video_job(
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let artifact_only = bilibili_downloads_artifacts_only(config, job)?;
     let root = guard.root().clone();
+    if let Some(plan) = expected_plan.as_ref() {
+        validate_bilibili_collection_output_layout_version(
+            plan.bilibili_collection_output_layout_version,
+        )?;
+    }
+    prepare_bilibili_artifact_collection_execution_plan(
+        config,
+        job,
+        &root,
+        artifact_only,
+        &mut expected_plan,
+    )
+    .await?;
     let staging = create_video_staging_dir(&root)?;
     let staging_dir = staging.path().to_path_buf();
     staging.validate_for_path_access()?;
@@ -13698,6 +14012,18 @@ async fn run_staged_video_job(
             staging_dir.display()
         );
     }
+    if artifact_only
+        && !staged_media.is_empty()
+        && expected_plan.as_ref().is_some_and(|plan| {
+            plan.bilibili_collection_output_layout_version
+                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+        })
+    {
+        staging.preserve_for_recovery();
+        bail!(
+            "reviewed Bilibili artifact-only collection plan unexpectedly produced primary media; staged output was retained"
+        );
+    }
 
     if matches!(job, JobRequest::Youtube { .. }) {
         for path in &staged_media {
@@ -13764,10 +14090,16 @@ async fn run_staged_video_job(
                 progress: progress.as_ref(),
             },
         );
+    let artifact_collection_destination = if staged_media.is_empty() && artifact_only {
+        bilibili_collection_destination_context(expected_plan.as_ref())?
+    } else {
+        None
+    };
     let move_context = MoveExecutionContext {
         root: &root,
         staging: Some(&staging),
         bilibili_group_receipt: group_receipt_context,
+        bilibili_collection_destination: None,
     };
     send_bilibili_worker_entry_stage(
         progress.as_ref(),
@@ -13779,7 +14111,10 @@ async fn run_staged_video_job(
     {
         (
             move_staged_artifact_files_with_root(
-                move_context,
+                MoveExecutionContext {
+                    bilibili_collection_destination: artifact_collection_destination,
+                    ..move_context
+                },
                 &staging_dir,
                 &final_dir,
                 &staged_files,
@@ -13896,6 +14231,122 @@ async fn run_staged_video_job(
         .context("failed to durably finalize the staged video job")?;
     guard.mark_operation_clean();
     Ok(report)
+}
+
+async fn prepare_bilibili_artifact_collection_execution_plan(
+    config: &AppConfig,
+    job: &JobRequest,
+    output_root: &RootedFs,
+    artifact_only: bool,
+    expected_plan: &mut Option<PlanValidationSnapshot>,
+) -> Result<()> {
+    let Some(expected) = expected_plan.as_mut() else {
+        return Ok(());
+    };
+    if expected.bilibili_collection_output_layout_version.is_none() {
+        // Approved legacy plans keep their original SDK folder recipe and nested publication.
+        return Ok(());
+    }
+    validate_bilibili_collection_output_layout_version(
+        expected.bilibili_collection_output_layout_version,
+    )?;
+    let (url, selection) = match job {
+        JobRequest::Bilibili { url, selection } => (url.as_str(), *selection),
+        _ => bail!("Bilibili collection output layout was attached to a non-Bilibili job"),
+    };
+    if selection != Some(BilibiliSelection::All) || !artifact_only {
+        bail!(
+            "flat Bilibili collection plans require an All artifact-only download; replan this task"
+        );
+    }
+
+    let options = bilibili_core::download_options(config)?;
+    let media_profile = bilibili_group_media_profile(&options, config);
+    if expected.media_profile.as_deref() != Some(media_profile.as_str()) {
+        bail!(
+            "Bilibili artifact mode or requirements changed since the reviewed collection plan; replan this task"
+        );
+    }
+    let mut inventory = resolve_bilibili_episode_group_inventory(config, url, true).await?;
+    if !matches!(
+        inventory.source,
+        BilibiliGroupSource::Collection | BilibiliGroupSource::Season
+    ) {
+        bail!(
+            "flat Bilibili artifact plan no longer resolves to a collection or season; replan this task"
+        );
+    }
+    let current =
+        bilibili_collection_artifact_revalidation_snapshot(&inventory, expected, &options, config);
+    let differences = expected.blocking_differences(&current);
+    if !differences.is_empty() {
+        bail!(
+            "Bilibili collection artifact plan changed since review ({}); replan this task before downloading",
+            differences.join(", ")
+        );
+    }
+    if inventory.collection_output_layout_version != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+    {
+        bail!("Bilibili collection artifact plan has no supported flat output layout");
+    }
+
+    establish_bilibili_group_collection_directory(output_root, &mut inventory)?;
+    let directory = inventory.collection_directory_snapshot();
+    let BilibiliCollectionDirectorySnapshot::Existing {
+        path,
+        device,
+        inode,
+        is_directory,
+    } = &directory
+    else {
+        bail!("Bilibili artifact collection output directory was not established");
+    };
+    if !*is_directory {
+        bail!("Bilibili artifact collection output path is not a directory");
+    }
+    let directory_path = bilibili_group_collection_output_folder_path(output_root, path)?;
+    let entry = output_root.bind_entry(&directory_path, false)?;
+    let identity = output_root
+        .bound_entry_identity(&entry)?
+        .context("Bilibili artifact collection output directory disappeared after binding")?;
+    if !identity.is_dir() || identity.device() != *device || identity.inode() != *inode {
+        bail!(
+            "Bilibili artifact collection output directory identity changed after binding: {}",
+            directory_path.display()
+        );
+    }
+    expected.bilibili_collection_directory = directory;
+    Ok(())
+}
+
+fn bilibili_collection_destination_context(
+    expected_plan: Option<&PlanValidationSnapshot>,
+) -> Result<Option<BilibiliCollectionDestinationContext<'_>>> {
+    let Some(expected_plan) = expected_plan.filter(|plan| {
+        plan.bilibili_collection_output_layout_version
+            == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+    }) else {
+        return Ok(None);
+    };
+    let BilibiliCollectionDirectorySnapshot::Existing {
+        path,
+        is_directory: true,
+        ..
+    } = &expected_plan.bilibili_collection_directory
+    else {
+        bail!(
+            "Bilibili artifact collection publication requires its reviewed Existing directory witness"
+        );
+    };
+    checked_storage_relative_path(
+        Path::new(path),
+        "Bilibili artifact collection output directory scope",
+        false,
+    )?;
+    Ok(Some(BilibiliCollectionDestinationContext {
+        output_folder: path,
+        collection_directory: &expected_plan.bilibili_collection_directory,
+    }))
 }
 
 pub(crate) fn reconstruct_published_primary_media_paths(
@@ -20395,6 +20846,7 @@ struct MoveExecutionContext<'a> {
     root: &'a RootedFs,
     staging: Option<&'a BoundStagingDir>,
     bilibili_group_receipt: Option<BilibiliGroupReceiptWriteContext<'a>>,
+    bilibili_collection_destination: Option<BilibiliCollectionDestinationContext<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -20402,6 +20854,12 @@ struct BilibiliGroupReceiptWriteContext<'a> {
     expected_entry: &'a BilibiliWorkerExpectedEntry,
     media_profile: &'a str,
     progress: Option<&'a JobProgressSender>,
+}
+
+#[derive(Clone, Copy)]
+struct BilibiliCollectionDestinationContext<'a> {
+    output_folder: &'a str,
+    collection_directory: &'a BilibiliCollectionDirectorySnapshot,
 }
 
 #[derive(Debug)]
@@ -21855,6 +22313,7 @@ fn move_staged_video_files(
             root: &root,
             staging: None,
             bilibili_group_receipt: None,
+            bilibili_collection_destination: None,
         },
         staging_dir,
         final_dir,
@@ -22076,10 +22535,23 @@ where
         };
         prepare_staged_publication(root, staging, &mut plan, overwrite)?;
     }
-    let bound_destinations = if let Some(receipt_context) = context.bilibili_group_receipt {
-        bind_bilibili_group_destination_parents(root, &plan, receipt_context.expected_entry)?
-    } else {
-        None
+    let bound_destinations = match (
+        context.bilibili_group_receipt,
+        context.bilibili_collection_destination,
+    ) {
+        (Some(receipt_context), None) => {
+            bind_bilibili_group_destination_parents(root, &plan, receipt_context.expected_entry)?
+        }
+        (None, Some(collection_context)) => Some(bind_bilibili_collection_destination_parents(
+            root,
+            &plan,
+            collection_context.output_folder,
+            collection_context.collection_directory,
+        )?),
+        (Some(_), Some(_)) => {
+            bail!("Bilibili collection publication cannot bind both receipt and artifact contexts")
+        }
+        (None, None) => None,
     };
     before_first_move(root, bilibili_group_receipt.as_ref())?;
     let mut result = execute_move_plan_with_bound_destinations(
@@ -22106,7 +22578,22 @@ fn bind_bilibili_group_destination_parents(
         }
         return Ok(None);
     };
-    let (reviewed_path, device, inode, is_directory) = match &expected_entry.collection_directory {
+    bind_bilibili_collection_destination_parents(
+        root,
+        plan,
+        folder,
+        &expected_entry.collection_directory,
+    )
+    .map(Some)
+}
+
+fn bind_bilibili_collection_destination_parents(
+    root: &RootedFs,
+    plan: &[MoveStep],
+    folder: &str,
+    collection_directory: &BilibiliCollectionDirectorySnapshot,
+) -> Result<BTreeMap<PathBuf, BoundEntry>> {
+    let (reviewed_path, device, inode, is_directory) = match collection_directory {
         BilibiliCollectionDirectorySnapshot::Existing {
             path,
             device,
@@ -22116,13 +22603,13 @@ fn bind_bilibili_group_destination_parents(
         BilibiliCollectionDirectorySnapshot::Missing { .. }
         | BilibiliCollectionDirectorySnapshot::Untracked => {
             bail!(
-                "Bilibili collection output directory identity mismatch: worker lacks an Existing directory binding"
+                "Bilibili collection output directory identity mismatch: publication lacks an Existing directory binding"
             );
         }
     };
     if reviewed_path != folder || !is_directory {
         bail!(
-            "Bilibili collection output directory identity mismatch: worker directory binding does not match the selected folder"
+            "Bilibili collection output directory identity mismatch: reviewed directory binding does not match the selected folder"
         );
     }
 
@@ -22176,7 +22663,7 @@ fn bind_bilibili_group_destination_parents(
             bail!("Bilibili group move plan contains a duplicate destination path");
         }
     }
-    Ok(Some(destinations))
+    Ok(destinations)
 }
 
 #[cfg(test)]
@@ -22195,6 +22682,7 @@ fn move_staged_artifact_files(
             root: &root,
             staging: None,
             bilibili_group_receipt: None,
+            bilibili_collection_destination: None,
         },
         staging_dir,
         final_dir,
@@ -22252,11 +22740,26 @@ fn move_staged_artifact_files_with_root(
             None => err,
         });
     }
+    if context.bilibili_group_receipt.is_some() && context.bilibili_collection_destination.is_some()
+    {
+        bail!("artifact publication cannot bind both group receipt and directory contexts");
+    }
+    let bound_destinations = context
+        .bilibili_collection_destination
+        .map(|collection| {
+            bind_bilibili_collection_destination_parents(
+                root,
+                &plan,
+                collection.output_folder,
+                collection.collection_directory,
+            )
+        })
+        .transpose()?;
     let replaced_destinations = plan
         .iter()
         .map(|step| step.destination.clone())
         .collect::<BTreeSet<_>>();
-    let move_result = execute_artifact_move_plan(root, plan);
+    let move_result = execute_artifact_move_plan(root, plan, bound_destinations);
     match move_result {
         Ok(moved) => {
             if let Some(mut acquired) = acquisition.take() {
@@ -22350,10 +22853,35 @@ fn artifact_sidecar_suffix(source: &Path) -> Option<String> {
     Some(format!(".{}", source.extension()?.to_str()?))
 }
 
-fn execute_artifact_move_plan(root: &RootedFs, plan: Vec<MoveStep>) -> Result<Vec<MovedFile>> {
+fn execute_artifact_move_plan(
+    root: &RootedFs,
+    plan: Vec<MoveStep>,
+    mut bound_destinations: Option<BTreeMap<PathBuf, BoundEntry>>,
+) -> Result<Vec<MovedFile>> {
+    if bound_destinations.as_ref().is_some_and(|destinations| {
+        destinations.len() != plan.len()
+            || plan
+                .iter()
+                .any(|step| !destinations.contains_key(&step.destination))
+    }) {
+        bail!("Bilibili collection destination bindings do not match the artifact plan");
+    }
     let mut moved = Vec::new();
     for step in plan {
-        match move_step_with_bound_parents(root, step.clone()) {
+        let destination_entry = match bound_destinations.as_mut() {
+            Some(destinations) => match destinations.remove(&step.destination) {
+                Some(entry) => Some(entry),
+                None => {
+                    let error = anyhow!(
+                        "Bilibili collection destination binding is missing for {}",
+                        step.destination.display()
+                    );
+                    return Err(with_move_rollback_error(root, error, &moved));
+                }
+            },
+            None => None,
+        };
+        match move_step_with_bound_parents_and_destination(root, step.clone(), destination_entry) {
             Ok(moved_file) => moved.push(moved_file),
             Err(err) => {
                 let err = err.context(format!(
@@ -25165,6 +25693,245 @@ mod tests {
         );
     }
 
+    #[test]
+    fn artifact_collection_plan_snapshot_binds_sdk_source_mode_and_folder() {
+        let mut config = test_config();
+        config.bilibili.extra_args = vec!["--only".to_string(), "subtitle".to_string()];
+        let options =
+            bilibili_core::download_options(&config).expect("artifact-only options should parse");
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(1, None, None)]);
+        let sdk_entry = &plan.entries[0];
+        let download = BilibiliDownloadEntry {
+            index: sdk_entry.index,
+            aid: sdk_entry.aid,
+            bvid: sdk_entry.bvid.clone(),
+            cid: sdk_entry.cid,
+            epid: sdk_entry.epid,
+            title: sdk_entry.title.clone(),
+            ..BilibiliDownloadEntry::default()
+        };
+        let stable_media_id = bilibili_plan_stable_media_id(
+            download.bvid.as_deref(),
+            download.aid,
+            download.cid,
+            download.epid,
+        );
+        let entry = BilibiliGroupEntry {
+            download,
+            stable_media_id: stable_media_id.clone(),
+        };
+        let folder = "UP - Test [collection-123]";
+        let mut collection = test_collection_group_inventory(folder, None);
+        collection.title = "Test collection".to_string();
+        collection.output_template = Some(folder.to_string());
+        collection.entries = vec![entry.clone()];
+
+        let snapshot =
+            bilibili_collection_artifact_validation_snapshot(&plan, &collection, &options, &config)
+                .expect("SDK and collection identities should agree")
+                .expect("true collection should get the flat artifact plan");
+        assert_eq!(snapshot.bilibili_collection_output_layout_version, Some(1));
+        assert_eq!(snapshot.stable_media_ids, vec![stable_media_id.clone()]);
+        assert_eq!(
+            snapshot.bilibili_group_entries[0].stable_media_id,
+            stable_media_id
+        );
+        assert!(
+            snapshot
+                .media_profile
+                .as_deref()
+                .unwrap()
+                .contains("SubtitleOnly")
+        );
+        assert_eq!(
+            snapshot.bilibili_collection_directory,
+            BilibiliCollectionDirectorySnapshot::Missing {
+                path: folder.to_string(),
+            }
+        );
+
+        let season_folder = "Test season [season-456]";
+        let mut season = test_collection_group_inventory(season_folder, None);
+        season.source = BilibiliGroupSource::Season;
+        season.title = "Test season".to_string();
+        season.pgc_season_id = Some(456);
+        season.output_template = Some(season_folder.to_string());
+        season.entries = vec![entry];
+        let season_snapshot =
+            bilibili_collection_artifact_validation_snapshot(&plan, &season, &options, &config)
+                .expect("SDK and season identities should agree")
+                .expect("true season should get the flat artifact plan");
+        assert_eq!(
+            season_snapshot.bilibili_collection_output_layout_version,
+            Some(1)
+        );
+        assert_eq!(season_snapshot.bilibili_pgc_season_id, Some(456));
+        assert_eq!(season_snapshot.bilibili_pgc_episode_orders[0].index, 1);
+        assert_eq!(
+            season_snapshot.bilibili_collection_directory,
+            BilibiliCollectionDirectorySnapshot::Missing {
+                path: season_folder.to_string(),
+            }
+        );
+
+        let video_inventory = test_group_inventory(1);
+        assert!(
+            bilibili_collection_artifact_validation_snapshot(
+                &plan,
+                &video_inventory,
+                &options,
+                &config,
+            )
+            .expect("standalone video should remain on its own route")
+            .is_none()
+        );
+        let all_options = bilibili_core::download_options(&test_config())
+            .expect("normal media options should parse");
+        assert!(
+            bilibili_collection_artifact_validation_snapshot(
+                &plan,
+                &collection,
+                &all_options,
+                &config,
+            )
+            .expect("normal media plan must not use the artifact-only layout helper")
+            .is_none()
+        );
+
+        let mut mismatched = test_collection_group_inventory(folder, None);
+        mismatched.output_template = Some(folder.to_string());
+        let changed_download = BilibiliDownloadEntry {
+            index: sdk_entry.index,
+            aid: sdk_entry.aid,
+            bvid: sdk_entry.bvid.clone(),
+            cid: sdk_entry.cid + 1,
+            epid: sdk_entry.epid,
+            title: sdk_entry.title.clone(),
+            ..BilibiliDownloadEntry::default()
+        };
+        let changed_id = bilibili_plan_stable_media_id(
+            changed_download.bvid.as_deref(),
+            changed_download.aid,
+            changed_download.cid,
+            changed_download.epid,
+        );
+        mismatched.entries = vec![BilibiliGroupEntry {
+            download: changed_download,
+            stable_media_id: changed_id,
+        }];
+        assert!(
+            bilibili_collection_artifact_validation_snapshot(
+                &plan,
+                &mismatched,
+                &options,
+                &config,
+            )
+            .is_err(),
+            "SDK prepared-plan identity changes must block artifact publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_layout_legacy_none_and_unknown_version_are_explicit() {
+        assert!(validate_bilibili_collection_output_layout_version(None).is_ok());
+        assert!(validate_bilibili_collection_output_layout_version(Some(1)).is_ok());
+        assert!(validate_bilibili_collection_output_layout_version(Some(2)).is_err());
+        assert!(
+            bilibili_collection_destination_context(Some(&PlanValidationSnapshot::default()))
+                .expect("legacy plan has no collection destination context")
+                .is_none()
+        );
+
+        let mut config = test_config();
+        config.bilibili.extra_args = vec!["--only".to_string(), "subtitle".to_string()];
+        let output_root = temp_test_dir("legacy-artifact-layout-plan");
+        fs::create_dir_all(&output_root).expect("legacy output root should create");
+        let root = RootedFs::new(&output_root).expect("legacy output root should bind");
+        let mut expected = Some(PlanValidationSnapshot::default());
+        let reviewed = expected.clone();
+        prepare_bilibili_artifact_collection_execution_plan(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            &root,
+            true,
+            &mut expected,
+        )
+        .await
+        .expect("legacy plan should keep its prior output recipe");
+        assert_eq!(expected, reviewed);
+        let _ = fs::remove_dir_all(output_root);
+    }
+
+    #[test]
+    fn artifact_collection_destination_refuses_directory_replacement_during_move() {
+        let output_root = temp_test_dir("artifact-collection-directory-replacement");
+        let selected = output_root.join("category").join("Test [season-456]");
+        fs::create_dir_all(&selected).expect("selected collection directory should create");
+        let root = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_identity = root
+            .entry_identity(&selected)
+            .expect("selected identity should inspect")
+            .expect("selected collection directory should exist");
+        let storage_relative_folder = bilibili_storage_relative_collection_folder(
+            &output_root,
+            &output_root.join("category"),
+            "Test [season-456]",
+        )
+        .expect("category prefix should be included in the collection witness");
+        assert_eq!(storage_relative_folder, "category/Test [season-456]");
+        let snapshot = BilibiliCollectionDirectorySnapshot::Existing {
+            path: storage_relative_folder.clone(),
+            device: selected_identity.device(),
+            inode: selected_identity.inode(),
+            is_directory: true,
+        };
+        let expected_plan = PlanValidationSnapshot {
+            bilibili_collection_directory: snapshot.clone(),
+            bilibili_collection_output_layout_version: Some(1),
+            ..PlanValidationSnapshot::default()
+        };
+        let scoped_config =
+            bilibili_artifact_collection_worker_config(&test_config(), &root, &expected_plan)
+                .expect("worker config should restore the reviewed category prefix");
+        assert_eq!(
+            scoped_config.downloads.video_dir,
+            output_root.join("category")
+        );
+        assert_eq!(scoped_config.video_storage_root(), root.logical_root_path());
+        let staging = output_root.join("staging");
+        fs::create_dir_all(&staging).expect("staging directory should create");
+        let staged_file = staging.join("E0001-P001-cid100.nfo");
+        fs::write(&staged_file, b"NFO").expect("artifact should stage");
+        let destination = selected.join("E0001-P001-cid100.nfo");
+        let plan = vec![MoveStep {
+            source: staged_file.clone(),
+            destination: destination.clone(),
+            expected_identity: None,
+        }];
+        let bound = bind_bilibili_collection_destination_parents(
+            &root,
+            &plan,
+            &storage_relative_folder,
+            &snapshot,
+        )
+        .expect("selected destination parent should bind");
+
+        let retired = output_root.join("category").join("retired-season");
+        fs::rename(&selected, &retired).expect("selected directory should move");
+        fs::create_dir(&selected).expect("replacement directory should create");
+        let _error = execute_artifact_move_plan(&root, plan, Some(bound))
+            .expect_err("replacement during move must be refused");
+        assert!(
+            staged_file.exists(),
+            "failed move should restore staged artifact"
+        );
+        assert!(
+            !destination.exists(),
+            "artifact must not be published into the replacement directory"
+        );
+        let _ = fs::remove_dir_all(output_root);
+    }
+
     #[tokio::test]
     async fn group_identity_index_is_built_once_for_multiple_episode_scans() {
         let (config, root) = test_group_config("episode-group-shared-identity-index");
@@ -26176,6 +26943,7 @@ mod tests {
                     media_profile,
                     progress: None,
                 }),
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &collection_dir,
@@ -26350,6 +27118,7 @@ mod tests {
                     media_profile,
                     progress: None,
                 }),
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &collection_dir,
@@ -26456,6 +27225,7 @@ mod tests {
                     media_profile,
                     progress: None,
                 }),
+                bilibili_collection_destination: None,
             },
             &direct_staging_dir,
             &category_root,
@@ -26582,6 +27352,7 @@ mod tests {
                         media_profile: "test-group-publication-profile-v2",
                         progress: None,
                     }),
+                    bilibili_collection_destination: None,
                 },
                 &staging_dir,
                 &collection_dir,
@@ -26673,6 +27444,7 @@ mod tests {
                     media_profile: "test-group-publication-profile-v2",
                     progress: None,
                 }),
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &collection_dir,
@@ -33649,6 +34421,7 @@ mod tests {
                 root: &root,
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &final_dir,
@@ -34488,6 +35261,7 @@ mod tests {
                 root: &root,
                 staging: None,
                 bilibili_group_receipt: None,
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &final_dir,
@@ -36937,6 +37711,7 @@ mod tests {
                 root: &root,
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
+                bilibili_collection_destination: None,
             },
             &staging_dir,
             &final_dir,
@@ -40899,8 +41674,10 @@ mv video.original video.m4s || exit 46
             inherited_fd_base: None,
         };
 
+        // This guard covers command setup, spawn, scheduling, and output collection; the worker
+        // policy still disables production command deadlines.
         let output = tokio_timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             run_command_with_execution_context(
                 &config,
                 &spec,
