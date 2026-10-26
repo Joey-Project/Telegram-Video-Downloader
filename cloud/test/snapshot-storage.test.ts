@@ -469,8 +469,8 @@ describe("snapshot storage", () => {
     expect(observed.read()).toBe(0);
 
     const chunkRowsBefore = await testEnv.DB.prepare(
-      "SELECT sha256, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
-    ).bind(epoch).all<{ sha256: string; created_at: number }>();
+      "SELECT sha256, byte_length, data, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
+    ).bind(epoch).all<{ sha256: string; byte_length: number; data: string; created_at: number }>();
     await storeChunkedSnapshot(observed.db, {
       state_version: 1,
       reported_at: Date.now(),
@@ -481,9 +481,10 @@ describe("snapshot storage", () => {
     // A due heartbeat may update snapshot_meta, but must not rewrite content chunks.
     expect(observed.reset()).toBeLessThanOrEqual(1);
     const chunkRowsAfter = await testEnv.DB.prepare(
-      "SELECT sha256, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
-    ).bind(epoch).all<{ sha256: string; created_at: number }>();
-    expect(chunkRowsAfter).toEqual(chunkRowsBefore);
+      "SELECT sha256, byte_length, data, created_at FROM snapshot_content_chunks WHERE database_epoch = ? ORDER BY sha256 ASC",
+    ).bind(epoch).all<{ sha256: string; byte_length: number; data: string; created_at: number }>();
+    // Compare the stable chunk rows, not D1 response metadata such as query duration.
+    expect(chunkRowsAfter.results).toEqual(chunkRowsBefore.results);
 
     const changedStateText = '{"settings":{"download_dir":"/Videos","changed":true},"tasks":[]}';
     const changedBytes = encoder.encode(changedStateText);

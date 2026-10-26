@@ -20,6 +20,22 @@
 - Requests provides file and library-migration review, confirmation, and cancellation. Cancelling an unexecuted preview is saved on the Mac and never changes media; executing migrations retain their existing stop controls. Organizing contains operation forms and ongoing work. Settled results move to the searchable History view, which uses bounded recent Mac records and a cached snapshot rather than a permanent cloud archive. Missing history does not prevent rescanning the media library.
 - An uncollected video can be explicitly marked as standalone, or returned to unreviewed, through the same preview/confirmation flow. The declaration travels in its NFO and only suppresses the missing-collection reason; unavailable files, incomplete metadata, and uncertain matches still need attention.
 - `/settings` 管理多个媒体库及默认下载分类；`/file` 可选择媒体库，并通过“下载到这里”提交视频或合集。每个任务在入队时固定保存位置，之后修改默认设置只影响新任务。
+
+New Bilibili collection and season plans publish media and related files directly
+inside one collection folder. Ordered filenames retain the part number and stable
+source identity; NFO, subtitles, danmaku and artwork follow their media stem.
+Downloading all subtitles, danmaku or covers for a collection uses the same flat
+layout, including season folders.
+Previously approved tasks keep their legacy output recipe when resumed.
+
+To flatten an existing nested collection, open `/file`, select its videos, choose
+**Organize selected**, and choose the parent destination directory. The preview
+places known collection members directly in one collection folder, including
+multi-part entries. Review the media and associated NFO, subtitle, danmaku and
+artwork paths before confirming; no video is downloaded or transcoded again.
+If collection metadata is missing, use metadata recovery first. Only selected
+items and reliably matched sidecars move; ambiguous assets stay at the source.
+A partial batch can be resumed with the same preview rather than starting again.
 - 媒体库迁移支持整库或选定媒体，连同 NFO、弹幕、字幕和封面一起复制、校验及转移；未完成任务和暂存文件需要单独勾选，默认保留在原库。迁移提供暂停、继续、停止剩余项及重试失败项，原库不会自动取消登记。
 - macOS 上队列索引和记录通过 File Provider 协调读写，云端占位内容可在读取时按需物化。若系统无法协调访问，bot 会提示检查 Finder 中隐藏队列目录的下载状态并重试；读取失败不会清理队列或 staging 数据。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。

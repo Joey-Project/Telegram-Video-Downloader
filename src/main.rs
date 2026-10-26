@@ -14,6 +14,8 @@ mod downloader;
 mod episode_retry;
 mod file_manager;
 mod file_provider;
+#[cfg(test)]
+mod flat_collection_e2e_tests;
 mod library;
 mod library_migration;
 mod library_migration_bot;
