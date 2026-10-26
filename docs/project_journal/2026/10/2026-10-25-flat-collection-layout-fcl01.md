@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-25
 updated: 2026-10-26
 branch: "wip/flat-collection-layout"
-pr: ""
+pr: "62"
 supersedes: []
 superseded_by: ""
 ---
@@ -51,6 +51,10 @@ superseded_by: ""
 - Approved legacy tasks retain their original layout. A v1 season replan can
   recover legacy exact-path/hash attempt evidence and task-namespaced receipts;
   it cannot adopt another task's receipt or a generic unscoped media match.
+  Final group validation retains the accepted legacy scope only for entries
+  recovered from that exact evidence.
+- Unmuxed video segments and audio tracks take their ordinals from the ordered
+  SDK report, preserving playback order independently of directory enumeration.
 - Unsupported layout versions fail explicitly. Logical and canonical macOS root
   spellings are resolved against the captured root, retaining rooted containment
   and identity validation.
@@ -76,17 +80,23 @@ superseded_by: ""
 ## Validation
 
 - Formatting, strict all-targets Clippy and isolated release build pass with Rust
-  1.99.1. Default-parallel all-targets tests pass: 1,337 passed, zero failures,
+  1.99.1. Default-parallel all-targets tests pass: 1,339 passed, zero failures,
   16 existing ignored tests. The 42 Rust/Cargo inputs remained byte-identical
   across the final gates.
-- Focused collection coverage passes 88 tests; the dedicated legacy season
+- Focused collection coverage passes 89 tests; the dedicated legacy season
   exact-evidence/tamper/namespace regression also passes.
 - The mock Telegram cloud flow scans nested media, previews and confirms moves,
   persists a partial failure, reopens the same-epoch inbox/runtime and a fresh
   file manager, then resumes without duplicate moves or changed media bytes.
 - Download integration covers nested SDK output, multiple direct collection
   videos, a multi-part child, coherent sidecar KeepBoth names, partial conflicts,
-  group sequencing and explicit durable receipt verification. These use mocked
-  SDK outcomes and local files rather than a live upstream media download.
+  group sequencing and explicit durable receipt verification. Regression cases
+  also exercise complete legacy-season recovery and ordered unmuxed segment
+  publication with shared sidecars. These use mocked SDK outcomes and local
+  files rather than a live upstream media download.
+- Cloud validation passes typechecking, 362 backend tests, 82 mounted UI tests
+  and the Wrangler dry-run. The unchanged-snapshot storage test compares stable
+  stored rows instead of nondeterministic query timing metadata; its write-budget
+  assertion remains in place. No production Worker source changes.
 - Existing `cargo test --all-targets` CI discovery includes both new test modules.
   Transient PR/CI/deployment receipts stay in ignored task artifacts.

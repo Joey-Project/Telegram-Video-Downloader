@@ -3223,6 +3223,7 @@ async fn run_bilibili_episode_group_with_inventory(
     let output_root_path = config.video_storage_root().to_path_buf();
     let mut report_paths = BTreeSet::new();
     let mut report_evidence = Vec::<(BilibiliDownloadEntry, ExistingEpisodeEvidence)>::new();
+    let mut legacy_season_scope_recovered_indices = BTreeSet::new();
     let mut attempt = BilibiliGroupAttemptGuard::new(snapshot, progress.clone());
     attempt.send_snapshot();
 
@@ -3307,6 +3308,7 @@ async fn run_bilibili_episode_group_with_inventory(
                     .await
                     {
                         Ok(Some(verified)) => {
+                            legacy_season_scope_recovered_indices.insert(entry.download.index);
                             report_paths.extend(verified.paths);
                             report_evidence.extend(
                                 verified
@@ -3431,6 +3433,7 @@ async fn run_bilibili_episode_group_with_inventory(
                         .await
                         {
                             Ok(Some(verified)) => {
+                                legacy_season_scope_recovered_indices.insert(entry.download.index);
                                 let update = if missing_selection {
                                     BilibiliAttemptUpdate::AlreadyPresent {
                                         media_paths: verified.paths.clone(),
@@ -3605,6 +3608,7 @@ async fn run_bilibili_episode_group_with_inventory(
             .await
             {
                 Ok(Some(verified)) => {
+                    legacy_season_scope_recovered_indices.insert(entry.download.index);
                     let update = if missing_selection {
                         BilibiliAttemptUpdate::AlreadyPresent {
                             media_paths: verified.paths.clone(),
@@ -4031,11 +4035,17 @@ async fn run_bilibili_episode_group_with_inventory(
             .find(|saved| saved.index == entry.download.index)
             .cloned()
             .context("verified Bilibili group entry disappeared before completion")?;
+        let final_collection_output_folder =
+            if legacy_season_scope_recovered_indices.contains(&entry.download.index) {
+                None
+            } else {
+                collection_output_folder
+            };
         match revalidate_group_snapshot_entry(
             &output_root_path,
             &entry.download,
             &saved,
-            collection_output_folder,
+            final_collection_output_folder,
         )
         .await
         {
@@ -10497,21 +10507,21 @@ fn flatten_bilibili_collection_staging_output(
                 Ok((path, name, identity))
             })
             .collect::<Result<Vec<_>>>()?;
+        // The SDK report preserves playback order for segment lists. Directory enumeration does
+        // not, so derive segment and audio-track ordinals from the report before mapping leaves.
         let mut video_media = Vec::new();
         let mut audio_media = Vec::new();
-        for (path, _, _) in &direct_files {
-            if mux_path.as_ref() == Some(path) {
-                video_media.push(path.clone());
-                continue;
-            }
-            match report_file_kinds.get(path).copied() {
-                Some("video" | "flv_segment") => video_media.push(path.clone()),
-                Some("audio") => audio_media.push(path.clone()),
+        for file in &report_entry.files {
+            let path = rooted_bilibili_download_path(root, output_dir, &file.path)?;
+            match file.kind.as_str() {
+                "video" | "flv_segment" => push_unique_path(&mut video_media, path),
+                "audio" => push_unique_path(&mut audio_media, path),
                 _ => {}
             }
         }
-        if mux_path.is_some() {
-            video_media.retain(|path| mux_path.as_ref() == Some(path));
+        if let Some(mux_path) = mux_path.as_ref() {
+            video_media.clear();
+            video_media.push(mux_path.clone());
         }
         let primary_media = if video_media.is_empty() {
             audio_media.clone()
@@ -10524,11 +10534,18 @@ fn flatten_bilibili_collection_staging_output(
                 plan_entry.index
             );
         }
-        let primary_set = primary_media.iter().cloned().collect::<BTreeSet<_>>();
+        let primary_ordinals = primary_media
+            .iter()
+            .enumerate()
+            .map(|(ordinal, path)| (path.clone(), ordinal + 1))
+            .collect::<BTreeMap<_, _>>();
+        let audio_ordinals = audio_media
+            .iter()
+            .enumerate()
+            .map(|(ordinal, path)| (path.clone(), ordinal + 1))
+            .collect::<BTreeMap<_, _>>();
         let mut destination_names = BTreeSet::new();
         let mut pending_moves = Vec::new();
-        let mut primary_ordinal = 0usize;
-        let mut audio_ordinal = 0usize;
         for (source, source_name, identity) in &direct_files {
             let kind = report_file_kinds.get(source).copied();
             let extension = source
@@ -10538,16 +10555,19 @@ fn flatten_bilibili_collection_staging_output(
             let extension = extension
                 .map(|extension| format!(".{extension}"))
                 .unwrap_or_default();
-            let is_primary = primary_set.contains(source);
-            let variant = if is_primary {
-                primary_ordinal += 1;
+            let variant = if let Some(primary_ordinal) = primary_ordinals.get(source) {
                 if primary_media.len() == 1 {
                     String::new()
                 } else {
                     format!(".part-{primary_ordinal:03}")
                 }
             } else if kind == Some("audio") && !video_media.is_empty() {
-                audio_ordinal += 1;
+                let audio_ordinal = audio_ordinals.get(source).with_context(|| {
+                    format!(
+                        "Bilibili output audio file is absent from its report: {}",
+                        source.display()
+                    )
+                })?;
                 if audio_media.len() == 1 {
                     ".audio".to_string()
                 } else {
@@ -24282,6 +24302,136 @@ mod tests {
         assert!(unnamespaced.is_none());
 
         let _ = fs::remove_dir_all(output_root);
+    }
+
+    #[tokio::test]
+    async fn flat_season_v1_replan_completes_from_legacy_attempt_and_task_receipt() {
+        let (config, output_root) = test_group_config("flat-season-v1-replan-recovery");
+        fs::create_dir_all(&output_root).expect("legacy output root should create");
+        let season_folder = "Test season [season-17]";
+        let season_path = output_root.join(season_folder);
+        fs::create_dir(&season_path).expect("new season output folder should create");
+        let rooted_output = RootedFs::new(&output_root).expect("output root should bind");
+        let mut inventory = test_group_inventory(2);
+        inventory.source = BilibiliGroupSource::Season;
+        inventory.pgc_season_id = Some(17);
+        inventory.output_folder = Some(season_folder.to_string());
+        inventory.storage_relative_output_folder = Some(season_folder.to_string());
+        inventory.output_folder_identity = Some(
+            rooted_output
+                .entry_identity(&season_path)
+                .expect("season directory identity should be readable")
+                .expect("season directory should exist"),
+        );
+        inventory.collection_output_layout_version = Some(1);
+        let expected_plan = test_group_validation_snapshot_for_namespace(
+            &inventory,
+            &config,
+            "legacy-season-v1-replan-task",
+        );
+        let media_profile = expected_plan
+            .media_profile
+            .clone()
+            .expect("reviewed plan should include a media profile");
+        let namespace = expected_plan
+            .bilibili_publication_namespace
+            .as_deref()
+            .expect("reviewed plan should include a task namespace");
+
+        let mut previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            inventory.entries.iter().map(|entry| {
+                (
+                    entry.download.index,
+                    entry.download.title.clone(),
+                    Some(entry.stable_media_id.clone()),
+                )
+            }),
+            0,
+        );
+        previous.media_profile = Some(media_profile);
+        previous.bilibili_publication_namespace = Some(namespace.to_string());
+
+        let legacy_attempt_entry = &inventory.entries[0];
+        let legacy_attempt_path =
+            write_group_test_media(&output_root, legacy_attempt_entry.download.index);
+        let legacy_attempt_output = verify_group_output_paths(
+            output_root.clone(),
+            legacy_attempt_entry.download.clone(),
+            vec![legacy_attempt_path.clone()],
+            None,
+        )
+        .await
+        .expect("legacy attempt output should hash");
+        BilibiliAttemptUpdate::Verified {
+            media_paths: legacy_attempt_output.paths,
+            hashes: legacy_attempt_output.hashes,
+        }
+        .apply(&mut previous, legacy_attempt_entry.download.index);
+
+        let legacy_receipt_entry = &inventory.entries[1];
+        let legacy_receipt_path =
+            write_group_test_media(&output_root, legacy_receipt_entry.download.index);
+        let receipt_profile =
+            test_group_entry_receipt_profile(&expected_plan, &legacy_receipt_entry.stable_media_id);
+        persist_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &legacy_receipt_entry.stable_media_id,
+            &receipt_profile,
+            std::slice::from_ref(&legacy_receipt_path),
+            Some(namespace),
+            None,
+        )
+        .expect("same-task legacy receipt should persist");
+        previous.entry_started(legacy_receipt_entry.download.index);
+
+        let execute_count = Arc::new(StdMutex::new(0usize));
+        let executor_counter = Arc::clone(&execute_count);
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |_| {
+            let counter = Arc::clone(&executor_counter);
+            Box::pin(async move {
+                *counter
+                    .lock()
+                    .expect("executor counter should remain healthy") += 1;
+                bail!("exact legacy recovery should avoid a child download")
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+        let (progress, _receiver) = job_progress_channel();
+
+        let report = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            inventory.clone(),
+            Some(previous),
+            Some(expected_plan),
+            Some(progress.clone()),
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect("v1 season replan should complete with exact legacy evidence");
+
+        assert_eq!(
+            report
+                .primary_media_paths
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([legacy_attempt_path, legacy_receipt_path]),
+            "recovered legacy paths should remain in place"
+        );
+        assert_eq!(
+            *execute_count
+                .lock()
+                .expect("executor counter should remain healthy"),
+            0,
+            "verified legacy attempt and namespaced receipt should not redownload"
+        );
+        let saved = progress
+            .bilibili_attempt_snapshot()
+            .expect("completed group should retain its attempt snapshot");
+        assert_eq!(saved.outcome, Some(BilibiliAttemptOutcome::Verified));
+        assert_eq!(saved.verified_entries(), 2);
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
     }
 
     #[test]

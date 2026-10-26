@@ -554,6 +554,328 @@ fn direct_collection_mapper_and_publication_keep_multiple_videos_flat() {
     fs::remove_dir_all(&output_root).expect("isolated fixture root should be removed");
 }
 
+#[test]
+fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publication() {
+    let output_root = temp_root("flat-collection-segment-order");
+    let _cleanup = TestDirectory(output_root.clone());
+    let collection_folder = "Segment Collection";
+    let collection_dir = output_root.join(collection_folder);
+    fs::create_dir_all(&collection_dir).expect("collection output folder should be created");
+    let root = RootedFs::new(&output_root).expect("library root should bind");
+    let collection_identity = root
+        .entry_identity(&collection_dir)
+        .expect("collection identity should be readable")
+        .expect("collection directory should exist");
+    let staging = create_video_staging_dir(&root).expect("private staging should be created");
+    let output_dir = staging.path().to_path_buf();
+    let staged_collection_dir = output_dir.join(collection_folder);
+    fs::create_dir(&staged_collection_dir).expect("staged collection folder should be created");
+    let sdk_entry_dir = staged_collection_dir.join("P003-BV1-Segmented episode");
+    fs::create_dir(&sdk_entry_dir).expect("SDK entry directory should be created");
+
+    // These source names and creation order differ from the report order chosen below.
+    let segment_specs = [
+        ("Part 10.flv", b"playback segment three".as_slice()),
+        ("Part 3.flv", b"playback segment two".as_slice()),
+        ("Part 2.flv", b"playback segment one".as_slice()),
+    ];
+    let created_segment_paths = segment_specs
+        .iter()
+        .map(|(name, bytes)| {
+            let path = sdk_entry_dir.join(name);
+            write_fixture(&path, bytes);
+            path
+        })
+        .collect::<Vec<_>>();
+    let sidecar_specs = [
+        ("danmaku.xml", "danmaku", b"ordered danmaku".as_slice()),
+        (
+            "subtitle-en-US-01-trackhash.srt",
+            "subtitle",
+            b"ordered subtitle".as_slice(),
+        ),
+        (
+            "cover-image-deadbeef.jpg",
+            "cover",
+            b"entry artwork".as_slice(),
+        ),
+    ];
+    let sidecar_paths = sidecar_specs
+        .iter()
+        .map(|(name, _, bytes)| {
+            let path = sdk_entry_dir.join(name);
+            write_fixture(&path, bytes);
+            path
+        })
+        .collect::<Vec<_>>();
+
+    let sdk_entry_identity = root
+        .entry_identity(&sdk_entry_dir)
+        .expect("SDK entry identity should be readable")
+        .expect("SDK entry directory should exist");
+    let sdk_entry = root
+        .bind_entry(&sdk_entry_dir, false)
+        .expect("SDK entry should bind");
+    let directory_segment_order = root
+        .list_bound_directory(&sdk_entry, sdk_entry_identity)
+        .expect("SDK entry children should be listed")
+        .into_iter()
+        .map(|(name, _)| sdk_entry_dir.join(name))
+        .filter(|path| created_segment_paths.contains(path))
+        .collect::<Vec<_>>();
+    let lexical_segment_order = {
+        let mut paths = created_segment_paths.clone();
+        paths.sort();
+        paths
+    };
+    let (part_10, part_3, part_2) = (
+        created_segment_paths[0].clone(),
+        created_segment_paths[1].clone(),
+        created_segment_paths[2].clone(),
+    );
+    let report_order_candidates = vec![
+        vec![part_10.clone(), part_3.clone(), part_2.clone()],
+        vec![part_10.clone(), part_2.clone(), part_3.clone()],
+        vec![part_3.clone(), part_10.clone(), part_2.clone()],
+        vec![part_3.clone(), part_2.clone(), part_10.clone()],
+        vec![part_2.clone(), part_10.clone(), part_3.clone()],
+        vec![part_2.clone(), part_3.clone(), part_10.clone()],
+    ];
+    let report_primary_order = report_order_candidates
+        .into_iter()
+        .find(|order| {
+            order != &directory_segment_order
+                && order != &created_segment_paths
+                && order != &lexical_segment_order
+        })
+        .expect(
+            "three media segments allow an order distinct from enumeration, creation, and names",
+        );
+    assert_ne!(report_primary_order, directory_segment_order);
+    assert_ne!(report_primary_order, created_segment_paths);
+    assert_ne!(report_primary_order, lexical_segment_order);
+
+    let download_entry = BilibiliDownloadEntry {
+        index: 2,
+        aid: 999,
+        bvid: Some("BV1".to_string()),
+        cid: 456,
+        epid: None,
+        title: "Segmented episode".to_string(),
+        ..BilibiliDownloadEntry::default()
+    };
+    let plan = BilibiliDownloadPlan {
+        title: "Segment Collection".to_string(),
+        entries: vec![download_entry],
+    };
+    let mut report_files = report_primary_order
+        .iter()
+        .map(|path| BilibiliDownloadedFile {
+            kind: "flv_segment".to_string(),
+            path: path.clone(),
+        })
+        .collect::<Vec<_>>();
+    report_files.extend(
+        sidecar_specs
+            .iter()
+            .zip(&sidecar_paths)
+            .map(|((_, kind, _), path)| BilibiliDownloadedFile {
+                kind: (*kind).to_string(),
+                path: path.clone(),
+            }),
+    );
+    let mut report = BilibiliDownloadReport {
+        title: "Segment Collection".to_string(),
+        output_dir: output_dir.clone(),
+        entries: vec![BilibiliEntryDownloadReport {
+            index: 2,
+            title: "Segmented episode".to_string(),
+            files: report_files,
+            mux: None,
+        }],
+    };
+
+    let nfos = write_bilibili_nfos(
+        &output_dir,
+        "https://www.bilibili.com/video/BV1",
+        &plan,
+        &report,
+    )
+    .expect("the real Bilibili NFO writer should handle the first reported segment");
+    assert_eq!(nfos, vec![report_primary_order[0].with_extension("nfo")]);
+    let nfo_bytes = fs::read(&nfos[0]).expect("generated NFO should be readable");
+    let nfo_text = std::str::from_utf8(&nfo_bytes).expect("generated NFO should be UTF-8");
+    assert!(nfo_text.contains("<uniqueid type=\"bilibili\" default=\"true\">BV1</uniqueid>"));
+    assert!(nfo_text.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
+    let directory_segment_order_after_nfo = root
+        .list_bound_directory(&sdk_entry, sdk_entry_identity)
+        .expect("SDK entry children should remain listable after writing its NFO")
+        .into_iter()
+        .map(|(name, _)| sdk_entry_dir.join(name))
+        .filter(|path| created_segment_paths.contains(path))
+        .collect::<Vec<_>>();
+    assert_ne!(
+        report_primary_order, directory_segment_order_after_nfo,
+        "the fixture must keep report playback order distinct from filesystem enumeration"
+    );
+
+    let stable_media_id = bilibili_plan_stable_media_id(Some("BV1"), 999, 456, None);
+    let expected_entry = BilibiliWorkerExpectedEntry {
+        index: 2,
+        part_index: 3,
+        title: "Segmented episode".to_string(),
+        stable_media_id: stable_media_id.clone(),
+        bilibili_publication_namespace: Some(TEST_PUBLICATION_NAMESPACE.to_string()),
+        output_template: Some(collection_folder.to_string()),
+        collection_output_folder: Some(collection_folder.to_string()),
+        collection_output_layout_version: Some(1),
+        collection_directory: BilibiliCollectionDirectorySnapshot::Existing {
+            path: collection_folder.to_string(),
+            device: collection_identity.device(),
+            inode: collection_identity.inode(),
+            is_directory: collection_identity.is_dir(),
+        },
+        confirmed_streams: None,
+    };
+    let remapped = flatten_bilibili_collection_staging_output(
+        &root,
+        &output_dir,
+        &plan,
+        &mut report,
+        Some(&expected_entry),
+    )
+    .expect("the production mapper should flatten all reported segments and sidecars");
+    assert_eq!(remapped.len(), report.entries[0].files.len() + 1);
+
+    let flat_stem = bilibili_collection_flat_stem(
+        expected_entry.index,
+        expected_entry.part_index,
+        &expected_entry.stable_media_id,
+        &expected_entry.title,
+    )
+    .expect("fixture identity should fit the collection filename bound");
+    let mut ordered_flat_segments = Vec::new();
+    for (ordinal, source) in report_primary_order.iter().enumerate() {
+        let destination = remapped
+            .get(source)
+            .expect("every report-listed segment should be remapped");
+        let expected_file_name = format!("{flat_stem}.part-{:03}.flv", ordinal + 1);
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some(expected_file_name.as_str()),
+            "part suffixes must follow report playback order"
+        );
+        assert_eq!(destination.parent(), Some(staged_collection_dir.as_path()));
+        let expected_bytes = segment_specs
+            .iter()
+            .find(|(name, _)| sdk_entry_dir.join(name) == *source)
+            .map(|(_, bytes)| bytes.to_vec())
+            .expect("reported segment should have a fixture byte payload");
+        assert_eq!(fs::read(destination).unwrap(), expected_bytes);
+        ordered_flat_segments.push(destination.clone());
+    }
+    let report_segment_paths = report.entries[0]
+        .files
+        .iter()
+        .filter(|file| file.kind == "flv_segment")
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(report_segment_paths, ordered_flat_segments);
+
+    let flat_nfo = staged_collection_dir.join(format!("{flat_stem}.nfo"));
+    assert_eq!(remapped.get(&nfos[0]), Some(&flat_nfo));
+    assert_eq!(fs::read(&flat_nfo).unwrap(), nfo_bytes);
+    let expected_sidecars = sidecar_specs
+        .iter()
+        .zip(&sidecar_paths)
+        .map(|((name, _, bytes), source)| {
+            let extension = Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap();
+            let target = match *name {
+                "danmaku.xml" => {
+                    staged_collection_dir.join(format!("{flat_stem}.danmaku.{extension}"))
+                }
+                "subtitle-en-US-01-trackhash.srt" => staged_collection_dir
+                    .join(format!("{flat_stem}.en-US-01-trackhash.{extension}")),
+                "cover-image-deadbeef.jpg" => {
+                    staged_collection_dir.join(format!("{flat_stem}.cover-deadbeef.{extension}"))
+                }
+                _ => unreachable!("fixture sidecar was listed above"),
+            };
+            assert_eq!(remapped.get(source), Some(&target));
+            assert_eq!(target.parent(), Some(staged_collection_dir.as_path()));
+            assert_eq!(fs::read(&target).unwrap(), bytes.to_vec());
+            (target, bytes.to_vec())
+        })
+        .collect::<Vec<_>>();
+
+    let staged_files = remapped.values().cloned().collect::<Vec<_>>();
+    let duplicate = VideoDuplicate {
+        identity: VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: stable_media_id,
+        },
+        existing_videos: Vec::new(),
+        skip_summary: None,
+        overwrite_confirmation: None,
+    };
+    let publication = move_staged_video_files_with_root_and_sources(
+        MoveExecutionContext {
+            root: &root,
+            staging: Some(&staging),
+            bilibili_group_receipt: None,
+        },
+        &output_dir,
+        &output_root,
+        &staged_files,
+        VideoDuplicateAction::KeepBoth,
+        &duplicate,
+        StagedPrimaryMediaKind::Video,
+    )
+    .expect("the real staged publication path should publish all ordered segments and sidecars");
+    let expected_published_segments = ordered_flat_segments
+        .iter()
+        .map(|path| collection_dir.join(path.file_name().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        publication
+            .primary_destinations
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_published_segments
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    );
+    for (segment_source, destination) in report_primary_order
+        .iter()
+        .zip(&expected_published_segments)
+    {
+        assert_eq!(destination.parent(), Some(collection_dir.as_path()));
+        let expected_bytes = segment_specs
+            .iter()
+            .find(|(name, _)| sdk_entry_dir.join(name) == *segment_source)
+            .map(|(_, bytes)| bytes.to_vec())
+            .expect("published segment should have a fixture byte payload");
+        assert_eq!(fs::read(destination).unwrap(), expected_bytes);
+    }
+    let expected_published_nfo = collection_dir.join(format!("{flat_stem}.nfo"));
+    assert_eq!(fs::read(expected_published_nfo).unwrap(), nfo_bytes);
+    for (sidecar, expected_bytes) in expected_sidecars {
+        let destination = collection_dir.join(sidecar.file_name().unwrap());
+        assert_eq!(destination.parent(), Some(collection_dir.as_path()));
+        assert_eq!(fs::read(destination).unwrap(), expected_bytes);
+    }
+
+    staging
+        .finish()
+        .expect("published staging tree should be removed");
+    fs::remove_dir_all(&output_root).expect("isolated fixture root should be removed");
+}
+
 fn flat_test_group_entry(index: u32, bvid: &str, cid: u64, title: &str) -> BilibiliGroupEntry {
     let download = BilibiliDownloadEntry {
         index,
