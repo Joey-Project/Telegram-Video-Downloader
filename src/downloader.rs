@@ -10539,6 +10539,11 @@ fn flatten_bilibili_collection_staging_output(
             .enumerate()
             .map(|(ordinal, path)| (path.clone(), ordinal + 1))
             .collect::<BTreeMap<_, _>>();
+        let sidecar_stem = if primary_media.len() > 1 {
+            format!("{stem}.part-001")
+        } else {
+            stem.clone()
+        };
         let audio_ordinals = audio_media
             .iter()
             .enumerate()
@@ -10555,11 +10560,11 @@ fn flatten_bilibili_collection_staging_output(
             let extension = extension
                 .map(|extension| format!(".{extension}"))
                 .unwrap_or_default();
-            let variant = if let Some(primary_ordinal) = primary_ordinals.get(source) {
+            let (leaf_stem, variant) = if let Some(primary_ordinal) = primary_ordinals.get(source) {
                 if primary_media.len() == 1 {
-                    String::new()
+                    (stem.as_str(), String::new())
                 } else {
-                    format!(".part-{primary_ordinal:03}")
+                    (stem.as_str(), format!(".part-{primary_ordinal:03}"))
                 }
             } else if kind == Some("audio") && !video_media.is_empty() {
                 let audio_ordinal = audio_ordinals.get(source).with_context(|| {
@@ -10569,14 +10574,17 @@ fn flatten_bilibili_collection_staging_output(
                     )
                 })?;
                 if audio_media.len() == 1 {
-                    ".audio".to_string()
+                    (sidecar_stem.as_str(), ".audio".to_string())
                 } else {
-                    format!(".audio-{audio_ordinal:03}")
+                    (sidecar_stem.as_str(), format!(".audio-{audio_ordinal:03}"))
                 }
             } else {
-                bilibili_collection_sidecar_suffix(kind, source_name, &extension)
+                (
+                    sidecar_stem.as_str(),
+                    bilibili_collection_sidecar_suffix(kind, source_name, &extension),
+                )
             };
-            let leaf = bilibili_collection_flat_leaf(&stem, &variant, &extension)?;
+            let leaf = bilibili_collection_flat_leaf(leaf_stem, &variant, &extension)?;
             if !destination_names.insert(leaf.clone()) {
                 bail!("Bilibili collection sidecars map to a duplicate flat filename: {leaf}");
             }

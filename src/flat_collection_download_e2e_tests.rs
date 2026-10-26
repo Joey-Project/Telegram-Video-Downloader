@@ -1,6 +1,8 @@
 //! End-to-end tests for flattened collection staging and publication.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -554,13 +556,25 @@ fn direct_collection_mapper_and_publication_keep_multiple_videos_flat() {
     fs::remove_dir_all(&output_root).expect("isolated fixture root should be removed");
 }
 
-#[test]
-fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publication() {
+#[cfg(unix)]
+#[tokio::test]
+async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publication_and_missing_scan()
+ {
     let output_root = temp_root("flat-collection-segment-order");
     let _cleanup = TestDirectory(output_root.clone());
     let collection_folder = "Segment Collection";
     let collection_dir = output_root.join(collection_folder);
     fs::create_dir_all(&collection_dir).expect("collection output folder should be created");
+    let stable_media_id = bilibili_plan_stable_media_id(Some("BV1"), 999, 456, None);
+    let flat_stem = bilibili_collection_flat_stem(2, 3, &stable_media_id, "Segmented episode")
+        .expect("fixture identity should fit the collection filename bound");
+    let preexisting_first_segment = collection_dir.join(format!("{flat_stem}.part-001.flv"));
+    let preexisting_first_nfo = collection_dir.join(format!("{flat_stem}.part-001.nfo"));
+    write_fixture(&preexisting_first_segment, b"old conflicting segment");
+    write_fixture(
+        &preexisting_first_nfo,
+        b"<movie><uniqueid type=\"bilibili-cid\">cid999</uniqueid></movie>",
+    );
     let root = RootedFs::new(&output_root).expect("library root should bind");
     let collection_identity = root
         .entry_identity(&collection_dir)
@@ -719,7 +733,6 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
         "the fixture must keep report playback order distinct from filesystem enumeration"
     );
 
-    let stable_media_id = bilibili_plan_stable_media_id(Some("BV1"), 999, 456, None);
     let expected_entry = BilibiliWorkerExpectedEntry {
         index: 2,
         part_index: 3,
@@ -747,13 +760,6 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
     .expect("the production mapper should flatten all reported segments and sidecars");
     assert_eq!(remapped.len(), report.entries[0].files.len() + 1);
 
-    let flat_stem = bilibili_collection_flat_stem(
-        expected_entry.index,
-        expected_entry.part_index,
-        &expected_entry.stable_media_id,
-        &expected_entry.title,
-    )
-    .expect("fixture identity should fit the collection filename bound");
     let mut ordered_flat_segments = Vec::new();
     for (ordinal, source) in report_primary_order.iter().enumerate() {
         let destination = remapped
@@ -782,7 +788,8 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
         .collect::<Vec<_>>();
     assert_eq!(report_segment_paths, ordered_flat_segments);
 
-    let flat_nfo = staged_collection_dir.join(format!("{flat_stem}.nfo"));
+    let flat_first_segment_stem = format!("{flat_stem}.part-001");
+    let flat_nfo = staged_collection_dir.join(format!("{flat_first_segment_stem}.nfo"));
     assert_eq!(remapped.get(&nfos[0]), Some(&flat_nfo));
     assert_eq!(fs::read(&flat_nfo).unwrap(), nfo_bytes);
     let expected_sidecars = sidecar_specs
@@ -794,14 +801,14 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
                 .and_then(|ext| ext.to_str())
                 .unwrap();
             let target = match *name {
-                "danmaku.xml" => {
-                    staged_collection_dir.join(format!("{flat_stem}.danmaku.{extension}"))
-                }
-                "subtitle-en-US-01-trackhash.srt" => staged_collection_dir
-                    .join(format!("{flat_stem}.en-US-01-trackhash.{extension}")),
-                "cover-image-deadbeef.jpg" => {
-                    staged_collection_dir.join(format!("{flat_stem}.cover-deadbeef.{extension}"))
-                }
+                "danmaku.xml" => staged_collection_dir
+                    .join(format!("{flat_first_segment_stem}.danmaku.{extension}")),
+                "subtitle-en-US-01-trackhash.srt" => staged_collection_dir.join(format!(
+                    "{flat_first_segment_stem}.en-US-01-trackhash.{extension}"
+                )),
+                "cover-image-deadbeef.jpg" => staged_collection_dir.join(format!(
+                    "{flat_first_segment_stem}.cover-deadbeef.{extension}"
+                )),
                 _ => unreachable!("fixture sidecar was listed above"),
             };
             assert_eq!(remapped.get(source), Some(&target));
@@ -825,7 +832,11 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
         MoveExecutionContext {
             root: &root,
             staging: Some(&staging),
-            bilibili_group_receipt: None,
+            bilibili_group_receipt: Some(BilibiliGroupReceiptWriteContext {
+                expected_entry: &expected_entry,
+                media_profile: TEST_MEDIA_PROFILE,
+                progress: None,
+            }),
         },
         &output_dir,
         &output_root,
@@ -835,10 +846,11 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
         StagedPrimaryMediaKind::Video,
     )
     .expect("the real staged publication path should publish all ordered segments and sidecars");
-    let expected_published_segments = ordered_flat_segments
-        .iter()
-        .map(|path| collection_dir.join(path.file_name().unwrap()))
-        .collect::<Vec<_>>();
+    let expected_published_segments = vec![
+        collection_dir.join(format!("{flat_stem}.part-001 (2).flv")),
+        collection_dir.join(format!("{flat_stem}.part-002.flv")),
+        collection_dir.join(format!("{flat_stem}.part-003.flv")),
+    ];
     assert_eq!(
         publication
             .primary_destinations
@@ -862,13 +874,186 @@ fn sdk_unmuxed_segments_keep_report_order_and_shared_sidecars_through_publicatio
             .expect("published segment should have a fixture byte payload");
         assert_eq!(fs::read(destination).unwrap(), expected_bytes);
     }
-    let expected_published_nfo = collection_dir.join(format!("{flat_stem}.nfo"));
+    let published_first_segment_stem = format!("{flat_stem}.part-001 (2)");
+    let expected_published_nfo = collection_dir.join(format!("{published_first_segment_stem}.nfo"));
     assert_eq!(fs::read(expected_published_nfo).unwrap(), nfo_bytes);
     for (sidecar, expected_bytes) in expected_sidecars {
-        let destination = collection_dir.join(sidecar.file_name().unwrap());
+        let sidecar_name = sidecar.file_name().and_then(|name| name.to_str()).unwrap();
+        let sidecar_variant = sidecar_name
+            .strip_prefix(&flat_first_segment_stem)
+            .expect("mapper sidecar should use the complete first-segment stem");
+        let destination =
+            collection_dir.join(format!("{published_first_segment_stem}{sidecar_variant}"));
         assert_eq!(destination.parent(), Some(collection_dir.as_path()));
         assert_eq!(fs::read(destination).unwrap(), expected_bytes);
     }
+
+    assert_eq!(
+        fs::read(&preexisting_first_segment).unwrap(),
+        b"old conflicting segment",
+        "KeepBoth must preserve the pre-existing conflicting primary"
+    );
+    assert_eq!(
+        fs::read(&preexisting_first_nfo).unwrap(),
+        b"<movie><uniqueid type=\"bilibili-cid\">cid999</uniqueid></movie>",
+        "KeepBoth must preserve the pre-existing unrelated identity NFO"
+    );
+    assert!(
+        publication.bilibili_group_receipt.as_ref().is_some(),
+        "multi-segment publication should persist its recovery receipt"
+    );
+    let receipt = match load_bilibili_group_publication_receipt_blocking(
+        &output_root,
+        &expected_entry.stable_media_id,
+        TEST_MEDIA_PROFILE,
+        Some(TEST_PUBLICATION_NAMESPACE),
+        Some(collection_folder),
+    )
+    .expect("published group receipt should reload from durable storage")
+    {
+        BilibiliGroupReceiptLookup::Found(receipt) => receipt,
+        BilibiliGroupReceiptLookup::Missing => {
+            panic!("expected a durable multi-segment publication receipt, but none was saved")
+        }
+        BilibiliGroupReceiptLookup::ProfileMismatch => {
+            panic!("expected a durable multi-segment receipt with the test profile")
+        }
+    };
+    verify_bilibili_group_publication_plan_receipt_blocking(
+        &output_root,
+        &receipt,
+        &expected_published_segments,
+        Some(TEST_PUBLICATION_NAMESPACE),
+        Some(collection_folder),
+    )
+    .expect("the receipt should verify every published primary segment");
+
+    let tool_dir = output_root.join("test-tools");
+    fs::create_dir(&tool_dir).expect("task-local tool directory should be created");
+    let ffprobe = tool_dir.join("ffprobe");
+    write_fixture(&ffprobe, b"#!/bin/sh\nprintf 'video\\naudio\\n'\n");
+    let mut ffprobe_permissions = fs::metadata(&ffprobe)
+        .expect("task-local ffprobe fixture should be readable")
+        .permissions();
+    ffprobe_permissions.set_mode(0o755);
+    fs::set_permissions(&ffprobe, ffprobe_permissions)
+        .expect("task-local ffprobe fixture should be executable");
+    let mut config =
+        AppConfig::load(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml"))
+            .expect("example config should parse");
+    config.downloads.video_dir = output_root.clone();
+    config.set_video_storage_root(output_root.clone());
+    config.tools.ffmpeg = tool_dir.join("ffmpeg");
+    config.bilibili.auth.state_path = output_root.join("test-auth-state.json");
+
+    let group_entry = flat_test_group_entry(2, "BV1", 456, "Segmented episode");
+    let inventory = BilibiliEpisodeGroupInventory {
+        title: "Segment Collection".to_string(),
+        source: BilibiliGroupSource::Collection,
+        pgc_season_id: None,
+        entries: vec![group_entry.clone()],
+        output_template: Some(collection_folder.to_string()),
+        output_folder: Some(collection_folder.to_string()),
+        storage_relative_output_folder: Some(collection_folder.to_string()),
+        output_folder_identity: Some(collection_identity),
+        collection_output_layout_version: Some(1),
+    };
+    // Missing follows the identity NFO attached to the first segment. The durable receipt above
+    // independently verifies that all three segment files published under the same entry.
+    let identity_index =
+        build_bilibili_group_identity_index(&config, &inventory, DownloadMode::All)
+            .await
+            .expect("collection identity inventory should scan the published output");
+    let canonical_published_first_segment = fs::canonicalize(&expected_published_segments[0])
+        .expect("published first segment should have a canonical path");
+    let canonical_preexisting_first_segment = fs::canonicalize(&preexisting_first_segment)
+        .expect("pre-existing first segment should have a canonical path");
+    {
+        let index = identity_index.lock().await;
+        let matching_paths = index.metadata_videos(&bilibili_collection_cid_identity(456));
+        let canonical_matching_paths = matching_paths
+            .iter()
+            .map(|path| {
+                fs::canonicalize(path).unwrap_or_else(|error| {
+                    panic!(
+                        "indexed media path {} should resolve: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical_matching_paths,
+            vec![canonical_published_first_segment.clone()],
+            "only the new KeepBoth first segment should carry the requested CID identity"
+        );
+        assert!(!canonical_matching_paths.contains(&canonical_preexisting_first_segment));
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &group_entry.download
+        ));
+    }
+
+    let scanner_index = Arc::clone(&identity_index);
+    let scanner_config = config.clone();
+    let scanner_ffprobe = ffprobe_program(&config.tools.ffmpeg);
+    let scanner: BilibiliGroupExistingMediaScanner = Arc::new(move |entry| {
+        let index = Arc::clone(&scanner_index);
+        let config = scanner_config.clone();
+        let ffprobe = scanner_ffprobe.clone();
+        Box::pin(async move {
+            bilibili_plan_entry_compatible_existing_media_from_shared_index(
+                &config,
+                index,
+                &entry.download,
+                DownloadMode::All,
+                &ffprobe,
+            )
+            .await
+        })
+    });
+    let executor: BilibiliGroupEntryExecutor = Arc::new(|_| {
+        Box::pin(async {
+            bail!("Missing should reuse the CID-matched first segment without executing")
+        })
+    });
+    let hooks = BilibiliGroupExecutionHooks {
+        execute_entry: executor,
+        find_existing_media: scanner,
+        record_published_evidence: Arc::new(|_| Box::pin(async { Ok(()) })),
+        wait_before_retry: Arc::new(|_, _, _, _, _| Box::pin(async {})),
+    };
+    let missing_report = run_bilibili_episode_group_with_inventory(
+        &config,
+        &JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV1".to_string(),
+            selection: Some(BilibiliSelection::Missing),
+        },
+        inventory,
+        None,
+        None,
+        None,
+        hooks,
+    )
+    .await
+    .expect("Missing should recognize the newly published CID NFO through its first segment");
+    let canonical_missing_paths = missing_report
+        .primary_media_paths
+        .iter()
+        .map(|path| {
+            fs::canonicalize(path).unwrap_or_else(|error| {
+                panic!(
+                    "Missing media path {} should resolve: {error}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        canonical_missing_paths,
+        vec![canonical_published_first_segment],
+        "Missing inventory associates the entry identity with its designated first segment"
+    );
 
     staging
         .finish()

@@ -55,6 +55,13 @@ superseded_by: ""
   recovered from that exact evidence.
 - Unmuxed video segments and audio tracks take their ordinals from the ordered
   SDK report, preserving playback order independently of directory enumeration.
+  Shared entry sidecars follow the first primary segment's complete stem so the
+  existing publication and identity index can keep their association.
+- Collision handling remains per primary and its sidecars; partially occupied
+  segment sets may have different KeepBoth suffixes. Generic Missing discovery
+  recognizes the NFO-attached first segment as an existing candidate. Same-task
+  publication receipts, rather than that candidate scan, validate the full set
+  of published primary files.
 - Unsupported layout versions fail explicitly. Logical and canonical macOS root
   spellings are resolved against the captured root, retaining rooted containment
   and identity validation.
@@ -92,8 +99,10 @@ superseded_by: ""
   videos, a multi-part child, coherent sidecar KeepBoth names, partial conflicts,
   group sequencing and explicit durable receipt verification. Regression cases
   also exercise complete legacy-season recovery and ordered unmuxed segment
-  publication with shared sidecars. These use mocked SDK outcomes and local
-  files rather than a live upstream media download.
+  publication with shared sidecars, unrelated-identity KeepBoth conflicts,
+  full-set receipt verification and first-segment Missing discovery through the
+  real identity index. These use mocked SDK outcomes and local files rather than
+  a live upstream media download.
 - Cloud validation passes typechecking, 362 backend tests, 82 mounted UI tests
   and the Wrangler dry-run. The unchanged-snapshot storage test compares stable
   stored rows instead of nondeterministic query timing metadata; its write-budget
