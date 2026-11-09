@@ -229,6 +229,31 @@ const ownerSnapshot = {
   previews: [],
 };
 
+function ownerSnapshotWithSourceItems(
+  items: Array<Record<string, unknown>>,
+  { mediaCount = items.length, revision = "source-moved-view" }: { mediaCount?: number; revision?: string } = {},
+) {
+  const omittedCount = Math.max(0, mediaCount - items.length);
+  const sourceLibrary = {
+    ...sourceSnapshot,
+    revision,
+    items,
+    categories: ["History"],
+    warnings: omittedCount > 0
+      ? [`Cloud snapshot omitted ${omittedCount} library item(s) from the complete source view to fit the upload budget.`]
+      : [],
+  };
+  return {
+    ...ownerSnapshot,
+    library: {
+      ...sourceLibrary,
+      libraries: ownerSnapshot.library.libraries.map((entry) => entry.id === SOURCE_LIBRARY_ID
+        ? { ...entry, media_count: mediaCount }
+        : entry),
+    },
+  };
+}
+
 function element<T extends Element>(selector: string): T {
   const found = document.querySelector<T>(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
@@ -243,6 +268,67 @@ function setInputValue(selector: string, value: string) {
   const input = element<HTMLElement>(selector) as HTMLElement & { value: string };
   input.value = value;
   input.dispatchEvent(new Event(selector === "#search-input" ? "input" : "change", { bubbles: true }));
+}
+
+async function mountLibraryApp(snapshot: Record<string, unknown>) {
+  vi.useFakeTimers();
+  window.history.replaceState(null, "", "/file/");
+  vi.stubGlobal("crypto", webcrypto);
+  const { manifest, chunks } = await makeChunkedSnapshot(snapshot);
+  const sockets = installMockWebSocket();
+
+  const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
+  const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+  expect(body).toBeDefined();
+  document.body.innerHTML = body!;
+
+  Object.defineProperty(window, "Telegram", {
+    configurable: true,
+    value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+  });
+  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    value: vi.fn(() => ({ matches: true })),
+  });
+  const storage = new Map<string, string>();
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => { storage.set(key, String(value)); },
+    removeItem: (key: string) => { storage.delete(key); },
+    clear: () => { storage.clear(); },
+  });
+
+  const responseChunks = new Map(chunks);
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === "/api/updates/session") {
+      expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+      expect(init?.method).toBe("POST");
+      return { ok: true, status: 200, json: async () => updateSession() } as Response;
+    }
+    if (String(input) === "/api/state") {
+      expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+      expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
+      return { ok: true, status: 200, json: async () => manifest } as Response;
+    }
+    const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+    if (chunkPath) {
+      expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+      const sha256 = chunkPath[1]!;
+      return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
+    }
+    throw new Error(`Unexpected request ${String(input)}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  window.fetch = fetchMock as typeof window.fetch;
+
+  vi.resetModules();
+  // The browser entry has no declarations because it is executed for its side effects.
+  // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
+  await import("../public/file/app.js");
+  await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+  return { sockets, fetchMock };
 }
 
 function expectReasonLinked(row: HTMLElement) {
@@ -275,61 +361,16 @@ afterEach(async () => {
 });
 
 describe("mobile library selection and moved history", () => {
-  it("explains skipped rows, honors the selection limit, keeps ordinary missing items, and opens a moved target", async () => {
-    vi.useFakeTimers();
-    vi.stubGlobal("crypto", webcrypto);
-    const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
-    const sockets = installMockWebSocket();
-
-    const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
-    const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
-    expect(body).toBeDefined();
-    document.body.innerHTML = body!;
-
-    Object.defineProperty(window, "Telegram", {
-      configurable: true,
-      value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
-    });
-    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 390 });
-    Object.defineProperty(window, "matchMedia", {
-      configurable: true,
-      value: vi.fn(() => ({ matches: true })),
-    });
-    vi.stubGlobal("localStorage", window.localStorage);
-
-    const responseChunks = new Map(chunks);
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === "/api/updates/session") {
-        expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
-        expect(init?.method).toBe("POST");
-        return { ok: true, status: 200, json: async () => updateSession() } as Response;
-      }
-      if (String(input) === "/api/state") {
-        expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
-        expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
-        return { ok: true, status: 200, json: async () => manifest } as Response;
-      }
-      const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
-      if (chunkPath) {
-        expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
-        const sha256 = chunkPath[1]!;
-        return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
-      }
-      throw new Error(`Unexpected request ${String(input)}`);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    window.fetch = fetchMock as typeof window.fetch;
-
-    // The browser entry has no declarations because it is executed for its side effects.
-    // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
-    await import("../public/file/app.js");
-    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+  it("explains skipped rows, keeps ordinary missing items, and opens a moved target", async () => {
+    const { sockets } = await mountLibraryApp(ownerSnapshot);
     expect(sockets).toHaveLength(1);
     expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(SOURCE_LIBRARY_ID);
+    expect(element<HTMLElement>("#library-count").textContent).toBe("105");
+    expect(element<HTMLElement>("#library-summary").textContent).toContain("105 current entries");
+    expect(element<HTMLElement>("#library-summary").textContent).toContain("1 moved entry in history");
+    expect(element<HTMLOptionElement>('#status-filter option[value="moved"]').textContent).toBe("Moved history (1)");
 
-    // The first two pages contain the 100 selectable batch rows. The last batch row and the
-    // mixed-status present row remain visible on page three and are skipped at the cap.
+    // Selection survives pagination, and rows that are not present never enter the selection.
     click("#select-visible");
     expect(element<HTMLElement>("#selection-count").textContent).toBe("50 items selected");
     click('button[data-library-page="library"][data-page-direction="1"]');
@@ -337,30 +378,17 @@ describe("mobile library selection and moved history", () => {
     expect(element<HTMLElement>("#selection-count").textContent).toBe("100 items selected");
     click('button[data-library-page="library"][data-page-direction="1"]');
     click("#select-visible");
-    expect(element<HTMLElement>("#selection-count").textContent).toBe("100 items selected");
-    expect(element<HTMLElement>("#toast").textContent).toContain("Only 100 items can be selected");
-    expect(element<HTMLElement>("#toast").textContent).toContain("2 more were left unselected");
-
-    const cappedHistoryGroup = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-group]")]
-      .find((checkbox) => checkbox.closest("summary")?.textContent?.includes("History"));
-    expect(cappedHistoryGroup).toBeDefined();
-    cappedHistoryGroup!.click();
-    expect(element<HTMLElement>("#selection-count").textContent).toBe("100 items selected");
-    expect(element<HTMLElement>(".group-selection-cap-note").textContent).toContain("1 additional present item");
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("102 items selected");
 
     click("#clear-selection");
     expect(element<HTMLElement>("#selection-count").textContent).toBe("0 items selected");
     expect(document.querySelector(".group-selection-cap-note")).toBeNull();
     setInputValue("#search-input", "History");
-    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(5);
-    const movedRow = element<HTMLElement>('#library-list [data-item-row="source-moved-item"]');
-    const movedLink = element<HTMLElement>('[data-open-moved-target][data-source-item-id="source-moved-item"]');
-    expect(movedRow.querySelector(".moved-target")?.textContent).toContain("Moved to Archive");
-    expect(movedLink.dataset.targetLibraryId).toBe(TARGET_LIBRARY_ID);
-    expect(movedLink.dataset.targetItemId).toBe("archive-moved-item");
+    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(4);
+    expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
+    expect(document.querySelector('#library-list [data-item-row="ordinary-missing-item"]')).not.toBeNull();
 
     for (const itemId of [
-      "source-moved-item",
       "ordinary-missing-item",
       "history-unavailable-item",
       "history-unknown-item",
@@ -373,7 +401,7 @@ describe("mobile library selection and moved history", () => {
     const groupCount = historyGroup!.closest("summary")?.querySelector<HTMLElement>(".group-selection-count");
     expect(groupCount?.textContent).toMatch(/0[^0-9]*selected/iu);
     expect(groupCount?.textContent).toMatch(/1[^0-9]*selectable/iu);
-    expect(groupCount?.textContent).toMatch(/4[^0-9]*skipped/iu);
+    expect(groupCount?.textContent).toMatch(/3[^0-9]*skipped/iu);
     historyGroup!.click();
     expect(element<HTMLElement>("#selection-count").textContent).toBe("1 item selected");
     const selectedHistoryIds = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-item]:checked")]
@@ -383,8 +411,19 @@ describe("mobile library selection and moved history", () => {
       .find((count) => count.closest("summary")?.textContent?.includes("History"));
     expect(updatedGroupCount?.textContent).toMatch(/1[^0-9]*selected/iu);
     expect(updatedGroupCount?.textContent).toMatch(/1[^0-9]*selectable/iu);
-    expect(updatedGroupCount?.textContent).toMatch(/4[^0-9]*skipped/iu);
+    expect(updatedGroupCount?.textContent).toMatch(/3[^0-9]*skipped/iu);
 
+    setInputValue("#status-filter", "moved");
+    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(1);
+    const movedRow = element<HTMLElement>('#library-list [data-item-row="source-moved-item"]');
+    const movedLink = element<HTMLElement>('[data-open-moved-target][data-source-item-id="source-moved-item"]');
+    expect(movedRow.querySelector(".moved-target")?.textContent).toContain("Moved to Archive");
+    expect(movedLink.dataset.targetLibraryId).toBe(TARGET_LIBRARY_ID);
+    expect(movedLink.dataset.targetItemId).toBe("archive-moved-item");
+    expectReasonLinked(movedRow);
+    expect(element<HTMLElement>("#selection-actions").classList.contains("hidden")).toBe(true);
+
+    setInputValue("#status-filter", "");
     click('[data-view="needs"]');
     expect(document.querySelector('#needs-list [data-item-row="source-moved-item"]')).toBeNull();
     expect(document.querySelector('#needs-list [data-item-row="ordinary-missing-item"]')).not.toBeNull();
@@ -392,7 +431,7 @@ describe("mobile library selection and moved history", () => {
     click('[data-view="library"]');
     setInputValue("#search-input", "History moved source");
     setInputValue("#category-filter", "History");
-    setInputValue("#status-filter", "missing");
+    setInputValue("#status-filter", "moved");
     click('[data-open-moved-target][data-source-item-id="source-moved-item"]');
     expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(TARGET_LIBRARY_ID);
     expect(element<HTMLInputElement>("#search-input").value).toBe("");
@@ -401,5 +440,40 @@ describe("mobile library selection and moved history", () => {
     expect(element<HTMLElement>('#library-list [data-item-row="archive-moved-item"]')).not.toBeNull();
     expect(element<HTMLElement>(".detail-sheet").getAttribute("aria-label")).toBe("File details");
     expect(element<HTMLElement>(".detail-sheet h2").textContent).toBe("History moved in Archive");
+  });
+
+  it("shows an empty current view when every retained source row has moved and exposes moved history", async () => {
+    await mountLibraryApp(ownerSnapshotWithSourceItems([movedSource], { revision: "all-moved-source" }));
+
+    expect(element<HTMLElement>("#library-count").textContent).toBe("0");
+    expect(element<HTMLElement>("#library-empty").classList.contains("hidden")).toBe(false);
+    expect(element<HTMLElement>("#library-empty h2").textContent).toBe("No current or unresolved rows in the retained view");
+    expect(element<HTMLElement>("#library-empty p").textContent).toContain("1 verified moved entry is hidden from the default view");
+    expect(element<HTMLElement>("#library-empty p").textContent).toContain("Choose “Moved history” in File status to review them.");
+    expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
+    expect(element<HTMLOptionElement>('#status-filter option[value="moved"]').textContent).toBe("Moved history (1)");
+
+    setInputValue("#status-filter", "moved");
+    expect(element<HTMLElement>('#library-list [data-item-row="source-moved-item"]')).not.toBeNull();
+    expect(element<HTMLElement>("#library-empty").classList.contains("hidden")).toBe(true);
+  });
+
+  it("keeps omitted snapshot rows unclassified while showing moved history", async () => {
+    await mountLibraryApp(ownerSnapshotWithSourceItems([movedSource], {
+      mediaCount: 3,
+      revision: "partial-moved-source",
+    }));
+
+    const summary = element<HTMLElement>("#library-summary").textContent ?? "";
+    expect(summary).toContain("0 current entries in view");
+    expect(summary).not.toContain("2 current entries");
+    expect(summary).toContain("The cloud view retains 1 of 3 media items; 2 item details are omitted. Search, filters, and pagination cover only the retained rows.");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("2");
+    expect(element<HTMLElement>("#library-empty h2").textContent).toBe("No current or unresolved rows in the retained view");
+    expect(element<HTMLElement>("#library-empty p").textContent).toContain("2 item details are omitted from the cloud list and remain unclassified.");
+    expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
+
+    setInputValue("#status-filter", "moved");
+    expect(element<HTMLElement>('#library-list [data-item-row="source-moved-item"]')).not.toBeNull();
   });
 });

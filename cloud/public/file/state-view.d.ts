@@ -25,6 +25,10 @@ export function isIncompletePreview(entry: {
   revision?: string;
   status?: string;
 } | undefined): boolean;
+export function isPreviewDetailsAvailable(
+  entry: { incomplete?: boolean; preview?: unknown; preview_incomplete?: boolean; reload_required?: boolean; status?: string } | undefined,
+  options?: { compactSummaryValidated?: boolean },
+): boolean;
 export function isWaitingEntryPending(entry: { kind?: string; status?: string } | undefined): boolean;
 export function operationHistoryEntries<T extends { kind?: string; status?: string; preview?: unknown; result?: unknown }>(operations: T[] | undefined): T[];
 export function operationDetailsWarning(entry: {

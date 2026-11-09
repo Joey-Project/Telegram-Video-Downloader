@@ -26,6 +26,9 @@ use crate::library::{
 
 use super::*;
 
+#[path = "library_migration_receipt_tests.rs"]
+mod library_migration_receipt_tests;
+
 // Synthetic catalog joey-private-v3: api-key-a (active API key).
 const TEST_TELEGRAM_TOKEN: &str = "codex_synth_v1_api_key_a";
 
@@ -1838,6 +1841,19 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
     let preview = preview.result.unwrap();
     assert_eq!(preview["library_id"], original_id);
     assert_eq!(preview["root_binding"], original_binding);
+    let preview_receipt = runtime
+        .inbox
+        .record(704)
+        .expect("preview receipt should be readable")
+        .expect("preview receipt should exist");
+    let compact_preview_result =
+        crate::cloud_snapshot_budget::compact_file_preview_receipt_result(&preview_receipt)
+            .expect("the saved plan should produce a bounded preview summary");
+    assert!(compact_preview_result["preview"].get("items").is_none());
+    runtime
+        .inbox
+        .update(704, |record| record.result = Some(compact_preview_result))
+        .expect("compact preview summary should persist");
     let wrong = run_library_management_test_request(&runtime, 705, "file_confirm", serde_json::json!({
         "library_id": archive_id, "preview_id": preview["preview_id"], "revision": preview["revision"],
     })).await;
@@ -5944,7 +5960,7 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
 }
 
 #[tokio::test]
-async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() {
+async fn oversized_cloud_file_preview_keeps_a_bounded_receipt_and_full_plan() {
     const ITEM_COUNT: usize = 100;
     const IDS_PER_PATCH: usize = 48;
 
@@ -6028,29 +6044,40 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
         .expect("large preview request should enter processing");
     dispatch_cloud_record(runtime.clone(), large_request).await;
 
-    let rejected = inbox
+    let large_preview = inbox
         .record(1)
         .expect("large preview receipt should load")
         .expect("large preview receipt should remain present");
-    assert_eq!(rejected.status, InboxStatus::Failed);
-    assert!(
-        rejected.error.as_deref().is_some_and(|error| {
-            error.contains("too large to save and confirm")
-                && error.contains("split the changes into smaller previews")
-        }),
-        "oversized cloud preview should fail at the receipt-budget guard, got: {:?}",
-        rejected.error
+    assert_eq!(large_preview.status, InboxStatus::AwaitingConfirmation);
+    assert!(large_preview.error.is_none());
+    let large_receipt = large_preview
+        .result
+        .as_ref()
+        .expect("large confirmable preview should keep a bounded receipt");
+    assert!(crate::cloud_snapshot_budget::is_valid_compact_file_preview_result(&large_preview));
+    assert_eq!(large_receipt["details_incomplete"], true);
+    assert_eq!(large_receipt["result_truncated"], true);
+    assert_eq!(large_receipt["preview"]["file_preview_summary"], true);
+    assert_eq!(large_receipt["preview"]["summary_version"], 1);
+    assert_eq!(large_receipt["preview"]["selected_count"], ITEM_COUNT);
+    assert_eq!(large_receipt["preview"]["metadata_patch_count"], ITEM_COUNT);
+    assert_eq!(
+        large_receipt["preview"]["sample_metadata_patches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
     );
-    assert_eq!(persisted_cloud_preview_count(&video_root), 0);
+    assert_eq!(persisted_cloud_preview_count(&video_root), 1);
     assert!(
         (0..ITEM_COUNT)
             .all(|item_index| !video_root.join(format!("c{item_index:02}.nfo")).exists()),
-        "rejecting an oversized preview must not create any NFO target"
+        "summarizing an oversized preview must not apply metadata patches"
     );
     for source in &source_files {
         assert!(
             source.is_file(),
-            "preview rejection must leave {source:?} in place"
+            "preview creation must leave {source:?} in place"
         );
     }
     assert_eq!(
@@ -6101,7 +6128,7 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
         .as_str()
         .expect("preview receipt should include its revision")
         .to_string();
-    assert_eq!(persisted_cloud_preview_count(&video_root), 1);
+    assert_eq!(persisted_cloud_preview_count(&video_root), 2);
 
     inbox
         .persist(CloudRequest {
@@ -9442,6 +9469,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
     let _ = std::fs::remove_dir_all(root);
 }
+#[path = "bulk_selection_e2e_tests.rs"]
+mod bulk_selection_e2e_tests;
 #[path = "media_library_e2e_tests.rs"]
 mod media_library_e2e_tests;
 #[path = "media_library_snapshot_e2e_tests.rs"]

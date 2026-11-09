@@ -5,6 +5,7 @@ import { Event as HappyDOMEvent } from "happy-dom";
 import type { HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RECOVERY_PREVIEW_STORAGE_KEY } from "../public/file/metadata-recovery-preview-state.js";
+import { MAX_METADATA_RECOVERY_BATCH_ITEMS } from "../public/file/recovery-selection-batches.js";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
@@ -312,6 +313,8 @@ async function mountApp(options: {
   online?: boolean;
   snapshotStatus?: number;
   firstSnapshotStatus?: number;
+  echoSelectedRecoveryBatches?: boolean;
+  metadataRecoveryFailureStatus?: number;
 } = {}) {
   const {
     initialSnapshot = ownerSnapshot,
@@ -322,6 +325,8 @@ async function mountApp(options: {
     online = true,
     snapshotStatus = 0,
     firstSnapshotStatus = 0,
+    echoSelectedRecoveryBatches = false,
+    metadataRecoveryFailureStatus = 0,
   } = options;
   vi.useFakeTimers();
   vi.stubGlobal("crypto", webcrypto);
@@ -343,6 +348,7 @@ async function mountApp(options: {
 
   let currentManifest: Record<string, any>;
   let currentSnapshotStatus = snapshotStatus;
+  let currentMetadataRecoveryFailureStatus = metadataRecoveryFailureStatus;
   const responseChunks = new Map<string, string>();
   const knownEpochs = new Set<string>();
   const initial = await makeChunkedSnapshot(initialSnapshot);
@@ -411,7 +417,28 @@ async function mountApp(options: {
       const action = JSON.parse(String(init?.body)) as Record<string, any>;
       sentActions.push(action);
       if (action.kind === "metadata_recover") {
-        const recovery = action.payload.after_item_id === "item-100"
+        if (action.payload.scope === "selected" && currentMetadataRecoveryFailureStatus > 0) {
+          return {
+            ok: false,
+            status: currentMetadataRecoveryFailureStatus,
+            json: async () => ({ error: "Synthetic selected recovery failure." }),
+          } as Response;
+        }
+        const recovery = echoSelectedRecoveryBatches && action.payload.scope === "selected"
+          ? {
+            revision: "recovery-ui-r1",
+            total: action.payload.item_ids.length,
+            remaining: 0,
+            next_cursor: null,
+            items: action.payload.item_ids.map((itemId: string, index: number) => ({
+              item_id: itemId,
+              title: `Selected batch result ${index}`,
+              relative_path: `${itemId}.mkv`,
+              status: "unsupported",
+              reason: "Synthetic batch result.",
+            })),
+          }
+          : action.payload.after_item_id === "item-100"
           ? { revision: "recovery-ui-r1", total: 103, remaining: 0, next_cursor: null, items: [
             { item_id: "item-next", title: "Next batch video", relative_path: "Next.mkv", status: "ready", patch: { item_id: "item-next", source_ids: ["BVnext"] } },
           ] }
@@ -429,7 +456,7 @@ async function mountApp(options: {
           result: { scope: action.payload.scope, library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery },
         };
         await publishActionSnapshot({
-          ...ownerSnapshot,
+          ...initialSnapshot,
           state_version: actionSeq + 1,
           operations: [
             ...(previousRecoveryOperation ? [previousRecoveryOperation] : []),
@@ -444,7 +471,7 @@ async function mountApp(options: {
       if (action.kind === "file_preview") {
         if (!deferRecoveryPreviewSnapshot || !action.payload.expected_revision) {
           await publishActionSnapshot({
-            ...ownerSnapshot,
+            ...initialSnapshot,
             state_version: actionSeq + 1,
             operations: [
               ...(previousRecoveryOperation ? [previousRecoveryOperation] : []),
@@ -500,6 +527,7 @@ async function mountApp(options: {
     storage,
     get stateRequests() { return stateRequests; },
     setSnapshotStatus: (status: number) => { currentSnapshotStatus = status; },
+    setMetadataRecoveryFailureStatus: (status: number) => { currentMetadataRecoveryFailureStatus = status; },
     waitForMetadataSnapshotPrepared: () => metadataSnapshotPrepared,
     releaseMetadataActionResponse: () => releaseMetadataResponse?.(),
     releaseThirdStateResponse: () => releaseThirdStateResponse?.(),
@@ -592,6 +620,24 @@ function readyRecoverySnapshot(primaryRootBinding = ROOT_BINDING) {
     title: "Ready video",
   });
   return twoLibrarySnapshot({ primaryRootBinding, operations: [recovery] });
+}
+
+function selectedBatchSnapshot(count: number) {
+  return {
+    ...ownerSnapshot,
+    library: {
+      ...ownerSnapshot.library,
+      items: Array.from({ length: count }, (_, index) => ({
+        id: `selected-${String(index).padStart(3, "0")}`,
+        title: `Selected video ${String(index).padStart(3, "0")}`,
+        relative_path: `Selected/${index}.mkv`,
+        presence: "present",
+        bytes: 1024,
+        metadata_status: "partial",
+        confidence: "high",
+      })),
+    },
+  };
 }
 
 beforeEach(() => {
@@ -783,6 +829,88 @@ describe("metadata recovery Mini App flow", () => {
     });
     await waitForLocalActionQueueEmpty();
     await waitForRecoveryResult("Ready video");
+  });
+
+  it("analyzes a 150-item selection in two explicit batches without losing IDs", async () => {
+    const selectedIds = Array.from({ length: 150 }, (_, index) => `selected-${String(index).padStart(3, "0")}`);
+    const app = await mountApp({
+      initialSnapshot: selectedBatchSnapshot(150),
+      echoSelectedRecoveryBatches: true,
+    });
+
+    for (let page = 0; page < 3; page += 1) {
+      element<HTMLButtonElement>("#select-visible").click();
+      if (page < 2) {
+        element<HTMLButtonElement>('[data-library-page="library"][data-page-direction="1"]').click();
+      }
+    }
+    expect(element<HTMLElement>("#selection-count").textContent).toContain("150 items selected");
+
+    element<HTMLButtonElement>("#recover-selected").click();
+    await waitForRecoveryResult("Selected batch result 0");
+    await waitForLocalActionQueueEmpty();
+    const firstActions = app.sentActions.filter((action) => action.kind === "metadata_recover");
+    expect(firstActions).toHaveLength(1);
+    expect(firstActions[0]?.payload.item_ids).toEqual(selectedIds.slice(0, 100));
+    expect(firstActions[0]?.payload.item_ids).toHaveLength(MAX_METADATA_RECOVERY_BATCH_ITEMS);
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("50 selected items remain");
+    expect(element<HTMLButtonElement>("[data-recovery-next-selected]").textContent).toContain("50 remaining");
+
+    element<HTMLButtonElement>("[data-recovery-next-selected]").click();
+    await vi.waitFor(() => expect(app.sentActions.filter((action) => action.kind === "metadata_recover")).toHaveLength(2));
+    await waitForLocalActionQueueEmpty();
+    const analyses = app.sentActions.filter((action) => action.kind === "metadata_recover");
+    expect(analyses[1]?.payload.item_ids).toEqual(selectedIds.slice(100));
+    expect(analyses[1]?.payload.item_ids).toHaveLength(50);
+    expect(document.querySelector("[data-recovery-next-selected]")).toBeNull();
+  });
+
+  it.each([
+    [410, "delivery outcome is unknown"],
+    [400, "Analysis failed"],
+  ] as const)("does not offer another selected batch after HTTP %i", async (failureStatus, message) => {
+    const app = await mountApp({
+      initialSnapshot: selectedBatchSnapshot(150),
+      echoSelectedRecoveryBatches: true,
+    });
+    for (let page = 0; page < 3; page += 1) {
+      element<HTMLButtonElement>("#select-visible").click();
+      if (page < 2) {
+        element<HTMLButtonElement>('[data-library-page="library"][data-page-direction="1"]').click();
+      }
+    }
+    element<HTMLButtonElement>("#recover-selected").click();
+    await waitForRecoveryResult("Selected batch result 0");
+    await waitForLocalActionQueueEmpty();
+    expect(document.querySelector("[data-recovery-next-selected]")).not.toBeNull();
+
+    app.setMetadataRecoveryFailureStatus(failureStatus);
+    element<HTMLButtonElement>("[data-recovery-next-selected]").click();
+    await vi.waitFor(() => expect(app.sentActions.filter((action) => action.kind === "metadata_recover")).toHaveLength(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#recovery-status").textContent).toContain(message));
+    expect(document.querySelector("[data-recovery-next-selected]")).toBeNull();
+    if (failureStatus === 410) {
+      expect(element<HTMLButtonElement>("#recover-selected").disabled).toBe(true);
+      expect(document.querySelector("[data-recovery-retry-selected-batch]")).toBeNull();
+    } else {
+      const retryButton = element<HTMLButtonElement>("[data-recovery-retry-selected-batch]");
+      expect(retryButton.textContent).toContain("50 items");
+      retryButton.click();
+      await vi.waitFor(() => expect(app.sentActions.filter((action) => action.kind === "metadata_recover")).toHaveLength(3));
+      expect(app.sentActions.filter((action) => action.kind === "metadata_recover")[2]?.payload.item_ids)
+        .toEqual(app.sentActions.filter((action) => action.kind === "metadata_recover")[1]?.payload.item_ids);
+      await waitForLocalActionQueueEmpty();
+      expect(document.querySelector("[data-recovery-next-selected]")).toBeNull();
+    }
+    expect(app.sentActions.filter((action) => action.kind === "metadata_recover")[1]?.payload.item_ids)
+      .toEqual(Array.from({ length: 50 }, (_, index) => `selected-${String(index + 100).padStart(3, "0")}`));
+    if (failureStatus === 410) {
+      const savedActions = JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]");
+      expect(savedActions).toHaveLength(1);
+      expect(savedActions[0]?.delivery_outcome).toBe("outcome_unknown");
+    } else {
+      await waitForLocalActionQueueEmpty();
+    }
   });
 
   it("keeps a failed recovery preview visible after a same-root revision change", async () => {

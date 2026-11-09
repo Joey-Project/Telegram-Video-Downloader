@@ -512,7 +512,7 @@ describe("bounded library views", () => {
     ]);
   });
 
-  it("keeps verified moved records in library history but out of Needs organizing", () => {
+  it("hides verified moved records by default and exposes them through the moved-history status", () => {
     const moved = {
       id: "source-item",
       title: "Moved episode",
@@ -538,13 +538,20 @@ describe("bounded library views", () => {
     const incompleteMove = { id: "incomplete-move", presence: "missing", moved_to: { ...moved.moved_to, item_id: " " } };
 
     expect(movedToTarget(moved)).toEqual(moved.moved_to);
-    expect(filterLibraryItems([moved, ordinaryMissing]).map((item) => item.id)).toEqual(["source-item", "ordinary-missing"]);
+    expect(filterLibraryItems([moved, ordinaryMissing]).map((item) => item.id)).toEqual(["ordinary-missing"]);
+    expect(filterLibraryItems([moved, ordinaryMissing], { status: "missing" }).map((item) => item.id)).toEqual(["ordinary-missing"]);
+    expect(filterLibraryItems([moved, ordinaryMissing], { status: "moved" }).map((item) => item.id)).toEqual(["source-item"]);
     expect(needsOrganizing(moved)).toBe(false);
     expect(needsOrganizing(ordinaryMissing)).toBe(true);
     expect(movedToTarget(presentWithStaleMove)).toBeNull();
     expect(needsOrganizing(presentWithStaleMove)).toBe(true);
     expect(movedToTarget(incompleteMove)).toBeNull();
     expect(needsOrganizing(incompleteMove)).toBe(true);
+    expect(filterLibraryItems([presentWithStaleMove, incompleteMove]).map((item) => item.id)).toEqual([
+      "present-source",
+      "incomplete-move",
+    ]);
+    expect(filterLibraryItems([presentWithStaleMove, incompleteMove], { status: "moved" })).toEqual([]);
   });
 
   it("counts current-page selection eligibility separately from unavailable and read-only rows", () => {

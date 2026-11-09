@@ -51,13 +51,15 @@ const INDEX_VERSION: u32 = 1;
 const INDEX_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_INDEX_QUARANTINES: usize = 3;
 const MAX_MISSING_INDEX_RECORDS: usize = 1024;
-const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
-const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
+const PREVIEW_LIMIT: usize = 32 * 1024 * 1024;
+const MANIFEST_LIMIT: usize = 64 * 1024 * 1024;
 const ABANDONED_PREVIEW_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TERMINAL_BATCH_RECOVERY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS: usize = 32;
 const MAX_OPERATION_STATE_FILES_PER_PASS: usize = 32;
-const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 32 * 1024 * 1024;
+// Cleanup reads the candidate again before removal; even the largest accepted
+// manifest must fit both reads in one bounded pass.
+const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 2 * MANIFEST_LIMIT;
 const MAX_OPERATION_STATE_CLEANUP_ROOTS: usize = 8;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
 const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
@@ -153,6 +155,59 @@ struct PreviewAnchorStore {
     by_preview: HashMap<String, PreviewAnchorEntry>,
     order: VecDeque<String>,
     file_count: usize,
+}
+
+/// Keeps the strongest available in-process proof while bounding retained descriptors per preview.
+#[derive(Default)]
+struct PreviewAnchorCollector {
+    anchors: HashMap<String, BoundFile>,
+    mandatory_tokens: HashSet<String>,
+}
+
+impl PreviewAnchorCollector {
+    fn retain(&mut self, token: String, file: BoundFile) -> Result<()> {
+        let identity = decode_identity_token(&token)?;
+        let mandatory = identity_requires_live_preview_anchor(&identity);
+        if self.anchors.contains_key(&token) {
+            if mandatory {
+                self.mandatory_tokens.insert(token);
+            }
+            return Ok(());
+        }
+
+        if self.anchors.len() >= MAX_PINNED_FILES_PER_PREVIEW {
+            if !mandatory {
+                return Ok(());
+            }
+            let optional = self
+                .anchors
+                .keys()
+                .find(|token| !self.mandatory_tokens.contains(*token))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "preview selects too many files without a persistent creation-time signal; split the selection"
+                    )
+                })?;
+            self.anchors.remove(&optional);
+            self.mandatory_tokens.remove(&optional);
+        }
+
+        if mandatory {
+            self.mandatory_tokens.insert(token.clone());
+        }
+        self.anchors.insert(token, file);
+        Ok(())
+    }
+
+    fn into_anchors(self) -> HashMap<String, BoundFile> {
+        self.anchors
+    }
+}
+
+struct PreviewFileBuildContext<'a> {
+    reserved_targets: &'a mut TargetReservationSet,
+    preview_anchors: &'a mut PreviewAnchorCollector,
 }
 
 struct PreviewAnchorEntry {
@@ -3151,7 +3206,7 @@ impl LibraryManager {
             )?,
             None => HashMap::new(),
         };
-        let mut preview_anchors = HashMap::new();
+        let mut preview_anchors = PreviewAnchorCollector::default();
         for item_id in item_ids {
             let item = items_by_id
                 .get(item_id.as_str())
@@ -3175,15 +3230,20 @@ impl LibraryManager {
                     "move target directory exceeds the scan depth limit of {MAX_DEPTH} components"
                 );
             }
-            let (files, anchors) = self.preview_files_for_item(
-                item,
-                &item_target_dir,
-                rename,
-                conflict,
-                &mut reserved_targets,
-                target_device_for_path,
-            )?;
-            preview_anchors.extend(anchors);
+            let files = {
+                let mut context = PreviewFileBuildContext {
+                    reserved_targets: &mut reserved_targets,
+                    preview_anchors: &mut preview_anchors,
+                };
+                self.preview_files_for_item(
+                    item,
+                    &item_target_dir,
+                    rename,
+                    conflict,
+                    &mut context,
+                    target_device_for_path,
+                )?
+            };
             let main_target = files
                 .iter()
                 .find(|file| file.source_path == item.relative_path)
@@ -3299,7 +3359,7 @@ impl LibraryManager {
             } = self
                 .read_file_with_token_and_handle(&source_media, None)?
                 .ok_or_else(|| anyhow!("selected media disappeared before metadata preview"))?;
-            preview_anchors.insert(media_identity.clone(), media_file);
+            preview_anchors.retain(media_identity.clone(), media_file)?;
             let move_target = move_targets
                 .get(patch.item_id.as_str())
                 .filter(|entry| entry.outcome == MoveOutcome::Move);
@@ -3373,7 +3433,7 @@ impl LibraryManager {
                     file,
                 }) => {
                     let decoded = decode_identity_token(&token)?;
-                    preview_anchors.insert(token.clone(), file);
+                    preview_anchors.retain(token.clone(), file)?;
                     (
                         Some(token),
                         Some(sha),
@@ -3474,7 +3534,7 @@ impl LibraryManager {
             bail!("move preview exceeds its private storage limit");
         }
         validate_preview(&preview)?;
-        store_preview_anchors(&id, &preview.revision, preview_anchors)?;
+        store_preview_anchors(&id, &preview.revision, preview_anchors.into_anchors())?;
         if let Err(error) = self.write_private_file(&self.preview_path(&id), &contents) {
             release_preview_anchors(&id);
             return Err(error);
@@ -3488,9 +3548,9 @@ impl LibraryManager {
         target_dir: &Path,
         rename: bool,
         conflict: ConflictPolicy,
-        reserved_targets: &mut TargetReservationSet,
+        context: &mut PreviewFileBuildContext<'_>,
         target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
-    ) -> Result<(Vec<FileMovePreview>, HashMap<String, BoundFile>)> {
+    ) -> Result<Vec<FileMovePreview>> {
         let primary = self.absolute_path(&item.relative_path)?;
         let mut source_paths = vec![item.relative_path.clone()];
         source_paths.extend(
@@ -3576,7 +3636,8 @@ impl LibraryManager {
         };
         let mut candidate = base_target.clone();
         let mut targets = targets_for(&candidate)?;
-        let conflicts = self.has_move_conflicts(&source_paths, &targets, reserved_targets)?;
+        let conflicts =
+            self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)?;
         if conflicts && conflict == ConflictPolicy::KeepBoth {
             let parent = base_target.parent().unwrap_or_else(|| Path::new(""));
             let mut found = false;
@@ -3591,7 +3652,7 @@ impl LibraryManager {
                 let name = file_name_with_stem(&primary, &candidate_stem, "")?;
                 candidate = parent.join(name);
                 targets = targets_for(&candidate)?;
-                if !self.has_move_conflicts(&source_paths, &targets, reserved_targets)? {
+                if !self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)? {
                     found = true;
                     break;
                 }
@@ -3600,10 +3661,10 @@ impl LibraryManager {
                 bail!("could not find a free keep-both filename");
             }
         }
-        let final_conflicts = self.has_move_conflicts(&source_paths, &targets, reserved_targets)?;
+        let final_conflicts =
+            self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)?;
         let mut files = Vec::new();
         let mut source_devices = Vec::new();
-        let mut anchors = HashMap::new();
         for (source_rel, target_rel) in source_paths.iter().zip(targets) {
             let source_abs = self.absolute_path(source_rel)?;
             let skip = final_conflicts && conflict == ConflictPolicy::Skip;
@@ -3622,9 +3683,10 @@ impl LibraryManager {
                     .ok_or_else(|| {
                         anyhow!("selected media or attachment disappeared: {source_rel}")
                     })?;
-                let size = token_size(&token)?;
+                let identity = decode_identity_token(&token)?;
+                let size = identity.size;
                 let source_device = file.identity().device();
-                anchors.insert(token.clone(), file);
+                context.preview_anchors.retain(token.clone(), file)?;
                 (token, size, source_device)
             };
             source_devices.push(source_device);
@@ -3636,7 +3698,7 @@ impl LibraryManager {
             });
         }
         if final_conflicts && conflict == ConflictPolicy::Skip {
-            return Ok((files, anchors));
+            return Ok(files);
         }
         for ((source_path, file), source_device) in
             source_paths.iter().zip(&files).zip(source_devices)
@@ -3659,7 +3721,7 @@ impl LibraryManager {
                 .cmp(&right_primary)
                 .then_with(|| left.source_path.cmp(&right.source_path))
         });
-        Ok((files, anchors))
+        Ok(files)
     }
 
     fn has_move_conflicts(
@@ -7378,8 +7440,10 @@ fn identity_tokens_match_with_pinned_file(
     identity_tokens_equal_except_birth_time(current, &anchor_current)
 }
 
-fn token_size(token: &str) -> Result<u64> {
-    Ok(decode_identity_token(token)?.size)
+fn identity_requires_live_preview_anchor(identity: &IdentityToken) -> bool {
+    // Decoding rejects partial birth pairs. Full tokens bind content and access policy; only
+    // missing birth time needs a descriptor to disambiguate inode reuse.
+    identity.birth_seconds.is_none()
 }
 
 fn parse_optional_i64(value: &str) -> Result<Option<i64>> {
@@ -7494,25 +7558,23 @@ fn start_preview_anchor_reaper() -> Result<()> {
 fn required_preview_anchor_tokens(persisted: &PersistedPreview) -> Result<HashSet<String>> {
     let mut required = HashSet::new();
     for file in persisted.preview.items.iter().flat_map(|item| &item.files) {
-        if !file.identity.is_empty()
-            && decode_identity_token(&file.identity)?
-                .birth_seconds
-                .is_none()
-        {
-            required.insert(file.identity.clone());
+        if !file.identity.is_empty() {
+            let identity = decode_identity_token(&file.identity)?;
+            if identity_requires_live_preview_anchor(&identity) {
+                required.insert(file.identity.clone());
+            }
         }
     }
     for patch in &persisted.patches {
-        if decode_identity_token(&patch.media_identity)?
-            .birth_seconds
-            .is_none()
-        {
+        let media_identity = decode_identity_token(&patch.media_identity)?;
+        if identity_requires_live_preview_anchor(&media_identity) {
             required.insert(patch.media_identity.clone());
         }
-        if let Some(identity) = patch.expected_identity.as_deref()
-            && decode_identity_token(identity)?.birth_seconds.is_none()
-        {
-            required.insert(identity.to_string());
+        if let Some(expected_identity) = patch.expected_identity.as_deref() {
+            let identity = decode_identity_token(expected_identity)?;
+            if identity_requires_live_preview_anchor(&identity) {
+                required.insert(expected_identity.to_string());
+            }
         }
     }
     Ok(required)
@@ -11194,6 +11256,128 @@ mod tests {
             .expect("operation-state fixture should open for mtime adjustment");
         file.set_modified(SystemTime::now() - age)
             .expect("operation-state fixture mtime should update");
+    }
+
+    #[test]
+    fn large_selection_storage_round_trips_and_expires_without_stranding_documents() {
+        let root = TemporaryRoot::new("large-selection-storage");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"media fixture").expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("fixture scan should complete");
+        let seed = cleanup_preview(&manager, &item_at(&snapshot, "clip.mp4").id);
+        let identity = seed.items[0].files[0].identity.clone();
+        let folder = format!("合集 {}", "乐".repeat(60));
+        // Exercise storage and cleanup for 5,000 four-file media bundles with
+        // multibyte names that fit filesystem component limits. These synthetic
+        // paths are never executed as media moves.
+        let mut preview = seed.clone();
+        preview.items = (0..5_000)
+            .map(|index| {
+                let stem = format!("{folder}/P{index:04}-{}", "曲".repeat(45));
+                let files = ["mp4", "nfo", "ass", "jpg"]
+                    .into_iter()
+                    .map(|extension| {
+                        let source_path = format!("{stem}.{extension}");
+                        FileMovePreview {
+                            target_path: format!("Archive/{source_path}"),
+                            source_path,
+                            bytes: 13,
+                            identity: identity.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                MovePreviewItem {
+                    item_id: format!("copy-{index:024x}"),
+                    source_path: files[0].source_path.clone(),
+                    target_path: files[0].target_path.clone(),
+                    outcome: MoveOutcome::Move,
+                    files,
+                    reason: None,
+                }
+            })
+            .collect();
+        let persisted = PersistedPreview {
+            version: 1,
+            process_nonce: manager.process_nonce.clone(),
+            preview: preview.clone(),
+            patches: Vec::new(),
+        };
+        let preview_bytes = serde_json::to_vec(&persisted).unwrap();
+        assert!(preview_bytes.len() > 16 * 1024 * 1024);
+        assert!(preview_bytes.len() <= PREVIEW_LIMIT);
+        let preview_path = manager.preview_path(&preview.id);
+        manager
+            .write_private_file(&preview_path, &preview_bytes)
+            .unwrap();
+        let saved = manager
+            .read_private_file(&preview_path, PREVIEW_LIMIT)
+            .unwrap()
+            .unwrap();
+        let restored: PersistedPreview = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.preview, preview);
+
+        let mut manifest = cleanup_batch(&preview, true, false, false);
+        manifest.files = preview
+            .items
+            .iter()
+            .flat_map(|item| {
+                item.files.iter().map(|file| ManifestFile {
+                    item_id: item.item_id.clone(),
+                    source_path: file.source_path.clone(),
+                    target_path: file.target_path.clone(),
+                    identity: file.identity.clone(),
+                    state: ManifestFileState::Moved,
+                    error: None,
+                })
+            })
+            .collect();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(manifest_bytes.len() > 32 * 1024 * 1024);
+        assert!(manifest_bytes.len() <= MANIFEST_LIMIT);
+        let batch_path = manager.batch_path(&preview.id);
+        manager
+            .write_batch_manifest(&batch_path, &manifest)
+            .unwrap();
+        let saved = manager
+            .read_private_file(&batch_path, MANIFEST_LIMIT)
+            .unwrap()
+            .unwrap();
+        let restored: BatchManifest = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.files.len(), 20_000);
+        assert_eq!(restored.preview.items.len(), 5_000);
+
+        manifest.warnings.push("x".repeat(MANIFEST_LIMIT));
+        assert!(
+            manager
+                .write_batch_manifest(&batch_path, &manifest)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&batch_path).unwrap(),
+            saved,
+            "an oversized rewrite must retain the valid recovery document"
+        );
+        drop(manifest);
+
+        let old_age = Duration::from_secs(9 * 24 * 60 * 60);
+        set_operation_state_age(&preview_path, old_age);
+        set_operation_state_age(&batch_path, old_age);
+        let registry = Mutex::new(OperationStateCleanupCursorRegistry::default());
+        for _ in 0..4 {
+            let warnings = run_operation_state_cleanup(&manager, &registry);
+            assert!(warnings.is_empty(), "cleanup warnings: {warnings:?}");
+        }
+        assert!(
+            !preview_path.exists(),
+            "large terminal preview should expire"
+        );
+        assert!(
+            !batch_path.exists(),
+            "large terminal batch must fit read and revalidation"
+        );
+        assert_eq!(fs::read(media_path).unwrap(), b"media fixture");
+        release_preview_anchors(&preview.id);
     }
 
     fn run_operation_state_cleanup(
@@ -19409,6 +19593,349 @@ mod tests {
         assert!(store.by_preview.is_empty());
         assert!(store.order.is_empty());
         assert_eq!(store.file_count, 0);
+    }
+
+    fn bulk_preview_snapshot(
+        root: &TemporaryRoot,
+        prefix: &str,
+        count: usize,
+        include_nfo: bool,
+    ) -> (LibrarySnapshot, HashMap<String, Vec<u8>>) {
+        let mut items = Vec::with_capacity(count);
+        let mut contents = HashMap::with_capacity(count * if include_nfo { 2 } else { 1 });
+        for index in 0..count {
+            let relative_path = format!("{prefix}-{index:04}.mp4");
+            let media_bytes = format!("media-content-{prefix}-{index:04}").into_bytes();
+            fs::write(root.path().join(&relative_path), &media_bytes)
+                .expect("bulk media fixture should write");
+            contents.insert(relative_path.clone(), media_bytes);
+            if include_nfo {
+                let nfo_path = with_extension(Path::new(&relative_path), "nfo");
+                let nfo_relative_path = path_to_relative_string(&nfo_path)
+                    .expect("bulk NFO path should remain relative");
+                let nfo_bytes =
+                    format!("<movie><title>Before {index}</title><future>keep</future></movie>\n")
+                        .into_bytes();
+                fs::write(root.path().join(&nfo_relative_path), &nfo_bytes)
+                    .expect("bulk NFO fixture should write");
+                contents.insert(nfo_relative_path, nfo_bytes);
+            }
+            items.push(index_fixture_item(
+                &format!("{prefix}-{index:04}"),
+                &relative_path,
+                Presence::Present,
+            ));
+        }
+        (
+            LibrarySnapshot {
+                revision: format!("{prefix}-revision"),
+                scanned_at: 0,
+                root_label: "fixture".to_string(),
+                items,
+                categories: Vec::new(),
+                warnings: Vec::new(),
+            },
+            contents,
+        )
+    }
+
+    #[test]
+    fn preview_anchor_collector_bounds_handles_and_prioritizes_mandatory_proofs() {
+        let root = TemporaryRoot::new("preview-anchor-collector-budget");
+        let manager = manager(&root);
+        let mut collector = PreviewAnchorCollector::default();
+        let capacity = MAX_PINNED_FILES_PER_PREVIEW;
+        let mut overflow_optional = None;
+
+        for index in 0..=capacity {
+            let relative_path = format!("optional-{index:04}.mp4");
+            fs::write(
+                root.path().join(&relative_path),
+                format!("optional-{index}"),
+            )
+            .expect("optional anchor fixture should write");
+            let read = manager
+                .read_file_with_token_and_handle(&root.path().join(&relative_path), None)
+                .expect("optional identity should read")
+                .expect("optional fixture should exist");
+            assert!(
+                decode_identity_token(&read.token)
+                    .expect("optional identity should decode")
+                    .birth_seconds
+                    .is_some(),
+                "the fixture should provide persistent identity for optional anchors"
+            );
+            if index == capacity {
+                overflow_optional = Some(read.token.clone());
+            }
+            collector
+                .retain(read.token, read.file)
+                .expect("optional anchors beyond the budget should be discarded");
+            assert!(collector.anchors.len() <= capacity);
+        }
+        assert_eq!(collector.anchors.len(), capacity);
+        assert!(collector.mandatory_tokens.is_empty());
+        assert!(
+            !collector
+                .anchors
+                .contains_key(&overflow_optional.expect("overflow token should be captured"))
+        );
+
+        manager.make_preview_creation_time_unavailable_for_test();
+        for index in 0..=capacity {
+            let relative_path = format!("mandatory-{index:04}.mp4");
+            fs::write(
+                root.path().join(&relative_path),
+                format!("mandatory-{index}"),
+            )
+            .expect("mandatory anchor fixture should write");
+            let read = manager
+                .read_file_with_token_and_handle(&root.path().join(&relative_path), None)
+                .expect("mandatory identity should read")
+                .expect("mandatory fixture should exist");
+            assert!(
+                decode_identity_token(&read.token)
+                    .expect("mandatory identity should decode")
+                    .birth_seconds
+                    .is_none(),
+                "the existing hook should remove persistent creation-time evidence"
+            );
+            let result = collector.retain(read.token, read.file);
+            if index < capacity {
+                result.expect("mandatory anchors should evict optional anchors first");
+            } else {
+                assert!(
+                    format!("{:#}", result.expect_err("mandatory overflow must fail"))
+                        .contains("too many files without a persistent creation-time signal")
+                );
+            }
+            assert!(collector.anchors.len() <= capacity);
+        }
+        assert_eq!(collector.anchors.len(), capacity);
+        assert_eq!(collector.mandatory_tokens.len(), capacity);
+        assert!(
+            collector
+                .anchors
+                .keys()
+                .all(|token| collector.mandatory_tokens.contains(token))
+        );
+    }
+
+    fn cached_preview_anchor_tokens(preview_id: &str) -> HashSet<String> {
+        let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
+            return HashSet::new();
+        };
+        cache
+            .lock()
+            .expect("preview anchor cache should remain healthy")
+            .by_preview
+            .get(preview_id)
+            .map(|entry| entry.anchors.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn cached_preview_anchor_count(preview_id: &str) -> usize {
+        cached_preview_anchor_tokens(preview_id).len()
+    }
+
+    #[test]
+    fn persistent_identity_bulk_preview_confirms_more_than_anchor_capacity() {
+        let root = TemporaryRoot::new("persistent-identity-bulk-preview");
+        let count = MAX_PINNED_FILES_PER_PREVIEW + 1;
+        let (snapshot, contents) = bulk_preview_snapshot(&root, "move", count, false);
+        let manager = manager(&root);
+        let item_ids = snapshot
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let preview = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: &item_ids,
+                    target_relative_dir: Some("Moved"),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect("persistent identities should allow a selection beyond the descriptor limit");
+
+        assert_eq!(preview.items.len(), count);
+        assert!(preview.items.iter().all(|item| {
+            item.outcome == MoveOutcome::Move
+                && item.files.len() == 1
+                && decode_identity_token(&item.files[0].identity)
+                    .is_ok_and(|identity| identity.birth_seconds.is_some())
+        }));
+        let persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("bulk preview should be persisted");
+        assert!(
+            required_preview_anchor_tokens(&persisted)
+                .expect("persistent tokens should decode")
+                .is_empty()
+        );
+        let retained_tokens = cached_preview_anchor_tokens(&preview.id);
+        assert_eq!(retained_tokens.len(), MAX_PINNED_FILES_PER_PREVIEW);
+        assert!(retained_tokens.len() <= MAX_PINNED_FILES_PER_PREVIEW);
+        let touched_item = preview
+            .items
+            .iter()
+            .find(|item| retained_tokens.contains(&item.files[0].identity))
+            .expect("a selected source should retain an optional descriptor proof");
+        let expected_token = touched_item.files[0].identity.as_str();
+        let touched_path = root.path().join(&touched_item.source_path);
+        let touched_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&touched_path)
+            .expect("retained source should open for a benign timestamp update");
+        touched_file
+            .set_modified(SystemTime::now() - Duration::from_secs(24 * 60 * 60))
+            .expect("retained source mtime should update");
+        let current_token = manager
+            .read_file_with_token(&touched_path, None)
+            .expect("touched source identity should remain readable")
+            .expect("touched source should remain present")
+            .0;
+        assert!(
+            identity_tokens_equal_except_birth_time(expected_token, &current_token)
+                .expect("touched source tokens should decode")
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("bulk selection should confirm with bounded descriptor anchors");
+        assert_eq!(result.status, BatchStatus::Complete);
+        assert_eq!(result.items.len(), count);
+        assert!(result.items.iter().all(|item| {
+            item.outcome == MoveOutcome::Move
+                && item.moved_files == 1
+                && item.total_files == 1
+                && item.error.is_none()
+        }));
+        for item in &preview.items {
+            assert!(!root.path().join(&item.source_path).exists());
+            assert_eq!(
+                fs::read(root.path().join(&item.target_path))
+                    .expect("every confirmed target should remain readable"),
+                contents[&item.source_path],
+                "confirmed content should match the selected source {}",
+                item.source_path
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_identity_bulk_metadata_preview_bounds_optional_media_and_nfo_anchors() {
+        let root = TemporaryRoot::new("persistent-identity-bulk-metadata-preview");
+        let count = MAX_PINNED_FILES_PER_PREVIEW + 1;
+        let (snapshot, contents) = bulk_preview_snapshot(&root, "patch", count, true);
+        let manager = manager(&root);
+        let patches = snapshot
+            .items
+            .iter()
+            .map(|item| MetadataPatch {
+                item_id: item.id.clone(),
+                title: Some(format!("Updated {}", item.title)),
+                source_ids: Vec::new(),
+                collection: None,
+                fill_missing_only: false,
+                organization_status: None,
+            })
+            .collect::<Vec<_>>();
+        let preview = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: &[],
+                    target_relative_dir: None,
+                    rename: false,
+                    conflict: ConflictPolicy::Skip,
+                    patches: &patches,
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect("persistent media and NFO identities should fit within the anchor budget");
+
+        assert!(preview.items.is_empty());
+        assert_eq!(preview.metadata_patches.len(), count);
+        assert!(preview.metadata_patches.iter().all(|patch| patch.changed));
+        let persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("bulk metadata preview should be persisted");
+        assert_eq!(persisted.patches.len(), count);
+        assert!(persisted.patches.iter().all(|patch| {
+            decode_identity_token(&patch.media_identity)
+                .is_ok_and(|identity| identity.birth_seconds.is_some())
+                && patch.expected_identity.as_deref().is_some_and(|identity| {
+                    decode_identity_token(identity)
+                        .is_ok_and(|identity| identity.birth_seconds.is_some())
+                })
+        }));
+        assert!(
+            required_preview_anchor_tokens(&persisted)
+                .expect("persistent patch tokens should decode")
+                .is_empty()
+        );
+        assert_eq!(
+            cached_preview_anchor_count(&preview.id),
+            MAX_PINNED_FILES_PER_PREVIEW
+        );
+        for (relative_path, expected) in contents {
+            assert_eq!(
+                fs::read(root.path().join(relative_path))
+                    .expect("metadata preview should leave its source file readable"),
+                expected,
+                "preview must not mutate media or NFO content"
+            );
+        }
+        release_preview_anchors(&preview.id);
+    }
+
+    #[test]
+    fn bulk_preview_without_creation_time_is_rejected_without_side_effects() {
+        let root = TemporaryRoot::new("missing-creation-time-bulk-preview");
+        let count = MAX_PINNED_FILES_PER_PREVIEW + 1;
+        let (snapshot, contents) = bulk_preview_snapshot(&root, "fallback", count, false);
+        let manager = manager(&root);
+        manager.make_preview_creation_time_unavailable_for_test();
+        let item_ids = snapshot
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let preview_count_before = persisted_preview_count(&manager);
+        let error = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: &item_ids,
+                    target_relative_dir: Some("Should not be created"),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect_err("fallback descriptor requests beyond the cap must fail closed");
+
+        assert!(
+            format!("{error:#}")
+                .contains("too many files without a persistent creation-time signal")
+        );
+        assert_eq!(persisted_preview_count(&manager), preview_count_before);
+        assert!(!root.path().join("Should not be created").exists());
+        for (relative_path, expected) in contents {
+            assert_eq!(
+                fs::read(root.path().join(relative_path))
+                    .expect("rejected preview should leave every source readable"),
+                expected,
+                "rejected preview must not change source contents"
+            );
+        }
     }
 
     #[test]

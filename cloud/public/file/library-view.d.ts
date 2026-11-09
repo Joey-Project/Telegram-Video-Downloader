@@ -106,6 +106,7 @@ export function mediaSnapshotOmissionNotice(descriptor: MediaLibraryDescriptor |
 export function operationLibraryId(operation: Record<string, unknown> | null | undefined): string;
 export function operationMatchesLibrary(operation: Record<string, unknown> | null | undefined, libraryId: string): boolean;
 export function collectionIdentity(collection: unknown): string;
+/** The default filter hides validated moved history; status "moved" selects only those rows. */
 export function filterLibraryItems<T extends LibraryViewItem>(
   items: readonly T[] | null | undefined,
   filters?: { query?: string; category?: string; status?: string },
