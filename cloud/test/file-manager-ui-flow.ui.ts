@@ -666,6 +666,89 @@ function filePreviewFixture(seq: number, libraryId: string, rootBinding: string,
   };
 }
 
+function compactFilePreviewSummary(id = "compact-file-preview", revision = "compact-file-r1") {
+  return {
+    file_preview_summary: true,
+    summary_version: 1,
+    id,
+    revision,
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    selected_count: 5_000,
+    metadata_only: false,
+    target_relative_dir: "Reviewed",
+    rename: false,
+    conflict: "skip",
+    move_item_count: 5_000,
+    file_count: 5_000,
+    total_bytes: "5000000000",
+    outcome_counts: { move: 4_998, skip: 1, no_op: 1 },
+    conflict_count: 1,
+    metadata_patch_count: 0,
+    changed_metadata_patch_count: 0,
+    sample_items: [{
+      item_id: "sample-item-1",
+      source_path: "Films/Example.mkv",
+      target_path: "Reviewed/Example.mkv",
+      outcome: "move",
+      file_count: 1,
+      sample_files: [{ source_path: "Films/Example.mkv", target_path: "Reviewed/Example.mkv", bytes: 1_000_000 }],
+      omitted_file_count: 0,
+    }],
+    sample_metadata_patches: [],
+    omitted_item_count: 4_999,
+    omitted_file_count: 4_999,
+    omitted_metadata_patch_count: 0,
+    summary_message: "The sample rows are partial. Confirm applies the entire saved batch.",
+  };
+}
+
+function compactFileConfirmResult(seq: number, status = "partial") {
+  const id = `compact-file-confirm-${seq}`;
+  const revision = `compact-file-confirm-r${seq}`;
+  return {
+    seq,
+    request_id: `file-confirm-${seq}`,
+    kind: "file_confirm",
+    status: status === "complete" ? "completed" : "failed",
+    details_incomplete: true,
+    result_truncated: true,
+    result: {
+      preview_id: id,
+      revision,
+      details_incomplete: true,
+      result_truncated: true,
+      operation: {
+        file_confirm_summary: true,
+        summary_version: 1,
+        id,
+        revision,
+        status,
+        retryable_access_error: status !== "complete",
+        selected_count: 5_000,
+        outcome_counts: { move: 4_998, skip: 1, no_op: 1 },
+        file_count: 5_000,
+        moved_file_count: 4_900,
+        metadata_patched_item_count: 2_000,
+        error_count: status === "complete" ? 0 : 100,
+        warning_count: 1,
+        sample_items: [{
+          item_id: "sample-result-item",
+          outcome: "move",
+          moved_files: 1,
+          total_files: 1,
+          metadata_patched: true,
+          error: null,
+        }],
+        omitted_item_count: 4_999,
+        sample_warnings: ["Representative warning"],
+        omitted_warning_count: 0,
+        summary_message: "A bounded sample is shown; complete item results are saved locally.",
+      },
+    },
+  };
+}
+
 async function mountFileManagerFixture(
   initialSnapshot: Record<string, any>,
   storage: MemoryStorageFixture,
@@ -901,6 +984,155 @@ afterEach(async () => {
 });
 
 describe("file manager UI flow", () => {
+  it("reviews a compact 5,000-item preview as a bounded sample and confirms only its saved identity", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const id = "compact-file-preview";
+    const revision = "compact-file-r1";
+    const summary = compactFilePreviewSummary(id, revision);
+    const preview = {
+      seq: 911,
+      kind: "file_preview",
+      status: "awaiting_confirmation",
+      preview_id: id,
+      revision,
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      incomplete: true,
+      preview_incomplete: true,
+      reload_required: true,
+      preview: summary,
+    };
+    const incompleteOperation = {
+      seq: preview.seq,
+      kind: "file_preview",
+      status: "awaiting_confirmation",
+      preview_id: id,
+      revision,
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      details_incomplete: true,
+      result_truncated: true,
+      result: {
+        preview_id: id,
+        revision,
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        details_incomplete: true,
+        result_truncated: true,
+      },
+    };
+    const snapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      last_seen: Date.now(),
+      operations: [incompleteOperation],
+      previews: [preview],
+    };
+    const fixture = await mountFileManagerFixture(snapshot, makeMemoryStorage());
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+
+    const card = element<HTMLElement>("#preview-list article.stack-card");
+    expect(card.textContent).toContain("5,000 selected items");
+    expect(card.textContent).toContain("4,998 move · 1 skip · 1 no change");
+    expect(card.textContent).toContain("5,000,000,000 bytes");
+    expect(card.textContent).toContain("Showing 1 sample media item and 1 sample attached-file path");
+    expect(card.textContent).toContain("4,999 item details omitted");
+    expect(card.textContent).toContain("Destination: Reviewed");
+    expect(card.textContent).toContain("Rename: No");
+    expect(card.textContent).toContain("If a file already exists: Skip it");
+    expect(card.textContent).toContain("These rows are examples only; they are not the full plan.");
+    expect(card.textContent).toContain("Sample item · sample-item-1");
+    const confirm = element<HTMLButtonElement>(`[data-confirm="${id}"]`);
+    expect(confirm.disabled).toBe(false);
+    expect(confirm.textContent).toBe("Confirm changes for all 5,000 selected items");
+
+    confirm.click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    expect(fixture.actions[0]?.kind).toBe("file_confirm");
+    expect(fixture.actions[0]?.payload).toEqual({
+      preview_id: id,
+      revision,
+      library_id: LIBRARY_ID,
+    });
+  });
+
+  it("keeps malformed compact file preview totals non-confirmable", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const id = "compact-file-preview-invalid";
+    const revision = "compact-file-invalid-r1";
+    const summary = compactFilePreviewSummary(id, revision);
+    summary.outcome_counts = { move: 4_997, skip: 1, no_op: 1 };
+    const snapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      last_seen: Date.now(),
+      previews: [{
+        seq: 912,
+        kind: "file_preview",
+        status: "awaiting_confirmation",
+        preview_id: id,
+        revision,
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        incomplete: true,
+        preview_incomplete: true,
+        reload_required: true,
+        preview: summary,
+      }],
+    };
+    const fixture = await mountFileManagerFixture(snapshot, makeMemoryStorage());
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("Refresh required");
+    expect(document.querySelector(`[data-confirm="${id}"]`)).toBeNull();
+    expect(fixture.actions).toHaveLength(0);
+  });
+
+  it("shows compact file-confirm history with full totals and bounded result samples", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const completeFallback = {
+      seq: 914,
+      kind: "file_confirm",
+      status: "completed",
+      details_incomplete: true,
+      result_truncated: true,
+      result: {
+        preview_id: "compact-file-confirm-fallback",
+        revision: "compact-file-confirm-fallback-r1",
+        details_incomplete: true,
+        result_truncated: true,
+        operation: {
+          file_confirm_summary: true,
+          summary_version: 1,
+          details_available: false,
+          status: "completed",
+          summary_message: "The batch operation finished, but its detailed receipt could not be retained.",
+        },
+      },
+    };
+    const snapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      last_seen: Date.now(),
+      operations: [compactFileConfirmResult(913), completeFallback],
+    };
+    await mountFileManagerFixture(snapshot, makeMemoryStorage());
+    element<HTMLButtonElement>('[data-view="history"]').click();
+
+    const historyText = element<HTMLElement>("#operation-list").textContent ?? "";
+    expect(historyText).toContain("5,000 item results");
+    expect(historyText).toContain("4,900 of 5,000 related files moved");
+    expect(historyText).toContain("4,999 item results omitted");
+    expect(historyText).toContain("Sample result · sample-result-item");
+    expect(historyText).toContain("Sample warning: Representative warning");
+    expect(historyText).toContain("Detailed batch results are unavailable in this snapshot.");
+    expect(historyText).not.toContain("1 item ·");
+    expect(historyText).not.toContain("Some operation details were omitted from the saved history.");
+  });
+
   it("watches cloud-pending scans and imports after reload, then stops at terminal state", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

@@ -51,13 +51,15 @@ const INDEX_VERSION: u32 = 1;
 const INDEX_LIMIT: usize = 16 * 1024 * 1024;
 const MAX_INDEX_QUARANTINES: usize = 3;
 const MAX_MISSING_INDEX_RECORDS: usize = 1024;
-const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
-const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
+const PREVIEW_LIMIT: usize = 32 * 1024 * 1024;
+const MANIFEST_LIMIT: usize = 64 * 1024 * 1024;
 const ABANDONED_PREVIEW_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TERMINAL_BATCH_RECOVERY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS: usize = 32;
 const MAX_OPERATION_STATE_FILES_PER_PASS: usize = 32;
-const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 32 * 1024 * 1024;
+// Cleanup reads the candidate again before removal; even the largest accepted
+// manifest must fit both reads in one bounded pass.
+const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 2 * MANIFEST_LIMIT;
 const MAX_OPERATION_STATE_CLEANUP_ROOTS: usize = 8;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
 const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
@@ -11194,6 +11196,128 @@ mod tests {
             .expect("operation-state fixture should open for mtime adjustment");
         file.set_modified(SystemTime::now() - age)
             .expect("operation-state fixture mtime should update");
+    }
+
+    #[test]
+    fn large_selection_storage_round_trips_and_expires_without_stranding_documents() {
+        let root = TemporaryRoot::new("large-selection-storage");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"media fixture").expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("fixture scan should complete");
+        let seed = cleanup_preview(&manager, &item_at(&snapshot, "clip.mp4").id);
+        let identity = seed.items[0].files[0].identity.clone();
+        let folder = format!("合集 {}", "乐".repeat(60));
+        // Exercise storage and cleanup for 5,000 four-file media bundles with
+        // multibyte names that fit filesystem component limits. These synthetic
+        // paths are never executed as media moves.
+        let mut preview = seed.clone();
+        preview.items = (0..5_000)
+            .map(|index| {
+                let stem = format!("{folder}/P{index:04}-{}", "曲".repeat(45));
+                let files = ["mp4", "nfo", "ass", "jpg"]
+                    .into_iter()
+                    .map(|extension| {
+                        let source_path = format!("{stem}.{extension}");
+                        FileMovePreview {
+                            target_path: format!("Archive/{source_path}"),
+                            source_path,
+                            bytes: 13,
+                            identity: identity.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                MovePreviewItem {
+                    item_id: format!("copy-{index:024x}"),
+                    source_path: files[0].source_path.clone(),
+                    target_path: files[0].target_path.clone(),
+                    outcome: MoveOutcome::Move,
+                    files,
+                    reason: None,
+                }
+            })
+            .collect();
+        let persisted = PersistedPreview {
+            version: 1,
+            process_nonce: manager.process_nonce.clone(),
+            preview: preview.clone(),
+            patches: Vec::new(),
+        };
+        let preview_bytes = serde_json::to_vec(&persisted).unwrap();
+        assert!(preview_bytes.len() > 16 * 1024 * 1024);
+        assert!(preview_bytes.len() <= PREVIEW_LIMIT);
+        let preview_path = manager.preview_path(&preview.id);
+        manager
+            .write_private_file(&preview_path, &preview_bytes)
+            .unwrap();
+        let saved = manager
+            .read_private_file(&preview_path, PREVIEW_LIMIT)
+            .unwrap()
+            .unwrap();
+        let restored: PersistedPreview = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.preview, preview);
+
+        let mut manifest = cleanup_batch(&preview, true, false, false);
+        manifest.files = preview
+            .items
+            .iter()
+            .flat_map(|item| {
+                item.files.iter().map(|file| ManifestFile {
+                    item_id: item.item_id.clone(),
+                    source_path: file.source_path.clone(),
+                    target_path: file.target_path.clone(),
+                    identity: file.identity.clone(),
+                    state: ManifestFileState::Moved,
+                    error: None,
+                })
+            })
+            .collect();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(manifest_bytes.len() > 32 * 1024 * 1024);
+        assert!(manifest_bytes.len() <= MANIFEST_LIMIT);
+        let batch_path = manager.batch_path(&preview.id);
+        manager
+            .write_batch_manifest(&batch_path, &manifest)
+            .unwrap();
+        let saved = manager
+            .read_private_file(&batch_path, MANIFEST_LIMIT)
+            .unwrap()
+            .unwrap();
+        let restored: BatchManifest = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.files.len(), 20_000);
+        assert_eq!(restored.preview.items.len(), 5_000);
+
+        manifest.warnings.push("x".repeat(MANIFEST_LIMIT));
+        assert!(
+            manager
+                .write_batch_manifest(&batch_path, &manifest)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&batch_path).unwrap(),
+            saved,
+            "an oversized rewrite must retain the valid recovery document"
+        );
+        drop(manifest);
+
+        let old_age = Duration::from_secs(9 * 24 * 60 * 60);
+        set_operation_state_age(&preview_path, old_age);
+        set_operation_state_age(&batch_path, old_age);
+        let registry = Mutex::new(OperationStateCleanupCursorRegistry::default());
+        for _ in 0..4 {
+            let warnings = run_operation_state_cleanup(&manager, &registry);
+            assert!(warnings.is_empty(), "cleanup warnings: {warnings:?}");
+        }
+        assert!(
+            !preview_path.exists(),
+            "large terminal preview should expire"
+        );
+        assert!(
+            !batch_path.exists(),
+            "large terminal batch must fit read and revalidation"
+        );
+        assert_eq!(fs::read(media_path).unwrap(), b"media fixture");
+        release_preview_anchors(&preview.id);
     }
 
     fn run_operation_state_cleanup(

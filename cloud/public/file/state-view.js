@@ -73,6 +73,12 @@ export function isIncompletePreview(entry) {
     || typeof entry.preview !== "object";
 }
 
+export function isPreviewDetailsAvailable(entry, { compactSummaryValidated = false } = {}) {
+  if (compactSummaryValidated
+      && String(entry?.status ?? "").toLowerCase() === "awaiting_confirmation") return true;
+  return !isIncompletePreview(entry);
+}
+
 export function isWaitingEntryPending(entry) {
   const status = String(entry?.status ?? "pending").toLowerCase();
   return ["file_preview", "library_migration_preview"].includes(entry?.kind)

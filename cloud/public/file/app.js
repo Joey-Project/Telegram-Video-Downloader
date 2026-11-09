@@ -3,6 +3,7 @@ import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegac
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { buildMetadataRecoveryPreviewPayload, buildOrganizationStatusPatch, groupMetadataRecoveryItems, metadataRecoveryOperationId, parseMetadataRecoveryReport } from "./metadata-recovery.js";
 import { readRecoveryPreviewRequest, writeRecoveryPreviewRequest } from "./metadata-recovery-preview-state.js";
+import { MAX_METADATA_RECOVERY_BATCH_ITEMS, advanceRecoverySelectionQueue, createRecoverySelectionQueue, getCurrentRecoverySelectionBatch, getRecoverySelectionQueueStatus, matchesRecoverySelectionQueue } from "./recovery-selection-batches.js";
 import { HttpResponseError } from "./http-error.js";
 import { createOwnerSnapshotLoader } from "./snapshot-loader.js";
 import { createSnapshotUpdates } from "./snapshot-updates.js";
@@ -12,9 +13,11 @@ import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limi
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
 import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationControlActions, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
-import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
+import { buildWaitingEntries, isPresentMedia, isPreviewDetailsAvailable, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
+import { filePreviewSummaryConfirmLabel, normalizeFilePreviewSummary, renderFilePreviewSummary } from "./file-preview-summary.js";
+import { normalizeFileConfirmSummary, renderFileConfirmSummary } from "./file-confirm-summary.js";
 import { registeredMediaLibrary } from "./library-view.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, librarySelectionCounts, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, movedToTarget, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
@@ -40,7 +43,7 @@ const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "r
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoverySelectionQueue: null, metadataRecoverySelectionRequestId: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let snapshotRefreshPending = false;
@@ -146,7 +149,32 @@ function dismissMetadataRecoveryId(id) {
   }
 }
 
-function clearMetadataRecoveryReport({ dismiss = true } = {}) {
+function clearMetadataRecoverySelectionQueue() {
+  state.metadataRecoverySelectionQueue = null;
+  state.metadataRecoverySelectionRequestId = null;
+}
+
+function currentMetadataRecoverySelectionQueue(context = recoveryContext()) {
+  const queue = state.metadataRecoverySelectionQueue;
+  if (!queue) return null;
+  if (!context || !matchesRecoverySelectionQueue(queue, {
+    libraryId: context.libraryId,
+    rootBinding: context.rootBinding,
+    selectedIds: [...state.selected],
+  })) {
+    clearMetadataRecoverySelectionQueue();
+    return null;
+  }
+  return queue;
+}
+
+function clearMetadataRecoverySelectionRequest(requestId) {
+  if (state.metadataRecoverySelectionRequestId === requestId) {
+    state.metadataRecoverySelectionRequestId = null;
+  }
+}
+
+function clearMetadataRecoveryReport({ dismiss = true, preserveSelectionQueue = false } = {}) {
   const current = state.metadataRecovery;
   if (dismiss && current?.requestId) {
     const latestSeq = recoveryOperationsForLibrary(current.libraryId)
@@ -159,6 +187,8 @@ function clearMetadataRecoveryReport({ dismiss = true } = {}) {
     if (Number.isSafeInteger(current.seq)) dismissMetadataRecoveryId(String(current.seq));
   }
   state.metadataRecovery = null;
+  state.metadataRecoverySelectionRequestId = null;
+  if (!preserveSelectionQueue) state.metadataRecoverySelectionQueue = null;
 }
 
 function setMetadataRecoveryPreviewRequest(request) {
@@ -466,6 +496,7 @@ function recoveryOperationMatches(operation, recovery) {
 function currentMetadataRecovery() {
   const context = recoveryContext();
   if (!context) return null;
+  currentMetadataRecoverySelectionQueue(context);
   let recovery = state.metadataRecovery;
   if (!recovery) {
     const queuedAction = [...readActionQueue()].reverse().find((action) => {
@@ -509,6 +540,7 @@ function currentMetadataRecovery() {
       recovery.selectedIds.clear();
       recovery.candidateChoices.clear();
       recovery.invalidated = true;
+      clearMetadataRecoverySelectionRequest(recovery.requestId);
     }
     const operation = recovery.requestId
       ? recoveryOperationsForLibrary(context.libraryId).find((entry) => recoveryOperationMatches(entry, recovery))
@@ -520,6 +552,7 @@ function currentMetadataRecovery() {
         recovery.report = null;
         recovery.selectedIds.clear();
         recovery.candidateChoices.clear();
+        clearMetadataRecoverySelectionRequest(recovery.requestId);
       }
       else {
         const report = recoveryOperationReport(operation);
@@ -527,19 +560,35 @@ function currentMetadataRecovery() {
           if (report.revision === context.revision && !recovery.invalidated) {
             recovery.report = report;
             recovery.error = null;
+            recovery.deliveryUnknown = false;
+            if (state.metadataRecoverySelectionRequestId === recovery.requestId) {
+              const queue = currentMetadataRecoverySelectionQueue(context);
+              state.metadataRecoverySelectionQueue = queue
+                ? advanceRecoverySelectionQueue(queue, {
+                  libraryId: context.libraryId,
+                  rootBinding: context.rootBinding,
+                  selectedIds: [...state.selected],
+                  outcome: "queued",
+                })
+                : null;
+              clearMetadataRecoverySelectionRequest(recovery.requestId);
+            }
           } else {
             recovery.report = null;
             recovery.selectedIds.clear();
             recovery.candidateChoices.clear();
             recovery.invalidated = true;
+            clearMetadataRecoverySelectionRequest(recovery.requestId);
           }
         } else if (["failed", "stale", "rejected"].includes(String(operation.status))) {
           recovery.error = String(operation.error ?? operation.message ?? "Metadata analysis failed on your computer.");
+          clearMetadataRecoverySelectionRequest(recovery.requestId);
         } else if (["completed", "complete", "succeeded"].includes(String(operation.status))) {
           recovery.invalidated = true;
           recovery.report = null;
           recovery.selectedIds.clear();
           recovery.candidateChoices.clear();
+          clearMetadataRecoverySelectionRequest(recovery.requestId);
         }
       }
     }
@@ -577,34 +626,92 @@ function currentMetadataRecovery() {
   return null;
 }
 
-async function requestMetadataRecovery(scope, { deferredItemIds = null } = {}) {
+async function requestMetadataRecovery(scope, { deferredItemIds = null, continueSelected = false } = {}) {
   if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before analyzing metadata.");
   const context = recoveryContext();
   if (!context) return showToast("The displayed library identity or revision is unavailable. Refresh the library before analyzing metadata.");
-  const current = deferredItemIds === null ? null : currentMetadataRecovery();
+  const current = currentMetadataRecovery();
+  const requestPending = Boolean(current?.requestId && !current.report && !current.error && !current.invalidated);
+  if (requestPending || current?.deliveryUnknown) {
+    return showToast("Wait for the current analysis outcome before starting another batch.");
+  }
+
+  let selectionQueueForRequest = null;
+  let selectionQueueRequest = false;
+  let selectedItemIds = null;
   if (deferredItemIds !== null && (scope !== "selected" || !Array.isArray(deferredItemIds)
-      || deferredItemIds.length === 0 || deferredItemIds.length > MAX_SELECTED_ITEMS
+      || deferredItemIds.length === 0 || deferredItemIds.length > MAX_METADATA_RECOVERY_BATCH_ITEMS
       || !current || current.scope !== "selected" || !current.report
       || current.report.revision !== context.revision
       || deferredItemIds.some((id) => !current.report.items.some((item) => item.item_id === id && item.status === "deferred")))) {
     return showToast("The deferred results no longer match this library revision. Analyze the current selection again before retrying.");
   }
+
+  if (scope === "selected" && deferredItemIds === null) {
+    const selectedIds = [...state.selected];
+    if (continueSelected) {
+      selectionQueueForRequest = currentMetadataRecoverySelectionQueue(context);
+      const queueStatus = getRecoverySelectionQueueStatus(selectionQueueForRequest);
+      if (!selectionQueueForRequest || !queueStatus?.hasCurrentBatch
+          || !current || current.scope !== "selected"
+          || !current.report && !current.invalidated && !current.error
+          || current.report && current.report.revision !== context.revision) {
+        return showToast("The next selected batch is no longer available. Select the remaining items and analyze them again.");
+      }
+    } else {
+      if (selectedIds.length === 0 || selectedIds.length > MAX_SELECTED_ITEMS) {
+        return showToast(`Select between 1 and ${MAX_SELECTED_ITEMS} present items to analyze metadata.`);
+      }
+      selectionQueueForRequest = createRecoverySelectionQueue({
+        libraryId: context.libraryId,
+        rootBinding: context.rootBinding,
+        itemIds: selectedIds,
+      });
+      if (!selectionQueueForRequest) {
+        return showToast(`Select between 1 and ${MAX_SELECTED_ITEMS} unique present items to analyze metadata.`);
+      }
+    }
+    selectedItemIds = getCurrentRecoverySelectionBatch(selectionQueueForRequest);
+    if (!selectedItemIds || selectedItemIds.length > MAX_METADATA_RECOVERY_BATCH_ITEMS) {
+      return showToast("The selected batch is no longer available. Select the items again and retry.");
+    }
+    selectionQueueRequest = true;
+  } else if (scope === "selected") {
+    selectedItemIds = deferredItemIds;
+  }
+
   const payload = {
     library_id: context.libraryId,
     root_binding: context.rootBinding,
     scope,
-    ...(scope === "selected" ? { item_ids: deferredItemIds === null ? [...state.selected] : [...deferredItemIds] } : {}),
+    ...(scope === "selected" ? { item_ids: [...selectedItemIds] } : {}),
   };
-  if (scope === "selected" && (payload.item_ids.length === 0 || payload.item_ids.length > MAX_SELECTED_ITEMS)) {
-    return showToast(`Select between 1 and ${MAX_SELECTED_ITEMS} present items to analyze metadata.`);
+  if (scope === "selected" && (payload.item_ids.length === 0 || payload.item_ids.length > MAX_METADATA_RECOVERY_BATCH_ITEMS)) {
+    return showToast(`Metadata recovery analyzes at most ${MAX_METADATA_RECOVERY_BATCH_ITEMS} selected items per batch.`);
   }
   if (scope === "library") {
-    const current = currentMetadataRecovery();
     if (current?.scope === "library" && current.report?.remaining > 0 && current.report.next_cursor) payload.after_item_id = current.report.next_cursor;
   }
   await submitAction("metadata_recover", payload, {
     onQueued: (action) => {
       state.dismissedRecoveryRequestIds.delete(action.request_id);
+      if (selectionQueueRequest) {
+        const currentContext = recoveryContext();
+        if (currentContext && matchesRecoverySelectionQueue(selectionQueueForRequest, {
+          libraryId: currentContext.libraryId,
+          rootBinding: currentContext.rootBinding,
+          selectedIds: [...state.selected],
+        })) {
+          state.metadataRecoverySelectionQueue = selectionQueueForRequest;
+          state.metadataRecoverySelectionRequestId = action.request_id;
+        } else {
+          clearMetadataRecoverySelectionQueue();
+        }
+      } else if (scope === "library") {
+        clearMetadataRecoverySelectionQueue();
+      } else {
+        state.metadataRecoverySelectionRequestId = null;
+      }
       state.metadataRecovery = {
         requestId: action.request_id,
         libraryId: context.libraryId,
@@ -1143,16 +1250,23 @@ function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
   const recoveryRevisionChanged = Boolean(recovery
     && resolveMediaLibrary(previousSnapshot, recovery.libraryId).snapshot?.revision
       !== resolveMediaLibrary(nextSnapshot, recovery.libraryId).snapshot?.revision);
+  const selectionQueue = state.metadataRecoverySelectionQueue;
+  const selectionQueueBindingChanged = Boolean(selectionQueue
+    && entryFor(nextSnapshot, selectionQueue.libraryId)?.root_binding !== selectionQueue.rootBinding);
   const previewBindingChanged = Boolean(previewRequest
     && entryFor(nextSnapshot, previewRequest.libraryId)?.root_binding !== previewRequest.rootBinding);
 
   if (recoveryBindingChanged || recoveryRevisionChanged) {
-    clearMetadataRecoveryReport({ dismiss: false });
+    clearMetadataRecoveryReport({
+      dismiss: false,
+      preserveSelectionQueue: recoveryRevisionChanged && !recoveryBindingChanged && !selectionQueueBindingChanged,
+    });
   }
+  if (selectionQueueBindingChanged) clearMetadataRecoverySelectionQueue();
   if (previewBindingChanged && state.metadataRecoveryPreviewRequest === previewRequest) {
     setMetadataRecoveryPreviewRequest(null);
   }
-  return recoveryBindingChanged || recoveryRevisionChanged || previewBindingChanged;
+  return recoveryBindingChanged || recoveryRevisionChanged || selectionQueueBindingChanged || previewBindingChanged;
 }
 
 function acceptFreshSnapshot(snapshot) {
@@ -1879,6 +1993,7 @@ async function drainActionQueue({ quiet = false } = {}) {
         }
         if (action.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
           state.metadataRecovery.error = rejection.error;
+          clearMetadataRecoverySelectionRequest(action.request_id);
           renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, { status: "rejected", error: rejection.error });
@@ -1912,6 +2027,11 @@ async function drainActionQueue({ quiet = false } = {}) {
           state.downloadSubmission = null;
           state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
           renderDownloadStatus();
+        }
+        if (action?.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
+          state.metadataRecovery.error = typeof error?.message === "string" ? error.message : "The request was rejected before analysis started.";
+          clearMetadataRecoverySelectionRequest(action.request_id);
+          renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, {
           status: "rejected",
@@ -2086,12 +2206,14 @@ function updateSelectedItems(candidateIds, selected) {
   const result = updateSelectionWithinLimit(state.selected, candidateIds, selected);
   state.selected.clear();
   for (const id of result.ids) state.selected.add(id);
+  currentMetadataRecoverySelectionQueue();
   state.groupSelectionLimitNotice = null;
   return result.omittedCount;
 }
 
 function clearSelectedItems() {
   state.selected.clear();
+  clearMetadataRecoverySelectionQueue();
   state.groupSelectionLimitNotice = null;
 }
 
@@ -2200,6 +2322,7 @@ function renderLibrary() {
   renderLibrarySelector();
   const library = activeLibrarySnapshot();
   const canOperate = libraryCanOperate();
+  const movedCount = libraryItems().filter((item) => movedToTarget(item) !== null).length;
   const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
   let prunedSelection = false;
   for (const id of state.selected) {
@@ -2207,7 +2330,10 @@ function renderLibrary() {
     state.selected.delete(id);
     prunedSelection = true;
   }
-  if (prunedSelection) state.groupSelectionLimitNotice = null;
+  if (prunedSelection) {
+    currentMetadataRecoverySelectionQueue();
+    state.groupSelectionLimitNotice = null;
+  }
   renderFilters();
   const items = filteredItems();
   const needsItems = items.filter(needsOrganizing);
@@ -2223,24 +2349,65 @@ function renderLibrary() {
   const omissionNotice = mediaSnapshotOmissionNotice(activeLibrary().descriptor, library);
   const firstScanPending = synced && (library?.ready === false || Number(library?.scanned_at) === 0);
   const retainedRowsMissing = mediaInfo.omittedCount > 0 && mediaInfo.retainedCount === 0;
+  const currentAndUnresolvedCount = Math.max(0, mediaInfo.totalCount - movedCount);
+  const currentEntriesSummaryCount = mediaInfo.omittedCount > 0
+    ? Math.max(0, mediaInfo.retainedCount - movedCount)
+    : currentAndUnresolvedCount;
+  const currentEntriesSummaryLabel = mediaInfo.omittedCount > 0 ? "current entries in view" : "current entries";
   const localOffline = mediaLibraryAvailability(activeLibrary().descriptor) === "offline";
   const savedLibraryView = activeLibrary().descriptor?.snapshot_stale === true;
-  byId("library-empty").classList.toggle("hidden", !synced || libraryItems().length > 0 && !firstScanPending);
-  list.classList.toggle("hidden", !synced || !library || firstScanPending || libraryItems().length === 0);
+  byId("library-empty").classList.toggle("hidden", !synced || firstScanPending || libraryItems().length > 0 && items.length > 0);
+  list.classList.toggle("hidden", !synced || !library || firstScanPending || items.length === 0);
   const emptyHeading = byId("library-empty").querySelector("h2");
   const emptyCopy = byId("library-empty").querySelector("p");
+  const statusFilter = byId("status-filter").value;
+  const movedStatusOption = byId("status-filter").querySelector('option[value="moved"]');
+  if (movedStatusOption) movedStatusOption.textContent = movedCount > 0
+    ? `Moved history (${movedCount.toLocaleString()})`
+    : "Moved history";
+  const hasExtraFilters = Boolean(state.query.trim() || byId("category-filter").value || statusFilter);
+  const omittedDetailsCopy = mediaInfo.omittedCount > 0
+    ? ` ${mediaInfo.omittedCount.toLocaleString()} item details are omitted from the cloud list and remain unclassified.`
+    : "";
+  const matchingRowsSummary = `${items.length.toLocaleString()} matching item${items.length === 1 ? "" : "s"}`;
+  const pageSummary = items.length
+    ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)}`
+    : "no matches";
+  const movedHistoryCountLabel = `${movedCount.toLocaleString()} moved entr${movedCount === 1 ? "y" : "ies"}`;
+  const movedHistorySummary = movedCount === 0
+    ? ""
+    : statusFilter === "moved"
+      ? ""
+      : `${movedHistoryCountLabel} in history`;
+  const selectionSummary = state.selected.size && statusFilter !== "moved"
+    ? `${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}`
+    : "";
   if (firstScanPending) {
     emptyHeading.textContent = "Waiting for the first scan";
     emptyCopy.textContent = "Your computer is connected. The library will appear when its first scan completes.";
-  } else if (localOffline) {
-    emptyHeading.textContent = "This media root is offline";
-    emptyCopy.textContent = "The last saved view remains available when one was synced. Reconnect the desktop drive and refresh to scan it again.";
   } else if (!library) {
     emptyHeading.textContent = "No saved view for this library";
     emptyCopy.textContent = "This registered root has not reported a library snapshot yet.";
   } else if (retainedRowsMissing) {
     emptyHeading.textContent = "The cloud list has no retained media rows";
     emptyCopy.textContent = `The full scan reports ${mediaInfo.totalCount.toLocaleString()} media items, but no item details fit in this cloud view. Open the desktop app to browse the complete list.`;
+  } else if (items.length === 0 && libraryItems().length > 0) {
+    if (statusFilter === "moved") {
+      emptyHeading.textContent = "No matching moved history";
+      emptyCopy.textContent = `No verified moved entries match the current search or folder filter.${omittedDetailsCopy}`;
+    } else if (!hasExtraFilters && movedCount === libraryItems().length) {
+      emptyHeading.textContent = "No current or unresolved rows in the retained view";
+      emptyCopy.textContent = `${movedCount.toLocaleString()} verified moved entr${movedCount === 1 ? "y is" : "ies are"} hidden from the default view. Choose “Moved history” in File status to review them.${omittedDetailsCopy}`;
+    } else {
+      emptyHeading.textContent = "No matching retained rows";
+      const movedHistoryHint = movedCount > 0
+        ? ` ${movedCount.toLocaleString()} verified moved entr${movedCount === 1 ? "y is" : "ies are"} available under “Moved history”.`
+        : "";
+      emptyCopy.textContent = `Change the search or filters to see other rows.${movedHistoryHint}${omittedDetailsCopy}`;
+    }
+  } else if (localOffline) {
+    emptyHeading.textContent = "This media root is offline";
+    emptyCopy.textContent = "The last saved view remains available when one was synced. Reconnect the desktop drive and refresh to scan it again.";
   } else {
     emptyHeading.textContent = "No media found yet";
     emptyCopy.textContent = "Run a scan on the connected computer to discover videos and their sidecar files.";
@@ -2249,12 +2416,11 @@ function renderLibrary() {
     list.innerHTML = "";
     byId("library-empty").classList.add("hidden");
   }
-  const total = mediaInfo.totalCount;
-  byId("library-count").textContent = synced && !firstScanPending ? String(total) : "—";
+  byId("library-count").textContent = synced && !firstScanPending ? String(currentAndUnresolvedCount) : "—";
   byId("library-summary").textContent = firstScanPending
     ? "Your computer is connected, but the first scan has not completed."
     : state.snapshot?.synced
-    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${items.length.toLocaleString()} matching retained item${items.length === 1 ? "" : "s"} · ${items.length ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)} filtered retained rows` : "no matches"} · ${mediaInfo.retainedCount.toLocaleString()} retained in cloud list · ${total.toLocaleString()} in library${omissionNotice ? ` · ${omissionNotice}` : ""}${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
+    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${matchingRowsSummary} · ${pageSummary} · ${currentEntriesSummaryCount.toLocaleString()} ${currentEntriesSummaryLabel}${movedHistorySummary ? ` · ${movedHistorySummary}` : ""}${omissionNotice ? ` · ${omissionNotice}` : ""}${selectionSummary ? ` · ${selectionSummary}` : ""}`
     : "A first scan has not completed yet.";
   const needsTotal = libraryItems().filter(needsOrganizing).length;
   byId("needs-count").textContent = synced && !firstScanPending ? String(needsTotal) : "—";
@@ -2266,7 +2432,7 @@ function renderLibrary() {
   byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
   byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
   byId("download-here").disabled = !canOperate;
-  byId("select-visible").disabled = !canOperate;
+  byId("select-visible").disabled = !canOperate || presentMediaItems(libraryPage.items).length === 0;
   byId("target-dir").disabled = !canOperate;
   byId("root-target").disabled = !canOperate;
   byId("rename-toggle").disabled = !canOperate;
@@ -2274,7 +2440,7 @@ function renderLibrary() {
   byId("preview-move").disabled = !canOperate || state.selected.size === 0;
   byId("import-legacy").disabled = !canOperate;
   const selectionActions = byId("selection-actions");
-  selectionActions.classList.toggle("hidden", state.selected.size === 0 || ["waiting", "history"].includes(state.view));
+  selectionActions.classList.toggle("hidden", state.selected.size === 0 || ["waiting", "history"].includes(state.view) || byId("status-filter").value === "moved");
   byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
   byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
   byId("recover-selected").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
@@ -2323,15 +2489,35 @@ function renderMetadataRecovery() {
   const current = recoveryContext();
   const canOperate = Boolean(current && libraryCanOperate(current.libraryId));
   const recovery = current ? currentMetadataRecovery() : null;
+  const selectionQueue = currentMetadataRecoverySelectionQueue(current);
+  const selectionQueueStatus = getRecoverySelectionQueueStatus(selectionQueue);
   const report = recovery?.report ?? null;
   const groups = report ? groupMetadataRecoveryItems(report.items) : null;
+  const analysisUnknown = recovery?.deliveryUnknown === true;
+  const analysisPending = Boolean(state.metadataRecoverySelectionRequestId
+    || recovery?.requestId && !report && !recovery.error && !recovery.invalidated);
+  const nextSelectedBatchAvailable = Boolean(canOperate && recovery?.scope === "selected"
+    && selectionQueueStatus?.hasCurrentBatch
+    && (report?.revision === current?.revision || recovery.invalidated)
+    && !analysisPending && !analysisUnknown && !recovery.error);
+  const nextSelectedBatchButton = nextSelectedBatchAvailable
+    ? `<button class="secondary-button" type="button" data-recovery-next-selected>Analyze next selected batch (${selectionQueueStatus.remainingCount.toLocaleString()} remaining)</button>`
+    : "";
+  const retrySelectedBatchAvailable = Boolean(canOperate && recovery?.scope === "selected"
+    && recovery.error && selectionQueueStatus?.hasCurrentBatch && !analysisPending && !analysisUnknown);
+  const retrySelectedBatchButton = retrySelectedBatchAvailable
+    ? `<button class="secondary-button" type="button" data-recovery-retry-selected-batch>Retry this selected batch (${selectionQueueStatus.currentCount.toLocaleString()} items)</button>`
+    : "";
   const libraryButton = byId("recover-library");
   if (libraryButton) {
-    libraryButton.disabled = !canOperate || Boolean(recovery?.requestId && !report && !recovery.error && !recovery.invalidated);
+    libraryButton.disabled = !canOperate || analysisPending || analysisUnknown;
     libraryButton.textContent = recovery?.scope === "library" && report?.remaining > 0 ? "Analyze next batch" : "Analyze current library";
   }
   const selectedButton = byId("recover-selected");
-  if (selectedButton) selectedButton.disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
+  if (selectedButton) {
+    selectedButton.disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS
+      || analysisPending || analysisUnknown || nextSelectedBatchAvailable || retrySelectedBatchAvailable;
+  }
   const status = byId("recovery-status");
   const results = byId("metadata-recovery-results");
   if (!status || !results) return;
@@ -2352,21 +2538,26 @@ function renderMetadataRecovery() {
     status.textContent = recovery.compacted
       ? "This saved report was compacted and its item details are unavailable. Analyze again to get a fresh report."
       : "The library changed after this analysis. Its selections and candidates were cleared; analyze again before previewing updates.";
-    results.innerHTML = "";
+    if (nextSelectedBatchAvailable && selectionQueueStatus) {
+      status.textContent += ` ${selectionQueueStatus.remainingCount.toLocaleString()} selected items remain in this page's selection.`;
+      results.innerHTML = `<div class="recovery-footer">${nextSelectedBatchButton}</div>`;
+    } else {
+      results.innerHTML = "";
+    }
     return;
   }
   if (!report) {
     status.textContent = recovery.deliveryUnknown
-      ? "The analysis request delivery outcome is unknown. Check your computer before starting another analysis; this request will not be resent automatically."
+      ? "The analysis request delivery outcome is unknown. Check your computer before starting another analysis; this request will not be resent automatically. No later selected batch was sent."
       : recovery.error
-        ? `Analysis failed: ${recovery.error}`
-        : "Metadata analysis is queued or running on your computer. Results arrive through the existing live update connection.";
-    results.innerHTML = "";
+        ? `Analysis failed: ${recovery.error} No later selected batch was sent.`
+        : "Metadata analysis is queued or running on your computer. Results arrive through the existing live update connection; the next selected batch waits for this report.";
+    results.innerHTML = retrySelectedBatchButton ? `<div class="recovery-footer">${retrySelectedBatchButton}</div>` : "";
     return;
   }
 
   status.textContent = recovery.scope === "selected"
-    ? `Analysis revision ${report.revision} · ${report.items.length} selected result${report.items.length === 1 ? "" : "s"} · ${report.total} needs-organizing candidates in the library`
+    ? `Analysis revision ${report.revision} · ${report.items.length} item${report.items.length === 1 ? "" : "s"} in this selected batch${selectionQueueStatus ? ` · ${selectionQueueStatus.submittedCount.toLocaleString()} of ${selectionQueueStatus.totalCount.toLocaleString()} submitted` : ""}`
     : `Analysis revision ${report.revision} · ${report.items.length} items in this batch · ${report.total} needs-organizing candidates in the library · ${report.remaining} remaining after this batch`;
   const sections = Object.entries(groups).filter(([key, items]) => key !== "deferred" || items.length > 0).map(([key, items]) => {
     const content = items.length ? items.map((item) => recoveryItemMarkup(item, recovery)).join("")
@@ -2382,6 +2573,13 @@ function renderMetadataRecovery() {
   const deferredRetry = recovery.scope === "selected" && deferredItems.length > 0
     ? `<button class="secondary-button" type="button" data-recovery-retry-deferred>Analyze deferred items</button>`
     : "";
+  const selectedContinuationHint = recovery.scope !== "selected"
+    ? ""
+    : selectionQueueStatus
+      ? selectionQueueStatus.remainingCount > 0
+        ? `<p class="field-hint">${selectionQueueStatus.remainingCount.toLocaleString()} selected items remain. Analyze each next batch when you are ready.</p>`
+        : `<p class="field-hint">All ${selectionQueueStatus.totalCount.toLocaleString()} selected items have an analysis report.</p>`
+      : `<p class="field-hint">This saved report restores only its analyzed batch. To continue a larger selection after reloading, select the remaining items again in the current library.</p>`;
   const previewPayload = canOperate ? buildMetadataRecoveryPreviewPayload({
     report,
     libraryId: current.libraryId,
@@ -2389,7 +2587,7 @@ function renderMetadataRecovery() {
     itemIds: [...recovery.selectedIds],
     candidateChoices: recovery.candidateChoices,
   }) : null;
-  results.innerHTML = `${continuationHint ? `<p class="field-hint">${escapeHtml(continuationHint)}</p>` : ""}<div class="recovery-group-list">${sections}</div><div class="recovery-footer"><button class="primary-button" type="button" data-recovery-preview ${previewPayload ? "" : "disabled"}>Preview selected updates</button>${deferredRetry}${recovery.scope === "library" && report.remaining > 0 ? `<button class="secondary-button" type="button" data-recovery-next>Analyze next batch</button>` : ""}<button class="quiet-button" type="button" data-recovery-clear>Clear report and choices</button></div>`;
+  results.innerHTML = `${continuationHint ? `<p class="field-hint">${escapeHtml(continuationHint)}</p>` : ""}${selectedContinuationHint}<div class="recovery-group-list">${sections}</div><div class="recovery-footer"><button class="primary-button" type="button" data-recovery-preview ${previewPayload ? "" : "disabled"}>Preview selected updates</button>${deferredRetry}${recovery.scope === "library" && report.remaining > 0 ? `<button class="secondary-button" type="button" data-recovery-next>Analyze next batch</button>` : ""}${nextSelectedBatchButton}<button class="quiet-button" type="button" data-recovery-clear>Clear report and choices</button></div>`;
 }
 
 function operationTitle(operation) {
@@ -2492,7 +2690,7 @@ function operationPreview(operation) {
   const id = operation.preview_id ?? result.preview_id ?? preview?.preview_id ?? preview?.id;
   const revision = operation.revision ?? result.revision ?? preview?.revision;
   if (typeof id !== "string" || typeof revision !== "string") return null;
-  return {
+  const normalized = {
     ...operation,
     kind: "file_preview",
     seq: operation.seq,
@@ -2506,6 +2704,7 @@ function operationPreview(operation) {
     reason: operation.reason,
     ...(identity ?? {}),
   };
+  return { ...normalized, compactSummary: normalizeFilePreviewSummary(normalized) };
 }
 
 function allFilePreviews() {
@@ -2516,19 +2715,31 @@ function allFilePreviews() {
     const id = preview.preview_id ?? preview.id;
     const revision = preview.revision ?? preview.preview?.revision;
     if (typeof id !== "string" || typeof revision !== "string") continue;
-    collected.push({
+    const resultPreview = preview.result?.preview && typeof preview.result.preview === "object"
+      ? preview.result.preview
+      : null;
+    const previewDetails = preview.preview && typeof preview.preview === "object"
+      ? preview.preview
+      : resultPreview ?? (preview.file_preview_summary === true ? preview : null);
+    const normalized = {
       ...preview,
       kind: "file_preview",
       seq: preview.seq,
       id,
       revision,
-      preview: incomplete ? null : preview.preview && typeof preview.preview === "object" ? preview.preview : preview,
-      incomplete: incomplete || !preview.preview,
+      preview: previewDetails,
+      incomplete: incomplete || !previewDetails,
       preview_incomplete: preview.preview_incomplete === true,
       reload_required: preview.reload_required === true,
       reason: preview.reason,
       status: preview.status,
       ...(fileOperationLibraryIdentity(preview) ?? {}),
+    };
+    const compactSummary = normalizeFilePreviewSummary(normalized);
+    collected.push({
+      ...normalized,
+      preview: incomplete && !compactSummary ? null : previewDetails,
+      compactSummary,
     });
   }
   for (const operation of Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []) {
@@ -2540,7 +2751,8 @@ function allFilePreviews() {
     if (Number.isSafeInteger(value.seq) && value.seq > 0) {
       const key = `seq:${value.seq}`;
       const existing = unique.get(key);
-      if (!existing || existing.incomplete && !value.incomplete) unique.set(key, value);
+      const detailRank = (entry) => entry.compactSummary ? 1 : !entry.incomplete && entry.preview ? 2 : 0;
+      if (!existing || detailRank(value) > detailRank(existing)) unique.set(key, value);
     } else {
       unique.set(JSON.stringify([value.kind, value.id, value.revision]), value);
     }
@@ -2560,6 +2772,14 @@ function omittedPreviewAggregate(snapshot = state.snapshot) {
 
 function previews() {
   return allFilePreviews().filter((entry) => !entry.library_id || entry.library_id === activeLibraryId());
+}
+
+function currentFilePreviewSummary(entry) {
+  const summary = entry?.compactSummary;
+  if (!summary || summary.id !== entry.id || summary.revision !== entry.revision
+      || summary.libraryId !== entry.library_id
+      || !fileOperationIdentityMatches(state.snapshot, entry, summary.libraryId)) return null;
+  return summary;
 }
 
 function previewCancellationPayload(kind, entry) {
@@ -3214,23 +3434,43 @@ function renderPreviews() {
   byId("preview-list").innerHTML = requestCard + omittedNotice + pending.map((entry) => {
     const cancel = previewCancellationMarkup("file_preview", entry);
     const cardId = previewCardId("file_preview", entry);
-    if (isIncompletePreview(entry)) {
-      const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
+    const compactSummary = currentFilePreviewSummary(entry);
+    const identityMatches = fileOperationIdentityMatches(state.snapshot, entry, entry.library_id ?? "");
+    if (!isPreviewDetailsAvailable(entry, { compactSummaryValidated: Boolean(compactSummary) })) {
+      const compactMarker = entry.preview?.file_preview_summary === true
+        || entry.result?.preview?.file_preview_summary === true;
+      const reason = compactMarker
+        ? identityMatches
+          ? "This compact preview summary is incomplete or inconsistent. Request a fresh preview before confirming."
+          : "This compact preview no longer matches the current library registration. Request a fresh preview before confirming."
+        : entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
       return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${cancel}</div></article>`;
     }
-    if (!fileOperationIdentityMatches(state.snapshot, entry, entry.library_id ?? "")) {
+    if (!identityMatches) {
       return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>Preview needs refreshing</h3><p>This saved preview does not have a verified identity for the current library registration. No changes were applied; request a fresh preview before confirming.</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${cancel}</div></article>`;
     }
     const preview = entry.preview;
-    const hasMetadataChanges = hasMetadataPreviewChanges(preview);
-    const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
+    const hasMetadataChanges = compactSummary
+      ? compactSummary.metadataOnly || compactSummary.changedMetadataPatchCount > 0
+      : hasMetadataPreviewChanges(preview);
+    const hasMoveItems = compactSummary
+      ? compactSummary.moveItemCount > 0
+      : Array.isArray(preview.items) && preview.items.length > 0;
     const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
     const libraryId = typeof entry.library_id === "string" ? entry.library_id : "";
     const libraryAvailable = libraryCanOperate(libraryId);
     const cancellationBusy = previewCancellationBusy("file_preview", entry);
     const canConfirm = libraryAvailable && !cancellationBusy;
     const offlineMessage = libraryAvailable ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
-    return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button>${cancel}</div></article>`;
+    const destination = compactSummary?.metadataOnly
+      ? "Metadata only · file locations stay the same"
+      : compactSummary
+        ? compactSummary.targetRelativeDir || "Library root"
+        : preview.target_relative_dir ?? "Metadata only · file locations stay the same";
+    const conflict = compactSummary?.conflict ?? preview.conflict ?? "skip";
+    const details = compactSummary ? renderFilePreviewSummary(compactSummary) : describePreview(preview);
+    const confirmLabel = compactSummary ? filePreviewSummaryConfirmLabel(compactSummary) : "Confirm changes";
+    return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(destination)} · Conflict: ${escapeHtml(conflict)}</p>${offlineMessage}</div><span class="state-pill pending">${compactSummary ? "Compact review" : "Review needed"}</span></div><div class="preview-table">${details}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>${escapeHtml(confirmLabel)}</button>${cancel}</div></article>`;
   }).join("");
   if (!requestCard && !omittedNotice && !pending.length) byId("preview-list").innerHTML = "";
 }
@@ -3365,6 +3605,7 @@ function renderOperations() {
   const renderEntries = (entries) => entries.slice().reverse().map((entry) => {
     const result = entry.result && typeof entry.result === "object" ? entry.result : {};
     const outcome = result.operation && typeof result.operation === "object" ? result.operation : result;
+    const fileConfirmSummary = normalizeFileConfirmSummary(entry);
     const preview = result.preview && typeof result.preview === "object"
       ? result.preview
       : entry.preview && typeof entry.preview === "object" ? entry.preview : null;
@@ -3378,7 +3619,11 @@ function renderOperations() {
     const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
     const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
     const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
-    const summary = cancelTarget
+    const summary = fileConfirmSummary?.detailsAvailable
+      ? `${statusText(fileConfirmSummary.status)} · ${fileConfirmSummary.selectedCount.toLocaleString()} item results · ${fileConfirmSummary.movedFileCount.toLocaleString()}/${fileConfirmSummary.fileCount.toLocaleString()} related files moved`
+      : fileConfirmSummary
+        ? "The batch result details are unavailable in this snapshot."
+        : cancelTarget
       ? `Cancelled ${cancelTarget}. No changes were applied by this request.`
       : entry.kind === "file_preview" && String(entry.status).toLowerCase() === "cancelled"
         ? "This preview was cancelled before confirmation. No changes were applied."
@@ -3403,7 +3648,7 @@ function renderOperations() {
       return `<div class="preview-line"><span>${escapeHtml(label)}<br><span class="field-hint">${escapeHtml(fileProgress + metadata)}</span>${item.error ? `<br><span class="preview-reason">${escapeHtml(item.error)}</span>` : ""}</span><strong class="${item.error ? "skip" : "move"}">${item.error ? "Needs review" : "Done"}</strong></div>`;
     }).join("");
     const warningDetails = [...warnings, ...(typeof telegramWarning === "string" ? [telegramWarning] : [])];
-    if (detailsWarning) warningDetails.push(detailsWarning);
+    if (detailsWarning && !fileConfirmSummary) warningDetails.push(detailsWarning);
     const sourceLibraryId = String(result.source_library_id ?? "");
     const targetLibraryId = String(result.target_library_id ?? "");
     const libraryContext = sourceLibraryId && targetLibraryId
@@ -3411,8 +3656,9 @@ function renderOperations() {
       : operationLibraryId(entry) ? libraryLabel(operationLibraryId(entry)) : "";
     const contextLabel = libraryContext ? `<p class="field-hint">${escapeHtml(libraryContext)}</p>` : "";
     const previewDetails = preview ? `<div class="preview-table">${describePreview(preview)}</div>` : "";
+    const fileConfirmDetails = fileConfirmSummary ? renderFileConfirmSummary(fileConfirmSummary) : "";
     const title = entry.kind === "preview_cancel" ? "Preview cancellation" : operationTitle(entry);
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(entry.error ?? summary)}</p>${contextLabel}</div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${previewDetails}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(entry.error ?? summary)}</p>${contextLabel}</div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${previewDetails}${fileConfirmDetails}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
   }).join("");
   byId("active-operation-list").innerHTML = renderEntries(active);
   byId("operation-list").innerHTML = renderEntries(history);
@@ -4150,6 +4396,16 @@ function bindEvents() {
     }
     const recoveryNext = event.target.closest("[data-recovery-next]");
     if (recoveryNext) { requestMetadataRecovery("library"); return; }
+    const recoveryNextSelected = event.target.closest("[data-recovery-next-selected]");
+    if (recoveryNextSelected) {
+      requestMetadataRecovery("selected", { continueSelected: true });
+      return;
+    }
+    const recoveryRetrySelectedBatch = event.target.closest("[data-recovery-retry-selected-batch]");
+    if (recoveryRetrySelectedBatch) {
+      requestMetadataRecovery("selected", { continueSelected: true });
+      return;
+    }
     const previewNoticeDismiss = event.target.closest("[data-recovery-preview-dismiss]");
     if (previewNoticeDismiss) {
       if (state.metadataRecoveryPreviewRequest?.requestId === previewNoticeDismiss.dataset.recoveryPreviewDismiss) {
@@ -4379,7 +4635,8 @@ function bindEvents() {
         return;
       }
       const matchingPreview = previews().find((entry) => entry.id === confirm.dataset.confirm && entry.revision === confirm.dataset.revision);
-      if (!matchingPreview || isIncompletePreview(matchingPreview)) {
+      const compactSummary = currentFilePreviewSummary(matchingPreview);
+      if (!matchingPreview || !isPreviewDetailsAvailable(matchingPreview, { compactSummaryValidated: Boolean(compactSummary) })) {
         showToast("This preview is incomplete. Request a fresh preview before confirming.");
         return;
       }

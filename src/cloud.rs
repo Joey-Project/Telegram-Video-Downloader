@@ -1971,6 +1971,92 @@ impl InboxRecord {
             return Ok(false);
         }
 
+        if self.request.kind == "file_preview"
+            && let Some(result) =
+                crate::cloud_snapshot_budget::compact_file_preview_receipt_result(self)
+        {
+            self.result = Some(result);
+            if serde_json::to_vec(self)?
+                .len()
+                .saturating_add(safety_margin)
+                <= limit
+            {
+                return Ok(true);
+            }
+        }
+
+        if self.request.kind == "file_confirm" {
+            if let Some(result) =
+                crate::cloud_snapshot_budget::compact_file_confirm_receipt_result(self)
+            {
+                self.result = Some(result);
+                if serde_json::to_vec(self)?
+                    .len()
+                    .saturating_add(safety_margin)
+                    <= limit
+                {
+                    return Ok(true);
+                }
+            }
+
+            // A large executed batch must retain its actual terminal status even if an
+            // unexpected result shape prevents detailed compaction. Never turn a successful
+            // filesystem operation into a failure merely because its receipt was too large.
+            let original = self.result.as_ref();
+            let preview_id = original
+                .and_then(|value| value.get("preview_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let revision = original
+                .and_then(|value| value.get("revision"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            self.result = Some(serde_json::json!({
+                "preview_id": preview_id,
+                "revision": revision,
+                "details_incomplete": true,
+                "result_truncated": true,
+                "operation": {
+                    "file_confirm_summary": true,
+                    "summary_version": 1,
+                    "details_available": false,
+                    "status": match self.status {
+                        InboxStatus::Pending => "pending",
+                        InboxStatus::Processing => "processing",
+                        InboxStatus::AwaitingConfirmation => "awaiting_confirmation",
+                        InboxStatus::Completed => "completed",
+                        InboxStatus::Failed => "failed",
+                        InboxStatus::Retryable => "retryable",
+                        InboxStatus::Uncertain => "uncertain",
+                        InboxStatus::Stale => "stale",
+                        InboxStatus::Cancelled => "cancelled",
+                    },
+                    "summary_message": "The batch operation finished, but its detailed receipt could not be retained.",
+                },
+            }));
+            if serde_json::to_vec(self)?
+                .len()
+                .saturating_add(safety_margin)
+                <= limit
+            {
+                return Ok(true);
+            }
+            bail!("cloud inbox file confirmation cannot fit its compact terminal receipt");
+        }
+
+        if let Some(result) =
+            crate::cloud_snapshot_budget::compact_library_migration_receipt_result(self)
+        {
+            self.result = Some(result);
+            if serde_json::to_vec(self)?
+                .len()
+                .saturating_add(safety_margin)
+                <= limit
+            {
+                return Ok(true);
+            }
+        }
+
         if self.request.kind == "legacy_import"
             && self.compact_oversized_legacy_import_result(limit, safety_margin)?
         {

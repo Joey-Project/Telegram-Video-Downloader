@@ -523,6 +523,7 @@ async fn slow_inline_control_handler_does_not_consume_pong_deadline() {
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
     let first_nonce = timeout(Duration::from_secs(5), ping_rx.recv())
         .await
         .expect("first idle probe should be sent")
@@ -538,8 +539,10 @@ async fn slow_inline_control_handler_does_not_consume_pong_deadline() {
         .await
         .expect("fake peer should write the control frame");
     handler_started.notified().await;
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(25)).await;
     drop(viewer_guard);
+    tokio::time::resume();
 
     waiting.notified().await;
     release_pong_tx
@@ -551,7 +554,9 @@ async fn slow_inline_control_handler_does_not_consume_pong_deadline() {
     // The next loop notification proves the reader consumed the Pong before the deadline check.
     waiting.notified().await;
 
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
     let later_nonce = timeout(Duration::from_secs(5), ping_rx.recv())
         .await
         .expect("session should remain connected after slow inline work")

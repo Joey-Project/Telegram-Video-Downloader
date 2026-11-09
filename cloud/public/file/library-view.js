@@ -375,9 +375,13 @@ export function filterLibraryItems(items, { query = "", category = "", status = 
   const normalizedQuery = String(query).trim().toLocaleLowerCase();
   const filtered = (Array.isArray(items) ? items : []).filter((item) => {
     const text = [item?.title, item?.relative_path, item?.id, ...(Array.isArray(item?.source_ids) ? item.source_ids : [])].join(" ").toLocaleLowerCase();
+    const moved = movedToTarget(item) !== null;
+    const matchesStatus = status === "moved"
+      ? moved
+      : !moved && (!status || statusOf(item) === status);
     return (!normalizedQuery || text.includes(normalizedQuery))
       && (!category || itemFolder(item) === category)
-      && (!status || statusOf(item) === status);
+      && matchesStatus;
   });
   return sortLibraryItems(filtered);
 }

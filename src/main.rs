@@ -4,6 +4,8 @@ mod bilibili_auth;
 mod bilibili_core;
 mod bilibili_danmaku;
 mod bilibili_planning;
+#[cfg(test)]
+mod bulk_selection_tests;
 mod cloud;
 #[cfg(test)]
 mod cloud_bot_tests;
@@ -4100,6 +4102,8 @@ struct FilePreviewPayload {
     metadata_patches: Vec<MetadataPatchInput>,
 }
 
+const MAX_CLOUD_SELECTED_ITEMS: usize = 5_000;
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetadataPatchInput {
@@ -4754,15 +4758,42 @@ async fn dispatch_cloud_management(
                     "The persisted preview is incomplete. Run a fresh preview.",
                 ));
             };
-            let preview: MovePreview = match serde_json::from_value(preview_value.clone()) {
-                Ok(preview) => preview,
-                Err(error) => {
-                    return Ok(cloud_dispatch_failure(format!(
-                        "persisted preview is invalid: {error}"
-                    )));
+            let preview_identity = if preview_value
+                .get("file_preview_summary")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                if !crate::cloud_snapshot_budget::is_valid_compact_file_preview_result(
+                    &preview_record,
+                ) {
+                    return Ok(cloud_dispatch_failure(
+                        "The compact preview summary is invalid. Run a fresh preview.",
+                    ));
                 }
+                (
+                    preview_value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    preview_value
+                        .get("revision")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            } else {
+                let preview: MovePreview = match serde_json::from_value(preview_value.clone()) {
+                    Ok(preview) => preview,
+                    Err(error) => {
+                        return Ok(cloud_dispatch_failure(format!(
+                            "persisted preview is invalid: {error}"
+                        )));
+                    }
+                };
+                (preview.id, preview.revision)
             };
-            if preview.id != payload.preview_id || preview.revision != payload.revision {
+            if preview_identity.0 != payload.preview_id || preview_identity.1 != payload.revision {
                 return Ok(cloud_dispatch_failure(
                     "Preview identity or revision did not match. Run a fresh preview.",
                 ));
@@ -5053,8 +5084,10 @@ fn validate_file_preview_payload(
         })
         .collect::<Vec<_>>();
     let mut item_ids = payload.item_ids.unwrap_or_default();
-    if item_ids.len() > 100 || patch_inputs.len() > 100 {
-        return Err("A file preview can include at most 100 items.".to_string());
+    if item_ids.len() > MAX_CLOUD_SELECTED_ITEMS || patch_inputs.len() > MAX_CLOUD_SELECTED_ITEMS {
+        return Err(format!(
+            "A file preview can include at most {MAX_CLOUD_SELECTED_ITEMS} items."
+        ));
     }
     let selected_item_count = item_ids.len();
     if item_ids
@@ -5271,7 +5304,11 @@ fn validate_cloud_file_preview_receipt(receipt: &InboxRecord, preview: &MovePrev
     generated.result = Some(cloud_file_preview_result(preview, library_id, root_binding));
     generated.error = None;
     generated.next_attempt_at = 0;
-    if generated.compact_oversized_result()? {
+    let was_compacted = generated.compact_oversized_result()?;
+    if generated.status != InboxStatus::AwaitingConfirmation
+        || (was_compacted
+            && !crate::cloud_snapshot_budget::is_valid_compact_file_preview_result(&generated))
+    {
         bail!(
             "This preview is too large to save and confirm. Select fewer files or split the changes into smaller previews."
         );

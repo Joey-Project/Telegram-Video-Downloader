@@ -5,17 +5,18 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::*;
 use crate::file_manager::{LibraryManager, MigrationScanResult};
+use crate::library::ConflictPolicy;
 use crate::library::Presence;
 use crate::library_migration::{
     MigrationControl, MigrationDeliveryState, MigrationDiscoveryWarning,
-    MigrationDiscoveryWarningKind, MigrationDiscoveryWarnings, MigrationEngine, MigrationPreview,
-    MigrationRequest, MigrationRunStatus, MigrationRuntimeContext, MigrationScope, MigrationStatus,
-    MigrationTaskImpact, validate_migration_scan_paths,
+    MigrationDiscoveryWarningKind, MigrationDiscoveryWarnings, MigrationEngine, MigrationItemPhase,
+    MigrationPreview, MigrationRequest, MigrationRunStatus, MigrationRuntimeContext,
+    MigrationScope, MigrationStatus, MigrationTaskImpact, validate_migration_scan_paths,
 };
 use crate::media_libraries::TaskDestination;
 use crate::safe_fs::RootedFs;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const MAX_MIGRATION_TASKS: usize = 10_000;
 
@@ -181,6 +182,29 @@ struct BoundMigrationPreview {
     target_root_binding: String,
 }
 
+struct BoundMigrationPreviewReceipt {
+    id: String,
+    revision: String,
+    source_library_id: String,
+    source_root_binding: String,
+    target_library_id: String,
+    target_root_binding: String,
+    scope: MigrationScope,
+    conflict: ConflictPolicy,
+    include_incomplete_tasks: bool,
+    set_target_default_on_success: bool,
+    item_count: usize,
+    file_count: usize,
+    total_bytes: u64,
+    required_space_bytes: u64,
+    available_space_bytes: u64,
+    conflict_count: usize,
+    incomplete_task_count: usize,
+    staging_bytes: u64,
+    compact_summary: bool,
+    sample_items: Option<Vec<crate::cloud_snapshot_budget::MigrationPreviewSummaryItemV1>>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfirmPayload {
@@ -227,6 +251,210 @@ fn manager_for_verified_root(
             preview_cleanup_gate,
         )?,
     ))
+}
+
+fn migration_preview_receipt(
+    record: &crate::cloud::InboxRecord,
+    expected_id: &str,
+    expected_revision: &str,
+) -> Result<BoundMigrationPreviewReceipt> {
+    if record.request.kind != "library_migration_preview"
+        || record.status != InboxStatus::AwaitingConfirmation
+    {
+        bail!("migration preview is no longer awaiting confirmation");
+    }
+    let result = record
+        .result
+        .as_ref()
+        .context("migration preview result is missing")?;
+    let compact_marker_present =
+        result.get("migration_summary").is_some() || result.get("summary_version").is_some();
+
+    if compact_marker_present {
+        if result.get("migration_summary").and_then(Value::as_bool) != Some(true)
+            || result.get("summary_version").is_some()
+        {
+            bail!("saved migration preview summary is malformed; create a fresh preview");
+        }
+        let summary =
+            crate::cloud_snapshot_budget::validated_migration_preview_summary(record, result)
+                .context("saved migration preview summary is malformed; create a fresh preview")?;
+        if summary.id.as_str() != expected_id || summary.revision.as_str() != expected_revision {
+            bail!("migration preview ID or revision does not match confirmation");
+        }
+        validate_migration_summary_request_binding(record, &summary)?;
+        return Ok(BoundMigrationPreviewReceipt {
+            id: summary.id,
+            revision: summary.revision,
+            source_library_id: summary.source_library_id,
+            source_root_binding: summary.source_root_binding,
+            target_library_id: summary.target_library_id,
+            target_root_binding: summary.target_root_binding,
+            scope: summary.scope,
+            conflict: summary.conflict,
+            include_incomplete_tasks: summary.include_incomplete_tasks,
+            set_target_default_on_success: summary.set_target_default_on_success,
+            item_count: summary.item_count,
+            file_count: summary.file_count,
+            total_bytes: summary.total_bytes,
+            required_space_bytes: summary.required_space_bytes,
+            available_space_bytes: summary.available_space_bytes,
+            conflict_count: summary.conflict_count,
+            incomplete_task_count: summary.incomplete_task_count,
+            staging_bytes: summary.staging_bytes,
+            compact_summary: true,
+            sample_items: Some(summary.sample_items),
+        });
+    }
+
+    let bound: BoundMigrationPreview = serde_json::from_value(result.clone())
+        .context("saved migration preview has no root binding; create a fresh preview")?;
+    let preview = bound.preview;
+    if preview.id.as_str() != expected_id || preview.revision.as_str() != expected_revision {
+        bail!("migration preview ID or revision does not match confirmation");
+    }
+    Ok(BoundMigrationPreviewReceipt {
+        id: preview.id,
+        revision: preview.revision,
+        source_library_id: preview.source_library_id,
+        source_root_binding: bound.source_root_binding,
+        target_library_id: preview.target_library_id,
+        target_root_binding: bound.target_root_binding,
+        scope: preview.scope,
+        conflict: preview.conflict,
+        include_incomplete_tasks: preview.include_incomplete_tasks,
+        set_target_default_on_success: preview.set_target_default_on_success,
+        item_count: preview.item_count,
+        file_count: preview.file_count,
+        total_bytes: preview.total_bytes,
+        required_space_bytes: preview.required_space_bytes,
+        available_space_bytes: preview.available_space_bytes,
+        conflict_count: preview.conflict_count,
+        incomplete_task_count: preview.incomplete_task_count,
+        staging_bytes: preview.staging_bytes,
+        compact_summary: false,
+        sample_items: None,
+    })
+}
+
+fn validate_migration_summary_request_binding(
+    record: &crate::cloud::InboxRecord,
+    summary: &crate::cloud_snapshot_budget::MigrationPreviewSummaryV1,
+) -> Result<()> {
+    let payload = &record.request.payload;
+    let source_library_id = payload
+        .get("source_library_id")
+        .and_then(Value::as_str)
+        .context("migration preview request has no source library ID")?;
+    let source_root_binding = payload
+        .get("source_root_binding")
+        .and_then(Value::as_str)
+        .context("migration preview request has no source root binding")?;
+    let target_library_id = payload
+        .get("target_library_id")
+        .and_then(Value::as_str)
+        .context("migration preview request has no target library ID")?;
+    let target_root_binding = payload
+        .get("target_root_binding")
+        .and_then(Value::as_str)
+        .context("migration preview request has no target root binding")?;
+    let scope: MigrationScope = serde_json::from_value(
+        payload
+            .get("scope")
+            .cloned()
+            .context("migration preview request has no scope")?,
+    )?;
+    let conflict: Option<ConflictPolicy> =
+        serde_json::from_value(payload.get("conflict").cloned().unwrap_or(Value::Null))?;
+    let include_incomplete_tasks = match payload.get("include_incomplete_tasks") {
+        Some(value) => value
+            .as_bool()
+            .context("migration preview request has an invalid unfinished-task option")?,
+        None => false,
+    };
+    let set_target_default_on_success = match payload.get("set_target_default_on_success") {
+        Some(value) => value
+            .as_bool()
+            .context("migration preview request has an invalid default-library option")?,
+        None => false,
+    };
+    if summary.source_library_id.as_str() != source_library_id
+        || summary.source_root_binding.as_str() != source_root_binding
+        || summary.target_library_id.as_str() != target_library_id
+        || summary.target_root_binding.as_str() != target_root_binding
+        || summary.scope != scope
+        || summary.conflict != conflict.unwrap_or(ConflictPolicy::Skip)
+        || summary.include_incomplete_tasks != include_incomplete_tasks
+        || summary.set_target_default_on_success != set_target_default_on_success
+    {
+        bail!("saved migration preview root identity does not match its original request");
+    }
+    Ok(())
+}
+
+fn validate_migration_summary_matches_preview(
+    receipt: &BoundMigrationPreviewReceipt,
+    preview: &MigrationPreview,
+) -> Result<()> {
+    if !receipt.compact_summary {
+        return Ok(());
+    }
+    if receipt.id != preview.id
+        || receipt.revision != preview.revision
+        || receipt.source_library_id != preview.source_library_id
+        || receipt.target_library_id != preview.target_library_id
+        || receipt.scope != preview.scope
+        || receipt.conflict != preview.conflict
+        || receipt.include_incomplete_tasks != preview.include_incomplete_tasks
+        || receipt.set_target_default_on_success != preview.set_target_default_on_success
+        || receipt.item_count != preview.item_count
+        || receipt.file_count != preview.file_count
+        || receipt.total_bytes != preview.total_bytes
+        || receipt.required_space_bytes != preview.required_space_bytes
+        || receipt.available_space_bytes != preview.available_space_bytes
+        || receipt.conflict_count != preview.conflict_count
+        || receipt.incomplete_task_count != preview.incomplete_task_count
+        || receipt.staging_bytes != preview.staging_bytes
+    {
+        bail!("saved migration preview summary does not match the complete private plan");
+    }
+    for sample in receipt.sample_items.iter().flatten() {
+        let item = preview
+            .items
+            .iter()
+            .find(|item| item.item_id == sample.item_id)
+            .context("saved migration preview sample is not in the complete private plan")?;
+        let (status, outcome) = match item.status {
+            MigrationItemPhase::Skipped => ("skipped", "skip"),
+            MigrationItemPhase::Copying => ("copying", "move"),
+            _ => bail!("saved migration preview sample has an invalid planned status"),
+        };
+        let path_matches = |summary_path: &str, full_path: &str| {
+            summary_path == full_path
+                || summary_path
+                    .strip_suffix('…')
+                    .is_some_and(|prefix| full_path.starts_with(prefix))
+        };
+        if sample.conflict != item.conflict
+            || sample.status != status
+            || sample.outcome != outcome
+            || sample.bytes != item.bytes
+            || !path_matches(&sample.source_path, &item.source_path)
+            || !path_matches(&sample.target_path, &item.target_path)
+        {
+            bail!("saved migration preview sample does not match the complete private plan");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn validate_preview_receipt_for_test(
+    record: &crate::cloud::InboxRecord,
+    expected_id: &str,
+    expected_revision: &str,
+) -> Result<()> {
+    migration_preview_receipt(record, expected_id, expected_revision).map(|_| ())
 }
 
 fn engine(runtime: &CloudBotRuntime, source: &str, target: &str) -> Result<MigrationEngine> {
@@ -370,30 +598,14 @@ fn build_preview(
                 .context("the migration preview being refreshed is unavailable")?;
             if record.request.kind != "library_migration_preview"
                 || record.status != InboxStatus::AwaitingConfirmation
-                || record
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some(id)
-                || record
-                    .result
-                    .as_ref()
-                    .and_then(|result| result.get("revision"))
-                    .and_then(serde_json::Value::as_str)
-                    != Some(revision)
             {
                 bail!("the migration preview being refreshed is no longer awaiting confirmation");
             }
-            let prior = serde_json::from_value::<BoundMigrationPreview>(
-                record
-                    .result
-                    .clone()
-                    .context("the saved migration preview is missing its root identity")?,
-            )
-            .context("the saved migration preview is missing its root identity")?;
-            if prior.preview.source_library_id != payload.source_library_id
-                || prior.preview.target_library_id != payload.target_library_id
+            let prior = migration_preview_receipt(&record, id, revision).context(
+                "the migration preview being refreshed is no longer awaiting confirmation",
+            )?;
+            if prior.source_library_id != payload.source_library_id
+                || prior.target_library_id != payload.target_library_id
                 || prior.source_root_binding != payload.source_root_binding
                 || prior.target_root_binding != payload.target_root_binding
             {
@@ -499,7 +711,7 @@ fn build_preview(
                 && record
                     .result
                     .as_ref()
-                    .and_then(|result| result.get("id"))
+                    .and_then(|result| result.get("id").or_else(|| result.get("preview_id")))
                     .and_then(serde_json::Value::as_str)
                     == Some(id.as_str())
                 && record
@@ -662,22 +874,13 @@ async fn dispatch_inner(
             if record.request.kind != "library_migration_preview" {
                 bail!("a file-operation preview cannot authorize a library migration");
             }
-            let bound_preview: BoundMigrationPreview = serde_json::from_value(
-                record
-                    .result
-                    .clone()
-                    .context("migration preview result is missing")?,
-            )
-            .context("saved migration preview has no root binding; create a fresh preview")?;
-            let preview = bound_preview.preview;
-            if preview.id != payload.preview_id || preview.revision != payload.revision {
-                bail!("migration preview ID or revision does not match confirmation");
-            }
+            let preview_receipt =
+                migration_preview_receipt(&record, &payload.preview_id, &payload.revision)?;
             let io_lease = try_acquire_library_io(
                 runtime,
                 &[
-                    preview.source_library_id.clone(),
-                    preview.target_library_id.clone(),
+                    preview_receipt.source_library_id.clone(),
+                    preview_receipt.target_library_id.clone(),
                 ],
             )
             .await?;
@@ -687,10 +890,11 @@ async fn dispatch_inner(
             let worker = runtime.clone();
             let id = payload.preview_id.clone();
             let revision = payload.revision;
-            let source_library_id = preview.source_library_id.clone();
-            let target_library_id = preview.target_library_id.clone();
-            let source_root_binding = bound_preview.source_root_binding;
-            let target_root_binding = bound_preview.target_root_binding;
+            let response_revision = preview_receipt.revision.clone();
+            let source_library_id = preview_receipt.source_library_id.clone();
+            let target_library_id = preview_receipt.target_library_id.clone();
+            let source_root_binding = preview_receipt.source_root_binding.clone();
+            let target_root_binding = preview_receipt.target_root_binding.clone();
             let blocking_io_lease = Arc::clone(&io_lease);
             let migration = tokio::task::spawn_blocking(move || {
                 let _io_lease = blocking_io_lease;
@@ -712,6 +916,7 @@ async fn dispatch_inner(
                     &source_library_id,
                     &target_library_id,
                 )?;
+                validate_migration_summary_matches_preview(&preview_receipt, &persisted)?;
                 let engine =
                     MigrationEngine::new(&source_library_id, source, &target_library_id, target)?;
                 let expected_default_revision = if persisted.set_target_default_on_success {
@@ -734,7 +939,7 @@ async fn dispatch_inner(
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
                 result: Some(
-                    json!({"preview_id": payload.preview_id,"revision": preview.revision,"migration": status}),
+                    json!({"preview_id": payload.preview_id,"revision": response_revision,"migration": status}),
                 ),
                 error: None,
                 related_preview: Some((record.request.seq, InboxStatus::Completed)),
