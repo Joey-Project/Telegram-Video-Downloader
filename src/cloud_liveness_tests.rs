@@ -373,9 +373,10 @@ async fn healthy_idle_pongs_preserve_controls_and_do_not_poll_rest() {
         .await
         .expect("session should enter its idle wait after handling both controls");
 
-    tokio::time::pause();
     for expected_watch in [true, false, true] {
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
         let nonce = timeout(Duration::from_secs(5), ping_rx.recv())
             .await
             .expect("healthy server should receive each idle probe")

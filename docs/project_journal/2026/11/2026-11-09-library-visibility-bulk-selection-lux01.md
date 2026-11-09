@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-09
 updated: 2026-11-09
 branch: "wip/library-moved-bulk"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/64"
 supersedes: []
 superseded_by: ""
 ---
@@ -30,6 +30,13 @@ superseded_by: ""
 - Frontend, Worker and local file-preview validation agree on the 5,000-item
   ceiling. A 5,001-item action is rejected before Worker inbox insertion.
   Existing request-byte, filesystem identity and descriptor-anchor limits remain.
+- Move and metadata previews share a bounded descriptor budget. Tokens without
+  complete persistent creation-time evidence take priority; other descriptors
+  are retained within the remaining budget to tolerate benign timestamp
+  changes. Previously accepted selections retain all their identity anchors.
+  Large selections use persistent identity for files without a cached handle.
+  Exact object, content and access-policy validation still applies; more than
+  512 files requiring live identity evidence are rejected before persistence.
 - Private preview and batch storage budgets are 32 MiB and 64 MiB. Cleanup has
   a 128 MiB pass budget so even the largest accepted document can be read and
   revalidated before expiration. Oversized rewrites retain the previous record.
@@ -54,12 +61,18 @@ superseded_by: ""
   migration coverage confirms a compact preview for 101 real files and pauses
   before copying. The 5,000-item tests cover wire persistence, summary bounds
   and multibyte-path storage/expiration, not a 5,000-file copy run.
-- A pre-existing liveness test was stabilized by pausing Tokio time only for
+- Additional real-file regressions move and verify all 513 selected files,
+  including a benign timestamp update to an anchored source after preview,
+  preview 513 existing-NFO metadata patches within the descriptor budget, and
+  reject 513 files lacking creation-time evidence without persisting a preview
+  or modifying sources. Existing anchor and creation-time regressions pass.
+- Two pre-existing liveness tests were stabilized by pausing Tokio time only for
   explicit advances and resuming it for real TCP/notification waits. The idle,
-  Pong and slow-handler timings and all assertions remain unchanged. Three
-  focused repetitions passed; no production liveness behavior changed.
+  Pong and slow-handler timings and all assertions remain unchanged. Each test
+  passed three focused repetitions; the full liveness module also passed.
+  No production liveness behavior changed.
 - Native formatting and strict Clippy passed. The final default-parallel
-  all-target suite passed 1,366 tests with 17 ignored and no failures, including
+  all-target suite passed 1,370 tests with 17 ignored and no failures, including
   both 101-item E2Es and the 5,000-item storage/expiration regression.
 - Existing CI discovers every new test. Operational build, source-binding and
   deployment evidence remains in the private local task directory.
