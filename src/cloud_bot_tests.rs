@@ -10135,6 +10135,9 @@ async fn preview_cancel_rejects_completed_confirmation_after_history_eviction_an
     let _ = fs::remove_dir_all(fixture.root);
 }
 
+#[path = "cloud_liveness_tests.rs"]
+mod liveness;
+
 #[tokio::test]
 async fn preview_cancel_is_durable_binding_independent_and_preserves_completed_files_mock_telegram_e2e()
  {

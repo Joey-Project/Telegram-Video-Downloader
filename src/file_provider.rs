@@ -5,6 +5,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "file_provider_memory_tests.rs"]
+mod memory_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "file_provider_memory_soak_tests.rs"]
+mod memory_soak_tests;
+
 pub(crate) trait QueueFileProvider: Send + Sync {
     fn coordinate_read(
         &self,
@@ -166,65 +174,72 @@ fn coordinate(
     use std::ptr::NonNull;
 
     use block2::StackBlock;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2_foundation::{
         NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions,
         NSFileCoordinatorWritingOptions, NSURL,
     };
 
-    let url = NSURL::from_file_path(path).ok_or_else(|| {
-        FileProviderAccessError::new(path, operation_name(write), "path is not a valid file URL")
-    })?;
-    let coordinator = NSFileCoordinator::new();
-    let accessor_result = RefCell::new(None);
-    let accessor = RefCell::new(accessor);
-    let block = StackBlock::new(|coordinated_url: NonNull<NSURL>| {
-        let coordinated_path = unsafe { coordinated_url.as_ref() }.to_file_path();
-        let result = match coordinated_path {
-            Some(coordinated_path) => (accessor.borrow_mut())(&coordinated_path),
-            None => Err(FileProviderAccessError::new(
+    // Bound Foundation's autoreleased temporaries to this synchronous operation.
+    autoreleasepool(|_| {
+        let url = NSURL::from_file_path(path).ok_or_else(|| {
+            FileProviderAccessError::new(
                 path,
                 operation_name(write),
-                "File Provider returned a non-file URL",
+                "path is not a valid file URL",
             )
-            .into()),
-        };
-        accessor_result.replace(Some(result));
-    });
-    let mut coordination_error: Option<Retained<NSError>> = None;
+        })?;
+        let coordinator = NSFileCoordinator::new();
+        let accessor_result = RefCell::new(None);
+        let accessor = RefCell::new(accessor);
+        let block = StackBlock::new(|coordinated_url: NonNull<NSURL>| {
+            let coordinated_path = unsafe { coordinated_url.as_ref() }.to_file_path();
+            let result = match coordinated_path {
+                Some(coordinated_path) => (accessor.borrow_mut())(&coordinated_path),
+                None => Err(FileProviderAccessError::new(
+                    path,
+                    operation_name(write),
+                    "File Provider returned a non-file URL",
+                )
+                .into()),
+            };
+            accessor_result.replace(Some(result));
+        });
+        let mut coordination_error: Option<Retained<NSError>> = None;
 
-    if write {
-        coordinator.coordinateWritingItemAtURL_options_error_byAccessor(
-            &url,
-            NSFileCoordinatorWritingOptions::ForReplacing,
-            Some(&mut coordination_error),
-            &block,
-        );
-    } else {
-        coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
-            &url,
-            NSFileCoordinatorReadingOptions::empty(),
-            Some(&mut coordination_error),
-            &block,
-        );
-    }
+        if write {
+            coordinator.coordinateWritingItemAtURL_options_error_byAccessor(
+                &url,
+                NSFileCoordinatorWritingOptions::ForReplacing,
+                Some(&mut coordination_error),
+                &block,
+            );
+        } else {
+            coordinator.coordinateReadingItemAtURL_options_error_byAccessor(
+                &url,
+                NSFileCoordinatorReadingOptions::empty(),
+                Some(&mut coordination_error),
+                &block,
+            );
+        }
 
-    if let Some(error) = coordination_error {
-        return Err(FileProviderAccessError::new(
-            path,
-            operation_name(write),
-            format!("{error:?}"),
-        )
-        .into());
-    }
+        if let Some(error) = coordination_error {
+            return Err(FileProviderAccessError::new(
+                path,
+                operation_name(write),
+                format!("{error:?}"),
+            )
+            .into());
+        }
 
-    accessor_result.into_inner().ok_or_else(|| {
-        FileProviderAccessError::new(
-            path,
-            operation_name(write),
-            "the coordinated accessor was not called",
-        )
-    })?
+        accessor_result.into_inner().ok_or_else(|| {
+            FileProviderAccessError::new(
+                path,
+                operation_name(write),
+                "the coordinated accessor was not called",
+            )
+        })?
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -237,54 +252,57 @@ fn coordinate_move(
     use std::ptr::NonNull;
 
     use block2::StackBlock;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2_foundation::{NSError, NSFileCoordinator, NSFileCoordinatorWritingOptions, NSURL};
 
-    let source_url = NSURL::from_file_path(source).ok_or_else(|| {
-        FileProviderAccessError::new(source, "move", "source is not a valid file URL")
-    })?;
-    let destination_url = NSURL::from_file_path(destination).ok_or_else(|| {
-        FileProviderAccessError::new(destination, "move", "destination is not a valid file URL")
-    })?;
-    let coordinator = NSFileCoordinator::new();
-    let accessor_result = RefCell::new(None);
-    let accessor = RefCell::new(accessor);
-    let block = StackBlock::new(
-        |coordinated_source: NonNull<NSURL>, coordinated_destination: NonNull<NSURL>| {
-            let source_path = unsafe { coordinated_source.as_ref() }.to_file_path();
-            let destination_path = unsafe { coordinated_destination.as_ref() }.to_file_path();
-            let result = match (source_path, destination_path) {
-                (Some(source_path), Some(destination_path)) => {
-                    (accessor.borrow_mut())(&source_path, &destination_path)
-                }
-                _ => Err(FileProviderAccessError::new(
-                    source,
-                    "move",
-                    "File Provider returned a non-file URL",
-                )
-                .into()),
-            };
-            accessor_result.replace(Some(result));
-        },
-    );
-    let mut coordination_error: Option<Retained<NSError>> = None;
+    // Bound Foundation's autoreleased temporaries to this synchronous operation.
+    autoreleasepool(|_| {
+        let source_url = NSURL::from_file_path(source).ok_or_else(|| {
+            FileProviderAccessError::new(source, "move", "source is not a valid file URL")
+        })?;
+        let destination_url = NSURL::from_file_path(destination).ok_or_else(|| {
+            FileProviderAccessError::new(destination, "move", "destination is not a valid file URL")
+        })?;
+        let coordinator = NSFileCoordinator::new();
+        let accessor_result = RefCell::new(None);
+        let accessor = RefCell::new(accessor);
+        let block = StackBlock::new(
+            |coordinated_source: NonNull<NSURL>, coordinated_destination: NonNull<NSURL>| {
+                let source_path = unsafe { coordinated_source.as_ref() }.to_file_path();
+                let destination_path = unsafe { coordinated_destination.as_ref() }.to_file_path();
+                let result = match (source_path, destination_path) {
+                    (Some(source_path), Some(destination_path)) => {
+                        (accessor.borrow_mut())(&source_path, &destination_path)
+                    }
+                    _ => Err(FileProviderAccessError::new(
+                        source,
+                        "move",
+                        "File Provider returned a non-file URL",
+                    )
+                    .into()),
+                };
+                accessor_result.replace(Some(result));
+            },
+        );
+        let mut coordination_error: Option<Retained<NSError>> = None;
 
-    coordinator.coordinateWritingItemAtURL_options_writingItemAtURL_options_error_byAccessor(
-        &source_url,
-        NSFileCoordinatorWritingOptions::ForMoving,
-        &destination_url,
-        NSFileCoordinatorWritingOptions::ForReplacing,
-        Some(&mut coordination_error),
-        &block,
-    );
+        coordinator.coordinateWritingItemAtURL_options_writingItemAtURL_options_error_byAccessor(
+            &source_url,
+            NSFileCoordinatorWritingOptions::ForMoving,
+            &destination_url,
+            NSFileCoordinatorWritingOptions::ForReplacing,
+            Some(&mut coordination_error),
+            &block,
+        );
 
-    if let Some(error) = coordination_error {
-        return Err(FileProviderAccessError::new(source, "move", format!("{error:?}")).into());
-    }
+        if let Some(error) = coordination_error {
+            return Err(FileProviderAccessError::new(source, "move", format!("{error:?}")).into());
+        }
 
-    accessor_result.into_inner().ok_or_else(|| {
-        FileProviderAccessError::new(source, "move", "the coordinated accessor was not called")
-    })?
+        accessor_result.into_inner().ok_or_else(|| {
+            FileProviderAccessError::new(source, "move", "the coordinated accessor was not called")
+        })?
+    })
 }
 
 #[cfg(target_os = "macos")]
