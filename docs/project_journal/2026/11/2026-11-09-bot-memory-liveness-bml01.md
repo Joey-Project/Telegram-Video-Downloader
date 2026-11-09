@@ -1,11 +1,11 @@
 ---
 id: 20261109-bml01
 title: Bound native coordination memory and detect silent cloud disconnects
-status: active
+status: completed
 created: 2026-11-09
 updated: 2026-11-09
 branch: "wip/bot-memory-liveness"
-pr: ""
+pr: "63"
 supersedes: []
 superseded_by: ""
 ---
@@ -52,8 +52,8 @@ superseded_by: ""
   inbox/FileProvider calls, distinguishing live allocation growth from RSS.
 - Real local WebSocket tests for healthy/missing/mismatched Pong and reconnect
   recovery with authoritative REST, durable local records and mock Telegram.
-- Formatting, strict Clippy, full Rust tests and release build using isolated
-  Cargo target/build paths; preserve remote CI/review as separate evidence.
+- Formatting, strict Clippy, full Rust tests and release build use isolated
+  Cargo target/build paths; remote CI/review remain separate evidence.
 
 The five native lifetime cases fail against the unchanged baseline product
 implementation and pass with per-operation pools. A first sandboxed run failed
@@ -83,8 +83,22 @@ or snapshot refresh. This verifies runtime support; the documented absence of
 Durable Object handler wakeups remains a platform contract rather than a billing
 measurement.
 
+Whole-branch validation with Rust/Cargo 1.99.1 passed formatting, strict
+all-target Clippy, all-target tests (**1,353 passed, 0 failed, 17 ignored**) and
+an offline release build. The ignored count includes the existing 16 cases and
+the new manual memory soak. Five new native lifetime cases and five new socket
+cases, including the mock Telegram reconnect E2E, run automatically in the
+existing macOS Rust CI job. Three existing socket ordering/backlog/long-idle
+regressions also passed their focused gates.
+
+The successful full run used normal native macOS coordination. An earlier
+default-sandbox invocation failed with coordination access errors and was
+retained separately; it is not a code regression result. The 45 Rust/Cargo
+input hashes were unchanged across the successful checks and release build.
+
 ## References
 
+- [Implementation and review: PR #63](https://github.com/Joey-Project/Telegram-Video-Downloader/pull/63).
 - [Apple: autorelease pools and long-lived threads](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/MemoryMgmt/Articles/mmAutoreleasePools.html).
 - [objc2 0.6.4: autorelease pools](https://docs.rs/objc2/0.6.4/objc2/rc/fn.autoreleasepool.html).
 - [Cloudflare: automatic protocol Ping/Pong handling](https://developers.cloudflare.com/durable-objects/best-practices/websockets/#automatic-pingpong-handling).

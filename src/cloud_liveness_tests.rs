@@ -641,7 +641,7 @@ async fn expired_idle_websocket_reconnects_and_acks_before_telegram_dispatch() {
         let first_socket = accept_local_websocket(&listener).await?;
         let _ = first_connection_tx.send(());
 
-        let retry_request = serve_request_page(&listener, &[request.clone()]).await?;
+        let retry_request = serve_request_page(&listener, std::slice::from_ref(&request)).await?;
         drop(first_socket);
         anyhow::ensure!(retry_request.method == "requests");
         let (mut ack_stream, ack_request) = receive_rest_request(&listener).await?;

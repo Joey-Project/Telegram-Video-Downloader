@@ -3389,6 +3389,7 @@ async fn cloud_websocket_receiver_with_liveness_policy(
     }
 }
 
+#[cfg(test)]
 async fn receive_cloud_websocket_session(
     runtime: &CloudBotRuntime,
     socket: &mut CloudWebSocket,
