@@ -131,6 +131,8 @@ const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
 const CLOUD_PUBLICATION_COALESCE: Duration = Duration::from_millis(80);
 const CLOUD_IDLE_PUBLICATION_EXPIRY: Duration = Duration::from_secs(60 * 60);
 const CLOUD_IDLE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CLOUD_WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_secs(60);
+const CLOUD_WEBSOCKET_PONG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOUD_REFRESH_RESULT_RETENTION_MILLIS: u64 = 5 * 60 * 1000;
 const MAX_PENDING_SNAPSHOT_REFRESHES: usize = 64;
 const MAX_RETAINED_SNAPSHOT_REFRESHES: usize = 128;
@@ -148,6 +150,7 @@ static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
     Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>>,
 > = OnceLock::new();
 static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLOUD_WEBSOCKET_PING_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_SELECTION_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static COLLECTION_DETAILS_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_ACCESS_KEY_TICKET_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -496,6 +499,23 @@ struct CloudBotRuntime {
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(test)]
     test_cloud_ready_marker_emissions: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+struct CloudWebSocketLivenessPolicy {
+    idle_ping_interval: Duration,
+    pong_timeout: Duration,
+}
+
+const CLOUD_WEBSOCKET_LIVENESS_POLICY: CloudWebSocketLivenessPolicy =
+    CloudWebSocketLivenessPolicy {
+        idle_ping_interval: CLOUD_WEBSOCKET_IDLE_PING_INTERVAL,
+        pong_timeout: CLOUD_WEBSOCKET_PONG_TIMEOUT,
+    };
+
+struct PendingCloudWebSocketProbe {
+    nonce: Vec<u8>,
+    deadline: Instant,
 }
 
 #[derive(Clone)]
@@ -3306,6 +3326,13 @@ fn remaining_cloud_reconciliation_delay(
 }
 
 async fn cloud_websocket_receiver(runtime: CloudBotRuntime) {
+    cloud_websocket_receiver_with_liveness_policy(runtime, CLOUD_WEBSOCKET_LIVENESS_POLICY).await;
+}
+
+async fn cloud_websocket_receiver_with_liveness_policy(
+    runtime: CloudBotRuntime,
+    liveness: CloudWebSocketLivenessPolicy,
+) {
     let mut backoff = Duration::from_secs(1);
     loop {
         if runtime.epoch_fatal.is_signaled() {
@@ -3327,7 +3354,14 @@ async fn cloud_websocket_receiver(runtime: CloudBotRuntime) {
             Ok(mut socket) => {
                 backoff = Duration::from_secs(1);
                 info!("connected to local cloud request WebSocket");
-                match receive_cloud_websocket_session(&runtime, &mut socket, None).await {
+                match receive_cloud_websocket_session_with_liveness_policy(
+                    &runtime,
+                    &mut socket,
+                    None,
+                    liveness,
+                )
+                .await
+                {
                     Ok(()) => warn!("local cloud request WebSocket closed"),
                     Err(error) => {
                         if error.downcast_ref::<CloudDatabaseEpochChanged>().is_some() {
@@ -3360,6 +3394,35 @@ async fn receive_cloud_websocket_session(
     socket: &mut CloudWebSocket,
     waiting: Option<Arc<Notify>>,
 ) -> Result<()> {
+    receive_cloud_websocket_session_with_liveness_policy(
+        runtime,
+        socket,
+        waiting,
+        CLOUD_WEBSOCKET_LIVENESS_POLICY,
+    )
+    .await
+}
+
+async fn receive_cloud_websocket_session_with_liveness_policy(
+    runtime: &CloudBotRuntime,
+    socket: &mut CloudWebSocket,
+    waiting: Option<Arc<Notify>>,
+    liveness: CloudWebSocketLivenessPolicy,
+) -> Result<()> {
+    receive_cloud_websocket_session_observing_handler(runtime, socket, waiting, liveness, None)
+        .await
+}
+
+async fn receive_cloud_websocket_session_observing_handler(
+    runtime: &CloudBotRuntime,
+    socket: &mut CloudWebSocket,
+    waiting: Option<Arc<Notify>>,
+    liveness: CloudWebSocketLivenessPolicy,
+    handler_started: Option<Arc<Notify>>,
+) -> Result<()> {
+    // This watchdog is deliberately limited to transport-idle gaps. The reader handles each
+    // application frame inline; its processing time is excluded from the Pong deadline and the
+    // idle window restarts after that handler returns.
     suspend_cloud_viewers(runtime).await;
     let (mut writer, mut reader) = socket.split();
     let (outbound, mut outbound_receiver) =
@@ -3367,38 +3430,96 @@ async fn receive_cloud_websocket_session(
     *runtime.websocket_writer.lock().await = Some(outbound.clone());
     let result = async {
         replay_retained_refresh_results(runtime).await;
+        let mut last_inbound_at = Instant::now();
+        let mut pending_probe: Option<PendingCloudWebSocketProbe> = None;
         loop {
             if let Some(waiting) = &waiting {
                 waiting.notify_one();
             }
+            let probe_deadline = pending_probe.as_ref().map_or(
+                last_inbound_at + liveness.idle_ping_interval,
+                |probe| probe.deadline,
+            );
             tokio::select! {
                 _ = runtime.epoch_fatal.notified() => return Ok(()),
+                _ = tokio::time::sleep_until(probe_deadline) => {
+                    if pending_probe.is_some() {
+                        bail!("local cloud WebSocket liveness ping timed out without a matching Pong");
+                    }
+                    let nonce = next_cloud_websocket_ping_nonce();
+                    tokio_timeout(
+                        liveness.pong_timeout,
+                        writer.send(WsMessage::Ping(nonce.clone().into())),
+                    )
+                    .await
+                    .context("timed out writing local cloud WebSocket liveness ping")?
+                    .context("failed to write local cloud WebSocket liveness ping")?;
+                    pending_probe = Some(PendingCloudWebSocketProbe {
+                        nonce,
+                        deadline: Instant::now() + liveness.pong_timeout,
+                    });
+                }
                 outbound_message = outbound_receiver.recv() => {
                     let Some(outbound_message) = outbound_message else {
                         return Ok(());
                     };
                     let text = serde_json::to_string(&outbound_message)
                         .context("failed to encode local cloud WebSocket control response")?;
-                    writer.send(WsMessage::Text(text.into()))
-                        .await
-                        .context("failed to write local cloud WebSocket control response")?;
+                    let write_started_at = Instant::now();
+                    tokio_timeout(
+                        liveness.pong_timeout,
+                        writer.send(WsMessage::Text(text.into())),
+                    )
+                    .await
+                    .context("timed out writing local cloud WebSocket control response")?
+                    .context("failed to write local cloud WebSocket control response")?;
+                    extend_cloud_websocket_probe_deadline(&mut pending_probe, write_started_at.elapsed());
                 }
                 message = reader.next() => {
                     match message {
                         Some(Ok(WsMessage::Text(text))) => {
-                            handle_cloud_websocket_payload(runtime, text.as_bytes()).await?;
+                            let handler_started_at = Instant::now();
+                            if let Some(handler_started) = &handler_started {
+                                handler_started.notify_one();
+                            }
+                            let result = handle_cloud_websocket_payload(runtime, text.as_bytes()).await;
+                            extend_cloud_websocket_probe_deadline(&mut pending_probe, handler_started_at.elapsed());
+                            last_inbound_at = Instant::now();
+                            result?;
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
-                            handle_cloud_websocket_payload(runtime, &bytes).await?;
+                            let handler_started_at = Instant::now();
+                            if let Some(handler_started) = &handler_started {
+                                handler_started.notify_one();
+                            }
+                            let result = handle_cloud_websocket_payload(runtime, &bytes).await;
+                            extend_cloud_websocket_probe_deadline(&mut pending_probe, handler_started_at.elapsed());
+                            last_inbound_at = Instant::now();
+                            result?;
                         }
                         Some(Ok(WsMessage::Ping(payload))) => {
-                            writer.send(WsMessage::Pong(payload))
-                                .await
-                                .context("failed to answer local cloud WebSocket ping")?;
+                            last_inbound_at = Instant::now();
+                            let write_started_at = Instant::now();
+                            tokio_timeout(
+                                liveness.pong_timeout,
+                                writer.send(WsMessage::Pong(payload)),
+                            )
+                            .await
+                            .context("timed out answering local cloud WebSocket ping")?
+                            .context("failed to answer local cloud WebSocket ping")?;
+                            extend_cloud_websocket_probe_deadline(&mut pending_probe, write_started_at.elapsed());
                         }
-                        Some(Ok(WsMessage::Pong(_))) => {}
+                        Some(Ok(WsMessage::Pong(payload))) => {
+                            last_inbound_at = Instant::now();
+                            if pending_probe
+                                .as_ref()
+                                .is_some_and(|probe| payload.as_ref() == probe.nonce.as_slice())
+                            {
+                                pending_probe = None;
+                            }
+                        }
                         Some(Ok(WsMessage::Close(_))) | None => return Ok(()),
-                        Some(Ok(WsMessage::Frame(_))) => {}
+                        Some(Ok(WsMessage::Frame(_))) => last_inbound_at = Instant::now(),
                         Some(Err(error)) => {
                             return Err(anyhow::anyhow!(error).context("local cloud WebSocket failed"));
                         }
@@ -3411,6 +3532,22 @@ async fn receive_cloud_websocket_session(
     *runtime.websocket_writer.lock().await = None;
     suspend_cloud_viewers(runtime).await;
     result
+}
+
+fn next_cloud_websocket_ping_nonce() -> Vec<u8> {
+    CLOUD_WEBSOCKET_PING_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .to_be_bytes()
+        .to_vec()
+}
+
+fn extend_cloud_websocket_probe_deadline(
+    pending_probe: &mut Option<PendingCloudWebSocketProbe>,
+    paused_for: Duration,
+) {
+    if let Some(probe) = pending_probe {
+        probe.deadline += paused_for;
+    }
 }
 
 async fn handle_cloud_websocket_payload(runtime: &CloudBotRuntime, payload: &[u8]) -> Result<()> {
