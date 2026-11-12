@@ -117,6 +117,7 @@ mod collection_message_tests {
             next_job_id: Arc::new(AtomicU64::new(next_job_id)),
             queue,
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         }
     }
 
@@ -1504,6 +1505,7 @@ mod collection_message_tests {
                 next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: Duration::ZERO,
+                music: None,
             },
             chat_id,
             job_id,
@@ -2009,6 +2011,8 @@ mod collection_message_tests {
                 id: "all-present-details-page".to_string(),
                 data: Some(collection_details_callback_data(details_token, 1)),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: main_message_id,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,
@@ -2100,6 +2104,8 @@ mod collection_message_tests {
                 id: "details-running-edit-held".to_string(),
                 data: Some(collection_details_callback_data(details_token, 1)),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: main_message_id,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,
@@ -2262,6 +2268,8 @@ mod collection_message_tests {
                 id: "details-terminal-page-back".to_string(),
                 data: Some(collection_details_callback_data(details_token, 0)),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: main_message_id,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,
@@ -2405,6 +2413,8 @@ mod collection_message_tests {
                 id: "late-old-selection-callback".to_string(),
                 data: Some(old_callback_data),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: 1_100,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,
@@ -2557,6 +2567,8 @@ mod collection_message_tests {
                 id: "old-duplicate-cancel".to_string(),
                 data: Some(first_cancel_callback),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: 2_100,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,
@@ -2932,6 +2944,8 @@ mod collection_message_tests {
                 id: format!("stale-queue-action-{index}"),
                 data: Some(queue_callback_data(action, id, 0)),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: 6_000 + index as i64,
                     chat: crate::telegram::Chat {
                         id: CHAT_ID,

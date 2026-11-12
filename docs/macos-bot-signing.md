@@ -11,6 +11,16 @@ $HOME/.local/lib/telegram-video-downloader/bin/telegram-video-downloader
 This is independent of Cargo's `target-dir` and `build-dir`. Explicit
 `scripts/launch_agent.sh install` / `deploy` commands own deployment; ordinary
 Cargo builds, tests, and cache cleanup do not install or restart the service.
+
+Music automation has a separate fixed test executable named
+`telegram-video-downloader-test` at
+`$HOME/.local/lib/telegram-video-downloader-test/bin/telegram-video-downloader-test`.
+Its signing identifier is `io.github.telegram-local-downloader.bot.test`, with the
+same trusted certificate and a separate designated requirement. The production
+path and identifier above remain unchanged. See
+[the Music automation procedure](macos-music-automation.md) for test-only signing,
+one-shot permission requests and sender verification. A test permission grant is
+not a production permission grant.
 The installer isolates both Cargo output directories, including when a global
 Cargo configuration redirects intermediate artifacts to a shared cache.
 

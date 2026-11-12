@@ -3,6 +3,9 @@ name = "telegram-video-downloader"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-runtime = []
+
 [dependencies]
 anyhow = "1"
 bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "da70c4787b4b5f78bac2ce4f9b87fc035cffb74f", package = "bbdown-core" }
@@ -24,9 +27,10 @@ unicode-normalization = "0.1"
 url = "2"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["block2", "NSError", "NSFileCoordinator", "NSURL", "std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["block2", "NSArray", "NSDictionary", "NSError", "NSAppleEventDescriptor", "NSAppleScript", "NSFileCoordinator", "NSFileManager", "NSString", "NSURL", "NSValue", "std"] }

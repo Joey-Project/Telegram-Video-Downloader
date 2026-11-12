@@ -24,6 +24,17 @@ subtitle_languages = ["zh-Hans", "zh-Hant", "zh", "zh-CN", "zh-TW", "en", "ja"]
 write_nfo = true
 keep_sidecars = true
 
+# Automatic Apple Music imports are supported on macOS. `enabled` defaults to
+# true on macOS and false on other targets; leave it disabled elsewhere.
+[music]
+max_file_bytes = 536870912 # 512 MiB
+cloud_poll_seconds = 60
+# Defaults are rooted at the configured video download root. With the default
+# downloads.video_dir above, they resolve to these hidden directories:
+# state_dir = "~/Movies/Downloads/.telegram-video-downloader-music"
+# staging_dir = "~/Movies/Downloads/.telegram-video-downloader-staging/music"
+archive_dir = "~/Library/Mobile Documents/com~apple~CloudDocs/Collection/Music"
+
 [bilibili]
 # Legacy CLI fields accept only mapped bbdown-core options. Unsupported values, non-empty
 # plan_args, and a BBDown.config file in video_dir fail startup instead of being ignored.

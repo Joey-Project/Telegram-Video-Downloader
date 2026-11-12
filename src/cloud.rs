@@ -65,9 +65,10 @@ pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 const CLOUD_INBOX_TERMINAL_REPLAY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // Abandoned confirmations expire with the persisted preview manifests in file_manager.rs.
 const CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION: Duration = CLOUD_INBOX_TERMINAL_REPLAY_RETENTION;
-// Each inbox API call makes bounded recovery/cleanup progress instead of draining history at once.
+// Startup recovery and each terminal-maintenance page stay bounded instead of draining history.
 const CLOUD_INBOX_SCAN_MAX_NAMES: usize = 32;
 const CLOUD_INBOX_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CLOUD_INBOX_TERMINAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -2188,6 +2189,9 @@ struct InboxRecoveryScan {
     processing_recovery: BTreeSet<u64>,
     // Only a rescan hint for directory-entry churn; identity and access policy are checked apart.
     directory_entry_set_stamp: Option<BoundDirectoryEntrySetStamp>,
+    terminal_maintenance_in_progress: bool,
+    terminal_maintenance_entry_set_stamp: Option<BoundDirectoryEntrySetStamp>,
+    terminal_maintenance_completed_at: Option<u64>,
 }
 
 enum InboxRecordRead {
@@ -2319,6 +2323,9 @@ impl CloudInbox {
                 indexing_complete: false,
                 processing_recovery: BTreeSet::new(),
                 directory_entry_set_stamp: None,
+                terminal_maintenance_in_progress: false,
+                terminal_maintenance_entry_set_stamp: None,
+                terminal_maintenance_completed_at: None,
             })),
         };
         // The first recovery page is bounded; pending() continues the scan before any dispatch.
@@ -2739,7 +2746,19 @@ impl CloudInbox {
         let mut record = self
             .read_record_path(&path)?
             .ok_or_else(|| anyhow!("cloud inbox request {seq} is missing"))?;
+        let was_active_confirmation = matches!(
+            record.request.kind.as_str(),
+            "file_confirm" | "library_migration_confirm"
+        ) && matches!(
+            record.status,
+            InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+        );
         update(&mut record)?;
+        let released_active_confirmation = was_active_confirmation
+            && !matches!(
+                record.status,
+                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+            );
         record.updated_at = now_seconds();
         self.write_record_path(&path, &record)?;
         let mut pending = self
@@ -2752,6 +2771,17 @@ impl CloudInbox {
             .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
         set_pending_sequence(&mut pending, seq, record.status);
         state_index.record(&record);
+        drop(state_index);
+        drop(pending);
+        if released_active_confirmation {
+            let mut scan = self
+                .recovery_scan
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?;
+            scan.terminal_maintenance_in_progress = true;
+            scan.cursor = None;
+            scan.terminal_maintenance_entry_set_stamp = None;
+        }
         Ok(record)
     }
 
@@ -3264,9 +3294,25 @@ impl CloudInbox {
             .lock()
             .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?;
         if scan.initial_complete {
-            // Retention runs only after the startup index is complete. Deletions can perturb the
-            // cursor, so later bounded calls resume with fresh passes until it reaches every row.
-            self.prune_terminal_receipts_page(&mut scan)?;
+            // Retention runs only after startup indexing completes. Continue an active bounded
+            // pass, but avoid rescanning completed receipts on every dispatcher poll.
+            let now = now_seconds();
+            let maintenance_due = match scan.terminal_maintenance_completed_at {
+                None => true,
+                Some(last) => {
+                    now.saturating_sub(last) >= CLOUD_INBOX_TERMINAL_MAINTENANCE_INTERVAL.as_secs()
+                }
+            };
+            if scan.terminal_maintenance_in_progress || maintenance_due {
+                scan.terminal_maintenance_in_progress = true;
+                self.prune_terminal_receipts_page(&mut scan)?;
+                if scan.cursor.is_none()
+                    && !self.terminal_maintenance_enumeration_changed(&mut scan)?
+                {
+                    scan.terminal_maintenance_in_progress = false;
+                    scan.terminal_maintenance_completed_at = Some(now_seconds());
+                }
+            }
             return Ok(true);
         }
 
@@ -3444,6 +3490,21 @@ impl CloudInbox {
         let expected = scan
             .directory_entry_set_stamp
             .ok_or_else(|| anyhow!("cloud inbox initial enumeration stamp is missing"))?;
+        Ok(self.current_directory_entry_set_stamp()? != expected)
+    }
+
+    fn terminal_maintenance_enumeration_changed(
+        &self,
+        scan: &mut InboxRecoveryScan,
+    ) -> Result<bool> {
+        let expected = scan
+            .terminal_maintenance_entry_set_stamp
+            .take()
+            .ok_or_else(|| anyhow!("cloud inbox terminal maintenance stamp is missing"))?;
+        Ok(self.current_directory_entry_set_stamp()? != expected)
+    }
+
+    fn current_directory_entry_set_stamp(&self) -> Result<BoundDirectoryEntrySetStamp> {
         let mut current = None;
         let mut read = |coordinated_path: &Path| -> Result<()> {
             let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
@@ -3465,7 +3526,7 @@ impl CloudInbox {
         let current = current.ok_or_else(|| {
             anyhow!("File Provider did not provide cloud inbox enumeration revalidation")
         })?;
-        Ok(current != expected)
+        Ok(current)
     }
 
     fn prune_terminal_receipts_page(&self, scan: &mut InboxRecoveryScan) -> Result<()> {
@@ -3595,6 +3656,15 @@ impl CloudInbox {
             if scan.cursor.is_none() {
                 if !scan.indexing_complete && !scan.initial_complete {
                     scan.directory_entry_set_stamp =
+                        Some(self.root.bound_directory_entry_set_stamp(
+                            &directory,
+                            self.directory_identity,
+                            0o700,
+                        )?);
+                } else if scan.terminal_maintenance_in_progress
+                    && scan.terminal_maintenance_entry_set_stamp.is_none()
+                {
+                    scan.terminal_maintenance_entry_set_stamp =
                         Some(self.root.bound_directory_entry_set_stamp(
                             &directory,
                             self.directory_identity,
@@ -4632,6 +4702,117 @@ mod tests {
                 .expect("terminal duplicate should deduplicate after restart")
         );
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_retention_is_hourly_and_prunes_when_due() {
+        let root = temp_root("inbox-terminal-maintenance-interval");
+        fs::create_dir_all(&root).expect("root should create");
+        let provider = Arc::new(crate::file_provider::MockQueueFileProvider::default());
+        let inbox = CloudInbox::open_with_file_provider(&root, provider.clone())
+            .expect("inbox should open");
+        inbox
+            .persist(request(1, "completed receipt"))
+            .expect("request should persist");
+        inbox
+            .persist_dispatch_result(1, InboxStatus::Completed, None, None)
+            .expect("request should complete");
+        let path = inbox.record_path(1);
+
+        // Setup may have triggered maintenance while the inbox was empty. Make the completed
+        // receipt immediately due so its coordinated read is observable in the first poll.
+        {
+            let mut scan = inbox
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available");
+            scan.cursor = None;
+            scan.terminal_maintenance_in_progress = false;
+            scan.terminal_maintenance_completed_at = None;
+        }
+        let receipt_reads = || {
+            provider
+                .read_paths()
+                .iter()
+                .filter(|read_path| *read_path == &path)
+                .count()
+        };
+        let before_maintenance = receipt_reads();
+
+        assert!(
+            inbox
+                .pending()
+                .expect("idle pending should load")
+                .is_empty(),
+            "a completed receipt must not become dispatchable"
+        );
+        let after_maintenance = receipt_reads();
+        assert_eq!(
+            after_maintenance,
+            before_maintenance + 1,
+            "the due maintenance page reads the receipt once"
+        );
+
+        for _ in 0..8 {
+            assert!(
+                inbox
+                    .pending()
+                    .expect("repeated idle pending should load")
+                    .is_empty(),
+                "a completed receipt must remain non-dispatchable"
+            );
+        }
+        assert_eq!(
+            receipt_reads(),
+            after_maintenance,
+            "ordinary dispatcher polls must not reread completed receipts"
+        );
+
+        let old = now_seconds().saturating_sub(
+            CLOUD_INBOX_TERMINAL_REPLAY_RETENTION
+                .as_secs()
+                .saturating_add(1),
+        );
+        let mut expired = inbox
+            .record(1)
+            .expect("completed receipt should be readable")
+            .expect("completed receipt should exist");
+        expired.updated_at = old;
+        inbox
+            .write_record_path(&path, &expired)
+            .expect("receipt should retain its expired timestamp");
+        let before_due_sweep = receipt_reads();
+        {
+            let mut scan = inbox
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available");
+            scan.terminal_maintenance_completed_at = Some(
+                now_seconds().saturating_sub(
+                    CLOUD_INBOX_TERMINAL_MAINTENANCE_INTERVAL
+                        .as_secs()
+                        .saturating_add(1),
+                ),
+            );
+        }
+
+        inbox
+            .pending()
+            .expect("due terminal cleanup should succeed");
+        assert!(
+            receipt_reads() > before_due_sweep,
+            "a due maintenance pass must reread and evaluate the terminal receipt"
+        );
+        assert!(
+            inbox
+                .record(1)
+                .expect("expired receipt lookup should succeed")
+                .is_none(),
+            "due cleanup should still remove expired terminal receipts"
+        );
+
+        drop(inbox);
         let _ = fs::remove_dir_all(root);
     }
 

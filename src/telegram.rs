@@ -34,6 +34,26 @@ pub struct Message {
     pub chat: Chat,
     pub text: Option<String>,
     pub from: Option<User>,
+    pub audio: Option<Audio>,
+    pub document: Option<Document>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Audio {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: Option<u64>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: Option<u64>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,16 +330,15 @@ impl TelegramClient {
             .send()
             .await
             .map_err(strip_reqwest_url)
-            .context("telegram editMessageText request failed")?
-            .error_for_status()
-            .map_err(strip_reqwest_url)
-            .context("telegram editMessageText returned HTTP error")?
+            .context("telegram editMessageText request failed")?;
+        let status = response.status();
+        let response = response
             .json::<ApiResponse<serde::de::IgnoredAny>>()
             .await
             .map_err(strip_reqwest_url)
             .context("failed to decode telegram editMessageText response")?;
 
-        telegram_optional_result(response, "editMessageText")
+        telegram_edit_result(status, response)
     }
 
     pub async fn set_my_commands(&self, commands: Vec<BotCommand>) -> Result<()> {
@@ -443,6 +462,25 @@ fn telegram_optional_result<T>(response: ApiResponse<T>, method: &str) -> Result
                 .unwrap_or_else(|| "unknown error".to_string())
         );
     }
+}
+
+fn telegram_edit_result<T>(status: reqwest::StatusCode, response: ApiResponse<T>) -> Result<()> {
+    // An earlier edit can succeed even if its response is lost. Repeating the
+    // same edit is safe; Telegram reports that the desired text already exists.
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && !response.ok
+        && response.description.as_deref().is_some_and(|description| {
+            let description = description.to_ascii_lowercase();
+            description == "message is not modified"
+                || description.starts_with("bad request: message is not modified")
+        })
+    {
+        return Ok(());
+    }
+    if !status.is_success() {
+        bail!("telegram editMessageText returned HTTP {status}");
+    }
+    telegram_optional_result(response, "editMessageText")
 }
 
 impl Chat {
@@ -585,5 +623,32 @@ mod tests {
         .expect_err("missing result should fail");
 
         assert!(err.to_string().contains("did not include result"));
+    }
+
+    #[test]
+    fn repeated_message_edit_is_confirmed_but_other_http_errors_fail() {
+        let response = |description: &str| ApiResponse::<()> {
+            ok: false,
+            result: None,
+            description: Some(description.to_string()),
+        };
+        assert!(telegram_edit_result(
+            reqwest::StatusCode::BAD_REQUEST,
+            response("Bad Request: message is not modified: specified new message content is exactly the same"),
+        ).is_ok());
+        assert!(
+            telegram_edit_result(
+                reqwest::StatusCode::BAD_REQUEST,
+                response("Bad Request: message to edit not found"),
+            )
+            .is_err()
+        );
+        assert!(
+            telegram_edit_result(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                response("message is not modified"),
+            )
+            .is_err()
+        );
     }
 }

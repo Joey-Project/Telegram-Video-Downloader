@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub bilibili: BilibiliConfig,
     #[serde(default)]
     pub bot: BotConfig,
+    #[serde(default)]
+    pub music: crate::music_types::MusicSettings,
     #[serde(skip)]
     project_dir: PathBuf,
     #[serde(skip)]
@@ -211,6 +213,10 @@ impl AppConfig {
             video: VideoConfig::default(),
             bilibili: BilibiliConfig::default(),
             bot: BotConfig::default(),
+            music: crate::music_types::MusicSettings {
+                enabled: false,
+                ..Default::default()
+            },
             project_dir: PathBuf::from("."),
             config_file: None,
             video_storage_root: None,
@@ -313,6 +319,55 @@ impl AppConfig {
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
         let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
         self.bilibili.auth.credential_file = self.resolve_project_path(&credential_file);
+        self.expand_music_paths();
+    }
+
+    fn expand_music_paths(&mut self) {
+        let runtime_root = env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
+            .unwrap_or_else(|| self.project_dir.clone());
+        let defaults = [
+            self.video_storage_root()
+                .join(".telegram-video-downloader-music"),
+            self.video_storage_root()
+                .join(".telegram-video-downloader-staging/music"),
+            PathBuf::from("~/Library/Mobile Documents/com~apple~CloudDocs/Collection/Music"),
+            PathBuf::from("~/.config/telegram-video-downloader/mtproto.json"),
+            runtime_root.join("music-runtime/bin/python3"),
+            runtime_root.join("libexec/music_transfer.py"),
+        ];
+        let project = self.project_dir.clone();
+        let paths = [
+            &mut self.music.state_dir,
+            &mut self.music.staging_dir,
+            &mut self.music.archive_dir,
+            &mut self.music.credentials_path,
+            &mut self.music.helper_python,
+            &mut self.music.transfer_helper,
+        ];
+        for (path, default) in paths.into_iter().zip(defaults) {
+            let expanded = expand_home_path(if path.as_os_str().is_empty() {
+                &default
+            } else {
+                path
+            });
+            *path = if expanded.is_absolute() {
+                expanded
+            } else {
+                project.join(expanded)
+            };
+        }
+        if self.music.ffmpeg.as_os_str().is_empty() {
+            self.music.ffmpeg = self.tools.ffmpeg.clone();
+        } else {
+            self.music.ffmpeg = expand_home_path(&self.music.ffmpeg);
+        }
+        if self.music.ffprobe.as_os_str().is_empty() {
+            self.music.ffprobe = self.music.ffmpeg.with_file_name("ffprobe");
+        } else {
+            self.music.ffprobe = expand_home_path(&self.music.ffprobe);
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -339,6 +394,25 @@ impl AppConfig {
         }
         if self.bot.command_idle_timeout_seconds == 0 {
             bail!("bot.command_idle_timeout_seconds must be at least 1");
+        }
+        if self.music.enabled {
+            if !(1..=512 * 1024 * 1024).contains(&self.music.max_file_bytes) {
+                bail!("music.max_file_bytes must be between 1 byte and 512 MiB");
+            }
+            if !(10..=3600).contains(&self.music.cloud_poll_seconds) {
+                bail!("music.cloud_poll_seconds must be between 10 and 3600");
+            }
+            for (left, right) in [
+                (&self.music.state_dir, &self.music.staging_dir),
+                (&self.music.state_dir, &self.music.archive_dir),
+                (&self.music.staging_dir, &self.music.archive_dir),
+            ] {
+                let left = normalize_path_for_comparison(left)?;
+                let right = normalize_path_for_comparison(right)?;
+                if left.starts_with(&right) || right.starts_with(&left) {
+                    bail!("music state, staging and original archive directories must not overlap");
+                }
+            }
         }
         if let Some(cloud) = &self.cloud {
             let worker_url = url::Url::parse(&cloud.worker_url)
@@ -985,6 +1059,27 @@ mod tests {
         );
         assert!(config.video.write_nfo);
         assert!(config.video.keep_sidecars);
+        assert_eq!(config.music.enabled, cfg!(target_os = "macos"));
+        assert_eq!(config.music.max_file_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.music.cloud_poll_seconds, 60);
+        assert_eq!(
+            config.music.state_dir,
+            config
+                .downloads
+                .video_dir
+                .join(".telegram-video-downloader-music")
+        );
+        assert_eq!(
+            config.music.staging_dir,
+            config
+                .downloads
+                .video_dir
+                .join(".telegram-video-downloader-staging/music")
+        );
+        assert_eq!(
+            config.music.archive_dir,
+            home.join("Library/Mobile Documents/com~apple~CloudDocs/Collection/Music")
+        );
         assert!(config.bilibili.extra_args.is_empty());
         assert!(config.bilibili.global_args.is_empty());
         assert!(config.bilibili.plan_args.is_empty());
@@ -1015,6 +1110,44 @@ mod tests {
         assert_eq!(config.bilibili.auth.credential_profile, None);
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
+    }
+
+    #[test]
+    fn music_config_rejects_overlapping_storage_and_unbounded_work() {
+        let mut config = AppConfig::for_test();
+        config.music.enabled = true;
+        config.music.state_dir = PathBuf::from("/tmp/music-config/state");
+        config.music.staging_dir = PathBuf::from("/tmp/music-config/staging");
+        config.music.archive_dir = PathBuf::from("/tmp/music-config/archive");
+        config
+            .validate()
+            .expect("independent directories should pass");
+        config.music.staging_dir = config.music.state_dir.join("nested");
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not overlap")
+        );
+        config.music.staging_dir = PathBuf::from("/tmp/music-config/staging");
+        config.music.max_file_bytes = 513 * 1024 * 1024;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("512 MiB")
+        );
+        config.music.max_file_bytes = 512 * 1024 * 1024;
+        config.music.cloud_poll_seconds = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("between 10 and 3600")
+        );
     }
 
     #[test]
