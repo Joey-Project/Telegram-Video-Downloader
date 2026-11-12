@@ -27,6 +27,13 @@ mod metadata_recovery;
 mod metadata_recovery_bot;
 #[cfg(test)]
 mod metadata_recovery_e2e_tests;
+mod music_automation;
+mod music_import;
+mod music_manager;
+mod music_native;
+mod music_runtime;
+mod music_transfer;
+mod music_types;
 mod pgc_metadata_backfill;
 mod queue;
 mod redaction;
@@ -261,6 +268,7 @@ struct BotContext {
     next_job_id: Arc<AtomicU64>,
     queue: Arc<QueueManager>,
     queue_start_retry_delay: Duration,
+    music: Option<Arc<music_runtime::MusicService>>,
 }
 
 struct JobProgressContext {
@@ -284,6 +292,60 @@ async fn main() -> Result<()> {
         .init();
 
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--music-seed-accepted"))
+    {
+        if args.len() != 3 {
+            bail!("usage: --music-seed-accepted CONFIG ACCEPTED_PROOF_JSON");
+        }
+        let config = AppConfig::load(Path::new(&args[1]))?;
+        #[cfg(all(feature = "test-runtime", not(test)))]
+        music_runtime::validate_test_profile(&config)?;
+        let seeded = music_runtime::seed_accepted_records(config, PathBuf::from(&args[2])).await?;
+        println!("{}", serde_json::json!({"seeded": seeded, "added": false}));
+        return Ok(());
+    }
+    if let Some(mode) = args.first().and_then(|arg| {
+        if arg == std::ffi::OsStr::new("--music-import") {
+            Some("import")
+        } else if arg == std::ffi::OsStr::new("--music-import-status") {
+            Some("status")
+        } else {
+            None
+        }
+    }) {
+        if args.len() != 2 {
+            bail!("Music import diagnostics require exactly one request file");
+        }
+        println!(
+            "{}",
+            music_import::run_cli(mode, std::path::Path::new(&args[1]))?
+        );
+        return Ok(());
+    }
+    if let Some(mode) = args.first().and_then(|arg| {
+        if arg == std::ffi::OsStr::new("--music-check") {
+            Some("check")
+        } else if arg == std::ffi::OsStr::new("--music-authorize") {
+            Some("authorize")
+        } else if arg == std::ffi::OsStr::new("--music-quit") {
+            Some("quit")
+        } else {
+            None
+        }
+    }) {
+        if args.len() != 1 {
+            bail!("Music automation diagnostics do not accept additional arguments");
+        }
+        let result = if mode == "authorize" {
+            music_runtime::request_permission_for_profile()?
+        } else {
+            music_automation::run_cli(mode)?
+        };
+        println!("{}", result);
+        return Ok(());
+    }
     if args
         .first()
         .is_some_and(|arg| arg == std::ffi::OsStr::new("--bilibili-worker"))
@@ -320,7 +382,10 @@ async fn main() -> Result<()> {
 
 async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
     let config = Arc::new(AppConfig::load(&config_path)?);
+    #[cfg(all(feature = "test-runtime", not(test)))]
+    music_runtime::validate_test_profile(&config)?;
     let telegram = TelegramClient::new(config.telegram.token.clone());
+    let music_shutdown = shutdown_receiver.clone();
     let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
     tokio::pin!(shutdown);
     let setup_config = Arc::clone(&config);
@@ -378,6 +443,17 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     let queue = Arc::new(queue);
     tokio::spawn(expire_pending_duplicate_jobs());
 
+    let music = config.music.enabled.then(|| {
+        let service = music_runtime::MusicService::new(
+            config.music.clone(),
+            telegram.clone(),
+            config.telegram.token.clone(),
+            music_shutdown,
+        );
+        service.start();
+        service
+    });
+
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
@@ -397,15 +473,16 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
     };
     let next_job_id = Arc::new(AtomicU64::new(1));
+    let context = BotContext {
+        telegram: telegram.clone(),
+        config: Arc::clone(&config),
+        job_dispatch,
+        next_job_id,
+        queue: Arc::clone(&queue),
+        queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        music,
+    };
     if let Some(cloud_config) = &config.cloud {
-        let context = BotContext {
-            telegram: telegram.clone(),
-            config: Arc::clone(&config),
-            job_dispatch,
-            next_job_id,
-            queue: Arc::clone(&queue),
-            queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
-        };
         return run_cloud_bot(context, cloud_config.clone(), &mut shutdown).await;
     }
     let mut offset = None;
@@ -424,12 +501,8 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
                 match updates {
                     Ok(updates) => {
                         emit_poll_readiness(&mut startup_poll_successes);
-                        if let Err(err) = process_telegram_updates(
-                            &telegram,
-                            &config,
-                            &job_dispatch,
-                            &next_job_id,
-                            &queue,
+                        if let Err(err) = process_telegram_updates_with_context(
+                            &context,
                             updates,
                             &mut offset,
                         )
@@ -4454,17 +4527,9 @@ async fn dispatch_cloud_telegram(
     };
     let bot = runtime.bot.clone();
     if let Some(message) = update.message {
-        handle_message(
-            bot.clone(),
-            update.update_id,
-            message.message_id,
-            message.from.map(|user| user.id),
-            message.chat.id,
-            message.chat.is_private(),
-            message.text.as_deref(),
-        )
-        .await
-        .with_context(|| format!("Telegram cloud update {} failed", update.update_id))?;
+        handle_telegram_message(bot.clone(), update.update_id, &message)
+            .await
+            .with_context(|| format!("Telegram cloud update {} failed", update.update_id))?;
     }
     if let Some(callback_query) = update.callback_query {
         handle_callback_query(bot, callback_query).await;
@@ -6523,6 +6588,7 @@ async fn retry_delay_or_shutdown(
     }
 }
 
+#[cfg(test)]
 async fn process_telegram_updates(
     telegram: &TelegramClient,
     config: &Arc<AppConfig>,
@@ -6539,6 +6605,7 @@ async fn process_telegram_updates(
         next_job_id: Arc::clone(next_job_id),
         queue: Arc::clone(queue),
         queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        music: None,
     };
     process_telegram_updates_with_context(&context, updates, offset).await
 }
@@ -6552,19 +6619,13 @@ async fn process_telegram_updates_with_context(
         let update_id = update.update_id;
         if let Some(message) = update.message {
             let chat_id = message.chat.id;
-            if let Err(err) = handle_message(
-                (*context).clone(),
-                update_id,
-                message.message_id,
-                message.from.map(|user| user.id),
-                chat_id,
-                message.chat.is_private(),
-                message.text.as_deref(),
-            )
-            .await
-            .with_context(|| format!("telegram message update {update_id} failed"))
+            if let Err(err) = handle_telegram_message(context.clone(), update_id, &message)
+                .await
+                .with_context(|| format!("telegram message update {update_id} failed"))
             {
-                if is_file_provider_access_error(&err) {
+                if err.is::<MusicAdmissionFailure>() {
+                    return Err(err);
+                } else if is_file_provider_access_error(&err) {
                     warn!(
                         update_id,
                         chat_id,
@@ -6793,6 +6854,159 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct MusicAdmissionFailure;
+
+impl std::fmt::Display for MusicAdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("music task was not durably admitted")
+    }
+}
+
+impl std::error::Error for MusicAdmissionFailure {}
+
+fn music_upload_from_message(
+    update_id: i64,
+    message: &telegram::Message,
+    max_bytes: u64,
+) -> Result<Option<music_types::MusicUpload>> {
+    let (file_id, unique_id, name, size, mime, is_audio) = if let Some(audio) = &message.audio {
+        (
+            &audio.file_id,
+            &audio.file_unique_id,
+            &audio.file_name,
+            audio.file_size,
+            &audio.mime_type,
+            true,
+        )
+    } else if let Some(document) = &message.document {
+        (
+            &document.file_id,
+            &document.file_unique_id,
+            &document.file_name,
+            document.file_size,
+            &document.mime_type,
+            false,
+        )
+    } else {
+        return Ok(None);
+    };
+    let inferred_extension = match mime.as_deref() {
+        Some("audio/mp4" | "audio/x-m4a") => Some("m4a"),
+        Some("audio/mpeg" | "audio/mp3") => Some("mp3"),
+        Some("audio/aac" | "audio/aacp" | "audio/x-aac") => Some("aac"),
+        _ => None,
+    };
+    let file_name = name
+        .clone()
+        .unwrap_or_else(|| format!("audio.{}", inferred_extension.unwrap_or("unknown")));
+    let extension = Path::new(&file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac") {
+        if is_audio {
+            bail!("Supported music formats are .m4a, .mp3 and .aac.");
+        }
+        return Ok(None);
+    }
+    let size =
+        size.context("Telegram did not provide the music file size. Please resend it as a file.")?;
+    if size == 0 || size > max_bytes {
+        bail!(
+            "Music files must be between 1 byte and {}.",
+            human_bytes(max_bytes)
+        );
+    }
+    let upload = music_types::MusicUpload {
+        update_id,
+        chat_id: message.chat.id,
+        message_id: message.message_id,
+        user_id: message
+            .from
+            .as_ref()
+            .context("Music uploads require an identified sender.")?
+            .id,
+        file_id: file_id.clone(),
+        file_unique_id: unique_id.clone(),
+        file_name,
+        file_size: size,
+        mime_type: mime.clone(),
+    };
+    // Reject permanent metadata errors before durable admission, so an invalid
+    // upload cannot remain at the front of the polling/cloud inbox forever.
+    music_manager::validate_upload_shape(&upload, max_bytes)
+        .context("Telegram music metadata is invalid. Please resend the file.")?;
+    Ok(Some(upload))
+}
+
+async fn handle_telegram_message(
+    context: BotContext,
+    update_id: i64,
+    message: &telegram::Message,
+) -> Result<()> {
+    if message.audio.is_some() || message.document.is_some() {
+        // Music changes the local system library, so public link-download access
+        // never grants it: require an explicitly allowed private sender.
+        let owner = message.chat.is_private()
+            && message.chat.id > 0
+            && message
+                .from
+                .as_ref()
+                .is_some_and(|sender| sender.id == message.chat.id)
+            && context
+                .config
+                .telegram
+                .allowed_chat_ids
+                .contains(&message.chat.id);
+        if !owner {
+            return Ok(());
+        }
+        match music_upload_from_message(update_id, message, context.config.music.max_file_bytes) {
+            Ok(Some(upload)) => {
+                if let Some(service) = &context.music {
+                    match service.enqueue(upload).await {
+                        Ok(_) => {}
+                        Err(error) if error.is::<music_manager::MusicCapacityFull>() => {
+                            send_or_log(
+                                &context.telegram,
+                                message.chat.id,
+                                "The Music queue is full. No task was created for this file. Use /music to manage existing tasks, then resend the file when there is room.".into(),
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(error.context(MusicAdmissionFailure)),
+                    }
+                } else {
+                    send_or_log(
+                        &context.telegram,
+                        message.chat.id,
+                        "Music imports are disabled on this bot. No music task was created.".into(),
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                send_or_log(&context.telegram, message.chat.id, error.to_string()).await;
+                return Ok(());
+            }
+            Ok(None) => {}
+        }
+    }
+    handle_message(
+        context,
+        update_id,
+        message.message_id,
+        message.from.as_ref().map(|sender| sender.id),
+        message.chat.id,
+        message.chat.is_private(),
+        message.text.as_deref(),
+    )
+    .await
+}
+
 async fn handle_message(
     context: BotContext,
     update_id: i64,
@@ -6812,6 +7026,63 @@ async fn handle_message(
 
     if !config.telegram.is_chat_allowed(chat_id) {
         warn!(chat_id, "ignoring message from unauthorized chat");
+        return Ok(());
+    }
+
+    if text
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command.split('@').next() == Some("/music"))
+    {
+        if !is_private_chat
+            || submitter_user_id != Some(chat_id)
+            || !config.telegram.allowed_chat_ids.contains(&chat_id)
+        {
+            return Ok(());
+        }
+        let Some(service) = &context.music else {
+            send_or_log(
+                &telegram,
+                chat_id,
+                "Music imports are disabled on this bot.".into(),
+            )
+            .await;
+            return Ok(());
+        };
+        let parts = text.split_whitespace().collect::<Vec<_>>();
+        if matches!(parts.as_slice(), [_, "authorize"]) {
+            let status = telegram.send_message(chat_id, "Check the Mac for this bot's Music authorization request. Existing music and downloads are retained.".into()).await?;
+            if !service.authorize(chat_id, status) {
+                telegram
+                    .edit_message_text(
+                        chat_id,
+                        status,
+                        "A Music authorization request is already waiting on the Mac.".into(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        let response: Result<String> = match parts.as_slice() {
+            [_] | [_, "list"] => service.summary(chat_id).await,
+            [_, "retry", id] => {
+                service.retry(chat_id, id).await.map(|()| "Music task resumed. Its existing status message will be updated; an uncertain add will never be repeated.".into())
+            }
+            [_, "cancel", id] => {
+                service.cancel(chat_id, id).await.map(|()| "Music task cancellation requested. Existing imported tracks, originals and partial downloads are retained.".into())
+            }
+            _ => Ok("Usage: /music, /music authorize, /music retry TASK_ID, or /music cancel TASK_ID.".into()),
+        };
+        let response = response.unwrap_or_else(|error| {
+            format!(
+                "Music request could not be completed: {}",
+                redact_sensitive_text(&error.to_string())
+                    .chars()
+                    .take(2048)
+                    .collect::<String>()
+            )
+        });
+        send_or_log(&telegram, chat_id, response).await;
         return Ok(());
     }
 
@@ -6922,6 +7193,10 @@ fn default_bot_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "settings".to_string(),
             description: "Manage media libraries and download defaults.".to_string(),
+        },
+        BotCommand {
+            command: "music".to_string(),
+            description: "View, retry or cancel music imports.".to_string(),
         },
         BotCommand {
             command: "bbdown".to_string(),
@@ -7052,6 +7327,7 @@ fn help_message() -> String {
         "",
         "Send Bilibili or YouTube links directly to download videos.",
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
+        "Send .m4a, .mp3 or .aac files in the allowed private chat to import music automatically.",
         "",
         "Commands:",
         "/help - Show this help.",
@@ -7059,6 +7335,7 @@ fn help_message() -> String {
         "/file - Open the private file manager in a private chat.",
         "/settings - Manage media libraries and download defaults in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
+        "/music - View music imports; /music retry TASK_ID or /music cancel TASK_ID.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
         "/bbdown logout - Clear the local BBDown credential state.",
@@ -15825,6 +16102,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue,
             queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+            music: None,
         };
         let hints = queue_source_hints(&bot).expect("queue source hints should build");
         assert_eq!(hints.len(), 1);
@@ -17372,7 +17650,9 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "pdf", "queue", "file", "settings", "bbdown"]
+            vec![
+                "help", "pdf", "queue", "file", "settings", "music", "bbdown"
+            ]
         );
         assert_eq!(
             commands
@@ -17987,11 +18267,14 @@ mod tests {
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+                music: None,
             },
             crate::telegram::CallbackQuery {
                 id: "stale-bilibili-selection".to_string(),
                 data: Some(bilibili_selection_callback_data(token, "latest")),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: 1_001,
                     chat: crate::telegram::Chat {
                         id: chat_id,
@@ -19391,6 +19674,7 @@ mod tests {
             next_job_id,
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::from_secs(30),
+            music: None,
         };
         process_telegram_updates_with_context(&context, updates, &mut offset)
             .await
@@ -19473,6 +19757,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         assert!(
             prepare_persisted_task_for_job(&context, 123_456_789, task_id, 0, false).await,
@@ -19550,6 +19835,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         assert!(
             prepare_persisted_task_for_job(
@@ -19627,6 +19913,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         let job = JobRequest::Bilibili {
             url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
@@ -19732,6 +20019,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         prompt_bilibili_selection(
             &context,
@@ -20239,6 +20527,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
 
         assert!(
@@ -20336,6 +20625,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
 
         assert!(
@@ -20880,6 +21170,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(963)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         tokio_timeout(
             Duration::from_secs(5),
@@ -20978,6 +21269,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(967)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         tokio_timeout(
             Duration::from_secs(5),
@@ -21044,6 +21336,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         let cancel = Arc::new(Notify::new());
         cancel.notify_one();
@@ -21143,6 +21436,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         assert!(
             persist_queued_task_state(
@@ -21540,6 +21834,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         let mut offset = None;
         process_telegram_updates_with_context(&context, updates, &mut offset)
@@ -21629,6 +21924,7 @@ mod tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         handle_queue_callback(
             context.clone(),
@@ -22462,11 +22758,14 @@ mod tests {
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+                music: None,
             },
             crate::telegram::CallbackQuery {
                 id: "next-page".to_string(),
                 data: Some(next_callback_data),
                 message: Some(crate::telegram::Message {
+                    audio: None,
+                    document: None,
                     message_id: 700,
                     chat: crate::telegram::Chat {
                         id: 123_456_789,
@@ -23729,4 +24028,5 @@ mod tests {
 
     include!("collection_message_tests.rs");
     include!("queue_metadata_tests.rs");
+    include!("music_bot_tests.rs");
 }

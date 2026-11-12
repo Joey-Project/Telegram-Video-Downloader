@@ -84,6 +84,7 @@ mod queue_metadata_tests {
             next_job_id: Arc::new(AtomicU64::new(1)),
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
+            music: None,
         };
         tokio_timeout(Duration::from_secs(10), process_job_after_duplicate_check(
             context, CHAT_ID, 1, id.to_string(), 0, job,
