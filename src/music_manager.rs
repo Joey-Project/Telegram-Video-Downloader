@@ -29,6 +29,7 @@ const OWNER_LOCK_FILE: &str = "owner.lock";
 const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOBS: usize = 1_000;
+const MAX_ACTIVE_JOBS: usize = 1_000;
 const MAX_CATALOG_ENTRIES: usize = 2_048;
 const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 512;
@@ -45,6 +46,17 @@ pub struct Admission {
     pub job_id: String,
     pub created: bool,
 }
+
+#[derive(Debug)]
+pub struct MusicCapacityFull;
+
+impl std::fmt::Display for MusicCapacityFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("music job capacity is full; no task was created")
+    }
+}
+
+impl std::error::Error for MusicCapacityFull {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -159,7 +171,6 @@ impl Default for StoredState {
 struct MusicStore {
     state_path: PathBuf,
     archive_dir: PathBuf,
-    max_file_bytes: u64,
     provider: Arc<dyn QueueFileProvider>,
     state: Mutex<StoredState>,
     _owner_lock: File,
@@ -176,11 +187,10 @@ impl MusicStore {
 
         let state_path = settings.state_dir.join(STATE_FILE);
         let state = read_state(&state_path, provider.as_ref())?.unwrap_or_default();
-        validate_stored_state(&state, settings.max_file_bytes, &settings.archive_dir)?;
+        validate_stored_state(&state, &settings.archive_dir)?;
         let store = Self {
             state_path,
             archive_dir: settings.archive_dir.clone(),
-            max_file_bytes: settings.max_file_bytes,
             provider,
             state: Mutex::new(state),
             _owner_lock: owner_lock,
@@ -233,7 +243,7 @@ impl MusicStore {
             .map_err(|_| anyhow!("music job state lock was poisoned"))?;
         let mut next = guard.clone();
         let output = update(&mut next)?;
-        validate_stored_state(&next, self.max_file_bytes, &self.archive_dir)?;
+        validate_stored_state(&next, &self.archive_dir)?;
         write_state_atomic(&self.state_path, &next, self.provider.as_ref())?;
         *guard = next;
         Ok(output)
@@ -263,9 +273,7 @@ impl MusicStore {
                     created: false,
                 });
             }
-            if state.jobs.len() >= MAX_JOBS {
-                bail!("music job capacity has been reached");
-            }
+            make_room_for_admission(state)?;
             let now = unix_seconds();
             state.jobs.insert(
                 job_id.clone(),
@@ -298,6 +306,7 @@ impl MusicStore {
                     status_next_attempt_at: None,
                 },
             );
+            make_room_for_serialized_admission(state, &job_id)?;
             Ok(Admission {
                 job_id,
                 created: true,
@@ -407,7 +416,7 @@ impl MusicStore {
         track: &MusicTrack,
         settings: &MusicSettings,
     ) -> Result<()> {
-        validate_prepared_audio(audio, settings.max_file_bytes)?;
+        validate_prepared_audio(audio, MAX_CONFIGURED_FILE_BYTES)?;
         validate_track(track)?;
         validate_archive_state(archive, &settings.archive_dir)?;
         if !track.cloud_complete() {
@@ -446,22 +455,34 @@ impl MusicStore {
 
     fn retry(&self, chat_id: i64, job_id: &str) -> Result<()> {
         self.transact(|state| {
+            let existing = state
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| anyhow!("music job was not found"))?;
+            if existing.upload.chat_id != chat_id {
+                bail!("music job was not found in this chat");
+            }
+            if existing.stage == JobStage::OutcomeUnknown {
+                bail!("the import outcome is unknown and cannot be retried automatically");
+            }
+            if !matches!(&existing.stage, JobStage::Failed | JobStage::Cancelled) {
+                bail!("only failed or cancelled music jobs can be retried");
+            }
+            if existing.add_intent && existing.persistent_id.is_none() {
+                bail!("the import outcome is unknown and cannot be retried automatically");
+            }
+            let active_jobs = state
+                .jobs
+                .values()
+                .filter(|job| job.job_id != job_id && !job.stage.is_terminal())
+                .count();
+            if active_jobs >= MAX_ACTIVE_JOBS {
+                return Err(MusicCapacityFull.into());
+            }
             let job = state
                 .jobs
                 .get_mut(job_id)
-                .ok_or_else(|| anyhow!("music job was not found"))?;
-            if job.upload.chat_id != chat_id {
-                bail!("music job was not found in this chat");
-            }
-            if job.stage == JobStage::OutcomeUnknown {
-                bail!("the import outcome is unknown and cannot be retried automatically");
-            }
-            if !matches!(&job.stage, JobStage::Failed | JobStage::Cancelled) {
-                bail!("only failed or cancelled music jobs can be retried");
-            }
-            if job.add_intent && job.persistent_id.is_none() {
-                bail!("the import outcome is unknown and cannot be retried automatically");
-            }
+                .expect("retryable job was checked above");
             job.cancel_requested = false;
             job.error = None;
             job.next_poll_at = None;
@@ -859,7 +880,7 @@ impl MusicManager {
             return;
         }
         let destination = job_dir.join(format!("original.{extension}"));
-        match completed_download(&destination, job.upload.file_size) {
+        match completed_download(&destination, job.upload.file_size, false) {
             Ok(true) => {
                 if self
                     .store
@@ -928,7 +949,7 @@ impl MusicManager {
             return;
         }
         if !matches!(
-            completed_download(&destination, job.upload.file_size),
+            completed_download(&destination, job.upload.file_size, true),
             Ok(true)
         ) {
             self.fail_job(
@@ -1002,7 +1023,7 @@ impl MusicManager {
             run_blocking(move || backend.prepare(&original, &work_dir, &cancellation)).await;
         let prepared = match prepared {
             Ok(prepared)
-                if validate_prepared_audio(&prepared, self.settings.max_file_bytes).is_ok()
+                if validate_prepared_audio(&prepared, MAX_CONFIGURED_FILE_BYTES).is_ok()
                     && prepared.original.size == job.upload.file_size =>
             {
                 prepared
@@ -1816,19 +1837,28 @@ fn supported_extension(file_name: &str) -> Option<&'static str> {
     }
 }
 
-fn completed_download(path: &Path, expected_size: u64) -> Result<bool> {
+fn completed_download(path: &Path, expected_size: u64, helper_verified: bool) -> Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("failed to inspect retained music download"),
     };
+    let link_count = metadata.nlink();
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
+        || !(1..=2).contains(&link_count)
         || metadata.len() > expected_size
     {
         bail!("retained music download is not an owned regular file of an allowed size");
+    }
+    if link_count == 2 {
+        if helper_verified {
+            bail!("music download still has an extra link after helper recovery");
+        }
+        // The transfer helper validates the receipt and inode, then removes its
+        // partial link before the completed file can be used for preparation.
+        return Ok(false);
     }
     Ok(metadata.len() == expected_size)
 }
@@ -1842,6 +1872,93 @@ fn job_identity(upload: &MusicUpload) -> (String, String) {
     digest.update(upload.file_unique_id.as_bytes());
     let digest = format!("{:x}", digest.finalize());
     (format!("mj1-{}", &digest[..24]), digest)
+}
+
+fn make_room_for_admission(state: &mut StoredState) -> Result<()> {
+    let active_jobs = state
+        .jobs
+        .values()
+        .filter(|job| !job.stage.is_terminal())
+        .count();
+    if active_jobs >= MAX_ACTIVE_JOBS {
+        return Err(MusicCapacityFull.into());
+    }
+
+    while state.jobs.len() >= MAX_JOBS {
+        let oldest_safe_complete = state
+            .jobs
+            .values()
+            .filter(|job| safe_to_evict_completed_job(state, job))
+            .min_by_key(|job| (job.created_at, job.updated_at, job.job_id.clone()))
+            .map(|job| job.job_id.clone());
+        let Some(job_id) = oldest_safe_complete else {
+            return Err(MusicCapacityFull.into());
+        };
+        state.jobs.remove(&job_id);
+    }
+    Ok(())
+}
+
+fn make_room_for_serialized_admission(state: &mut StoredState, new_job_id: &str) -> Result<()> {
+    loop {
+        if serde_json::to_vec(state)?.len() <= MAX_STATE_BYTES {
+            return Ok(());
+        }
+        let oldest_safe_complete = state
+            .jobs
+            .values()
+            .filter(|job| job.job_id != new_job_id && safe_to_evict_completed_job(state, job))
+            .min_by_key(|job| (job.created_at, job.updated_at, job.job_id.clone()))
+            .map(|job| job.job_id.clone());
+        let Some(job_id) = oldest_safe_complete else {
+            return Err(MusicCapacityFull.into());
+        };
+        state.jobs.remove(&job_id);
+    }
+}
+
+fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
+    if job.stage != JobStage::Complete
+        || !job.add_intent
+        || !job.local_copy_verified
+        || job.status_message_id.is_none()
+        || job.status_pending_text.is_some()
+        || job.status_edit_attempts != 0
+        || job.status_next_attempt_at.is_some()
+    {
+        return false;
+    }
+    let desired_status = render_status(job);
+    if job.status_text.as_deref() != Some(desired_status.as_str()) {
+        return false;
+    }
+    let (Some(prepared), Some(persistent_id), Some(track), Some(archive)) = (
+        job.prepared.as_ref(),
+        job.persistent_id.as_ref(),
+        job.track.as_ref(),
+        job.archive.as_ref(),
+    ) else {
+        return false;
+    };
+    if !track.cloud_complete()
+        || track.persistent_id.as_str() != persistent_id
+        || !archive.uploaded
+        || archive.uploading
+        || archive.downloading
+        || archive.conflicts
+        || archive.local_bytes
+    {
+        return false;
+    }
+    state
+        .content_catalog
+        .get(&prepared.original.sha256)
+        .is_some_and(|entry| {
+            entry.add_intent
+                && entry.persistent_id.as_ref() == Some(persistent_id)
+                && entry.prepared.original.sha256 == prepared.original.sha256
+                && entry.prepared.import.sha256 == prepared.import.sha256
+        })
 }
 
 fn validate_prepared_audio(audio: &PreparedAudio, max_original_bytes: u64) -> Result<()> {
@@ -1913,22 +2030,28 @@ fn validate_archive_state(archive: &ArchiveState, archive_dir: &Path) -> Result<
     Ok(())
 }
 
-fn validate_stored_state(
-    state: &StoredState,
-    max_file_bytes: u64,
-    archive_dir: &Path,
-) -> Result<()> {
+fn validate_stored_state(state: &StoredState, archive_dir: &Path) -> Result<()> {
     if state.version != STATE_VERSION
         || state.jobs.len() > MAX_JOBS
         || state.content_catalog.len() > MAX_CATALOG_ENTRIES
     {
         bail!("music state has an unsupported version or exceeds its limits");
     }
+    if state
+        .jobs
+        .values()
+        .filter(|job| !job.stage.is_terminal())
+        .count()
+        > MAX_ACTIVE_JOBS
+    {
+        bail!("music state exceeds the active job limit");
+    }
     for (job_id, job) in &state.jobs {
         if job_id != &job.job_id || job_id.len() > MAX_ID_BYTES {
             bail!("music state contains an invalid job ID");
         }
-        validate_upload_shape(&job.upload, max_file_bytes)?;
+        // Historic jobs must remain readable when operators lower today's admission limit.
+        validate_upload_shape(&job.upload, MAX_CONFIGURED_FILE_BYTES)?;
         let (expected_id, expected_origin) = job_identity(&job.upload);
         if job_id != &expected_id || job.origin_key != expected_origin {
             bail!("music state contains a mismatched upload origin");
@@ -1936,7 +2059,7 @@ fn validate_stored_state(
         if job
             .prepared
             .as_ref()
-            .is_some_and(|audio| validate_prepared_audio(audio, max_file_bytes).is_err())
+            .is_some_and(|audio| validate_prepared_audio(audio, MAX_CONFIGURED_FILE_BYTES).is_err())
         {
             bail!("music state contains invalid prepared audio metadata");
         }
@@ -2013,7 +2136,7 @@ fn validate_stored_state(
         if normalized_key.as_str() != sha || normalized_original != normalized_key {
             bail!("music catalog key does not match its original content hash");
         }
-        validate_prepared_audio(&entry.prepared, max_file_bytes)?;
+        validate_prepared_audio(&entry.prepared, MAX_CONFIGURED_FILE_BYTES)?;
         if !entry.archive.path.is_absolute()
             || entry
                 .archive
@@ -2035,7 +2158,8 @@ fn validate_stored_state(
 }
 
 pub(crate) fn validate_upload_shape(upload: &MusicUpload, max_file_bytes: u64) -> Result<()> {
-    // Stored records retain the same bounds as newly admitted updates.
+    // Callers pass the configured admission limit for new uploads, or the storage ceiling when
+    // validating persisted history that must survive later configuration changes.
     let settings = MusicSettings {
         enabled: true,
         state_dir: PathBuf::from("/state"),

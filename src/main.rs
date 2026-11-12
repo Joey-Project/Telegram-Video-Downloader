@@ -6966,10 +6966,18 @@ async fn handle_telegram_message(
         match music_upload_from_message(update_id, message, context.config.music.max_file_bytes) {
             Ok(Some(upload)) => {
                 if let Some(service) = &context.music {
-                    service
-                        .enqueue(upload)
-                        .await
-                        .context(MusicAdmissionFailure)?;
+                    match service.enqueue(upload).await {
+                        Ok(_) => {}
+                        Err(error) if error.is::<music_manager::MusicCapacityFull>() => {
+                            send_or_log(
+                                &context.telegram,
+                                message.chat.id,
+                                "The Music queue is full. No task was created for this file. Use /music to manage existing tasks, then resend the file when there is room.".into(),
+                            )
+                            .await;
+                        }
+                        Err(error) => return Err(error.context(MusicAdmissionFailure)),
+                    }
                 } else {
                     send_or_log(
                         &context.telegram,

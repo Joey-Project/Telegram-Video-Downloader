@@ -385,6 +385,28 @@ impl MusicBackend for MockBackend {
                 bail!("synthetic cancellation after a retained partial download");
             }
         }
+        if let Ok(metadata) = fs::symlink_metadata(destination)
+            && metadata.nlink() > 1
+        {
+            if metadata.nlink() == 2
+                && metadata.is_file()
+                && metadata.len() == 24
+                && fs::read(destination)? == b"complete original audio!"
+            {
+                // Model the helper's known receipt, inode check and partial unlink.
+                let partial = destination.with_file_name("helper-completed.part");
+                let partial_metadata = fs::symlink_metadata(&partial)?;
+                if !partial_metadata.is_file()
+                    || partial_metadata.dev() != metadata.dev()
+                    || partial_metadata.ino() != metadata.ino()
+                {
+                    bail!("synthetic helper rejected a mismatched publication partial");
+                }
+                fs::remove_file(partial)?;
+                return Ok(());
+            }
+            bail!("synthetic helper rejected an unverified linked destination");
+        }
         fs::write(destination, b"complete original audio!")?;
         Ok(())
     }
@@ -511,6 +533,147 @@ pub(crate) fn upload(message_id: i64, file_unique_id: &str) -> MusicUpload {
     }
 }
 
+fn stored_job(upload: MusicUpload, stage: JobStage, created_at: u64) -> StoredJob {
+    let (job_id, origin_key) = job_identity(&upload);
+    StoredJob {
+        job_id,
+        origin_key,
+        upload,
+        stage,
+        created_at,
+        updated_at: created_at,
+        attempt: 0,
+        prepare_attempt: 0,
+        archive_attempt: 0,
+        download_path: None,
+        download_complete: false,
+        prepared: None,
+        archive: None,
+        persistent_id: None,
+        track: None,
+        local_copy_verified: false,
+        add_intent: false,
+        cancel_requested: false,
+        next_poll_at: None,
+        error: None,
+        status_message_id: None,
+        status_send_attempted: false,
+        status_text: None,
+        status_pending_text: None,
+        status_edit_attempts: 0,
+        status_next_attempt_at: None,
+    }
+}
+
+/// Seed a full valid active queue in one atomic state write for Telegram intake tests.
+pub(crate) fn seed_full_active_queue(settings: &MusicSettings) {
+    let store = MusicStore::open(settings, platform_queue_file_provider())
+        .expect("music store should open for capacity fixture");
+    store
+        .transact(|state| {
+            let now = unix_seconds();
+            for index in 0..MAX_ACTIVE_JOBS {
+                let upload = upload(10_000 + index as i64, &format!("capacity-{index}"));
+                let job = stored_job(upload, JobStage::Queued, now);
+                state.jobs.insert(job.job_id.clone(), job);
+            }
+            Ok(())
+        })
+        .expect("full active queue should persist in one transaction");
+}
+
+fn seed_full_completed_history(settings: &MusicSettings) -> (String, String, PathBuf) {
+    let store = MusicStore::open(settings, platform_queue_file_provider())
+        .expect("music store should open for completed-history fixture");
+    let failed_upload = upload(20_001, "history-1");
+    let (failed_job_id, _) = job_identity(&failed_upload);
+    let failed_job_dir = settings.staging_dir.join(&failed_job_id);
+    ensure_private_directory(&failed_job_dir, store.provider.as_ref())
+        .expect("failed job staging should be private");
+    let retained_partial = failed_job_dir.join("original.m4a");
+    fs::write(&retained_partial, b"retained partial bytes")
+        .expect("failed job partial download should persist");
+
+    let first_job_id = store
+        .transact(|state| {
+            let now = unix_seconds();
+            let mut first_job_id = String::new();
+            for index in 0..MAX_JOBS {
+                let upload = upload(20_000 + index as i64, &format!("history-{index}"));
+                let mut job = stored_job(
+                    upload,
+                    if index == 1 {
+                        JobStage::Failed
+                    } else {
+                        JobStage::Complete
+                    },
+                    now.saturating_sub((MAX_JOBS - index) as u64),
+                );
+                if index == 1 {
+                    job.attempt = 1;
+                    job.download_path = Some(retained_partial.clone());
+                    job.error = Some("The partial download was retained for retry.".to_string());
+                } else {
+                    let original_sha = if index == 0 {
+                        "a".repeat(64)
+                    } else {
+                        format!("{:064x}", index + 1)
+                    };
+                    let prepared = PreparedAudio {
+                        original: AudioBytes {
+                            path: settings.staging_dir.join(format!("source-{index}.m4a")),
+                            sha256: original_sha.clone(),
+                            size: 24,
+                        },
+                        import: AudioBytes {
+                            path: settings.staging_dir.join(format!("import-{index}.m4a")),
+                            sha256: "b".repeat(64),
+                            size: 22,
+                        },
+                    };
+                    let archive = ArchiveState {
+                        path: settings.archive_dir.join(format!("seed-{index}.m4a")),
+                        uploaded: true,
+                        uploading: false,
+                        downloading: false,
+                        conflicts: false,
+                        local_bytes: false,
+                    };
+                    let persistent_id = format!("seed-pid-{index}");
+                    job.prepared = Some(prepared.clone());
+                    job.archive = Some(archive.clone());
+                    job.persistent_id = Some(persistent_id.clone());
+                    job.track = Some(MusicTrack {
+                        persistent_id: persistent_id.clone(),
+                        location: Some(PathBuf::from(format!("/Music/Seed-{index}.m4a"))),
+                        cloud_status: "uploaded".to_string(),
+                    });
+                    job.local_copy_verified = true;
+                    job.add_intent = true;
+                    job.status_message_id = Some(index as i64 + 1);
+                    job.status_send_attempted = true;
+                    job.status_text = Some(render_status(&job));
+                    if index == 0 {
+                        first_job_id = job.job_id.clone();
+                    }
+                    state.content_catalog.insert(
+                        original_sha,
+                        CatalogEntry {
+                            add_intent: true,
+                            persistent_id: Some(persistent_id),
+                            prepared,
+                            archive,
+                        },
+                    );
+                }
+                state.jobs.insert(job.job_id.clone(), job);
+            }
+            Ok(first_job_id)
+        })
+        .expect("bounded completed history should persist in one transaction");
+    (first_job_id, failed_job_id, retained_partial)
+}
+
 pub(crate) async fn open_manager(
     settings: MusicSettings,
     server: &TestHttpServer,
@@ -596,6 +759,196 @@ async fn admission_is_durable_idempotent_and_rejects_conflicting_origin_metadata
         .await
         .expect("summary should be available");
     assert!(summary.contains(&first.job_id));
+    server.stop();
+}
+
+#[tokio::test]
+async fn full_active_queue_returns_typed_capacity_but_accepts_replays() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    seed_full_active_queue(&settings);
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(settings, &server, backend).await;
+
+    let replay = manager
+        .enqueue(upload(10_000, "capacity-0"))
+        .await
+        .expect("a replay must remain idempotent when the queue is full");
+    assert!(!replay.created);
+    let error = manager
+        .enqueue(upload(50_000, "capacity-overflow"))
+        .await
+        .expect_err("a new job must be rejected when the active queue is full");
+    assert!(error.is::<MusicCapacityFull>());
+    let state = manager.store.snapshot().expect("state should read");
+    assert_eq!(state.jobs.len(), MAX_JOBS);
+    assert_eq!(
+        state
+            .jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal())
+            .count(),
+        MAX_ACTIVE_JOBS
+    );
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn completed_history_eviction_preserves_catalog_and_failed_partials() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let (evicted_job_id, failed_job_id, retained_partial) = seed_full_completed_history(&settings);
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(settings, &server, backend.clone() as Arc<dyn MusicBackend>).await;
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+
+    let admission = manager
+        .enqueue(upload(30_000, "catalog-after-history-eviction"))
+        .await
+        .expect("a safely evictable completed record should make room");
+    assert!(admission.created);
+    wait_for_complete(&manager, &admission.job_id).await;
+
+    let state = manager.store.snapshot().expect("state should read");
+    assert_eq!(state.jobs.len(), MAX_JOBS);
+    assert!(!state.jobs.contains_key(&evicted_job_id));
+    let failed = state
+        .jobs
+        .get(&failed_job_id)
+        .expect("failed retry history must not be evicted");
+    assert_eq!(failed.stage, JobStage::Failed);
+    assert_eq!(
+        failed.download_path.as_deref(),
+        Some(retained_partial.as_path())
+    );
+    assert!(
+        retained_partial.exists(),
+        "the partial download must remain"
+    );
+    let original_sha = "a".repeat(64);
+    assert!(state.content_catalog.contains_key(&original_sha));
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn lowering_admission_limit_keeps_historic_jobs_prepared_audio_and_catalog_valid() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let settings = fixture.settings();
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let admission = manager
+        .enqueue(upload(28, "retained-large-job"))
+        .await
+        .unwrap();
+    let prepared = PreparedAudio {
+        original: AudioBytes {
+            path: settings
+                .staging_dir
+                .join(&admission.job_id)
+                .join("original.m4a"),
+            sha256: "a".repeat(64),
+            size: 24,
+        },
+        import: AudioBytes {
+            path: settings
+                .staging_dir
+                .join(&admission.job_id)
+                .join("prepared.m4a"),
+            sha256: "b".repeat(64),
+            size: 22,
+        },
+    };
+    let archive = ArchiveState {
+        path: settings.archive_dir.join("retained-large-job.m4a"),
+        uploaded: true,
+        uploading: false,
+        downloading: false,
+        conflicts: false,
+        local_bytes: false,
+    };
+    let track = MusicTrack {
+        persistent_id: "persistent-id-retained".to_string(),
+        location: Some(PathBuf::from("/Music/Retained.m4a")),
+        cloud_status: "uploaded".to_string(),
+    };
+    manager
+        .store
+        .transact(|state| {
+            {
+                let job = state
+                    .jobs
+                    .get_mut(&admission.job_id)
+                    .expect("admitted job should exist");
+                job.stage = JobStage::Complete;
+                job.download_path = Some(prepared.original.path.clone());
+                job.download_complete = true;
+                job.prepared = Some(prepared.clone());
+                job.archive = Some(archive.clone());
+                job.persistent_id = Some(track.persistent_id.clone());
+                job.track = Some(track.clone());
+                job.local_copy_verified = true;
+                job.add_intent = true;
+                job.status_message_id = Some(28);
+                job.status_send_attempted = true;
+                job.status_text = Some(render_status(job));
+            }
+            state.content_catalog.insert(
+                "a".repeat(64),
+                CatalogEntry {
+                    add_intent: true,
+                    persistent_id: Some(track.persistent_id.clone()),
+                    prepared: prepared.clone(),
+                    archive: archive.clone(),
+                },
+            );
+            Ok(())
+        })
+        .expect("historical prepared state should persist under the original limit");
+    drop(manager);
+
+    let mut lowered_settings = settings;
+    lowered_settings.max_file_bytes = 1;
+    let reopened = open_manager(lowered_settings, &server, backend as Arc<dyn MusicBackend>).await;
+    let retained = reopened
+        .store
+        .job(&admission.job_id)
+        .expect("retained job should read")
+        .expect("retained job should remain in history");
+    assert_eq!(retained.stage, JobStage::Complete);
+    assert_eq!(retained.upload.file_size, 24);
+    assert_eq!(retained.prepared.as_ref().unwrap().original.size, 24);
+    assert_eq!(
+        reopened.store.snapshot().unwrap().content_catalog.len(),
+        1,
+        "historical catalog metadata should also survive the lower limit"
+    );
+
+    let error = reopened
+        .enqueue(upload(29, "above-lowered-limit"))
+        .await
+        .expect_err("new admission must still obey the lowered configured limit");
+    assert!(!error.is::<MusicCapacityFull>());
+    assert!(format!("{error:#}").contains("configured limit"));
+    drop(reopened);
     server.stop();
 }
 
@@ -761,6 +1114,89 @@ async fn an_existing_complete_original_is_prepared_without_redownloading() {
             .as_deref(),
         Some(original_path.as_path())
     );
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn two_link_original_is_recovered_through_the_trusted_download_helper() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(fixture.settings().archive_dir.clone());
+    let manager = open_manager(
+        fixture.settings(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let admission = manager
+        .enqueue(upload(26, "unique-26-linked"))
+        .await
+        .unwrap();
+    let job_dir = manager.settings.staging_dir.join(&admission.job_id);
+    ensure_private_directory(&job_dir, manager.store.provider.as_ref()).unwrap();
+    let original_path = job_dir.join("original.m4a");
+    fs::write(&original_path, b"complete original audio!").unwrap();
+    let published_link = job_dir.join("helper-completed.part");
+    fs::hard_link(&original_path, &published_link).unwrap();
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::nlink(&fs::symlink_metadata(&original_path).unwrap()),
+        2
+    );
+
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    wait_for_complete(&manager, &admission.job_id).await;
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::nlink(&fs::symlink_metadata(&original_path).unwrap()),
+        1,
+        "the helper must remove the verified partial before import"
+    );
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn unverified_two_link_original_is_preserved_and_never_imported() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(fixture.settings().archive_dir.clone());
+    let manager = open_manager(
+        fixture.settings(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let admission = manager
+        .enqueue(upload(27, "unique-27-linked-tamper"))
+        .await
+        .unwrap();
+    let job_dir = manager.settings.staging_dir.join(&admission.job_id);
+    ensure_private_directory(&job_dir, manager.store.provider.as_ref()).unwrap();
+    let original_path = job_dir.join("original.m4a");
+    fs::write(&original_path, b"tampered linked bytes").unwrap();
+    let published_link = job_dir.join("helper-completed.part");
+    fs::hard_link(&original_path, &published_link).unwrap();
+
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    wait_for_stage(&manager, &admission.job_id, JobStage::Failed).await;
+    assert_eq!(fs::read(&original_path).unwrap(), b"tampered linked bytes");
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
 
     let _ = shutdown.send(true);
     tokio::time::timeout(Duration::from_secs(5), worker)

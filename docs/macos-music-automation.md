@@ -35,6 +35,9 @@ root when configuration is loaded. Changing the selected video library in the
 Mini App does not relocate existing Music state or staging.
 The original archive defaults to
 `~/Library/Mobile Documents/com~apple~CloudDocs/Collection/Music`.
+Music resolves bare ffmpeg/ffprobe commands through the bot process's PATH.
+Explicit relative codec paths are resolved from the configuration directory.
+Missing tools fail the affected Music task without preventing bot startup.
 
 The Python transfer helper is installed only by an explicit operator command. The
 default command prints a plan without changing files; select one profile to apply:
@@ -59,6 +62,10 @@ use `/music retry TASK_ID` to resume a failed task or `/music cancel TASK_ID` to
 request cancellation. Cancellation and transfer failures keep resumable partial
 download data. Cancellation also preserves existing originals and imported
 tracks.
+When the queue has no safe room for another task, the upload is rejected with a
+queue-full message and later Telegram commands remain available. Resend the file
+after making room. Lowering the configured upload limit does not discard or
+invalidate previously accepted tasks.
 
 Only `/music authorize` requests Music permission. In production, send that command
 to the running production bot. The executable checks its fixed installation path

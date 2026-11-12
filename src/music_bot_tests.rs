@@ -194,6 +194,56 @@ mod music_bot_tests {
     }
 
     #[tokio::test]
+    async fn full_music_queue_does_not_block_later_telegram_commands() {
+        let directory = TestDirectory::new();
+        let server = TestHttpServer::start().await;
+        let config = config_for(&directory);
+        music_manager::tests::seed_full_active_queue(&config.music);
+        let backend = MockBackend::new(config.music.archive_dir.clone());
+        let gate = Arc::new(DownloadGate::default());
+        *backend.download_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        let (stop, shutdown) = watch::channel(false);
+        let service = music_runtime::MusicService::with_backend(
+            config.music.clone(),
+            server.client.clone(),
+            backend.clone(),
+            shutdown,
+        );
+        service.start();
+        let context = context(config, server.client.clone(), Some(service));
+        let help = serde_json::from_value(serde_json::json!({
+            "update_id": 100_002,
+            "message": {
+                "message_id": 100_002,
+                "chat": {"id": 42, "type": "private"},
+                "from": {"id": 42},
+                "text": "/help"
+            }
+        }))
+        .unwrap();
+        let mut offset = None;
+        tokio_timeout(
+            Duration::from_secs(10),
+            process_telegram_updates_with_context(
+                &context,
+                vec![update(100_001, 42, false, "overflow.m4a", 24), help],
+                &mut offset,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(offset, Some(100_003));
+        assert!(server.wait_for_text("The Music queue is full").await);
+        assert!(server.wait_for_text("Telegram Local Downloader Bot").await);
+        assert!(backend.downloads.load(Ordering::Relaxed) <= 1);
+        assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+        stop.send(true).unwrap();
+        gate.release();
+        server.stop();
+    }
+
+    #[tokio::test]
     async fn failed_music_admission_preserves_the_polling_offset() {
         let directory = TestDirectory::new();
         let server = TestHttpServer::start().await;

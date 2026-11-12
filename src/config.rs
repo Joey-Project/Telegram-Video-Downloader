@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs};
 
@@ -323,6 +324,19 @@ impl AppConfig {
     }
 
     fn expand_music_paths(&mut self) {
+        let search_path = env::var_os("PATH");
+        let runtime_working_dir = env::current_dir().ok();
+        self.expand_music_paths_with_environment(
+            search_path.as_deref(),
+            runtime_working_dir.as_deref(),
+        );
+    }
+
+    fn expand_music_paths_with_environment(
+        &mut self,
+        search_path: Option<&OsStr>,
+        runtime_working_dir: Option<&Path>,
+    ) {
         let runtime_root = env::current_exe()
             .ok()
             .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
@@ -358,16 +372,22 @@ impl AppConfig {
                 project.join(expanded)
             };
         }
-        if self.music.ffmpeg.as_os_str().is_empty() {
-            self.music.ffmpeg = self.tools.ffmpeg.clone();
+        let ffmpeg = if self.music.ffmpeg.as_os_str().is_empty() {
+            self.tools.ffmpeg.clone()
         } else {
-            self.music.ffmpeg = expand_home_path(&self.music.ffmpeg);
-        }
-        if self.music.ffprobe.as_os_str().is_empty() {
-            self.music.ffprobe = self.music.ffmpeg.with_file_name("ffprobe");
-        } else {
-            self.music.ffprobe = expand_home_path(&self.music.ffprobe);
-        }
+            expand_home_path(&self.music.ffmpeg)
+        };
+        let ffprobe = (!self.music.ffprobe.as_os_str().is_empty())
+            .then(|| expand_home_path(&self.music.ffprobe));
+        let (ffmpeg, ffprobe) = resolve_music_codec_tools(
+            &ffmpeg,
+            ffprobe.as_deref(),
+            &project,
+            search_path,
+            runtime_working_dir,
+        );
+        self.music.ffmpeg = ffmpeg;
+        self.music.ffprobe = ffprobe;
     }
 
     fn validate(&self) -> Result<()> {
@@ -899,6 +919,113 @@ fn expand_home_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn resolve_music_codec_tools(
+    ffmpeg: &Path,
+    ffprobe: Option<&Path>,
+    project_dir: &Path,
+    search_path: Option<&OsStr>,
+    runtime_working_dir: Option<&Path>,
+) -> (PathBuf, PathBuf) {
+    let derived_ffprobe;
+    let ffprobe = match ffprobe {
+        Some(path) => path,
+        None => {
+            derived_ffprobe = ffmpeg.with_file_name("ffprobe");
+            &derived_ffprobe
+        }
+    };
+    (
+        resolve_music_tool_path(ffmpeg, project_dir, search_path, runtime_working_dir),
+        resolve_music_tool_path(ffprobe, project_dir, search_path, runtime_working_dir),
+    )
+}
+
+fn resolve_music_tool_path(
+    configured: &Path,
+    project_dir: &Path,
+    search_path: Option<&OsStr>,
+    runtime_working_dir: Option<&Path>,
+) -> PathBuf {
+    if configured.is_absolute() {
+        return configured.to_path_buf();
+    }
+    if !is_bare_command_name(configured) {
+        return absolute_project_path(project_dir, configured, runtime_working_dir);
+    }
+
+    let current_dir = runtime_working_dir
+        .filter(|path| path.is_absolute())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| absolute_project_path(project_dir, Path::new("."), runtime_working_dir));
+    let mut first_candidate = None;
+    if let Some(search_path) = search_path {
+        for directory in env::split_paths(search_path) {
+            let directory = if directory.as_os_str().is_empty() {
+                current_dir.clone()
+            } else if directory.is_absolute() {
+                directory
+            } else {
+                current_dir.join(directory)
+            };
+            let candidate = directory.join(configured);
+            if first_candidate.is_none() {
+                first_candidate = Some(candidate.clone());
+            }
+            if is_executable_music_tool(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    // Do not make bot startup depend on optional media tools. Keep an absolute
+    // candidate so the bounded Music worker reports a task-level error if missing.
+    first_candidate
+        .unwrap_or_else(|| absolute_project_path(project_dir, configured, runtime_working_dir))
+}
+
+fn is_bare_command_name(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| path.as_os_str() == name)
+}
+
+fn absolute_project_path(
+    project_dir: &Path,
+    path: &Path,
+    runtime_working_dir: Option<&Path>,
+) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let project_dir = if project_dir.is_absolute() {
+        project_dir.to_path_buf()
+    } else {
+        runtime_working_dir
+            .filter(|path| path.is_absolute())
+            .map(Path::to_path_buf)
+            .map(|current_dir| current_dir.join(project_dir))
+            .unwrap_or_else(|| project_dir.to_path_buf())
+    };
+    project_dir.join(path)
+}
+
+fn is_executable_music_tool(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn default_concurrency() -> usize {
     2
 }
@@ -988,6 +1115,8 @@ fn default_bilibili_danmaku_display_area() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
     use super::*;
@@ -1046,6 +1175,8 @@ mod tests {
             PathBuf::from("scripts/pdf_helper.py")
         );
         assert_eq!(config.tools.ffmpeg, PathBuf::from("ffmpeg"));
+        assert!(config.music.ffmpeg.is_absolute());
+        assert!(config.music.ffprobe.is_absolute());
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
         assert_eq!(config.bot.progress_update_seconds, 5);
@@ -1110,6 +1241,124 @@ mod tests {
         assert_eq!(config.bilibili.auth.credential_profile, None);
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_default_music_ffmpeg_and_derived_ffprobe_from_injected_path() {
+        let root = temp_test_dir("music-codec-path");
+        let project = root.join("project");
+        let runtime_working_dir = root.join("runtime-cwd");
+        let bin = runtime_working_dir.join("private-path");
+        fs::create_dir_all(&project).expect("project directory should create");
+        fs::create_dir_all(&runtime_working_dir).expect("runtime working directory should create");
+        fs::create_dir_all(&bin).expect("private PATH directory should create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("test root should be private");
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o700))
+            .expect("project fixture should be private");
+        fs::set_permissions(&runtime_working_dir, fs::Permissions::from_mode(0o700))
+            .expect("runtime working directory should be private");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+            .expect("synthetic PATH should be private");
+        let ffmpeg = bin.join("ffmpeg");
+        let ffprobe = bin.join("ffprobe");
+        for executable in [&ffmpeg, &ffprobe] {
+            fs::write(executable, b"#!/bin/sh\nexit 0\n")
+                .expect("synthetic executable should write");
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700))
+                .expect("synthetic executable should be private and executable");
+        }
+        let search_path = env::join_paths([OsStr::new("private-path")])
+            .expect("relative synthetic PATH should encode");
+
+        let mut config = AppConfig::for_test();
+        config.project_dir = project;
+        config.music.enabled = false;
+        config.music.ffmpeg.clear();
+        config.music.ffprobe.clear();
+        config.tools.ffmpeg = default_ffmpeg();
+        config.expand_music_paths_with_environment(
+            Some(search_path.as_os_str()),
+            Some(&runtime_working_dir),
+        );
+
+        assert_eq!(config.music.ffmpeg, ffmpeg);
+        assert_eq!(config.music.ffprobe, ffprobe);
+        assert!(config.music.ffmpeg.is_absolute());
+        assert!(config.music.ffprobe.is_absolute());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_relative_music_codec_paths_remain_config_relative() {
+        let root = temp_test_dir("music-explicit-codec-path");
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("project directory should create");
+        let search_path = env::join_paths([root.join("unrelated-bin").into_os_string()])
+            .expect("synthetic PATH should encode");
+
+        let mut config = AppConfig::for_test();
+        config.project_dir = project.clone();
+        config.music.enabled = false;
+        config.music.ffmpeg = PathBuf::from("media-tools/ffmpeg");
+        config.music.ffprobe.clear();
+        config.expand_music_paths_with_environment(Some(search_path.as_os_str()), Some(&root));
+
+        assert_eq!(config.music.ffmpeg, project.join("media-tools/ffmpeg"));
+        assert_eq!(config.music.ffprobe, project.join("media-tools/ffprobe"));
+
+        let mut inherited_config = AppConfig::for_test();
+        inherited_config.project_dir = project.clone();
+        inherited_config.music.enabled = false;
+        inherited_config.music.ffmpeg.clear();
+        inherited_config.music.ffprobe.clear();
+        inherited_config.tools.ffmpeg = PathBuf::from("video-tools/ffmpeg");
+        inherited_config
+            .expand_music_paths_with_environment(Some(search_path.as_os_str()), Some(&root));
+
+        assert_eq!(
+            inherited_config.music.ffmpeg,
+            project.join("video-tools/ffmpeg")
+        );
+        assert_eq!(
+            inherited_config.music.ffprobe,
+            project.join("video-tools/ffprobe")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_music_tools_are_deferred_to_the_music_task() {
+        let root = temp_test_dir("missing-music-codec-tool");
+        let project = root.join("project");
+        let bin = root.join("private-path");
+        fs::create_dir_all(&project).expect("project directory should create");
+        fs::create_dir_all(&bin).expect("PATH directory should create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("test root should be private");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+            .expect("synthetic PATH should be private");
+        let search_path = env::join_paths([bin.as_os_str()]).expect("synthetic PATH should encode");
+
+        let mut config = AppConfig::for_test();
+        config.project_dir = project;
+        config.music.enabled = true;
+        config.tools.ffmpeg = PathBuf::from("missing-music-ffmpeg");
+        config.expand_music_paths_with_environment(Some(search_path.as_os_str()), Some(&root));
+
+        assert!(config.music.ffmpeg.is_absolute());
+        assert!(config.music.ffprobe.is_absolute());
+        assert!(!config.music.ffmpeg.exists());
+        assert!(!config.music.ffprobe.exists());
+        config
+            .validate()
+            .expect("missing optional media tools should not fail bot startup");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -5,7 +5,7 @@ status: active
 created: 2026-11-11
 updated: 2026-11-12
 branch: codex/music-auto-import
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/65"
 supersedes: []
 superseded_by: ""
 ---
@@ -103,7 +103,8 @@ the existing service helpers passed 101 tests and their shell integration test.
 feature-enabled Rust regression passed 1424 tests with 17 ignored and zero failures.
 All 52 targeted Music tests, 50 cloud-inbox tests and strict Clippy with and without
 the test-runtime feature passed. The local Worker/D1 metadata E2E file also passed
-all three tests. Remote CI and PR review have not been run for this local checkpoint.
+all three tests. The first integrated checkpoint also passed Rust and Cloudflare CI;
+the subsequent PR review corrections are described below.
 
 The first query-only catalog handover exposed a native compatibility issue before
 any catalog write or Music add: Foundation can successfully return no optional
@@ -166,6 +167,34 @@ forcing `Background` in the initial private harness introduced an extra scheduli
 variable. Its debug validation build optimizes the SHA-256 dependency so large-file
 integrity checks do not spend minutes in unoptimized software hashing. These are
 test-harness choices, not production deployment changes.
+
+## Review corrections
+
+- Resolve Music's bare ffmpeg/ffprobe commands against the process's effective PATH
+  before using the native worker. Relative PATH entries follow the runtime working
+  directory; explicit relative tool paths follow the configuration directory.
+  Missing codec tools fail the affected Music task rather than unrelated bot startup.
+- Keep active capacity distinct from safely reclaimable completed history. Preserve
+  failed, cancelled and uncertain-add records, partial files, the content catalog,
+  and outstanding status delivery. A genuinely full queue returns a typed refusal;
+  Telegram can advance past that rejected upload and process later commands.
+  Storage/startup failures still retain the update for retry.
+- Give the transfer helper an opportunity to recover interrupted hard-link
+  publication using its saved receipt, inode and content checks. Do not treat a
+  legitimate linked partial and final name as an unrecoverable completed download.
+- Validate retained jobs, prepared audio and catalog records against the storage
+  format's supported ceiling. A newly lowered admission limit applies to new
+  uploads and cannot invalidate existing state. The composite transfer/native
+  backend and accepted-record handover use that supported ceiling for retained
+  work, so previously admitted larger files can still finish execution.
+
+All 62 targeted Music/config/mock Telegram tests passed after these corrections,
+including full-capacity command progress and both valid and tampered publication
+recovery. The recovery fixture models the real helper removing its verified partial;
+the manager still requires single-link output before preparation.
+The retained-audio regression generates a bounded silent M4A fixture and validates
+it through real FFmpeg/ffprobe with an admission setting below the file's size;
+it does not play audio or contact Music.
 
 ## Initial proposal
 

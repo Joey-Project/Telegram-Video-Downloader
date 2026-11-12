@@ -20,6 +20,7 @@ use crate::music_types::{
 };
 use crate::telegram::TelegramClient;
 
+const MAX_SUPPORTED_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 /// Music metadata startup never holds up the ordinary Telegram receiver.
 pub struct MusicService {
     manager: OnceCell<Arc<MusicManager>>,
@@ -411,7 +412,7 @@ pub async fn seed_accepted_records(
                 || item.sha256.len() != 64
                 || !item.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
                 || item.size_bytes == 0
-                || item.size_bytes > settings.max_file_bytes
+                || item.size_bytes > MAX_SUPPORTED_SOURCE_BYTES
                 || item.archive_path.parent() != Some(settings.archive_dir.as_path())
             {
                 bail!("accepted Music track has an invalid content or archive identity");
@@ -464,7 +465,11 @@ pub async fn seed_accepted_records(
 }
 
 impl RuntimeMusicBackend {
-    pub fn new(settings: MusicSettings, bot_token: String) -> Self {
+    pub fn new(mut settings: MusicSettings, bot_token: String) -> Self {
+        // The manager enforces the current admission limit for new uploads.
+        // The backend must still process retained jobs admitted under a prior
+        // larger limit, up to the on-disk format ceiling.
+        settings.max_file_bytes = MAX_SUPPORTED_SOURCE_BYTES;
         Self {
             native: NativeMusicBackend::new(settings.clone()),
             transfer: MusicTransfer::new(settings, bot_token),
@@ -521,5 +526,128 @@ impl MusicBackend for RuntimeMusicBackend {
 
     fn evict_archive(&self, archive: &ArchiveState, track: &MusicTrack) -> Result<ArchiveState> {
         self.native.evict_archive(archive, track)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    fn find_test_tool(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join(name))
+            .find(|candidate| fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file()))
+    }
+
+    fn generate_silent_m4a(ffmpeg: &Path, output: &Path) -> Result<()> {
+        let mut child = Command::new(ffmpeg)
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                "0.25",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "ipod",
+                "-n",
+            ])
+            .arg(output)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("start ffmpeg for the file-only Music fixture")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("ffmpeg fixture generation exceeded 10 seconds");
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).context("poll bounded ffmpeg fixture process");
+                }
+            }
+        };
+        if !status.success() {
+            bail!("ffmpeg fixture generation failed with {status}");
+        }
+        let size = fs::metadata(output)
+            .context("inspect generated M4A fixture")?
+            .len();
+        if size == 0 || size > 2 * 1024 * 1024 {
+            bail!("generated M4A fixture has unexpected size {size}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn backend_prepares_retained_audio_above_current_admission_limit() {
+        let Some(ffmpeg) = find_test_tool("ffmpeg") else {
+            eprintln!("SKIP: ffmpeg is unavailable; retained-audio regression was not generated");
+            return;
+        };
+        let Some(ffprobe) = find_test_tool("ffprobe") else {
+            eprintln!("SKIP: ffprobe is unavailable; retained-audio regression was not generated");
+            return;
+        };
+
+        let temp_parent = fs::canonicalize(std::env::temp_dir())
+            .expect("resolve a local temp directory without symlink components");
+        let directory = tempfile::tempdir_in(temp_parent).expect("create private test directory");
+        let source = directory.path().join("retained-silence.m4a");
+        generate_silent_m4a(&ffmpeg, &source).expect("generate bounded file-only M4A fixture");
+
+        let current_admission_limit = 1;
+        let source_size = fs::metadata(&source).expect("inspect M4A fixture").len();
+        assert!(source_size > current_admission_limit);
+        let settings = MusicSettings {
+            enabled: true,
+            state_dir: directory.path().join("state"),
+            staging_dir: directory.path().join("staging"),
+            archive_dir: directory.path().join("archive"),
+            credentials_path: directory.path().join("credentials.json"),
+            helper_python: directory.path().join("python3"),
+            transfer_helper: directory.path().join("music_transfer.py"),
+            ffmpeg,
+            ffprobe,
+            max_file_bytes: current_admission_limit,
+            cloud_poll_seconds: 60,
+        };
+        let backend = RuntimeMusicBackend::new(settings, "codex_synth_v1_api_key_a".to_string());
+        let work_dir = directory.path().join("work");
+        fs::create_dir(&work_dir).expect("create isolated prepare work directory");
+
+        let prepared = backend
+            .prepare(&source, &work_dir, &MusicCancellation::default())
+            .expect("codec-validate retained audio above the current admission limit");
+        assert_eq!(prepared.original.size, source_size);
+        assert!(prepared.original.size > current_admission_limit);
+        assert_eq!(prepared.original.sha256, prepared.import.sha256);
+        assert_eq!(prepared.original.size, prepared.import.size);
+        assert_eq!(prepared.original.path, source);
+        assert_eq!(prepared.import.path, source);
     }
 }
