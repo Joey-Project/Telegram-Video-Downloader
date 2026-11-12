@@ -10,7 +10,36 @@ use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
 const MUSIC_BUNDLE_ID: &str = "com.apple.Music";
-const MUSIC_QUERY_TIMEOUT_SECS: u64 = 7;
+const MUSIC_QUERY_TIMEOUT_ENV: &str = "TELEGRAM_VIDEO_DOWNLOADER_MUSIC_QUERY_TIMEOUT_SECONDS";
+const MUSIC_MUTE_TIMEOUT_ENV: &str = "TELEGRAM_VIDEO_DOWNLOADER_MUSIC_MUTE_TIMEOUT_SECONDS";
+const MUSIC_QUERY_TIMEOUT_DEFAULT_SECS: u64 = 180;
+const MUSIC_MUTE_TIMEOUT_DEFAULT_SECS: u64 = 60;
+const MUSIC_TIMEOUT_MIN_SECS: u64 = 5;
+const MUSIC_TIMEOUT_MAX_SECS: u64 = 300;
+const MUSIC_OSASCRIPT_GRACE_SECS: u64 = 5;
+
+fn parse_timeout_seconds(value: Option<&str>, default_secs: u64) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (MUSIC_TIMEOUT_MIN_SECS..=MUSIC_TIMEOUT_MAX_SECS).contains(seconds))
+        .unwrap_or(default_secs)
+}
+
+fn configured_timeout_seconds(env_name: &str, default_secs: u64) -> u64 {
+    parse_timeout_seconds(std::env::var(env_name).ok().as_deref(), default_secs)
+}
+
+pub(crate) fn music_query_timeout_seconds() -> u64 {
+    configured_timeout_seconds(MUSIC_QUERY_TIMEOUT_ENV, MUSIC_QUERY_TIMEOUT_DEFAULT_SECS)
+}
+
+pub(crate) fn music_mute_timeout_seconds() -> u64 {
+    configured_timeout_seconds(MUSIC_MUTE_TIMEOUT_ENV, MUSIC_MUTE_TIMEOUT_DEFAULT_SECS)
+}
+
+pub(crate) fn osascript_supervisor_timeout_seconds(script_timeout_secs: u64) -> u64 {
+    script_timeout_secs.saturating_add(MUSIC_OSASCRIPT_GRACE_SECS)
+}
 
 /// A safe, non-prompting result for production Music permission checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +303,7 @@ fn open_music_bundle_bounded() -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    let timeout_secs = music_query_timeout_seconds();
     let mut child = Command::new("/usr/bin/open")
         .args(["-b", MUSIC_BUNDLE_ID])
         .stdin(Stdio::null())
@@ -281,7 +311,7 @@ fn open_music_bundle_bounded() -> anyhow::Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("open the fixed Apple Music bundle")?;
-    let deadline = Instant::now() + Duration::from_secs(MUSIC_QUERY_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         if let Some(status) = child
             .try_wait()
@@ -295,7 +325,7 @@ fn open_music_bundle_bounded() -> anyhow::Result<()> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("opening the fixed Apple Music bundle exceeded 7 seconds");
+            bail!("opening the fixed Apple Music bundle exceeded {timeout_secs} seconds");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -375,10 +405,11 @@ fn determine_permission(ask_user_if_needed: bool) -> anyhow::Result<Permission> 
             .recv()
             .context("AppleEvents permission worker stopped")?
     } else {
-        match receiver.recv_timeout(Duration::from_secs(MUSIC_QUERY_TIMEOUT_SECS)) {
+        let timeout_secs = music_query_timeout_seconds();
+        match receiver.recv_timeout(Duration::from_secs(timeout_secs)) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                bail!("AppleEvents permission check exceeded 7 seconds")
+                bail!("AppleEvents permission check exceeded {timeout_secs} seconds")
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("AppleEvents permission worker stopped")
@@ -499,9 +530,10 @@ where
 
 #[cfg(target_os = "macos")]
 fn system_output_is_muted() -> anyhow::Result<bool> {
+    let timeout_secs = music_mute_timeout_seconds();
     bounded_probe(
         "system output mute check",
-        std::time::Duration::from_secs(7),
+        std::time::Duration::from_secs(osascript_supervisor_timeout_seconds(timeout_secs)),
         system_output_is_muted_native,
     )
 }
@@ -552,8 +584,6 @@ const OSASCRIPT_PATH: &str = "/usr/bin/osascript";
 const SYSTEM_MUTE_STDOUT_LIMIT: usize = 128;
 #[cfg(target_os = "macos")]
 const SYSTEM_MUTE_STDERR_LIMIT: usize = 2048;
-#[cfg(target_os = "macos")]
-const SYSTEM_MUTE_UTILITY_TIMEOUT_SECS: u64 = 5;
 #[cfg(target_os = "macos")]
 const MUSIC_SCRIPT_SOURCE_LIMIT: usize = 16 * 1024;
 #[cfg(target_os = "macos")]
@@ -738,7 +768,7 @@ async fn run_fixed_system_mute_query() -> anyhow::Result<bool> {
         SYSTEM_MUTE_OSASCRIPT,
         ScriptDelivery::EvalArgument,
         "system-mute",
-        SYSTEM_MUTE_UTILITY_TIMEOUT_SECS,
+        music_mute_timeout_seconds(),
         SYSTEM_MUTE_STDOUT_LIMIT,
         SYSTEM_MUTE_STDERR_LIMIT,
         false,
@@ -790,30 +820,38 @@ fn query_music_read_only() -> anyhow::Result<Value> {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    let script_timeout_secs = music_query_timeout_seconds();
+    let receiver_timeout_secs = osascript_supervisor_timeout_seconds(script_timeout_secs) + 5;
     let (sender, receiver) = mpsc::channel();
     std::thread::Builder::new()
         .name("music-read-only-preflight".into())
         .spawn(move || {
-            let source = "set text item delimiters to {tab}\n\
-                          tell application id \"com.apple.Music\"\n\
-                          set v to version as string\n\
-                          set s to player state as string\n\
-                          set m to mute as string\n\
-                          set e to name of every encoder\n\
-                          set e to e as text\n\
-                          return v & tab & s & tab & m & tab & e\n\
-                          end tell"
-                .to_owned();
-            let result =
-                execute_owned_music_script(source, "Music.preflight", MUSIC_QUERY_TIMEOUT_SECS);
+            let source = format!(
+                "with timeout of {script_timeout_secs} seconds\n\
+                 set text item delimiters to {{tab}}\n\
+                 tell application id \"com.apple.Music\"\n\
+                 set v to version as string\n\
+                 set s to player state as string\n\
+                 set m to mute as string\n\
+                 set e to name of every encoder\n\
+                 set e to e as text\n\
+                 return v & tab & s & tab & m & tab & e\n\
+                 end tell\n\
+                 end timeout"
+            );
+            let result = execute_owned_music_script(
+                source,
+                "Music.preflight",
+                osascript_supervisor_timeout_seconds(script_timeout_secs),
+            );
             let _ = sender.send(result);
         })
         .context("start read-only Music query")?;
 
-    let text = match receiver.recv_timeout(Duration::from_secs(MUSIC_QUERY_TIMEOUT_SECS + 2)) {
+    let text = match receiver.recv_timeout(Duration::from_secs(receiver_timeout_secs)) {
         Ok(result) => result?,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            bail!("Music preflight worker exceeded 9 seconds")
+            bail!("Music preflight worker exceeded {receiver_timeout_secs} seconds")
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => bail!("Music query worker stopped"),
     };
@@ -884,6 +922,33 @@ mod tests {
         assert!(!parse_mute_text(" false \n").unwrap());
         assert!(parse_mute_text("unknown").is_err());
         assert!(parse_mute_text("").is_err());
+    }
+
+    #[test]
+    fn timeout_parser_accepts_only_bounded_integer_seconds() {
+        assert_eq!(parse_timeout_seconds(None, 180), 180);
+        assert_eq!(parse_timeout_seconds(Some("5"), 180), 5);
+        assert_eq!(parse_timeout_seconds(Some("180"), 180), 180);
+        assert_eq!(parse_timeout_seconds(Some("300"), 180), 300);
+        for invalid in [
+            "",
+            "0",
+            "4",
+            "301",
+            "-1",
+            "1.5",
+            "slow",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_timeout_seconds(Some(invalid), 180),
+                180,
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(parse_timeout_seconds(None, 60), 60);
+        assert_eq!(osascript_supervisor_timeout_seconds(180), 185);
+        assert_eq!(osascript_supervisor_timeout_seconds(60), 65);
     }
 
     #[test]

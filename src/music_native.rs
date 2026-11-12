@@ -22,7 +22,6 @@ const MAX_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
 const TOOL_STDOUT_LIMIT: usize = 64 * 1024;
 const TOOL_STDERR_LIMIT: usize = 16 * 1024;
 const AUDIO_TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const MUSIC_SCRIPT_TIMEOUT_SECS: u64 = 25;
 const VERIFIED_COPY_TTL: Duration = Duration::from_secs(5 * 60);
 const MUSIC_CLOUD_DIRECTORY: &str = "Library/Mobile Documents/com~apple~CloudDocs/Collection/Music";
 
@@ -251,8 +250,9 @@ impl NativeMusicBackend {
         // operation so File Provider cannot discard the import bytes mid-call.
         let lease = self.take_or_open_import_lease(&audio.import)?;
         let _source_lease = lease.file;
-        let script = build_add_script(&audio.import.path)?;
-        let response = execute_music_script(script, "Music.add")?;
+        let timeout_secs = crate::music_automation::music_query_timeout_seconds();
+        let script = build_add_script(&audio.import.path, timeout_secs)?;
+        let response = execute_music_script(script, "Music.add", timeout_secs)?;
         let persistent_id = response.trim().to_ascii_uppercase();
         if !is_persistent_id(&persistent_id) {
             bail!("Music add returned an invalid persistent ID; outcome is unknown");
@@ -294,8 +294,9 @@ impl NativeMusicBackend {
 
     pub fn query_track(&self, persistent_id: &str) -> anyhow::Result<MusicTrack> {
         self.check_music_ready()?;
-        let script = build_status_script(persistent_id)?;
-        let response = execute_music_script(script, "Music.status")?;
+        let timeout_secs = crate::music_automation::music_query_timeout_seconds();
+        let script = build_status_script(persistent_id, timeout_secs)?;
+        let response = execute_music_script(script, "Music.status", timeout_secs)?;
         parse_track_status(persistent_id, &response)
     }
 
@@ -1218,14 +1219,14 @@ fn apple_script_literal(value: &str) -> anyhow::Result<String> {
     Ok(literal)
 }
 
-fn build_add_script(path: &Path) -> anyhow::Result<String> {
+fn build_add_script(path: &Path, timeout_secs: u64) -> anyhow::Result<String> {
     let path = path
         .to_str()
         .context("Music import path must be valid UTF-8")?;
     let path = apple_script_literal(path)?;
     Ok(format!(
         r#"on run
-with timeout of {MUSIC_SCRIPT_TIMEOUT_SECS} seconds
+with timeout of {timeout_secs} seconds
   tell application id "com.apple.Music"
     set addedItem to add (POSIX file {path})
     if class of addedItem is list then
@@ -1244,7 +1245,7 @@ end run"#
     ))
 }
 
-fn build_status_script(persistent_id: &str) -> anyhow::Result<String> {
+fn build_status_script(persistent_id: &str, timeout_secs: u64) -> anyhow::Result<String> {
     if !is_persistent_id(persistent_id) {
         bail!("invalid Music persistent ID");
     }
@@ -1254,7 +1255,7 @@ fn build_status_script(persistent_id: &str) -> anyhow::Result<String> {
 set trackLocation to ""
 set locationErrorNumber to ""
 set locationErrorMessage to ""
-with timeout of {MUSIC_SCRIPT_TIMEOUT_SECS} seconds
+with timeout of {timeout_secs} seconds
   tell application id "com.apple.Music"
     set fileMatches to (file tracks of library playlist 1 whose persistent ID is {persistent_id})
     if (count of fileMatches) > 1 then error "unexpected file track match count"
@@ -1329,16 +1330,24 @@ fn parse_track_status(persistent_id: &str, response: &str) -> anyhow::Result<Mus
 }
 
 #[cfg(target_os = "macos")]
-fn execute_music_script(source: String, stage: &'static str) -> anyhow::Result<String> {
+fn execute_music_script(
+    source: String,
+    stage: &'static str,
+    script_timeout_secs: u64,
+) -> anyhow::Result<String> {
     crate::music_automation::execute_owned_music_script(
         source,
         stage,
-        MUSIC_SCRIPT_TIMEOUT_SECS + 5,
+        crate::music_automation::osascript_supervisor_timeout_seconds(script_timeout_secs),
     )
 }
 
 #[cfg(not(target_os = "macos"))]
-fn execute_music_script(_source: String, _stage: &'static str) -> anyhow::Result<String> {
+fn execute_music_script(
+    _source: String,
+    _stage: &'static str,
+    _script_timeout_secs: u64,
+) -> anyhow::Result<String> {
     bail!("Apple Music automation is supported only on macOS")
 }
 
@@ -1838,11 +1847,15 @@ mod tests {
 
     #[test]
     fn fixed_music_scripts_use_posix_file_and_alias_based_location_readback() {
-        let add = build_add_script(Path::new("/tmp/artist\\\"track.m4a")).unwrap();
+        let script_timeout_secs = 180;
+        let add =
+            build_add_script(Path::new("/tmp/artist\\\"track.m4a"), script_timeout_secs).unwrap();
         assert!(add.contains("tell application id \"com.apple.Music\""));
         assert!(add.contains("add (POSIX file \"/tmp/artist\\\\\\\"track.m4a\")"));
+        assert!(add.contains("with timeout of 180 seconds"));
 
-        let status = build_status_script("0123456789abcdef").unwrap();
+        let status = build_status_script("0123456789abcdef", script_timeout_secs).unwrap();
+        assert!(status.contains("with timeout of 180 seconds"));
         let get_location = status
             .find("set trackFile to (get location of trackItem)")
             .unwrap();
@@ -1852,6 +1865,10 @@ mod tests {
         assert!(get_location < alias_conversion);
         assert!(status.contains("whose persistent ID is \"0123456789ABCDEF\""));
         assert!(!status.contains("POSIX path of (location of trackItem)"));
+        assert_eq!(
+            crate::music_automation::osascript_supervisor_timeout_seconds(script_timeout_secs),
+            185
+        );
     }
 
     #[test]

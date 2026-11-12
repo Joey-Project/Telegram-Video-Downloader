@@ -163,6 +163,23 @@ on worker threads with finite deadlines. An unavailable or timed-out mute check
 stops the diagnostic before any Music request. `status` includes a bounded
 diagnostic tail for a completed run that returned a non-JSON error.
 
+On a busy Mac, set `TELEGRAM_VIDEO_DOWNLOADER_MUSIC_QUERY_TIMEOUT_SECONDS` in the
+environment inherited by the fixed executable to change the bounded Music query
+deadline. It defaults to 180 seconds and accepts integer values from 5 through
+300; an unset, malformed or out-of-range value uses the 180-second default. This
+deadline covers nonprompt permission checks, opening the fixed Music bundle when
+needed, read-only preflight queries, and normal add/status scripts. AppleScript
+gets that timeout, with the owned `osascript` child supervisor allowing an
+additional 5 seconds to kill and reap the child.
+
+`TELEGRAM_VIDEO_DOWNLOADER_MUSIC_MUTE_TIMEOUT_SECONDS` sets the separate system
+mute-query deadline used by the muted diagnostic preflight. It defaults to 60
+seconds and accepts integer values from 5 through 300; invalid or out-of-range
+values use the 60-second default. The `osascript` child gets that deadline and
+the parent probe allows 5 additional seconds for cleanup. This mute timeout does
+not gate normal Music imports. Explicit authorization prompts remain untimed and
+wait for the user's decision; these variables do not choose a consent response.
+
 System mute validation uses a fixed volume-only `/usr/bin/osascript` child, with
 output caps and a child deadline. Music scripts use a separate owned interpreter,
 passed over stdin rather than process arguments. Only internal fixed templates are
