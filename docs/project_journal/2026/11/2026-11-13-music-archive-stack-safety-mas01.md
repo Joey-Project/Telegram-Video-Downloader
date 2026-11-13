@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/music-archive-stack-safety
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/69"
 supersedes: []
 superseded_by: ""
 ---
@@ -39,9 +39,12 @@ revalidation. No global thread-stack increase is required.
   real Telegram FLAC task recovered from the interrupted archive phase, passed
   archive verification and saved its first Music persistent ID. It reused its
   retained download and verified ALAC; no file was resent or converted again.
-- Music cloud, independent-copy and iCloud eviction checks remain distinct from
-  successful archive recovery. The FLAC integration journal and private live
-  proof track that broader acceptance. Production deployment is a separate gate.
+- The real task subsequently completed: Music reported `matched`, its independent
+  local ALAC matched the prepared file's SHA-256, and the unchanged original FLAC
+  was uploaded to iCloud Drive before local eviction. A private read-only proof
+  independently checked these states, retained source/import/Music bytes and
+  the three pre-existing accepted task/catalog bindings. Production deployment
+  remains a separate gate.
 
 The explicit Python-runtime installation step is documented for upgrades too;
 updating a bot binary or converter does not update the separately installed

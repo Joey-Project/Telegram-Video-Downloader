@@ -106,6 +106,10 @@ This exposed a shared archive-stack issue, covered by the
 [archive stack safety follow-up](2026-11-13-music-archive-stack-safety-mas01.md).
 The test profile's old Python transfer helper also needed the explicit runtime
 upgrade; replacing the executable/converter alone does not replace that helper.
+The real task subsequently reached `matched`; its independent Music ALAC copy
+matched the import SHA-256. iCloud confirmed the original FLAC upload before
+eviction, and a private read-only acceptance proof preserved the three baseline
+tasks/catalog bindings and checked all four retained local source/import files.
 
 ## Next steps
 
