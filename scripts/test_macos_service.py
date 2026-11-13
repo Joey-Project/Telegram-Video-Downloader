@@ -40,6 +40,13 @@ class InstallationTest(unittest.TestCase):
         self.home = self.root / "home"
         self.repo = self.root / "repo"
         self.home.mkdir()
+        self.converter = (
+            self.home
+            / ".local/lib/telegram-video-downloader/libexec/flac-alac-converter"
+        )
+        self.converter.parent.mkdir(parents=True)
+        self.converter.write_bytes(b"old signed converter")
+        self.converter.chmod(0o755)
         self.repo.mkdir()
         self.old_binary = self.repo / "target/release" / service.EXECUTABLE
         self.old_binary.parent.mkdir(parents=True)
@@ -1161,12 +1168,38 @@ class InstallationTest(unittest.TestCase):
         def command(argv, **kwargs):
             args = [str(value) for value in argv]
             events.append(args)
+            if (
+                len(args) >= 2
+                and Path(args[1]).name == "install_flac_converter.py"
+            ):
+                if "--apply" in args or "--apply-signed" in args:
+                    self.assertEqual(
+                        registry,
+                        {},
+                        "converter replacement must happen after the bot stops",
+                    )
+                    source = Path(args[args.index("--source") + 1])
+                    destination = deployment.converter
+                    temporary = destination.with_name(".converter-test-installing")
+                    shutil.copy2(source, temporary)
+                    os.replace(temporary, destination)
+                return subprocess.CompletedProcess(args, 0, "", "")
             if args[0] == "codesign":
                 if "--sign" in args:
                     target = Path(args[-1])
                     self.assertNotIn(target, [self.artifact, self.old_binary, deployment.binary])
                     target.write_bytes(target.read_bytes() + b"|signed")
-                output = "designated => " + REQUIREMENT if "-dr" in args else ""
+                if "-dr" in args:
+                    target_name = Path(args[-1]).name
+                    requirement = (
+                        service.converter_requirement(FINGERPRINT)
+                        if target_name
+                        in {service.CONVERTER_EXECUTABLE, "staged-flac-alac-converter", "previous-converter"}
+                        else REQUIREMENT
+                    )
+                    output = "designated => " + requirement
+                else:
+                    output = ""
                 return subprocess.CompletedProcess(args, 0, output, "")
             if args[0] == "security":
                 return subprocess.CompletedProcess(args, 0, FINGERPRINT, "")
@@ -1190,7 +1223,12 @@ class InstallationTest(unittest.TestCase):
                 self.assertNotEqual(
                     kwargs["env"]["CARGO_BUILD_BUILD_DIR"], str(self.repo / "target")
                 )
-                output = build / "release" / service.EXECUTABLE
+                binary = (
+                    service.CONVERTER_EXECUTABLE
+                    if "flac-alac-converter" in args
+                    else service.EXECUTABLE
+                )
+                output = build / "release" / binary
                 output.parent.mkdir(parents=True)
                 output.write_bytes(b"new unsigned executable")
                 output.chmod(0o700)
@@ -1215,6 +1253,16 @@ class InstallationTest(unittest.TestCase):
             shutil.copy2(self.artifact, output)
             return output
 
+        def build_converter(repo, backup):
+            events.append(["cargo", "mocked-converter-build"])
+            self.assertEqual(repo, self.repo)
+            self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
+            output = backup / "converter-build/release" / service.CONVERTER_EXECUTABLE
+            output.parent.mkdir(parents=True)
+            output.write_bytes(b"new converter executable")
+            output.chmod(0o700)
+            return output
+
         patches = [
             mock.patch.object(service, "run", side_effect=command),
             mock.patch.object(service, "service_info", side_effect=info),
@@ -1227,6 +1275,7 @@ class InstallationTest(unittest.TestCase):
                 service, "pid_exists", side_effect=lambda pid: pid in registry.values()
             ),
             mock.patch.object(service, "build_release", side_effect=build),
+            mock.patch.object(service, "build_converter_release", side_effect=build_converter),
         ]
         for patch in patches:
             patch.start()
@@ -1240,6 +1289,11 @@ class InstallationTest(unittest.TestCase):
         with mock.patch.object(deployment, "wait_ready", return_value=303):
             result = deployment.deploy()
         self.assertEqual(deployment.binary.read_bytes(), b"new unsigned executable|signed")
+        self.assertEqual(self.converter.read_bytes(), b"old signed converter|signed")
+        self.assertEqual(
+            deployment.converter,
+            self.home / ".local/lib/telegram-video-downloader/libexec/flac-alac-converter",
+        )
         self.assertEqual(self.artifact.read_bytes(), b"new unsigned executable")
         self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
         self.assertEqual(self.state_snapshot(), self.before_state)
@@ -1261,10 +1315,43 @@ class InstallationTest(unittest.TestCase):
         with mock.patch.object(deployment, "wait_ready", return_value=303):
             deployment.deploy()
         build_index = next(index for index, event in enumerate(events) if event[0] == "cargo")
+        self.assertIn(["cargo", "mocked-converter-build"], events)
         old_signature = ["codesign", "-dr", "-", str(self.old_binary)]
         self.assertIn(old_signature, events[:build_index])
         self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
         self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_no_build_can_take_an_explicit_converter_artifact(self):
+        converter_artifact = self.root / "converter-release-artifact"
+        converter_artifact.write_bytes(b"explicit converter artifact")
+        converter_artifact.chmod(0o700)
+        deployment = self.deployment(
+            "deploy",
+            "--no-build",
+            "--binary",
+            str(self.artifact),
+            "--converter-binary",
+            str(converter_artifact),
+        )
+        events, registry = self.transaction_environment(deployment)
+        deployment.audit()
+        with mock.patch.object(deployment, "wait_ready", return_value=303):
+            deployment.deploy()
+        install_calls = [
+            event for event in events if len(event) >= 2 and Path(event[1]).name == "install_flac_converter.py"
+        ]
+        self.assertEqual(len(install_calls), 2)
+        self.assertTrue(all("production" in event for event in install_calls))
+        self.assertTrue(any("--apply-signed" in event for event in install_calls))
+        self.assertTrue(all(str(converter_artifact) in event or "staged-flac-alac-converter" in " ".join(event) for event in install_calls))
+        self.assertEqual(self.converter.read_bytes(), b"explicit converter artifact|signed")
+        self.assertEqual(registry, {self.gui: 303})
+
+    def test_no_build_requires_an_installed_or_explicit_converter_before_backup(self):
+        self.converter.unlink()
+        with self.assertRaisesRegex(service.InstallError, "no installed FLAC converter"):
+            self.deployment("deploy", "--no-build", "--binary", str(self.artifact))
+        self.external.assert_not_called()
 
     def test_invalid_captured_old_plist_is_rejected_before_build_stop_or_install(self):
         invalid_environment = {
@@ -1318,6 +1405,7 @@ class InstallationTest(unittest.TestCase):
         ):
             deployment.deploy()
         self.assertEqual(deployment.binary.read_bytes(), b"old signed executable")
+        self.assertEqual(self.converter.read_bytes(), b"old signed converter")
         expected = dict(self.original_plist)
         expected["ProgramArguments"] = [str(deployment.binary), str(self.config)]
         self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)

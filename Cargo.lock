@@ -1565,6 +1565,7 @@ dependencies = [
  "anyhow",
  "bbdown-core",
  "block2",
+ "flac-alac-converter",
  "futures-util",
  "image",
  "libc",

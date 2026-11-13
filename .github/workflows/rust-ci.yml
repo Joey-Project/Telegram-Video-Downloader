@@ -42,7 +42,12 @@ jobs:
       - name: Run workspace Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Build isolated native converter for Music integration tests
+        run: cargo build --locked -p flac-alac-converter
+
       - name: Run all Rust tests, including native codec and mock Telegram E2E
+        env:
+          FLAC_ALAC_TEST_CONVERTER: ${{ github.workspace }}/target/debug/flac-alac-converter
         run: cargo test --locked --workspace --all-targets --quiet
 
       - name: Test converter client without native dependencies
@@ -70,9 +75,12 @@ jobs:
           python3 scripts/test_music_test_runtime.py
           python3 scripts/test_music_transfer.py
           python3 scripts/test_music_runtime_installer.py
+          python3 scripts/test_install_flac_converter.py
           bash scripts/test_launch_agent.sh
 
       - name: Validate fixed Music test runtime metadata
+        env:
+          FLAC_ALAC_TEST_CONVERTER: ${{ github.workspace }}/target/debug/flac-alac-converter
         run: |
           cargo build --features test-runtime
           python3 scripts/music_test_runtime.py plan --binary target/debug/telegram-video-downloader

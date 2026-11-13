@@ -8,14 +8,14 @@ SERVICE_STOP_POLL_SECONDS=0.1
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/launch_agent.sh plan [--label LABEL] [--config PATH] [--binary INPUT]
-  scripts/launch_agent.sh install|deploy [--label LABEL] [--binary INPUT] [--no-build]
+  scripts/launch_agent.sh plan [--label LABEL] [--config PATH] [--binary INPUT] [--converter-binary INPUT]
+  scripts/launch_agent.sh install|deploy [--label LABEL] [--binary INPUT] [--converter-binary INPUT] [--no-build]
   scripts/launch_agent.sh rollback --backup PATH [--label LABEL] [--original-entrypoint]
   scripts/launch_agent.sh uninstall|restart|status|logs [--label LABEL]
 
-install/deploy build in isolated staging directories, sign a COPY, then atomically
-install ~/.local/lib/telegram-video-downloader/bin/telegram-video-downloader.
---binary is an input artifact; use --no-build with an existing release artifact.
+install/deploy build in isolated staging directories, sign copies, then atomically
+install the bot and the profile-local FLAC converter helper. --binary and
+--converter-binary are input artifacts; use --no-build with existing artifacts.
 Existing config, WorkingDirectory, environment and log paths remain unchanged.
 plan is read-only. rollback restores executable/plist and retains live state.
 --original-entrypoint explicitly restores the exact old plist, but only while
@@ -25,6 +25,7 @@ Environment overrides:
   BOT_LABEL       LaunchAgent label. Defaults to io.github.telegram-local-downloader.bot.
   BOT_CONFIG      Initial config path; an existing service config path is preserved.
   BOT_BINARY      Input release artifact; never the direct LaunchAgent target.
+  BOT_CONVERTER_BINARY Input native FLAC converter artifact.
   BOT_LOG_DIR     Initial log directory; existing service log paths are preserved.
   BOT_DOMAIN      launchd domain. Defaults to gui/$(id -u); bypasses legacy migration when set.
   BOT_DOTNET_ROOT Optional .NET runtime root for an initial installation.
@@ -49,6 +50,7 @@ shift
 label="${BOT_LABEL:-${DEFAULT_LABEL}}"
 config_path="${BOT_CONFIG:-}"
 binary_path="${BOT_BINARY:-}"
+converter_binary_path="${BOT_CONVERTER_BINARY:-}"
 log_dir="${BOT_LOG_DIR:-}"
 default_domain="gui/$(id -u)"
 legacy_domain="user/$(id -u)"
@@ -65,12 +67,13 @@ ready_timeout="180"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --label|--config|--binary|--backup|--ready-timeout)
+    --label|--config|--binary|--converter-binary|--backup|--ready-timeout)
       [[ $# -ge 2 ]] || die "$1 requires a value"
       case "$1" in
         --label) label="$2" ;;
         --config) config_path="$2" ;;
         --binary) binary_path="$2" ;;
+        --converter-binary) converter_binary_path="$2" ;;
         --backup) backup_path="$2" ;;
         --ready-timeout) ready_timeout="$2" ;;
       esac
@@ -188,6 +191,7 @@ production_action() {
   [[ "${use_default_domain}" != "1" ]] || args+=(--legacy-domain "${legacy_domain}")
   [[ -z "${config_path}" ]] || args+=(--config "${config_path}")
   [[ -z "${binary_path}" ]] || args+=(--binary "${binary_path}")
+  [[ -z "${converter_binary_path}" ]] || args+=(--converter-binary "${converter_binary_path}")
   [[ -z "${log_dir}" ]] || args+=(--log-dir "${log_dir}")
   [[ -z "${dotnet_root}" ]] || args+=(--dotnet-root "${dotnet_root}")
   [[ -z "${backup_path}" ]] || args+=(--backup "${backup_path}")

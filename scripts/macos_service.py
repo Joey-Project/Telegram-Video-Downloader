@@ -26,8 +26,11 @@ from pathlib import Path
 
 IDENTIFIER = "io.github.telegram-local-downloader.bot"
 EXECUTABLE = "telegram-video-downloader"
+CONVERTER_EXECUTABLE = "flac-alac-converter"
+CONVERTER_IDENTIFIER = "io.github.telegram-local-downloader.bot.converter"
 LAUNCHD_CLOUD_SHARED_SECRET = "TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET"
 STOP_TIMEOUT = 15
+COMMAND_TIMEOUT = 120
 SNAPSHOT_SECONDS = 120
 SNAPSHOT_BYTES = 256 * 1024 * 1024
 # launchd.plist(5), execvp(3), and the Darwin SDK's paths.h define this lookup.
@@ -592,6 +595,54 @@ def signature(binary):
     return requirement, identity
 
 
+def converter_requirement(identity):
+    if not re.fullmatch(r"[A-Fa-f0-9]{40}", identity):
+        raise InstallError("converter signing identity is invalid")
+    return (
+        f'identifier "{CONVERTER_IDENTIFIER}" and '
+        f'certificate leaf = H"{identity.lower()}"'
+    )
+
+
+def converter_installer_command(repo, source, identity, *, apply=False, apply_signed=False):
+    command = [
+        sys.executable,
+        str(Path(repo) / "scripts/install_flac_converter.py"),
+        "--profile",
+        "production",
+        "--source",
+        str(source),
+        "--identity",
+        identity,
+    ]
+    if apply:
+        command.append("--apply")
+    if apply_signed:
+        command.append("--apply-signed")
+    return command
+
+
+def verify_converter_signature(binary, identity):
+    requirement = converter_requirement(identity)
+    run(
+        [
+            "codesign",
+            "--verify",
+            "--strict",
+            "--test-requirement",
+            "=" + requirement,
+            binary,
+        ]
+    )
+    result = run(["codesign", "-dr", "-", binary])
+    designated = re.search(r"designated => (.+)", result.stdout + result.stderr)
+    if (
+        not designated
+        or f'identifier "{CONVERTER_IDENTIFIER}"' not in designated.group(1)
+    ):
+        raise InstallError("staged converter has the wrong designated identifier")
+
+
 def initial_identity():
     identities = run(["security", "find-identity", "-v", "-p", "codesigning"]).stdout
     matches = re.findall(
@@ -700,6 +751,75 @@ def build_release(repo, backup):
         finally:
             process.stdout.close()
     return build / "release" / EXECUTABLE
+
+
+def build_converter_release(repo, backup):
+    """Build the native helper in a separate Cargo invocation and target tree."""
+    build, cache = backup / "converter-build", backup / "converter-cargo-build"
+    environment = {
+        **os.environ,
+        "CARGO_TARGET_DIR": str(build),
+        "CARGO_BUILD_BUILD_DIR": str(cache),
+    }
+    command = [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--manifest-path",
+        str(repo / "Cargo.toml"),
+        "--target-dir",
+        str(build),
+        "--package",
+        "flac-alac-converter",
+    ]
+    log = backup / "converter-build.log"
+    with log.open("xb") as output:
+        os.chmod(log, 0o600)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=environment,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 1800
+        written = 0
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    if time.monotonic() >= deadline:
+                        raise InstallError("converter build exceeded its 30-minute budget")
+                    for key, _ in selector.select(timeout=0.1):
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        available = 8 * 1024 * 1024 - written
+                        output.write(chunk[:available])
+                        written += min(len(chunk), available)
+                        if len(chunk) > available:
+                            raise InstallError("converter build exceeded its 8-MiB diagnostic budget")
+            process.wait(timeout=max(1, deadline - time.monotonic()))
+            if process.returncode:
+                raise InstallError(
+                    f"converter cargo build failed (exit {process.returncode}); private diagnostic: {log}"
+                )
+        except BaseException:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                with suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            finally:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            raise
+        finally:
+            process.stdout.close()
+    return build / "release" / CONVERTER_EXECUTABLE
 
 
 def file_manifest(root, budget=SNAPSHOT_BYTES, deadline=None):
@@ -829,7 +949,26 @@ def validate_transaction(transaction, label=None):
         "binary": Path.home() / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE,
         "plist": Path.home() / "Library/LaunchAgents" / f"{saved_label}.plist",
     }
-    for key in ("binary", "previous_binary", "plist"):
+    converter_fields = {"converter", "had_converter", "converter_signing_identity"}
+    has_converter = bool(converter_fields.intersection(transaction))
+    if has_converter:
+        if not {"converter", "had_converter", "converter_signing_identity"}.issubset(
+            transaction
+        ):
+            raise InstallError("rollback transaction has incomplete converter metadata")
+        expected_paths["converter"] = (
+            Path.home()
+            / ".local/lib/telegram-video-downloader/libexec"
+            / CONVERTER_EXECUTABLE
+        )
+        if type(transaction["had_converter"]) is not bool:
+            raise InstallError("rollback transaction has an invalid had_converter")
+        if re.fullmatch(r"[A-Fa-f0-9]{40}", str(transaction["converter_signing_identity"])) is None:
+            raise InstallError("rollback transaction has an invalid converter signing identity")
+    path_keys = ["binary", "previous_binary", "plist"]
+    if has_converter:
+        path_keys.append("converter")
+    for key in path_keys:
         value = transaction[key]
         if (
             not isinstance(value, str)
@@ -1069,6 +1208,12 @@ class Deployment:
         self.config_has_cloud_shared_secret = False
         self.input_binary = absolute(args.binary, Path.cwd()) if args.binary else None
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
+        self.input_converter = (
+            absolute(args.converter_binary, Path.cwd()) if args.converter_binary else None
+        )
+        self.converter = (
+            self.home / ".local/lib/telegram-video-downloader/libexec" / CONVERTER_EXECUTABLE
+        )
         self.backups = self.home / ".local/lib/telegram-video-downloader/backups"
         self.plist_path = self.home / "Library/LaunchAgents" / f"{args.label}.plist"
         self.targets = [f"{args.domain}/{args.label}"]
@@ -1132,6 +1277,10 @@ class Deployment:
         )
         if args.config and self.old_plist and absolute(args.config, Path.cwd()) != self.config:
             raise InstallError("existing service config path is preserved; change it separately")
+        if args.no_build and not self.input_converter and not self.converter.is_file():
+            raise InstallError(
+                "no installed FLAC converter is available; pass --converter-binary or allow builds"
+            )
         if self.old_plist:
             self.log_paths = [
                 plist_path(self.old_plist[key], self.workdir)
@@ -1153,6 +1302,7 @@ class Deployment:
         validate_stderr_path(self.stderr_path)
         for path in [
             self.binary,
+            self.converter,
             self.backups,
         ]:
             no_symlinks(path)
@@ -1245,6 +1395,7 @@ class Deployment:
         self.registered = registered
         return {
             "binary": str(self.binary),
+            "converter": str(self.converter),
             "config": str(self.config),
             "working_directory": str(self.workdir),
             "logs": [str(path) for path in self.log_paths],
@@ -1560,6 +1711,22 @@ class Deployment:
         # Capture trusted executable and exact plist before Cargo runs.
         if self.old_binary_binding is not None:
             preserve_copy(Path(self.old_binary_binding["physical"]), backup / "previous-binary")
+        had_converter = self.converter.exists()
+        if had_converter:
+            no_symlinks(self.converter)
+            if not self.converter.is_file() or not os.access(self.converter, os.X_OK):
+                raise InstallError("installed FLAC converter is not an executable file")
+            run(
+                [
+                    "codesign",
+                    "--verify",
+                    "--strict",
+                    "--test-requirement",
+                    "=" + converter_requirement(self.identity),
+                    self.converter,
+                ]
+            )
+            preserve_copy(self.converter, backup / "previous-converter")
         if self.old_plist_bytes:
             preserve_copy(self.plist_path, backup / "previous.plist")
         atomic_bytes(backup / "designated-requirement.txt", self.requirement.encode())
@@ -1577,6 +1744,9 @@ class Deployment:
             "had_plist": bool(self.old_plist),
             "had_installed_binary": previous_installed,
             "requirement": self.requirement,
+            "converter": str(self.converter),
+            "had_converter": had_converter,
+            "converter_signing_identity": self.identity,
         }
         atomic_bytes(backup / "transaction.json", json.dumps(transaction, indent=2).encode())
         # Prove the retained fallback is usable before building or stopping the service.
@@ -1584,20 +1754,53 @@ class Deployment:
         validate_saved_plist(backup, transaction)
         self.revalidate_runtime_bindings()
         staged = backup / "staged-binary"
+        staged_converter = backup / "staged-flac-alac-converter"
         source = self.input_binary or self.repo / "target/release" / EXECUTABLE
+        converter_source = self.input_converter
+        if converter_source is None and self.args.no_build:
+            if not self.converter.is_file():
+                raise InstallError(
+                    "no installed FLAC converter is available; pass --converter-binary or allow builds"
+                )
+            converter_source = self.converter
         try:
             if not self.args.no_build:
                 built_source = build_release(self.repo, backup)
                 if not self.args.binary:
                     source = built_source
+                if converter_source is None:
+                    converter_source = build_converter_release(self.repo, backup)
             if not source.is_file() or not os.access(source, os.X_OK):
                 raise InstallError(f"input artifact is not executable: {source}")
+            if converter_source is None:
+                raise InstallError("FLAC converter input artifact is unavailable")
             trusted = (
                 Path(self.old_binary_binding["physical"])
                 if self.old_binary_binding
                 else self.old_binary
             )
             stage_artifact(source, staged, trusted)
+            stage_artifact(converter_source, staged_converter, trusted)
+            run(
+                [
+                    "codesign",
+                    "--force",
+                    "--options",
+                    "runtime",
+                    "--identifier",
+                    CONVERTER_IDENTIFIER,
+                    "--sign",
+                    self.identity,
+                    staged_converter,
+                ]
+            )
+            verify_converter_signature(staged_converter, self.identity)
+            run(
+                converter_installer_command(
+                    self.repo, staged_converter, self.identity, apply=False
+                ),
+                timeout=COMMAND_TIMEOUT,
+            )
             run(
                 ["codesign", "--force", "--sign", self.identity, "--identifier", IDENTIFIER, staged]
             )
@@ -1617,7 +1820,12 @@ class Deployment:
                 raise InstallError("staged signing identity or designated requirement changed")
         finally:
             # These unique directories belong exclusively to this deployment.
-            for generated in [backup / "build", backup / "cargo-build"]:
+            for generated in [
+                backup / "build",
+                backup / "cargo-build",
+                backup / "converter-build",
+                backup / "converter-cargo-build",
+            ]:
                 if generated.exists():
                     no_symlinks(generated)
                     shutil.rmtree(generated)
@@ -1631,6 +1839,13 @@ class Deployment:
             wait_for_no_bot_processes(expected_executables=(self.old_binary, self.binary))
             state_entries = self.snapshot_state(backup)
             offsets = capture_log_offsets([self.stderr_path])
+            self.converter_install_attempted = True
+            run(
+                converter_installer_command(
+                    self.repo, staged_converter, self.identity, apply_signed=True
+                ),
+                timeout=COMMAND_TIMEOUT,
+            )
             atomic_install(staged, self.binary)
             run(
                 [
@@ -1665,6 +1880,7 @@ class Deployment:
             )
             result = {
                 "backup": str(backup),
+                "converter": str(self.converter),
                 "pid": pid,
                 "startup_ready": True,
                 "readiness_mode": self.readiness_mode,
@@ -1680,7 +1896,13 @@ class Deployment:
                     str(failure) if isinstance(failure, InstallError) else type(failure).__name__
                 )
                 try:
-                    restore_binary_and_plist(backup, transaction)
+                    restore_transaction = transaction
+                    if not getattr(self, "converter_install_attempted", False):
+                        restore_transaction = dict(transaction)
+                        restore_transaction.pop("converter", None)
+                        restore_transaction.pop("had_converter", None)
+                        restore_transaction.pop("converter_signing_identity", None)
+                    restore_binary_and_plist(backup, restore_transaction)
                 except (InstallError, OSError, subprocess.TimeoutExpired) as restoration:
                     restoration_reason = (
                         str(restoration)
@@ -1773,6 +1995,39 @@ def validate_saved_plist(backup, transaction):
     return {"bytes": contents, "document": document, "mode": stat.S_IMODE(metadata.st_mode)}
 
 
+def validate_saved_converter(backup, transaction):
+    if "converter" not in transaction:
+        return None
+    source = Path(backup) / "previous-converter"
+    if not transaction["had_converter"]:
+        if source.exists() or source.is_symlink():
+            raise InstallError("backup contains an unexpected previous converter")
+        return None
+    no_symlinks(source)
+    try:
+        metadata = source.lstat()
+    except OSError:
+        raise InstallError("saved previous converter is missing") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or not os.access(source, os.X_OK)
+    ):
+        raise InstallError("saved previous converter is not a user-owned executable")
+    run(
+        [
+            "codesign",
+            "--verify",
+            "--strict",
+            "--test-requirement",
+            "=" + converter_requirement(transaction["converter_signing_identity"]),
+            source,
+        ]
+    )
+    return source
+
+
 def validate_original_entrypoint(backup, transaction, saved=None):
     """Admit an explicitly requested old entry only while its trusted bytes exist."""
     if not transaction["had_plist"] or not (backup / "previous-binary").is_file():
@@ -1817,6 +2072,7 @@ def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
     """Restore executable/plist only, retaining every newer runtime write."""
     transaction = validate_transaction(transaction)
     saved = validate_saved_plist(backup, transaction)
+    saved_converter = validate_saved_converter(backup, transaction)
     if original_entrypoint:
         # Missing/changed original binaries must fail before interrupting any service.
         original, _ = validate_original_entrypoint(backup, transaction, saved)
@@ -1824,6 +2080,23 @@ def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
     wait_for_no_bot_processes(
         expected_executables=(transaction["previous_binary"], transaction["binary"])
     )
+    if "converter" in transaction:
+        converter = Path(transaction["converter"])
+        no_symlinks(converter)
+        if saved_converter is not None:
+            atomic_install(saved_converter, converter)
+            run(
+                [
+                    "codesign",
+                    "--verify",
+                    "--strict",
+                    "--test-requirement",
+                    "=" + converter_requirement(transaction["converter_signing_identity"]),
+                    converter,
+                ]
+            )
+        elif converter.exists():
+            converter.unlink()
     binary = original if original_entrypoint else Path(transaction["binary"])
     if original_entrypoint:
         # Revalidate after stopping before launchd is allowed to execute this path.
@@ -1867,6 +2140,7 @@ def rollback(args):
     )
     # Reject incomplete rollback inputs before retaining files or changing service state.
     validate_saved_plist(backup, transaction)
+    validate_saved_converter(backup, transaction)
     retained = backup / datetime.datetime.now(datetime.UTC).strftime(
         "pre-rollback-%Y%m%dT%H%M%S.%fZ"
     )
@@ -1874,6 +2148,11 @@ def rollback(args):
     for source, name in [
         (Path(transaction["binary"]), "binary"),
         (Path(transaction["plist"]), "agent.plist"),
+        *(
+            [(Path(transaction["converter"]), "flac-alac-converter")]
+            if "converter" in transaction
+            else []
+        ),
     ]:
         if source.exists():
             preserve_copy(source, retained / name)
@@ -1899,6 +2178,10 @@ def parser():
     result.add_argument("--config")
     result.add_argument(
         "--binary", help="Input release artifact; never the direct LaunchAgent target"
+    )
+    result.add_argument(
+        "--converter-binary",
+        help="Input native FLAC converter artifact; default deploy builds it separately",
     )
     result.add_argument("--no-build", action="store_true")
     result.add_argument("--dotnet-root")

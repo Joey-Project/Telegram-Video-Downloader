@@ -39,6 +39,55 @@ Music resolves bare ffmpeg/ffprobe commands through the bot process's PATH.
 Explicit relative codec paths are resolved from the configuration directory.
 Missing tools fail the affected Music task without preventing bot startup.
 
+FLAC preparation uses a separate `libexec/flac-alac-converter` executable in the
+active installed profile. The bot links only its protocol/client library; the
+worker owns libFLAC decoding, AudioToolbox ALAC encoding, metadata migration and
+full decoded-PCM verification. Set `music.converter` to override the helper path
+and `music.conversion_timeout_seconds` to change the bounded conversion deadline
+(default 1800 seconds, accepted range 1–86400). Missing helpers fail the affected
+FLAC task without disabling existing M4A, MP3 or AAC imports.
+
+An explicit normal production deploy builds and installs the helper separately
+from the bot. For prebuilt artifacts, pass `--converter-binary` to
+`scripts/launch_agent.sh deploy --no-build --binary ...`; omitting it reuses an
+already installed helper and fails if none is available. The fixed test install
+accepts the same `--converter-binary` option but only updates its helper when that
+option is explicitly supplied.
+
+For a standalone helper installation, the following prints a plan; add `--apply`
+to sign and install a staged copy. Select the test profile for isolated acceptance.
+Use the existing trusted certificate's SHA-1 fingerprint as `--identity`.
+
+```sh
+python3 scripts/install_flac_converter.py --profile test --source /absolute/path/flac-alac-converter --identity CERTIFICATE_SHA1
+```
+
+The helper statically links FLAC/Ogg, includes their notices, and is rejected by
+the installer if its Mach-O dependency list includes non-system libraries. Its
+helper signing identifier does not replace either fixed bot's Automation identity.
+
+The iCloud archive contains the original `.flac`, including all original metadata.
+The generated `.m4a` is a local import source; Music must create its own local
+copy, and that copy must pass the existing independent-copy verification before
+the archived FLAC can be evicted. Sample rate, channel count and normalized sample
+values are preserved. Lossless precision promotion is allowed with a warning;
+there is no lossy encoding, resampling or downmix fallback. The first converter
+version accepts mono/stereo with a known sample count.
+
+Standard tags and artwork are mapped for Music; exact original tag values and
+other metadata are additionally preserved in namespaced M4A fields where possible.
+Music need not display every preserved field. A conversion report is saved with
+the prepared-audio task and in its private preparation directory; the existing
+task message includes bounded warnings. Interrupted conversions retain their
+source and private partial files, and retries use a new preparation directory.
+Once preparation has been durably saved, later retries and restarts reuse it.
+The existing import-intent record continues to prevent automatic duplicate adds
+when an earlier Music add has an uncertain outcome.
+
+Local conversion and the Music-owned copy are verified lossless. iTunes Match's
+cloud version follows Apple's matching/upload rules independently of that local
+guarantee and the unchanged iCloud Drive original.
+
 The Python transfer helper is installed only by an explicit operator command. The
 default command prints a plan without changing files; select one profile to apply:
 
@@ -55,7 +104,7 @@ credentials remain in the private file at
 `~/.config/telegram-video-downloader/mtproto.json`; keep its parent directory mode
 0700 and file mode 0600.
 
-Send an `.m4a`, `.mp3` or `.aac` audio/document upload to the bot from the allowed
+Send an `.m4a`, `.mp3`, `.aac` or `.flac` audio/document upload to the bot from the allowed
 owner's private chat. Group uploads, other chats, unsupported extensions and
 files larger than the configured limit are rejected. `/music` shows the task list;
 use `/music retry TASK_ID` to resume a failed task or `/music cancel TASK_ID` to

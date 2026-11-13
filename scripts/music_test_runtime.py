@@ -31,6 +31,9 @@ LOG_LIMIT = 64 * 1024
 REQUEST_LIMIT = 64 * 1024
 COMMAND_TIMEOUT = 15
 OUTPUT_LIMIT = 128 * 1024
+CONVERTER_INSTALLER = Path(__file__).with_name("install_flac_converter.py")
+CONVERTER_IDENTIFIER = "io.github.telegram-local-downloader.bot.converter"
+CONVERTER_INSTALL_TIMEOUT = 60
 
 
 class RuntimeErrorSafe(Exception):
@@ -300,7 +303,29 @@ def _active_test_process() -> bool:
     return bool(pids)
 
 
-def plan(binary: Path | None = None) -> dict:
+def _converter_destination() -> Path:
+    return _home_path(
+        Path(".local/lib/telegram-video-downloader-test/libexec/flac-alac-converter")
+    )
+
+
+def _converter_installer_args(source: Path, *, apply: bool) -> list[str]:
+    arguments = [
+        sys.executable,
+        str(CONVERTER_INSTALLER),
+        "--profile",
+        "test",
+        "--source",
+        str(source),
+        "--identity",
+        TRUSTED_FINGERPRINT,
+    ]
+    if apply:
+        arguments.append("--apply")
+    return arguments
+
+
+def plan(binary: Path | None = None, converter_binary: Path | None = None) -> dict:
     """Read-only artifact and destination preflight."""
     selected = Path(binary) if binary else _home_path(TEST_BINARY)
     result = {
@@ -308,11 +333,19 @@ def plan(binary: Path | None = None) -> dict:
         "binary": str(selected),
         "destination": str(_home_path(TEST_BINARY)),
         "identifier": TEST_IDENTIFIER,
+        "converter_identifier": CONVERTER_IDENTIFIER,
+        "converter_destination": str(_converter_destination()),
         "label": TEST_LABEL,
         "valid": False,
     }
     if binary is not None:
         _validate_binary(selected)
+    if converter_binary is not None:
+        _run(
+            _converter_installer_args(converter_binary, apply=False),
+            timeout=CONVERTER_INSTALL_TIMEOUT,
+        )
+        result["converter_source"] = str(converter_binary)
     installed = _home_path(TEST_BINARY)
     if installed.exists():
         _no_symlinks(installed, Path.home())
@@ -326,7 +359,7 @@ def plan(binary: Path | None = None) -> dict:
     return result
 
 
-def install(binary: Path) -> dict:
+def install(binary: Path, converter_binary: Path | None = None) -> dict:
     """Sign and atomically install only a caller-provided staged test artifact."""
     source = Path(binary).resolve(strict=True)
     _validate_binary(source)
@@ -336,6 +369,11 @@ def install(binary: Path) -> dict:
         _require_test_requirement(target)
         if _active_test_process():
             raise RuntimeErrorSafe("test binary is currently running")
+    if converter_binary is not None:
+        _run(
+            _converter_installer_args(converter_binary, apply=False),
+            timeout=CONVERTER_INSTALL_TIMEOUT,
+        )
     if not ENTITLEMENTS.is_file():
         raise RuntimeErrorSafe("tracked Music automation entitlements file is missing")
     identities = _run(["/usr/bin/security", "find-identity", "-v", "-p", "codesigning"])
@@ -372,9 +410,17 @@ def install(binary: Path) -> dict:
             timeout=None,
         )
         _require_test_requirement(staged)
+        if converter_binary is not None:
+            _run(
+                _converter_installer_args(converter_binary, apply=True),
+                timeout=CONVERTER_INSTALL_TIMEOUT,
+            )
         os.replace(staged, target)
     target.chmod(0o755)
-    return {"action": "install", "binary": str(target), "installed": True}
+    result = {"action": "install", "binary": str(target), "installed": True}
+    if converter_binary is not None:
+        result["converter"] = str(_converter_destination())
+    return result
 
 
 def _launchd_domain() -> str:
@@ -513,6 +559,11 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument("--binary", type=Path, help="staged test artifact for plan/install")
+    result.add_argument(
+        "--converter-binary",
+        type=Path,
+        help="staged native FLAC converter to install explicitly for plan/install",
+    )
     result.add_argument("--request", type=Path, help="private numbered Music import request")
     return result
 
@@ -525,12 +576,14 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeErrorSafe(f"{args.action} requires --request PATH")
         if args.action not in request_actions and args.request is not None:
             raise RuntimeErrorSafe("--request is only valid for import actions")
+        if args.converter_binary is not None and args.action not in {"plan", "install"}:
+            raise RuntimeErrorSafe("--converter-binary is only valid for plan or install")
         if args.action == "plan":
-            result = plan(args.binary)
+            result = plan(args.binary, args.converter_binary)
         elif args.action == "install":
             if args.binary is None:
                 raise RuntimeErrorSafe("install requires --binary STAGED_TEST_ARTIFACT")
-            result = install(args.binary)
+            result = install(args.binary, args.converter_binary)
         elif args.action in {"check", "authorize", "quit", *request_actions}:
             result = launch_action(args.action, args.request)
         else:

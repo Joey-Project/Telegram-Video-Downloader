@@ -197,20 +197,22 @@ BOT_LABEL=com.example.telegram-downloader BOT_CONFIG=/path/to/config.toml script
 部署已经构建的产物时，`--binary` 仅指定输入文件；脚本复制并签名暂存副本，不会修改该输入：
 
 ```sh
-scripts/launch_agent.sh deploy --no-build --binary /path/to/staged/release/telegram-video-downloader
+scripts/launch_agent.sh deploy --no-build --binary /path/to/staged/release/telegram-video-downloader --converter-binary /path/to/staged/release/flac-alac-converter
 ```
 
 ## 验证
 
 The independent [native FLAC-to-ALAC converter](crates/flac-alac-converter/README.md)
-has its own JSON Lines API, typed process client and real-codec E2E suite. It is
-not yet connected to automatic Music import. Workspace checks on macOS require
+has its own JSON Lines API, typed process client and real-codec E2E suite. Automatic
+Music imports use its isolated worker for FLAC uploads, retaining the original in
+iCloud Drive and importing the verified local ALAC. Workspace checks on macOS require
 `flac` and `pkg-config` (`brew install flac pkg-config`).
 
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace --all-targets
+cargo build --locked -p flac-alac-converter
+FLAC_ALAC_TEST_CONVERTER="$PWD/target/debug/flac-alac-converter" cargo test --locked --workspace --all-targets
 scripts/test_launch_agent.sh
 python3 -B scripts/test_macos_service.py
 uv run ruff format --check

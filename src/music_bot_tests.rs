@@ -3,6 +3,11 @@ mod music_bot_tests {
     use crate::music_manager::tests::{DownloadGate, MockBackend, TestDirectory, TestHttpServer};
 
     fn update(id: i64, sender: i64, document: bool, name: &str, size: u64) -> Update {
+        let mime_type = if name.to_ascii_lowercase().ends_with(".flac") {
+            "audio/flac"
+        } else {
+            "audio/mpeg"
+        };
         let mut message = serde_json::json!({
             "message_id": id,
             "chat": {"id": sender, "type": "private"},
@@ -13,8 +18,8 @@ mod music_bot_tests {
             "file_unique_id": "music-unique-fixture",
             "file_name": name,
             "file_size": size,
-            // Telegram supplied this hint for the real ALAC M4A test uploads too.
-            "mime_type": "audio/mpeg"
+            // Telegram may return a mismatched hint for older M4A uploads.
+            "mime_type": mime_type
         });
         serde_json::from_value(serde_json::json!({"update_id": id, "message": message})).unwrap()
     }
@@ -57,6 +62,7 @@ mod music_bot_tests {
             (false, "track.M4A"),
             (true, "track.mp3"),
             (true, "track.aac"),
+            (true, "track.FLAC"),
         ] {
             let message = update(8, 42, document, name, 32 * 1024 * 1024)
                 .message
@@ -69,6 +75,16 @@ mod music_bot_tests {
             assert_eq!(upload.chat_id, 42);
             assert_eq!(upload.user_id, 42);
         }
+        let mut inferred = update(9, 42, false, "track.flac", 32 * 1024 * 1024)
+            .message
+            .unwrap();
+        inferred.audio.as_mut().unwrap().file_name = None;
+        let upload = music_upload_from_message(9, &inferred, 512 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.file_name, "audio.flac");
+        assert_eq!(upload.mime_type.as_deref(), Some("audio/flac"));
+
         let oversized = update(8, 42, false, "track.m4a", 513 * 1024 * 1024)
             .message
             .unwrap();

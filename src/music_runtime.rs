@@ -430,6 +430,7 @@ pub async fn seed_accepted_records(
                 bail!("accepted Music track differs from its saved native receipt");
             }
             let audio = PreparedAudio {
+                conversion: None,
                 original: AudioBytes {
                     path: item.archive_path.clone(),
                     sha256: digest.clone(),
@@ -635,6 +636,7 @@ mod tests {
             ffprobe,
             max_file_bytes: current_admission_limit,
             cloud_poll_seconds: 60,
+            ..MusicSettings::default()
         };
         let backend = RuntimeMusicBackend::new(settings, "codex_synth_v1_api_key_a".to_string());
         let work_dir = directory.path().join("work");
