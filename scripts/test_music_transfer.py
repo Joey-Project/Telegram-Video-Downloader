@@ -342,6 +342,22 @@ class MusicTransferTests(unittest.TestCase):
         parsed = transfer.validate_request(raw, home)
         self.assertEqual(parsed.destination.name, "original.flac")
 
+    def test_request_accepts_wav_original_destination(self):
+        home, request, _ = self._fixture(extension="wav")
+        raw = {
+            "schema": 1,
+            "bot_token": request.bot_token,
+            "credentials_path": str(request.credentials_path),
+            "file_id": request.file_id,
+            "identity_sha256": request.identity_sha256,
+            "expected_size": request.expected_size,
+            "staging_root": str(request.staging_root),
+            "destination": str(request.destination),
+            "deadline_seconds": request.deadline_seconds,
+        }
+        parsed = transfer.validate_request(raw, home)
+        self.assertEqual(parsed.destination.name, "original.wav")
+
     def test_private_credentials_require_exact_owner_mode_and_shape(self):
         home, request, _ = self._fixture()
         with self.assertRaises(transfer.TransferError):

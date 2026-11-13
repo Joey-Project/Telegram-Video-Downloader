@@ -1,4 +1,4 @@
-//! Isolated FLAC-to-ALAC process adapter for Music preparation.
+//! Isolated lossless-source-to-ALAC process adapter for Music preparation.
 
 use anyhow::{Context, Result, bail, ensure};
 use flac_alac_converter::client::ConverterClient;
@@ -54,7 +54,7 @@ impl ConverterProcess for ConverterClient {
     }
 }
 
-pub(crate) fn convert_flac(
+pub(crate) fn convert_lossless(
     source: &AudioBytes,
     working_dir: &Path,
     settings: &MusicSettings,
@@ -62,7 +62,7 @@ pub(crate) fn convert_flac(
     trace: &mut ConversionTrace,
 ) -> Result<ConversionOutput> {
     let client = ConverterClient::new(settings.converter.clone());
-    convert_flac_with(
+    convert_lossless_with(
         &client,
         source,
         working_dir,
@@ -72,7 +72,7 @@ pub(crate) fn convert_flac(
     )
 }
 
-fn convert_flac_with(
+fn convert_lossless_with(
     client: &dyn ConverterProcess,
     source: &AudioBytes,
     working_dir: &Path,
@@ -86,7 +86,7 @@ fn convert_flac_with(
     );
     ensure!(
         source.sha256.len() == 64 && source.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "FLAC source SHA-256 is invalid"
+        "lossless source SHA-256 is invalid"
     );
     let canonical_working_dir = fs::canonicalize(working_dir).with_context(|| {
         format!(
@@ -123,16 +123,16 @@ fn convert_flac_with(
     let report = result.map_err(|error| {
         if let Some(path) = trace.staging_directory.as_ref() {
             error.context(format!(
-                "FLAC conversion failed; retained converter staging is at {}",
+            "lossless audio conversion failed; retained converter staging is at {}",
                 path.display()
             ))
         } else {
-            error.context("FLAC conversion failed; inspect the private prepare-attempt directory for retained staging")
+            error.context("lossless audio conversion failed; inspect the private prepare-attempt directory for retained staging")
         }
     })?;
     let canonical_output = fs::canonicalize(&output).with_context(|| {
         format!(
-            "resolve completed FLAC conversion output {}",
+            "resolve completed lossless conversion output {}",
             output.display()
         )
     })?;
@@ -159,7 +159,7 @@ pub(crate) fn validate_conversion_report(
     );
     ensure!(
         same_sha256(&report.input_sha256, source_sha256),
-        "converter report input SHA-256 does not match the original FLAC"
+        "converter report input SHA-256 does not match the original audio"
     );
     ensure!(
         is_sha256(&report.output_sha256),
@@ -191,13 +191,14 @@ pub(crate) fn validate_conversion_report(
 }
 
 pub(crate) fn persist_success_report(working_dir: &Path, report: &ConversionReport) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(report).context("serialize FLAC conversion report")?;
+    let bytes =
+        serde_json::to_vec_pretty(report).context("serialize lossless conversion report")?;
     ensure!(
         bytes.len() <= MAX_REPORT_BYTES,
-        "FLAC conversion report exceeds the private persistence limit"
+        "lossless conversion report exceeds the private persistence limit"
     );
     create_private_record(working_dir.join("conversion-report.json"), &bytes)
-        .context("persist complete FLAC conversion report without replacement")
+        .context("persist complete lossless conversion report without replacement")
 }
 
 pub(crate) fn persist_failure_record(
@@ -213,13 +214,14 @@ pub(crate) fn persist_failure_record(
         staging_directory: trace.staging_directory.clone(),
         retained_staging_directories: find_retained_staging_directories(working_dir)?,
     };
-    let bytes = serde_json::to_vec_pretty(&record).context("serialize FLAC conversion failure")?;
+    let bytes =
+        serde_json::to_vec_pretty(&record).context("serialize lossless conversion failure")?;
     ensure!(
         bytes.len() <= MAX_FAILURE_RECORD_BYTES,
-        "FLAC conversion failure record exceeds its persistence limit"
+        "lossless conversion failure record exceeds its persistence limit"
     );
     create_private_record(working_dir.join("conversion-failure.json"), &bytes)
-        .context("persist bounded FLAC conversion failure without replacement")
+        .context("persist bounded lossless conversion failure without replacement")
 }
 
 #[derive(Serialize)]
@@ -283,7 +285,7 @@ fn find_retained_staging_directories(working_dir: &Path) -> Result<Vec<PathBuf>>
 fn unique_output_path(working_dir: &Path, sha256: &str) -> Result<PathBuf> {
     ensure!(
         working_dir.is_absolute(),
-        "FLAC prepare directory must be absolute"
+        "lossless prepare directory must be absolute"
     );
     for _ in 0..128 {
         let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -292,7 +294,7 @@ fn unique_output_path(working_dir: &Path, sha256: &str) -> Result<PathBuf> {
             .unwrap_or_default()
             .as_nanos();
         let candidate = working_dir.join(format!(
-            "flac-alac-{}-{}-{}-{}.m4a",
+            "lossless-alac-{}-{}-{}-{}.m4a",
             &sha256[..16],
             std::process::id(),
             sequence,
@@ -304,14 +306,14 @@ fn unique_output_path(working_dir: &Path, sha256: &str) -> Result<PathBuf> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "inspect reserved FLAC conversion path {}",
+                        "inspect reserved lossless conversion path {}",
                         candidate.display()
                     )
                 });
             }
         }
     }
-    bail!("could not reserve a unique FLAC-to-ALAC output path")
+    bail!("could not reserve a unique lossless-to-ALAC output path")
 }
 
 fn valid_audio_spec(spec: &AudioSpec) -> bool {
@@ -507,7 +509,7 @@ mod tests {
         };
         let cancellation = MusicCancellation::default();
         let mut first_trace = ConversionTrace::default();
-        let first = convert_flac_with(
+        let first = convert_lossless_with(
             &converter,
             &source,
             &work_dir,
@@ -521,7 +523,7 @@ mod tests {
         assert_eq!(first.path.parent(), Some(directory.path()));
 
         let mut second_trace = ConversionTrace::default();
-        let second = convert_flac_with(
+        let second = convert_lossless_with(
             &converter,
             &source,
             &work_dir,
@@ -532,6 +534,52 @@ mod tests {
         .expect("retry conversion without replacing the first result");
         assert_ne!(first.path, second.path);
         assert_eq!(fs::read(&first.path).unwrap(), converter.output_contents);
+    }
+
+    #[test]
+    fn wav_conversion_report_binds_original_and_alac_hashes() {
+        let directory = TestDirectory::new();
+        let input_bytes = b"synthetic WAV source bytes";
+        let output_bytes = b"verified ALAC import bytes";
+        let path = directory.path().join("source.WAV");
+        fs::write(&path, input_bytes).expect("write WAV source fixture");
+        let source = AudioBytes {
+            path,
+            sha256: sha256(input_bytes),
+            size: input_bytes.len() as u64,
+        };
+        let converter = MockConverter {
+            source_sha256: source.sha256.clone(),
+            output_contents: output_bytes.to_vec(),
+            expect_cancelled: false,
+            warning: None,
+            fail_with_stage: None,
+        };
+        let mut trace = ConversionTrace::default();
+
+        let converted = convert_lossless_with(
+            &converter,
+            &source,
+            directory.path(),
+            37,
+            &MusicCancellation::default(),
+            &mut trace,
+        )
+        .expect("WAV source is sent through the existing conversion protocol");
+
+        assert_ne!(source.sha256, converted.report.output_sha256);
+        assert_eq!(converted.report.input_sha256, source.sha256);
+        assert_eq!(converted.report.output_sha256, sha256(output_bytes));
+        validate_conversion_report(&converted.report, &source.sha256, &converted.path)
+            .expect("conversion report remains bound to the source and ALAC output");
+        persist_success_report(directory.path(), &converted.report)
+            .expect("persist the complete WAV conversion report");
+        let saved: ConversionReport = serde_json::from_slice(
+            &fs::read(directory.path().join("conversion-report.json")).unwrap(),
+        )
+        .expect("parse the saved WAV conversion report");
+        assert_eq!(saved.input_sha256, source.sha256);
+        assert_eq!(saved.output_sha256, sha256(output_bytes));
     }
 
     #[test]
@@ -548,7 +596,7 @@ mod tests {
         let cancellation = MusicCancellation::default();
         cancellation.cancel();
         let mut trace = ConversionTrace::default();
-        let output = convert_flac_with(
+        let output = convert_lossless_with(
             &converter,
             &source,
             directory.path(),
@@ -613,7 +661,7 @@ mod tests {
         };
         let cancellation = MusicCancellation::default();
         let mut trace = ConversionTrace::default();
-        let error = convert_flac_with(
+        let error = convert_lossless_with(
             &converter,
             &source,
             directory.path(),

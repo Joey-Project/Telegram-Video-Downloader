@@ -1,6 +1,5 @@
 # Project TODO
 
-- [pending] Extend automatic Apple Music import to `.wav` by converting to ALAC. FLAC conversion is integrated through the isolated native worker; see [FLAC integration](project_journal/2026/11/2026-11-13-music-flac-integration-mfi01.md). Uploaded `.m4a`, `.mp3` and `.aac` imports, larger-file transfer, original archiving and separate Music/iCloud verification are implemented; see [the music import workstream](project_journal/2026/11/2026-11-11-apple-music-import-ami01.md) for validation and deployment boundaries.
 - [pending] Add a file-manager view of temporary directories belonging to interrupted, unfinished downloads, with explicit bulk selection and cleanup. Protect active writers, finished media, queue/control identities and recovery bindings; permanent retention remains the default until the user requests cleanup.
 - [pending] Integrate a reusable `BBDown-rust danmaku update` action for existing videos, collections and whole libraries without downloading media again. Refresh must append/merge without losing previously saved comments. The one-time offline recovery is complete; see [the closed recovery workstream](project_journal/2026/10/2026-10-16-bilibili-danmaku-deflate-bdd01.md).
 - [pending] Support uploaded `.torrent` files by submitting them to the existing local qBittorrent service.

@@ -8,6 +8,8 @@ pub mod metadata;
 pub mod native;
 pub mod protocol;
 pub mod types;
+#[cfg(feature = "native")]
+pub mod wav;
 
 pub use client::ConverterClient;
 pub use types::{ConversionReport, ConvertRequest, Event};

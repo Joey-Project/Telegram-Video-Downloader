@@ -1996,6 +1996,230 @@ async fn completed_catalog_seed_reuses_saved_import_and_archive_without_importin
     server.stop();
 }
 
+fn accepted_seed_record(
+    settings: &MusicSettings,
+    original_digit: char,
+    import_digit: char,
+    persistent_id: &str,
+    archive_name: &str,
+    converted: bool,
+) -> (PreparedAudio, ArchiveState, MusicTrack) {
+    let original_sha = original_digit.to_string().repeat(64);
+    let import_sha = if converted {
+        import_digit.to_string().repeat(64)
+    } else {
+        original_sha.clone()
+    };
+    let original_extension = if converted { "flac" } else { "m4a" };
+    let import_size = if converted { 120 } else { 100 };
+    let original_path = settings
+        .staging_dir
+        .join(format!("accepted-{original_digit}.{original_extension}"));
+    let import_path = settings
+        .staging_dir
+        .join(format!("accepted-{import_digit}.m4a"));
+    let conversion = converted.then(|| flac_alac_converter::types::ConversionReport {
+        version: flac_alac_converter::types::PROTOCOL_VERSION,
+        source: flac_alac_converter::types::AudioSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 24,
+            frames: 100,
+        },
+        output: flac_alac_converter::types::AudioSpec {
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 24,
+            frames: 100,
+        },
+        output_path: import_path.clone(),
+        input_sha256: original_sha.clone(),
+        output_sha256: import_sha.clone(),
+        pcm_sha256: "e".repeat(64),
+        audio_bit_exact: true,
+        metadata: flac_alac_converter::types::MetadataReport::default(),
+        warnings: Vec::new(),
+    });
+    (
+        PreparedAudio {
+            original: AudioBytes {
+                path: original_path,
+                sha256: original_sha,
+                size: 100,
+            },
+            import: AudioBytes {
+                path: import_path,
+                sha256: import_sha,
+                size: import_size,
+            },
+            conversion,
+        },
+        ArchiveState {
+            path: settings.archive_dir.join(archive_name),
+            uploaded: true,
+            uploading: false,
+            downloading: false,
+            conflicts: false,
+            local_bytes: false,
+        },
+        MusicTrack {
+            persistent_id: persistent_id.to_string(),
+            location: Some(PathBuf::from("/Music/accepted-seed.m4a")),
+            cloud_status: "matched".to_string(),
+        },
+    )
+}
+
+#[tokio::test]
+async fn accepted_seed_batch_previews_applies_and_replays_converted_and_legacy_records() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let settings = fixture.settings();
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(settings.clone(), &server, backend as Arc<dyn MusicBackend>).await;
+    let converted = accepted_seed_record(
+        &settings,
+        'a',
+        'b',
+        "0123456789ABCDEF",
+        "accepted-flac.flac",
+        true,
+    );
+    let legacy = accepted_seed_record(
+        &settings,
+        'c',
+        'c',
+        "FEDCBA9876543210",
+        "accepted-m4a.m4a",
+        false,
+    );
+    assert_ne!(converted.0.original.sha256, converted.0.import.sha256);
+    assert_eq!(legacy.0.original.sha256, legacy.0.import.sha256);
+    let records = vec![converted, legacy];
+    let state_path = settings.state_dir.join("jobs.json");
+    let before_bytes = fs::read(&state_path).expect("read baseline manager state");
+    let before_state = manager
+        .store
+        .snapshot()
+        .expect("read baseline manager state");
+
+    manager
+        .seed_completed_batch(&records, true)
+        .await
+        .expect("read-only preview should validate the full seed batch");
+    assert_eq!(fs::read(&state_path).unwrap(), before_bytes);
+    assert_eq!(
+        serde_json::to_value(manager.store.snapshot().unwrap().jobs).unwrap(),
+        serde_json::to_value(before_state.jobs).unwrap()
+    );
+    assert!(manager.store.snapshot().unwrap().content_catalog.is_empty());
+
+    manager
+        .seed_completed_batch(&records, false)
+        .await
+        .expect("verified converted and legacy records should seed atomically");
+    let after_apply_bytes = fs::read(&state_path).expect("read seeded manager state");
+    let state = manager.store.snapshot().expect("read seeded manager state");
+    assert_eq!(state.content_catalog.len(), 2);
+    assert!(state.jobs.is_empty());
+    assert_eq!(
+        state
+            .content_catalog
+            .get(&records[0].0.original.sha256)
+            .unwrap()
+            .prepared
+            .import
+            .sha256,
+        records[0].0.import.sha256
+    );
+
+    let mut replay = records.clone();
+    for (_, archive, _) in &mut replay {
+        archive.local_bytes = !archive.local_bytes;
+    }
+    manager
+        .seed_completed_batch(&replay, false)
+        .await
+        .expect("exact records remain idempotent across local archive hydration flags");
+    assert_eq!(fs::read(&state_path).unwrap(), after_apply_bytes);
+    assert_eq!(manager.store.snapshot().unwrap().content_catalog.len(), 2);
+    assert_eq!(manager.store.snapshot().unwrap().jobs.len(), 0);
+    server.stop();
+}
+
+#[tokio::test]
+async fn invalid_late_record_or_catalog_conflict_does_not_partially_seed_batch() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let settings = fixture.settings();
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(settings.clone(), &server, backend as Arc<dyn MusicBackend>).await;
+    let accepted = accepted_seed_record(
+        &settings,
+        'a',
+        'b',
+        "0123456789ABCDEF",
+        "accepted-existing.flac",
+        true,
+    );
+    manager
+        .seed_completed_batch(std::slice::from_ref(&accepted), false)
+        .await
+        .expect("baseline accepted record should seed");
+    let state_path = settings.state_dir.join("jobs.json");
+    let before_bytes = fs::read(&state_path).expect("read seeded manager state");
+    let before_state = manager.store.snapshot().expect("read seeded manager state");
+
+    let first = accepted_seed_record(
+        &settings,
+        'c',
+        'd',
+        "1111222233334444",
+        "accepted-first.flac",
+        true,
+    );
+    let mut invalid_report = accepted_seed_record(
+        &settings,
+        'e',
+        'f',
+        "5555666677778888",
+        "accepted-invalid.flac",
+        true,
+    );
+    invalid_report.0.conversion.as_mut().unwrap().output_sha256 = "0".repeat(64);
+    assert!(
+        manager
+            .seed_completed_batch(&[first.clone(), invalid_report], false)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), before_bytes);
+    assert_eq!(
+        serde_json::to_value(manager.store.snapshot().unwrap().content_catalog).unwrap(),
+        serde_json::to_value(before_state.content_catalog.clone()).unwrap()
+    );
+
+    let conflict = accepted_seed_record(
+        &settings,
+        'a',
+        'f',
+        "9999AAAABBBBCCCC",
+        "accepted-existing.flac",
+        true,
+    );
+    assert!(
+        manager
+            .seed_completed_batch(&[first, conflict], false)
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&state_path).unwrap(), before_bytes);
+    let after_state = manager.store.snapshot().unwrap();
+    assert_eq!(after_state.content_catalog.len(), 1);
+    assert_eq!(after_state.jobs.len(), 0);
+    server.stop();
+}
+
 #[test]
 fn legacy_prepared_audio_without_conversion_report_remains_readable() {
     let mut value = serde_json::to_value(PreparedAudio {

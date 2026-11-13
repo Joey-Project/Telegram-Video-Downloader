@@ -2,7 +2,7 @@
 name = "flac-alac-converter"
 version = "0.1.0"
 edition = "2024"
-description = "Isolated native FLAC to Apple Lossless conversion with metadata migration"
+description = "Isolated native FLAC and PCM WAVE to Apple Lossless conversion with metadata migration"
 
 [features]
 default = ["native"]

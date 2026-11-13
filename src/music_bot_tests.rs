@@ -5,6 +5,8 @@ mod music_bot_tests {
     fn update(id: i64, sender: i64, document: bool, name: &str, size: u64) -> Update {
         let mime_type = if name.to_ascii_lowercase().ends_with(".flac") {
             "audio/flac"
+        } else if name.to_ascii_lowercase().ends_with(".wav") {
+            "audio/wav"
         } else {
             "audio/mpeg"
         };
@@ -63,6 +65,7 @@ mod music_bot_tests {
             (true, "track.mp3"),
             (true, "track.aac"),
             (true, "track.FLAC"),
+            (false, "track.WAV"),
         ] {
             let message = update(8, 42, document, name, 32 * 1024 * 1024)
                 .message
@@ -84,6 +87,28 @@ mod music_bot_tests {
             .unwrap();
         assert_eq!(upload.file_name, "audio.flac");
         assert_eq!(upload.mime_type.as_deref(), Some("audio/flac"));
+
+        let mut inferred_wav = update(10, 42, false, "track.wav", 32 * 1024 * 1024)
+            .message
+            .unwrap();
+        inferred_wav.audio.as_mut().unwrap().file_name = None;
+        inferred_wav.audio.as_mut().unwrap().mime_type = Some("Audio/X-Wav".into());
+        let upload = music_upload_from_message(10, &inferred_wav, 512 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.file_name, "audio.wav");
+        assert_eq!(upload.mime_type.as_deref(), Some("Audio/X-Wav"));
+
+        let mut inferred_document = update(11, 42, true, "track.wav", 32 * 1024 * 1024)
+            .message
+            .unwrap();
+        inferred_document.document.as_mut().unwrap().file_name = None;
+        inferred_document.document.as_mut().unwrap().mime_type = Some("application/x-wav".into());
+        let upload = music_upload_from_message(11, &inferred_document, 512 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.file_name, "audio.wav");
+        assert_eq!(upload.mime_type.as_deref(), Some("application/x-wav"));
 
         let oversized = update(8, 42, false, "track.m4a", 513 * 1024 * 1024)
             .message

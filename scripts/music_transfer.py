@@ -518,7 +518,13 @@ def validate_request(value: dict[str, Any], home: Path | None = None) -> Transfe
         or staging_root.parent.name != ".telegram-video-downloader-staging"
         or destination.parent != staging_root / job_id
         or not re.fullmatch(r"mj1-[0-9a-f]{24}", job_id)
-        or destination.name not in {"original.m4a", "original.mp3", "original.aac", "original.flac"}
+        or destination.name not in {
+            "original.m4a",
+            "original.mp3",
+            "original.aac",
+            "original.flac",
+            "original.wav",
+        }
     ):
         raise TransferError(ErrorCode.INVALID_REQUEST)
     try:

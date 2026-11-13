@@ -199,6 +199,27 @@ impl MusicStore {
         Ok(store)
     }
 
+    fn open_for_seed(
+        settings: &MusicSettings,
+        provider: Arc<dyn QueueFileProvider>,
+    ) -> Result<Self> {
+        validate_private_directory(&settings.state_dir)?;
+        validate_private_directory(&settings.staging_dir)?;
+
+        let owner_lock_path = settings.state_dir.join(OWNER_LOCK_FILE);
+        let owner_lock = acquire_owner_lock(&owner_lock_path, provider.as_ref())?;
+        let state_path = settings.state_dir.join(STATE_FILE);
+        let state = read_state(&state_path, provider.as_ref())?.unwrap_or_default();
+        validate_stored_state(&state, &settings.archive_dir)?;
+        Ok(Self {
+            state_path,
+            archive_dir: settings.archive_dir.clone(),
+            provider,
+            state: Mutex::new(state),
+            _owner_lock: owner_lock,
+        })
+    }
+
     fn recover_interrupted_jobs(&self) -> Result<()> {
         self.transact(|state| {
             for job in state.jobs.values_mut() {
@@ -246,6 +267,24 @@ impl MusicStore {
         validate_stored_state(&next, &self.archive_dir)?;
         write_state_atomic(&self.state_path, &next, self.provider.as_ref())?;
         *guard = next;
+        Ok(output)
+    }
+
+    fn transact_if_changed<T>(
+        &self,
+        update: impl FnOnce(&mut StoredState) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("music job state lock was poisoned"))?;
+        let mut next = guard.clone();
+        let (output, changed) = update(&mut next)?;
+        if changed {
+            validate_stored_state(&next, &self.archive_dir)?;
+            write_state_atomic(&self.state_path, &next, self.provider.as_ref())?;
+            *guard = next;
+        }
         Ok(output)
     }
 
@@ -409,47 +448,96 @@ impl MusicStore {
         })
     }
 
-    fn seed_completed(
+    fn seed_completed_batch(
         &self,
-        audio: &PreparedAudio,
-        archive: &ArchiveState,
-        track: &MusicTrack,
+        records: &[(PreparedAudio, ArchiveState, MusicTrack)],
         settings: &MusicSettings,
+        dry_run: bool,
     ) -> Result<()> {
-        validate_prepared_audio(audio, MAX_CONFIGURED_FILE_BYTES)?;
-        validate_track(track)?;
-        validate_archive_state(archive, &settings.archive_dir)?;
-        if !track.cloud_complete() {
-            bail!("completed catalog seed requires uploaded or matched Music status");
+        if records.is_empty() {
+            bail!("accepted Music seed batch is empty");
         }
-        if !archive.uploaded || archive.uploading || archive.downloading || archive.conflicts {
-            bail!("completed catalog seed requires a stable uploaded archive");
-        }
-        let sha = normalize_sha256(&audio.original.sha256)?;
-        let persistent_id = track.persistent_id.clone();
-        let mut prepared = audio.clone();
-        prepared.original.sha256 = sha.clone();
-        prepared.import.sha256 = normalize_sha256(&prepared.import.sha256)?;
-        self.transact(|state| {
-            if let Some(existing) = state.content_catalog.get(&sha) {
-                if existing.persistent_id.as_deref() != Some(&persistent_id) {
-                    bail!("content catalog already maps this hash to a different Music track");
-                }
-                return Ok(());
+
+        let mut normalized = Vec::with_capacity(records.len());
+        let mut proof_hashes = BTreeMap::<String, ()>::new();
+        let mut proof_persistent_ids = BTreeMap::<String, ()>::new();
+        for (audio, archive, track) in records {
+            validate_prepared_audio(audio, MAX_CONFIGURED_FILE_BYTES)?;
+            validate_track(track)?;
+            validate_archive_state(archive, &settings.archive_dir)?;
+            if archive.path.parent() != Some(settings.archive_dir.as_path()) {
+                bail!(
+                    "completed catalog seed archive must be a direct child of the archive directory"
+                );
             }
-            if state.content_catalog.len() >= MAX_CATALOG_ENTRIES {
+            if !track.cloud_complete() {
+                bail!("completed catalog seed requires uploaded or matched Music status");
+            }
+            if !archive.uploaded || archive.uploading || archive.downloading || archive.conflicts {
+                bail!("completed catalog seed requires a stable uploaded archive");
+            }
+
+            let original_sha = normalize_sha256(&audio.original.sha256)?;
+            let import_sha = normalize_sha256(&audio.import.sha256)?;
+            if proof_hashes.insert(original_sha.clone(), ()).is_some() {
+                bail!("accepted Music seed batch repeats an original content hash");
+            }
+            if proof_persistent_ids
+                .insert(track.persistent_id.clone(), ())
+                .is_some()
+            {
+                bail!("accepted Music seed batch repeats a Music persistent ID");
+            }
+
+            let mut prepared = audio.clone();
+            prepared.original.sha256 = original_sha.clone();
+            prepared.import.sha256 = import_sha;
+            normalized.push((original_sha, prepared, archive.clone(), track.clone()));
+        }
+
+        self.transact_if_changed(|state| {
+            let mut pending = Vec::new();
+            for (sha, prepared, archive, track) in &normalized {
+                let persistent_id = &track.persistent_id;
+                if let Some(existing) = state.content_catalog.get(sha) {
+                    if !existing.add_intent
+                        || existing.persistent_id.as_deref() != Some(persistent_id)
+                        || !same_prepared_audio_identity(&existing.prepared, prepared)?
+                        || existing.archive.path != archive.path
+                    {
+                        bail!(
+                            "content catalog already contains a conflicting accepted Music record"
+                        );
+                    }
+                    continue;
+                }
+                if state.content_catalog.values().any(|existing| {
+                    existing.persistent_id.as_deref() == Some(persistent_id.as_str())
+                }) {
+                    bail!("content catalog already maps this Music track to different content");
+                }
+                pending.push((sha, prepared, archive, track));
+            }
+
+            if state.content_catalog.len().saturating_add(pending.len()) > MAX_CATALOG_ENTRIES {
                 bail!("music content catalog capacity has been reached");
             }
-            state.content_catalog.insert(
-                sha,
-                CatalogEntry {
-                    add_intent: true,
-                    persistent_id: Some(persistent_id),
-                    prepared: prepared.clone(),
-                    archive: archive.clone(),
-                },
-            );
-            Ok(())
+            if dry_run || pending.is_empty() {
+                return Ok(((), false));
+            }
+
+            for (sha, prepared, archive, track) in pending {
+                state.content_catalog.insert(
+                    sha.clone(),
+                    CatalogEntry {
+                        add_intent: true,
+                        persistent_id: Some(track.persistent_id.clone()),
+                        prepared: prepared.clone(),
+                        archive: archive.clone(),
+                    },
+                );
+            }
+            Ok(((), true))
         })
     }
 
@@ -639,6 +727,29 @@ impl MusicManager {
         }))
     }
 
+    /// Opens existing state and takes its owner lock without recovering or writing jobs.
+    pub(crate) fn open_for_seed(
+        settings: MusicSettings,
+        telegram: TelegramClient,
+        backend: Arc<dyn MusicBackend>,
+    ) -> Result<Arc<Self>> {
+        if !settings.enabled {
+            bail!("music processing is disabled");
+        }
+        validate_settings(&settings)?;
+        let provider = platform_queue_file_provider();
+        let store = MusicStore::open_for_seed(&settings, provider)?;
+        Ok(Arc::new(Self {
+            settings,
+            store: Arc::new(store),
+            telegram,
+            backend,
+            notify: Notify::new(),
+            cancellations: Mutex::new(BTreeMap::new()),
+            worker_started: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+
     /// Inserts a Telegram upload durably before returning to the update dispatcher.
     pub async fn enqueue(self: &Arc<Self>, upload: MusicUpload) -> Result<Admission> {
         let manager = Arc::clone(self);
@@ -766,22 +877,31 @@ impl MusicManager {
 
     /// Adds a previously accepted, fully verified track to the content catalog without import.
     /// The caller must validate its native acceptance evidence before calling this method.
+    #[cfg(test)]
     pub async fn seed_completed(
         &self,
         audio: &PreparedAudio,
         archive: &ArchiveState,
         track: &MusicTrack,
     ) -> Result<()> {
-        let audio = audio.clone();
-        let archive = archive.clone();
-        let track = track.clone();
+        self.seed_completed_batch(&[(audio.clone(), archive.clone(), track.clone())], false)
+            .await
+    }
+
+    /// Seeds a previously accepted batch atomically, or performs a locked read-only preview.
+    pub(crate) async fn seed_completed_batch(
+        &self,
+        records: &[(PreparedAudio, ArchiveState, MusicTrack)],
+        dry_run: bool,
+    ) -> Result<()> {
+        let records = records.to_vec();
         let store = Arc::clone(&self.store);
         let settings = self.settings.clone();
         tokio::task::spawn_blocking(move || {
-            store.seed_completed(&audio, &archive, &track, &settings)
+            store.seed_completed_batch(&records, &settings, dry_run)
         })
         .await
-        .context("music catalog seed worker stopped")??;
+        .context("music catalog batch seed worker stopped")??;
         Ok(())
     }
 
@@ -870,7 +990,7 @@ impl MusicManager {
             None => {
                 self.fail_job(
                     job_id,
-                    "Only .m4a, .mp3, .aac, and .flac files are accepted.",
+                    "Only .m4a, .mp3, .aac, .flac, and .wav files are accepted.",
                 )
                 .await;
                 return;
@@ -1815,7 +1935,7 @@ fn validate_upload(upload: &MusicUpload, settings: &MusicSettings) -> Result<()>
         || upload.file_name.chars().any(char::is_control)
         || supported_extension(&upload.file_name).is_none()
     {
-        bail!("music upload filename must end in .m4a, .mp3, .aac, or .flac");
+        bail!("music upload filename must end in .m4a, .mp3, .aac, .flac, or .wav");
     }
     if upload.file_size == 0 || upload.file_size > settings.max_file_bytes {
         bail!("music upload size is outside the configured limit");
@@ -1840,6 +1960,8 @@ fn supported_extension(file_name: &str) -> Option<&'static str> {
         Some("aac")
     } else if extension.eq_ignore_ascii_case("flac") {
         Some("flac")
+    } else if extension.eq_ignore_ascii_case("wav") {
+        Some("wav")
     } else {
         None
     }
@@ -1969,7 +2091,10 @@ fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
         })
 }
 
-fn validate_prepared_audio(audio: &PreparedAudio, max_original_bytes: u64) -> Result<()> {
+pub(crate) fn validate_prepared_audio(
+    audio: &PreparedAudio,
+    max_original_bytes: u64,
+) -> Result<()> {
     validate_audio_bytes(&audio.original, max_original_bytes)?;
     validate_audio_bytes(&audio.import, MAX_IMPORT_BYTES)?;
     if let Some(report) = &audio.conversion {
@@ -1993,6 +2118,10 @@ fn validate_prepared_audio(audio: &PreparedAudio, max_original_bytes: u64) -> Re
         normalize_sha256(&report.pcm_sha256)?;
     }
     Ok(())
+}
+
+fn same_prepared_audio_identity(left: &PreparedAudio, right: &PreparedAudio) -> Result<bool> {
+    Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
 }
 
 fn validate_audio_bytes(audio: &AudioBytes, max_bytes: u64) -> Result<()> {
@@ -2213,7 +2342,7 @@ fn render_status(job: &StoredJob) -> String {
         .as_ref()
         .and_then(|audio| audio.conversion.as_ref())
     {
-        text.push_str("\nFLAC → ALAC: verified lossless.");
+        text.push_str("\nLossless source → ALAC: verified.");
         for warning in report.warnings.iter().take(3) {
             let message: String = warning
                 .message
@@ -2554,7 +2683,7 @@ mod unit_tests {
         assert_eq!(supported_extension("ALBUM.M4A"), Some("m4a"));
         assert_eq!(supported_extension("voice.Mp3"), Some("mp3"));
         assert_eq!(supported_extension("voice.aAc"), Some("aac"));
-        assert_eq!(supported_extension("voice.wav"), None);
+        assert_eq!(supported_extension("voice.WAV"), Some("wav"));
     }
 
     #[test]
@@ -2590,3 +2719,7 @@ mod unit_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "music_wav_e2e_tests.rs"]
+mod wav_e2e_tests;

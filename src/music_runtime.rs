@@ -11,12 +11,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::sync::{Notify, OnceCell, oneshot, watch};
 
-use crate::music_manager::{Admission, MusicManager};
+use crate::music_manager::{Admission, MusicManager, validate_prepared_audio};
 use crate::music_native::NativeMusicBackend;
 use crate::music_transfer::MusicTransfer;
 use crate::music_types::{
-    ArchiveState, MusicBackend, MusicCancellation, MusicSettings, MusicTrack, MusicUpload,
-    PreparedAudio,
+    ArchiveState, AudioBytes, MusicBackend, MusicCancellation, MusicSettings, MusicTrack,
+    MusicUpload, PreparedAudio,
 };
 use crate::telegram::TelegramClient;
 
@@ -210,14 +210,14 @@ pub struct RuntimeMusicBackend {
     transfer: MusicTransfer,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct AcceptedProof {
     schema: u8,
     accepted: bool,
     items: Vec<AcceptedTrack>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct AcceptedTrack {
     sha256: String,
     size_bytes: u64,
@@ -226,6 +226,8 @@ struct AcceptedTrack {
     full_decode_passed: bool,
     music_copy_hash_verified: bool,
     archive_uploaded: bool,
+    #[serde(default)]
+    prepared_audio: Option<PreparedAudio>,
 }
 
 #[derive(Deserialize)]
@@ -379,45 +381,78 @@ fn read_private_proof<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> 
     serde_json::from_slice(&bytes).context("invalid accepted Music proof")
 }
 
-/// Explicit operator handover for the already accepted real test tracks; never adds tracks.
-pub async fn seed_accepted_records(
-    config: crate::config::AppConfig,
-    proof: std::path::PathBuf,
-) -> Result<usize> {
-    if !config.music.enabled {
-        bail!("enable music imports before seeding accepted tracks");
+fn verify_accepted_records(
+    proof: AcceptedProof,
+    settings: &MusicSettings,
+    native_root: &Path,
+    backend: &dyn MusicBackend,
+    mut verify_retained_audio: impl FnMut(&AudioBytes) -> Result<()>,
+) -> Result<Vec<(PreparedAudio, ArchiveState, MusicTrack)>> {
+    if proof.schema != 1 || !proof.accepted || proof.items.is_empty() || proof.items.len() > 64 {
+        bail!("invalid accepted Music proof scope");
     }
-    let settings = config.music.clone();
-    let telegram = TelegramClient::new(config.telegram.token.clone());
-    let backend: Arc<dyn MusicBackend> = Arc::new(RuntimeMusicBackend::new(
-        settings.clone(),
-        config.telegram.token.clone(),
-    ));
-    let (manager, records) = tokio::task::spawn_blocking(move || -> Result<_> {
-        use crate::music_types::AudioBytes;
-        let proof: AcceptedProof = read_private_proof(&proof)?;
-        if proof.schema != 1 || !proof.accepted || proof.items.is_empty() || proof.items.len() > 64
+
+    let mut prepared_records = Vec::with_capacity(proof.items.len());
+    let mut seen_hashes = std::collections::BTreeSet::new();
+    let mut seen_persistent_ids = std::collections::BTreeSet::new();
+    for item in proof.items {
+        if !item.full_decode_passed
+            || !item.music_copy_hash_verified
+            || !item.archive_uploaded
+            || item.sha256.len() != 64
+            || !item.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || item.size_bytes == 0
+            || item.size_bytes > MAX_SUPPORTED_SOURCE_BYTES
+            || item.archive_path.parent() != Some(settings.archive_dir.as_path())
+            || item.persistent_id.len() != 16
+            || !item
+                .persistent_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
-            bail!("invalid accepted Music proof scope");
+            bail!("accepted Music track has an invalid content or archive identity");
         }
-        let home = account_home()?;
-        // The native source receipts stay at the established test profile path.
-        let native_root = home.join(".local/lib/telegram-video-downloader-test/music-import");
-        backend.check_music_ready()?;
-        let mut records = Vec::new();
-        for item in proof.items {
-            if !item.full_decode_passed
-                || !item.music_copy_hash_verified
-                || !item.archive_uploaded
-                || item.sha256.len() != 64
-                || !item.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || item.size_bytes == 0
-                || item.size_bytes > MAX_SUPPORTED_SOURCE_BYTES
-                || item.archive_path.parent() != Some(settings.archive_dir.as_path())
+        let digest = item.sha256.to_ascii_lowercase();
+        if !seen_hashes.insert(digest.clone())
+            || !seen_persistent_ids.insert(item.persistent_id.clone())
+        {
+            bail!("accepted Music proof repeats a content hash or persistent ID");
+        }
+
+        let audio = if let Some(audio) = item.prepared_audio.clone() {
+            validate_prepared_audio(&audio, MAX_SUPPORTED_SOURCE_BYTES)?;
+            let report = audio
+                .conversion
+                .as_ref()
+                .context("accepted converted audio is missing its conversion report")?;
+            let original_extension = audio
+                .original
+                .path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str);
+            let import_extension = audio
+                .import
+                .path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str);
+            if !audio.original.sha256.eq_ignore_ascii_case(&digest)
+                || audio.original.size != item.size_bytes
+                || audio
+                    .original
+                    .sha256
+                    .eq_ignore_ascii_case(&audio.import.sha256)
+                || !original_extension.is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("flac") || extension.eq_ignore_ascii_case("wav")
+                })
+                || !import_extension.is_some_and(|extension| extension.eq_ignore_ascii_case("m4a"))
+                || !report.audio_bit_exact
             {
-                bail!("accepted Music track has an invalid content or archive identity");
+                bail!("accepted converted audio differs from its original and ALAC identities");
             }
-            let digest = item.sha256.to_ascii_lowercase();
+            verify_retained_audio(&audio.original)?;
+            verify_retained_audio(&audio.import)?;
+            audio
+        } else {
             let saved: AcceptedNativeReceipt =
                 read_private_proof(&native_root.join("receipts").join(format!("{digest}.json")))?;
             if saved.schema != 1
@@ -442,26 +477,72 @@ pub async fn seed_accepted_records(
                     size: item.size_bytes,
                 },
             };
-            let track = backend.query_track(&item.persistent_id)?;
-            if !track.cloud_complete() {
-                bail!("accepted Music track no longer has confirmed cloud status");
-            }
-            backend.verify_copy(&audio, &track)?;
-            let archive = backend.archive_status(&item.archive_path)?;
-            if !archive.uploaded || archive.uploading || archive.downloading || archive.conflicts {
-                bail!("accepted archive is not confirmed uploaded and stable");
-            }
-            records.push((audio, archive, track));
+            validate_prepared_audio(&audio, MAX_SUPPORTED_SOURCE_BYTES)?;
+            // Legacy receipts identify the retained same-hash M4A import. Their original
+            // path is the archive path and may be dataless after successful upload.
+            verify_retained_audio(&audio.import)?;
+            audio
+        };
+        prepared_records.push((item, audio));
+    }
+
+    backend.check_music_ready()?;
+    let mut records = Vec::with_capacity(prepared_records.len());
+    for (item, audio) in prepared_records {
+        let track = backend.query_track(&item.persistent_id)?;
+        if track.persistent_id != item.persistent_id {
+            bail!("Music returned a different persistent ID than the accepted record");
         }
-        let manager = MusicManager::open(settings, telegram, backend)?;
+        if !track.cloud_complete() {
+            bail!("accepted Music track no longer has confirmed cloud status");
+        }
+        backend.verify_copy(&audio, &track)?;
+        let archive = backend.archive_status(&item.archive_path)?;
+        if archive.path != item.archive_path
+            || !archive.uploaded
+            || archive.uploading
+            || archive.downloading
+            || archive.conflicts
+        {
+            bail!("accepted archive is not confirmed uploaded and stable");
+        }
+        records.push((audio, archive, track));
+    }
+    Ok(records)
+}
+
+/// Explicit operator handover for the already accepted real test tracks; never adds tracks.
+pub async fn seed_accepted_records(
+    config: crate::config::AppConfig,
+    proof: std::path::PathBuf,
+    dry_run: bool,
+) -> Result<usize> {
+    if !config.music.enabled {
+        bail!("enable music imports before seeding accepted tracks");
+    }
+    let settings = config.music.clone();
+    let telegram = TelegramClient::new(config.telegram.token.clone());
+    let backend: Arc<dyn MusicBackend> = Arc::new(RuntimeMusicBackend::new(
+        settings.clone(),
+        config.telegram.token.clone(),
+    ));
+    let verifier = NativeMusicBackend::new(settings.clone());
+    let (manager, records) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let proof: AcceptedProof = read_private_proof(&proof)?;
+        let home = account_home()?;
+        // The native source receipts stay at the established test profile path.
+        let native_root = home.join(".local/lib/telegram-video-downloader-test/music-import");
+        let records =
+            verify_accepted_records(proof, &settings, &native_root, backend.as_ref(), |audio| {
+                verifier.verify_retained_audio(audio)
+            })?;
+        let manager = MusicManager::open_for_seed(settings, telegram, backend)?;
         Ok((manager, records))
     })
     .await
     .context("accepted Music verification worker failed")??;
     let count = records.len();
-    for (audio, archive, track) in records {
-        manager.seed_completed(&audio, &archive, &track).await?;
-    }
+    manager.seed_completed_batch(&records, dry_run).await?;
     Ok(count)
 }
 
@@ -533,10 +614,405 @@ impl MusicBackend for RuntimeMusicBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
+
+    struct AcceptedTestBackend {
+        music_copy: PathBuf,
+        persistent_id_override: Mutex<Option<String>>,
+        archive_flags: Mutex<(bool, bool, bool, bool)>,
+        queried_ids: Mutex<Vec<String>>,
+        prepares: AtomicUsize,
+        adds: AtomicUsize,
+    }
+
+    impl AcceptedTestBackend {
+        fn new(music_copy: PathBuf) -> Self {
+            Self {
+                music_copy,
+                persistent_id_override: Mutex::new(None),
+                archive_flags: Mutex::new((true, false, false, false)),
+                queried_ids: Mutex::new(Vec::new()),
+                prepares: AtomicUsize::new(0),
+                adds: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MusicBackend for AcceptedTestBackend {
+        fn download(&self, _: &MusicUpload, _: &Path, _: &MusicCancellation) -> Result<()> {
+            bail!("accepted-record verification must not download audio")
+        }
+
+        fn prepare(&self, _: &Path, _: &Path, _: &MusicCancellation) -> Result<PreparedAudio> {
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            bail!("accepted-record verification must not reconvert audio")
+        }
+
+        fn archive(&self, _: &PreparedAudio, _: &str) -> Result<ArchiveState> {
+            bail!("accepted-record verification must not create archives")
+        }
+
+        fn add_track(&self, _: &PreparedAudio) -> Result<String> {
+            self.adds.fetch_add(1, Ordering::Relaxed);
+            bail!("accepted-record verification must not add Music tracks")
+        }
+
+        fn query_track(&self, persistent_id: &str) -> Result<MusicTrack> {
+            self.queried_ids
+                .lock()
+                .expect("query list should not be poisoned")
+                .push(persistent_id.to_string());
+            let returned_id = self
+                .persistent_id_override
+                .lock()
+                .expect("PID override should not be poisoned")
+                .clone()
+                .unwrap_or_else(|| persistent_id.to_string());
+            Ok(MusicTrack {
+                persistent_id: returned_id,
+                location: Some(self.music_copy.clone()),
+                cloud_status: "matched".to_string(),
+            })
+        }
+
+        fn verify_copy(&self, audio: &PreparedAudio, track: &MusicTrack) -> Result<()> {
+            anyhow::ensure!(track.location.as_deref() == Some(self.music_copy.as_path()));
+            let import = fs::read(&audio.import.path)?;
+            let copy = fs::read(&self.music_copy)?;
+            anyhow::ensure!(
+                import == copy,
+                "Music copy bytes differ from the saved import"
+            );
+            let digest = format!("{:x}", Sha256::digest(&copy));
+            anyhow::ensure!(digest == audio.import.sha256);
+            anyhow::ensure!(copy.len() as u64 == audio.import.size);
+            Ok(())
+        }
+
+        fn archive_status(&self, path: &Path) -> Result<ArchiveState> {
+            let (uploaded, uploading, downloading, conflicts) = *self
+                .archive_flags
+                .lock()
+                .expect("archive flags should not be poisoned");
+            Ok(ArchiveState {
+                path: path.to_path_buf(),
+                uploaded,
+                uploading,
+                downloading,
+                conflicts,
+                local_bytes: false,
+            })
+        }
+
+        fn evict_archive(&self, _: &ArchiveState, _: &MusicTrack) -> Result<ArchiveState> {
+            bail!("accepted-record verification must not evict archives")
+        }
+    }
+
+    struct AcceptedProofFixture {
+        _temp: tempfile::TempDir,
+        settings: MusicSettings,
+        native_root: PathBuf,
+        backend: Arc<AcceptedTestBackend>,
+        verifier: NativeMusicBackend,
+    }
+
+    impl AcceptedProofFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("create accepted-proof fixture");
+            let root = temp
+                .path()
+                .canonicalize()
+                .expect("canonicalize fixture root");
+            let settings = MusicSettings {
+                enabled: true,
+                state_dir: root.join("state"),
+                staging_dir: root.join("staging"),
+                archive_dir: root.join("archive"),
+                max_file_bytes: MAX_SUPPORTED_SOURCE_BYTES,
+                ..MusicSettings::default()
+            };
+            fs::create_dir_all(&settings.staging_dir).expect("create fixture staging root");
+            fs::create_dir_all(&settings.archive_dir).expect("create fixture archive root");
+            let native_root = root.join("test-profile/music-import");
+            fs::create_dir_all(&native_root).expect("create test native root");
+            let music_copy = root.join("Music/accepted-copy.m4a");
+            fs::create_dir_all(music_copy.parent().unwrap()).expect("create Music copy root");
+            let backend = Arc::new(AcceptedTestBackend::new(music_copy.clone()));
+            let verifier = NativeMusicBackend::new(settings.clone());
+            Self {
+                _temp: temp,
+                settings,
+                native_root,
+                backend,
+                verifier,
+            }
+        }
+
+        fn typed_proof(&self) -> (AcceptedProof, PreparedAudio, PathBuf, PathBuf) {
+            let original_path = self.settings.staging_dir.join("accepted/original.FLAC");
+            let import_path = self.settings.staging_dir.join("accepted/import.m4a");
+            fs::create_dir_all(original_path.parent().unwrap())
+                .expect("create accepted source directory");
+            let original_bytes = b"previously accepted FLAC source bytes";
+            let import_bytes = b"previously accepted ALAC import bytes";
+            fs::write(&original_path, original_bytes).expect("write accepted FLAC source");
+            fs::write(&import_path, import_bytes).expect("write accepted ALAC import");
+            let original_sha = format!("{:x}", Sha256::digest(original_bytes));
+            let import_sha = format!("{:x}", Sha256::digest(import_bytes));
+            fs::write(&self.backend.music_copy, import_bytes)
+                .expect("write Music-owned copy fixture");
+
+            let audio = PreparedAudio {
+                original: AudioBytes {
+                    path: original_path.clone(),
+                    sha256: original_sha.clone(),
+                    size: original_bytes.len() as u64,
+                },
+                import: AudioBytes {
+                    path: import_path.clone(),
+                    sha256: import_sha.clone(),
+                    size: import_bytes.len() as u64,
+                },
+                conversion: Some(flac_alac_converter::types::ConversionReport {
+                    version: flac_alac_converter::types::PROTOCOL_VERSION,
+                    source: flac_alac_converter::types::AudioSpec {
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bits_per_sample: 24,
+                        frames: 100,
+                    },
+                    output: flac_alac_converter::types::AudioSpec {
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bits_per_sample: 24,
+                        frames: 100,
+                    },
+                    output_path: import_path.clone(),
+                    input_sha256: original_sha.clone(),
+                    output_sha256: import_sha.clone(),
+                    pcm_sha256: "e".repeat(64),
+                    audio_bit_exact: true,
+                    metadata: flac_alac_converter::types::MetadataReport::default(),
+                    warnings: Vec::new(),
+                }),
+            };
+            let persistent_id = "1234567890ABCDEF".to_string();
+            let item = AcceptedTrack {
+                sha256: original_sha,
+                size_bytes: original_bytes.len() as u64,
+                persistent_id,
+                archive_path: self.settings.archive_dir.join("accepted-original.flac"),
+                full_decode_passed: true,
+                music_copy_hash_verified: true,
+                archive_uploaded: true,
+                prepared_audio: Some(audio.clone()),
+            };
+            (
+                AcceptedProof {
+                    schema: 1,
+                    accepted: true,
+                    items: vec![item],
+                },
+                audio,
+                original_path,
+                import_path,
+            )
+        }
+
+        fn verify(
+            &self,
+            proof: AcceptedProof,
+        ) -> Result<Vec<(PreparedAudio, ArchiveState, MusicTrack)>> {
+            verify_accepted_records(
+                proof,
+                &self.settings,
+                &self.native_root,
+                self.backend.as_ref(),
+                |audio| self.verifier.verify_retained_audio(audio),
+            )
+        }
+
+        fn assert_no_add_or_prepare(&self) {
+            assert_eq!(self.backend.prepares.load(Ordering::Relaxed), 0);
+            assert_eq!(self.backend.adds.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    fn make_private_directory(path: &Path) {
+        fs::create_dir_all(path).expect("create private proof directory");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("set private proof directory mode");
+    }
+
+    fn write_private_receipt(path: &Path, bytes: &[u8], persistent_id: &str) -> PathBuf {
+        let source_root = path.join("sources");
+        let receipt_root = path.join("receipts");
+        make_private_directory(&source_root);
+        make_private_directory(&receipt_root);
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let source_path = source_root.join(format!("{sha256}.m4a"));
+        fs::write(&source_path, bytes).expect("write retained legacy M4A source");
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600))
+            .expect("set retained M4A source mode");
+        let receipt = serde_json::json!({
+            "schema": 1,
+            "state": "complete",
+            "source_path": source_path,
+            "sha256": sha256,
+            "size": bytes.len(),
+            "track_persistent_id": persistent_id,
+        });
+        let receipt_path = receipt_root.join(format!("{sha256}.json"));
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("encode native receipt"),
+        )
+        .expect("write private native receipt");
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+            .expect("set private native receipt mode");
+        receipt_path
+    }
+
+    #[test]
+    fn typed_accepted_flac_uses_distinct_original_and_import_hashes_and_saved_pid() {
+        let fixture = AcceptedProofFixture::new();
+        let (proof, audio, _, _) = fixture.typed_proof();
+        assert_ne!(audio.original.sha256, audio.import.sha256);
+
+        let records = fixture
+            .verify(proof)
+            .expect("a fully verified converted record should pass handoff checks");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0.original.sha256, audio.original.sha256);
+        assert_eq!(records[0].0.import.sha256, audio.import.sha256);
+        assert!(records[0].0.conversion.is_some());
+        assert_eq!(
+            records[0].1.path,
+            fixture.settings.archive_dir.join("accepted-original.flac")
+        );
+        assert_eq!(records[0].2.persistent_id, "1234567890ABCDEF");
+        assert_eq!(
+            *fixture.backend.queried_ids.lock().unwrap(),
+            vec!["1234567890ABCDEF".to_string()]
+        );
+        fixture.assert_no_add_or_prepare();
+    }
+
+    #[test]
+    fn legacy_accepted_m4a_uses_same_hash_receipt_without_conversion() {
+        let fixture = AcceptedProofFixture::new();
+        let persistent_id = "0011223344556677";
+        let source_bytes = b"previously accepted legacy M4A bytes";
+        write_private_receipt(&fixture.native_root, source_bytes, persistent_id);
+        fs::write(&fixture.backend.music_copy, source_bytes)
+            .expect("write legacy Music copy fixture");
+        let digest = format!("{:x}", Sha256::digest(source_bytes));
+        let archive_path = fixture.settings.archive_dir.join("legacy-accepted.m4a");
+        let proof = AcceptedProof {
+            schema: 1,
+            accepted: true,
+            items: vec![AcceptedTrack {
+                sha256: digest.clone(),
+                size_bytes: source_bytes.len() as u64,
+                persistent_id: persistent_id.to_string(),
+                archive_path: archive_path.clone(),
+                full_decode_passed: true,
+                music_copy_hash_verified: true,
+                archive_uploaded: true,
+                prepared_audio: None,
+            }],
+        };
+
+        let records = fixture
+            .verify(proof)
+            .expect("the original receipt-backed M4A proof should remain accepted");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0.original.sha256, digest);
+        assert_eq!(records[0].0.import.sha256, records[0].0.original.sha256);
+        assert!(records[0].0.conversion.is_none());
+        assert_eq!(records[0].0.original.path, archive_path);
+        assert_eq!(
+            records[0].0.import.path,
+            fixture
+                .native_root
+                .join("sources")
+                .join(format!("{}.m4a", records[0].0.import.sha256))
+        );
+        fixture.assert_no_add_or_prepare();
+    }
+
+    #[test]
+    fn accepted_converted_proof_rejects_tampered_sources_and_report_before_query() {
+        for tamper in ["original", "import", "report"] {
+            let fixture = AcceptedProofFixture::new();
+            let (mut proof, _, original_path, import_path) = fixture.typed_proof();
+            match tamper {
+                "original" => fs::write(original_path, b"tampered original bytes")
+                    .expect("tamper original source fixture"),
+                "import" => fs::write(import_path, b"tampered import bytes")
+                    .expect("tamper import source fixture"),
+                "report" => {
+                    proof.items[0]
+                        .prepared_audio
+                        .as_mut()
+                        .unwrap()
+                        .conversion
+                        .as_mut()
+                        .unwrap()
+                        .output_sha256 = "0".repeat(64);
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                fixture.verify(proof).is_err(),
+                "{tamper} tampering must be rejected"
+            );
+            assert!(fixture.backend.queried_ids.lock().unwrap().is_empty());
+            fixture.assert_no_add_or_prepare();
+        }
+    }
+
+    #[test]
+    fn accepted_proof_rejects_wrong_music_pid_and_unstable_archive_without_importing() {
+        let fixture = AcceptedProofFixture::new();
+        let (proof, _, _, _) = fixture.typed_proof();
+        *fixture.backend.persistent_id_override.lock().unwrap() =
+            Some("FEDCBA0987654321".to_string());
+        assert!(fixture.verify(proof).is_err());
+        assert_eq!(
+            *fixture.backend.queried_ids.lock().unwrap(),
+            vec!["1234567890ABCDEF".to_string()]
+        );
+        fixture.assert_no_add_or_prepare();
+
+        let fixture = AcceptedProofFixture::new();
+        let (proof, _, _, _) = fixture.typed_proof();
+        *fixture.backend.archive_flags.lock().unwrap() = (true, true, false, false);
+        assert!(fixture.verify(proof).is_err());
+        fixture.assert_no_add_or_prepare();
+    }
+
+    #[test]
+    fn duplicate_accepted_proof_records_are_rejected_before_music_query() {
+        let fixture = AcceptedProofFixture::new();
+        let (mut proof, _, _, _) = fixture.typed_proof();
+        proof.items.push(proof.items[0].clone());
+
+        assert!(fixture.verify(proof).is_err());
+        assert!(fixture.backend.queried_ids.lock().unwrap().is_empty());
+        fixture.assert_no_add_or_prepare();
+    }
 
     fn find_test_tool(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;

@@ -1,7 +1,7 @@
 ---
 id: 20261113-mfi01
 title: FLAC uploads in automatic Music imports
-status: active
+status: completed
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/music-flac-integration
@@ -111,10 +111,17 @@ matched the import SHA-256. iCloud confirmed the original FLAC upload before
 eviction, and a private read-only acceptance proof preserved the three baseline
 tasks/catalog bindings and checked all four retained local source/import files.
 
-## Next steps
+## Production boundary
 
-Production rollout remains a separate explicit gate. Include the matching
-Python-runtime update, fixed signed bot and static helper, verify Music grant
-reuse, and retain rollback. Music cloud status, verified independent copy and
-iCloud-original upload/eviction are independently checked by the private live
-acceptance proof; a successful add alone is insufficient.
+The fixed signed production executable, static converter and matching Python
+runtime/helper were refreshed from the merged FLAC/archive-safety tree. Startup
+and Cloud ingress reconciliation passed, existing catalog records were preserved,
+and a read-only Music check reused the production grant. Scoped TCC evidence
+attributed the actual script request to the fixed production identity. Private
+acceptance and rollback receipts remain local.
+
+Converted accepted-record handoff and WAV support use the
+[follow-up workstream](2026-11-13-music-wav-handoff-mwh01.md). Each later deployment
+still requires its own controlled signing/readiness gate. Music cloud status,
+independent local copy and iCloud-original upload/eviction remain separate checks;
+a successful add alone is insufficient.

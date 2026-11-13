@@ -29,7 +29,7 @@ keep_sidecars = true
 [music]
 max_file_bytes = 536870912 # 512 MiB
 cloud_poll_seconds = 60
-# FLAC is converted losslessly by the installed native helper before Music import.
+# FLAC and supported PCM WAV are converted losslessly by the native helper.
 # converter defaults to the active profile's libexec/flac-alac-converter.
 conversion_timeout_seconds = 1800
 # Defaults are rooted at the configured video download root. With the default

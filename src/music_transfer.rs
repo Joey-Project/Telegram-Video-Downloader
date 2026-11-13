@@ -384,7 +384,9 @@ fn validate_transfer_paths(settings: &MusicSettings, destination: &Path) -> Resu
             .is_some_and(valid_job_id)
         || !matches!(
             destination.file_name().and_then(|name| name.to_str()),
-            Some("original.m4a" | "original.mp3" | "original.aac" | "original.flac")
+            Some(
+                "original.m4a" | "original.mp3" | "original.aac" | "original.flac" | "original.wav"
+            )
         )
         || settings
             .staging_dir
@@ -606,6 +608,7 @@ mod tests {
         };
         assert!(validate_transfer_paths(&settings, &job.join("original.m4a")).is_ok());
         assert!(validate_transfer_paths(&settings, &job.join("original.flac")).is_ok());
+        assert!(validate_transfer_paths(&settings, &job.join("original.wav")).is_ok());
         assert!(validate_transfer_paths(&settings, &job.join("input.mp3")).is_err());
         assert!(validate_transfer_paths(&settings, &job.join("../original.mp3")).is_err());
     }
