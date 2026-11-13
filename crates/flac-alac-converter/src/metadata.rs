@@ -34,14 +34,17 @@ const MAX_WARNINGS: usize = 128;
 
 const AUDIT_MEAN: &str = "org.joey.flac-original";
 const AUDIT_RAW_MEAN: &str = "org.joey.flac-original.raw";
+const WAV_AUDIT_MEAN: &str = "org.joey.wav-original";
+const WAV_AUDIT_RAW_MEAN: &str = "org.joey.wav-original.raw";
 const AUDIT_RAW_BLOCK_PREFIX: &str = "FLAC_RAW_BLOCK";
 const AUDIT_RAW_COMMENT_PREFIX: &str = "FLAC_RAW_COMMENT";
 const AUDIT_RAW_VENDOR_PREFIX: &str = "FLAC_RAW_VENDOR";
 const AUDIT_STREAMINFO_NAME: &str = "FLAC_STREAMINFO_RAW";
 
-/// Fully owned FLAC metadata needed for migration and exact read-back checks.
+/// Fully owned source metadata needed for migration and exact read-back checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceMetadata {
+    pub kind: SourceKind,
     pub audio: AudioSpec,
     pub comments: Vec<SourceComment>,
     pub comment_blocks: Vec<SourceCommentBlock>,
@@ -50,16 +53,34 @@ pub struct SourceMetadata {
     pub opaque_blocks: Vec<OpaqueMetadataBlock>,
     pub id3v2_prefix: Option<Vec<u8>>,
     pub streaminfo: Vec<u8>,
+    pub raw_chunks: Vec<RawMetadataChunk>,
     pub warnings: Vec<Warning>,
 }
 
-/// One valid UTF-8 Vorbis comment, preserving its original key spelling/order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceKind {
+    Flac,
+    Wav,
+}
+
+/// A bounded non-audio WAVE chunk retained byte-for-byte in the M4A audit area.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawMetadataChunk {
+    pub name: String,
+    pub label: String,
+    pub bytes: Vec<u8>,
+    pub unmapped: bool,
+}
+
+/// One valid UTF-8 source comment, preserving its original key spelling/order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceComment {
     pub block_index: usize,
     pub entry_index: usize,
     pub key: String,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_name: Option<String>,
 }
 
 /// Vendor data from one Vorbis Comment block.
@@ -257,6 +278,7 @@ pub fn read(path: &Path) -> Result<SourceMetadata> {
     ensure!(saw_streaminfo, "FLAC source has no STREAMINFO block");
     let audio = audio.context("FLAC source has no parsed STREAMINFO")?;
     Ok(SourceMetadata {
+        kind: SourceKind::Flac,
         audio,
         comments,
         comment_blocks,
@@ -265,11 +287,12 @@ pub fn read(path: &Path) -> Result<SourceMetadata> {
         opaque_blocks,
         id3v2_prefix,
         streaminfo,
+        raw_chunks: Vec::new(),
         warnings,
     })
 }
 
-/// Migrates source metadata to an existing encoded M4A and verifies every
+/// Migrates FLAC or WAVE source metadata to an existing encoded M4A and verifies every
 /// migrated value by reopening the result through mp4ameta.
 pub fn write_and_verify(source: &SourceMetadata, output: &Path) -> Result<MetadataReport> {
     prepare_moov_for_bounded_write(output)?;
@@ -287,124 +310,153 @@ pub fn write_and_verify(source: &SourceMetadata, output: &Path) -> Result<Metada
     let mut preserved_names = BTreeSet::new();
     let mut unknown_keys = BTreeSet::new();
 
-    for block in &source.comment_blocks {
-        let name = format!("FLAC_VORBIS_VENDOR_{:06}", block.block_index);
-        if let Some(vendor) = &block.vendor {
+    if source.kind == SourceKind::Flac {
+        for block in &source.comment_blocks {
+            let name = format!("FLAC_VORBIS_VENDOR_{:06}", block.block_index);
+            if let Some(vendor) = &block.vendor {
+                add_audit_data(
+                    &mut tag,
+                    &mut expected_audit,
+                    &name,
+                    Data::Utf8(vendor.clone()),
+                );
+                preserved_names.insert(format!("Vorbis vendor block {}", block.block_index));
+            }
+            if let Some(raw) = &block.invalid_vendor {
+                let raw_name = format!("{AUDIT_RAW_VENDOR_PREFIX}_{:06}", block.block_index);
+                add_audit_data(
+                    &mut tag,
+                    &mut expected_audit,
+                    &raw_name,
+                    Data::Reserved(raw.clone()),
+                );
+                preserved_names.insert(format!("raw Vorbis vendor block {}", block.block_index));
+                report
+                    .unmapped
+                    .push(format!("Vorbis vendor block {}", block.block_index));
+                report.warnings.push(Warning::new(
+                "invalid_vorbis_vendor_preserved",
+                format!("Vorbis Comment block {} had a non-UTF-8 vendor string; its original bytes were retained.", block.block_index),
+            ));
+            }
+        }
+
+        if let Some(raw) = &source.id3v2_prefix {
+            add_audit_data(
+                &mut tag,
+                &mut expected_audit,
+                "FLAC_ID3V2_PREFIX_RAW",
+                Data::Reserved(raw.clone()),
+            );
+            preserved_names.insert("ID3v2 prefix".to_owned());
+            report.unmapped.push("ID3v2 prefix".to_owned());
+            report.warnings.push(Warning::new(
+            "id3v2_prefix_preserved_opaque",
+            "An ID3v2 prefix before the FLAC stream was retained as opaque bytes; its frames were not interpreted or mapped.",
+        ));
+        }
+    }
+
+    for comment in &source.comments {
+        let audit_name = comment
+            .audit_name
+            .as_deref()
+            .unwrap_or(comment.key.as_str());
+        let ident = source_comment_ident(source.kind, audit_name);
+        let data = Data::Utf8(comment.value.clone());
+        tag.add_data(ident.clone(), data.clone());
+        expected_audit.push((ident, data));
+        preserved_names.insert(match source.kind {
+            SourceKind::Flac => format!("FLAC comment {}", comment.key),
+            SourceKind::Wav => format!("WAV INFO {}", audit_name.trim_start_matches("INFO_")),
+        });
+        if !is_mapped_key(&comment.key) {
+            unknown_keys.insert(match source.kind {
+                SourceKind::Flac => comment.key.clone(),
+                SourceKind::Wav => format!("WAV INFO {}", audit_name.trim_start_matches("INFO_")),
+            });
+        }
+    }
+
+    if source.kind == SourceKind::Flac {
+        for invalid in &source.invalid_comments {
+            let name = format!(
+                "{AUDIT_RAW_COMMENT_PREFIX}_{:06}_{:06}",
+                invalid.block_index, invalid.entry_index
+            );
             add_audit_data(
                 &mut tag,
                 &mut expected_audit,
                 &name,
-                Data::Utf8(vendor.clone()),
+                Data::Reserved(invalid.raw.clone()),
             );
-            preserved_names.insert(format!("Vorbis vendor block {}", block.block_index));
-        }
-        if let Some(raw) = &block.invalid_vendor {
-            let raw_name = format!("{AUDIT_RAW_VENDOR_PREFIX}_{:06}", block.block_index);
-            add_audit_data(
-                &mut tag,
-                &mut expected_audit,
-                &raw_name,
-                Data::Reserved(raw.clone()),
-            );
-            preserved_names.insert(format!("raw Vorbis vendor block {}", block.block_index));
-            report
-                .unmapped
-                .push(format!("Vorbis vendor block {}", block.block_index));
-            report.warnings.push(Warning::new(
-                "invalid_vorbis_vendor_preserved",
-                format!("Vorbis Comment block {} had a non-UTF-8 vendor string; its original bytes were retained.", block.block_index),
+            preserved_names.insert(format!(
+                "raw FLAC comment block {} entry {}",
+                invalid.block_index, invalid.entry_index
             ));
-        }
-    }
-
-    if let Some(raw) = &source.id3v2_prefix {
-        add_audit_data(
-            &mut tag,
-            &mut expected_audit,
-            "FLAC_ID3V2_PREFIX_RAW",
-            Data::Reserved(raw.clone()),
-        );
-        preserved_names.insert("ID3v2 prefix".to_owned());
-        report.unmapped.push("ID3v2 prefix".to_owned());
-        report.warnings.push(Warning::new(
-            "id3v2_prefix_preserved_opaque",
-            "An ID3v2 prefix before the FLAC stream was retained as opaque bytes; its frames were not interpreted or mapped.",
-        ));
-    }
-
-    for comment in &source.comments {
-        let ident = source_comment_ident(comment.key.as_str());
-        let data = Data::Utf8(comment.value.clone());
-        tag.add_data(ident.clone(), data.clone());
-        expected_audit.push((ident, data));
-        preserved_names.insert(format!("FLAC comment {}", comment.key));
-        if !is_mapped_key(&comment.key) {
-            unknown_keys.insert(comment.key.clone());
-        }
-    }
-
-    for invalid in &source.invalid_comments {
-        let name = format!(
-            "{AUDIT_RAW_COMMENT_PREFIX}_{:06}_{:06}",
-            invalid.block_index, invalid.entry_index
-        );
-        add_audit_data(
-            &mut tag,
-            &mut expected_audit,
-            &name,
-            Data::Reserved(invalid.raw.clone()),
-        );
-        preserved_names.insert(format!(
-            "raw FLAC comment block {} entry {}",
-            invalid.block_index, invalid.entry_index
-        ));
-        report.unmapped.push(format!(
-            "FLAC raw comment block {} entry {}",
-            invalid.block_index, invalid.entry_index
-        ));
-        report.warnings.push(Warning::new(
+            report.unmapped.push(format!(
+                "FLAC raw comment block {} entry {}",
+                invalid.block_index, invalid.entry_index
+            ));
+            report.warnings.push(Warning::new(
             "invalid_vorbis_comment_preserved",
             format!(
                 "FLAC comment block {} entry {} was retained as opaque bytes ({}) and was not mapped to Music fields.",
                 invalid.block_index, invalid.entry_index, invalid.reason
             ),
         ));
-    }
+        }
 
-    add_audit_data(
-        &mut tag,
-        &mut expected_audit,
-        AUDIT_STREAMINFO_NAME,
-        Data::Reserved(source.streaminfo.clone()),
-    );
-    preserved_names.insert("FLAC STREAMINFO".to_owned());
-
-    for block in &source.opaque_blocks {
-        let name = format!(
-            "{AUDIT_RAW_BLOCK_PREFIX}_{:06}_TYPE_{:02X}",
-            block.block_index, block.block_type
-        );
         add_audit_data(
             &mut tag,
             &mut expected_audit,
-            &name,
-            Data::Reserved(block.payload.clone()),
+            AUDIT_STREAMINFO_NAME,
+            Data::Reserved(source.streaminfo.clone()),
         );
-        preserved_names.insert(format!(
-            "FLAC metadata block {} type {}",
-            block.block_index, block.block_type
-        ));
-        report.unmapped.push(format!(
-            "FLAC metadata block {} type {}",
-            block.block_index, block.block_type
-        ));
-        report.warnings.push(Warning::new(
+        preserved_names.insert("FLAC STREAMINFO".to_owned());
+
+        for block in &source.opaque_blocks {
+            let name = format!(
+                "{AUDIT_RAW_BLOCK_PREFIX}_{:06}_TYPE_{:02X}",
+                block.block_index, block.block_type
+            );
+            add_audit_data(
+                &mut tag,
+                &mut expected_audit,
+                &name,
+                Data::Reserved(block.payload.clone()),
+            );
+            preserved_names.insert(format!(
+                "FLAC metadata block {} type {}",
+                block.block_index, block.block_type
+            ));
+            report.unmapped.push(format!(
+                "FLAC metadata block {} type {}",
+                block.block_index, block.block_type
+            ));
+            report.warnings.push(Warning::new(
             "opaque_flac_block_preserved",
             format!(
                 "FLAC metadata block {} (type {}) was retained in a namespaced M4A freeform atom.",
                 block.block_index, block.block_type
             ),
         ));
+        }
+    } else {
+        for chunk in &source.raw_chunks {
+            let ident = raw_audit_ident_for(source.kind, &chunk.name);
+            let data = Data::Reserved(chunk.bytes.clone());
+            tag.add_data(ident.clone(), data.clone());
+            expected_audit.push((ident, data));
+            preserved_names.insert(chunk.label.clone());
+            if chunk.unmapped {
+                report.unmapped.push(chunk.label.clone());
+                report.warnings.push(Warning::new(
+                    "wav_chunk_preserved_opaque",
+                    format!("{} was retained byte-for-byte in a namespaced M4A audit atom; its contents were not mapped to Music fields.", chunk.label),
+                ));
+            }
+        }
     }
 
     let mut expected_text_atoms = Vec::<(Fourcc, Vec<String>)>::new();
@@ -903,6 +955,7 @@ fn parse_vorbis_comment(
                 entry_index,
                 key,
                 value: value.to_owned(),
+                audit_name: None,
             }),
             Err(_) => invalid_comments.push(InvalidComment {
                 block_index,
@@ -1005,21 +1058,35 @@ fn add_audit_data(tag: &mut Tag, expected: &mut Vec<(DataIdent, Data)>, name: &s
     expected.push((ident, data));
 }
 
-fn source_comment_ident(key: &str) -> DataIdent {
-    FreeformIdent::new_borrowed(AUDIT_MEAN, key).into()
+fn source_comment_ident(kind: SourceKind, key: &str) -> DataIdent {
+    let mean = match kind {
+        SourceKind::Flac => AUDIT_MEAN,
+        SourceKind::Wav => WAV_AUDIT_MEAN,
+    };
+    FreeformIdent::new_borrowed(mean, key).into()
 }
 
 fn raw_audit_ident(name: &str) -> DataIdent {
-    DataIdent::freeform(AUDIT_RAW_MEAN, name.to_owned())
+    raw_audit_ident_for(SourceKind::Flac, name)
+}
+
+fn raw_audit_ident_for(kind: SourceKind, name: &str) -> DataIdent {
+    let mean = match kind {
+        SourceKind::Flac => AUDIT_RAW_MEAN,
+        SourceKind::Wav => WAV_AUDIT_RAW_MEAN,
+    };
+    DataIdent::freeform(mean, name.to_owned())
 }
 
 fn clear_our_audit_items(tag: &mut Tag) {
     let mut stale = Vec::<DataIdent>::new();
     for (ident, _) in tag.data() {
-        if ident
-            .freeform()
-            .is_some_and(|freeform| freeform.mean == AUDIT_MEAN || freeform.mean == AUDIT_RAW_MEAN)
-            && !stale.iter().any(|known| known == ident)
+        if ident.freeform().is_some_and(|freeform| {
+            freeform.mean == AUDIT_MEAN
+                || freeform.mean == AUDIT_RAW_MEAN
+                || freeform.mean == WAV_AUDIT_MEAN
+                || freeform.mean == WAV_AUDIT_RAW_MEAN
+        }) && !stale.iter().any(|known| known == ident)
         {
             stale.push(ident.clone());
         }
@@ -1605,8 +1672,8 @@ fn cap_warnings(warnings: &mut Vec<Warning>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_MEAN, Mp4Layout, prepare_moov_for_bounded_write, raw_audit_ident, scan_mp4_layout,
-        seek_to_flac_marker, source_comment_ident,
+        AUDIT_MEAN, Mp4Layout, SourceKind, prepare_moov_for_bounded_write, raw_audit_ident,
+        scan_mp4_layout, seek_to_flac_marker, source_comment_ident,
     };
     use mp4ameta::DataIdent;
     use std::fs::{self, File, OpenOptions};
@@ -1624,10 +1691,13 @@ mod tests {
             "FLAC_RAW_BLOCK_000002_TYPE_02",
         ] {
             assert_eq!(
-                source_comment_ident(name),
+                source_comment_ident(SourceKind::Flac, name),
                 DataIdent::freeform(AUDIT_MEAN, name.to_owned())
             );
-            assert_ne!(source_comment_ident(name), raw_audit_ident(name));
+            assert_ne!(
+                source_comment_ident(SourceKind::Flac, name),
+                raw_audit_ident(name)
+            );
         }
     }
 

@@ -149,6 +149,33 @@ impl NativeMusicBackend {
         Ok(())
     }
 
+    /// Re-open and re-hash retained bytes without materializing them or calling Music.
+    pub fn verify_retained_audio(&self, audio: &AudioBytes) -> anyhow::Result<()> {
+        ensure_no_symlink_components(&audio.path, false)?;
+        let path_metadata = fs::symlink_metadata(&audio.path)
+            .with_context(|| format!("inspect retained audio {}", audio.path.display()))?;
+        if !path_metadata.file_type().is_file() {
+            bail!("retained audio is not a regular file; refusing to open it");
+        }
+        if is_dataless(&path_metadata) {
+            bail!(
+                "retained audio is dataless; refusing to read it without explicit materialization"
+            );
+        }
+        let file = open_regular_file(&audio.path, true)
+            .context("open retained audio without following symlinks")?;
+        let open_metadata = file
+            .metadata()
+            .context("inspect the retained audio file before reading")?;
+        if is_dataless(&open_metadata) {
+            bail!("retained audio became dataless before verification; refusing to read it");
+        }
+        // Original sources are separately bounded at 512 MiB by their proof and manager record;
+        // converted imports may use the larger 1 GiB import ceiling.
+        verify_open_audio(&file, audio, MAX_IMPORT_BYTES)
+            .context("retained audio changed while its saved identity was verified")
+    }
+
     pub fn prepare(
         &self,
         original: &Path,
@@ -163,11 +190,11 @@ impl NativeMusicBackend {
         let original_audio =
             inspect_open_audio(&source_lease, original, self.settings.max_file_bytes)?;
 
-        if is_flac_path(original) {
+        if is_lossless_source_path(original) {
             ensure_directory(working_dir, true)?;
             let mut trace = crate::music_conversion::ConversionTrace::default();
             let result = (|| {
-                let converted = crate::music_conversion::convert_flac(
+                let converted = crate::music_conversion::convert_lossless(
                     &original_audio,
                     working_dir,
                     &self.settings,
@@ -177,7 +204,7 @@ impl NativeMusicBackend {
                 crate::music_conversion::persist_success_report(working_dir, &converted.report)?;
 
                 verify_open_audio(&source_lease, &original_audio, self.settings.max_file_bytes)
-                    .context("original FLAC changed while it was being converted")?;
+                    .context("original lossless audio changed while it was being converted")?;
                 materialize_if_needed(&converted.path, &self.settings, Some(cancel)).context(
                     "converted ALAC import needs bounded materialization before verification",
                 )?;
@@ -188,7 +215,7 @@ impl NativeMusicBackend {
                 }
                 let output_probe = probe_audio(&self.settings.ffprobe, &converted.path, cancel)?;
                 if output_probe.kind != AudioKind::M4a || output_probe.codec != "alac" {
-                    bail!("FLAC conversion did not produce an ALAC M4A import file");
+                    bail!("lossless audio conversion did not produce an ALAC M4A import file");
                 }
                 decode_audio(&self.settings.ffmpeg, &converted.path, cancel)
                     .context("decode the complete converted ALAC import before Music import")?;
@@ -580,10 +607,12 @@ fn check_cancelled(cancel: &MusicCancellation) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn is_flac_path(path: &Path) -> bool {
+fn is_lossless_source_path(path: &Path) -> bool {
     path.extension()
         .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("flac") || extension.eq_ignore_ascii_case("wav")
+        })
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -663,7 +692,7 @@ fn open_regular_file(path: &Path, require_owned: bool) -> anyhow::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options.open(path).with_context(|| {
         format!(
@@ -952,7 +981,7 @@ fn probe_audio(
         ("m4a", _) => bail!("M4A input must contain AAC or ALAC audio"),
         ("mp3", _) => bail!("MP3 input must contain MPEG Layer III audio"),
         ("aac", _) => bail!("raw AAC input must contain AAC audio"),
-        _ => bail!("supported audio extensions are .m4a, .mp3, and .aac"),
+        _ => bail!("supported audio extensions are .m4a, .mp3, .aac, .flac, and .wav"),
     };
     Ok(ProbeInfo {
         kind,
@@ -1194,7 +1223,7 @@ fn archive_filename(original_name: &str, audio: &AudioBytes) -> anyhow::Result<S
         .and_then(std::ffi::OsStr::to_str)
         .map(str::to_ascii_lowercase)
         .context("original audio filename has no extension")?;
-    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac") {
+    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac" | "wav") {
         bail!("original audio extension is unsupported for archiving");
     }
     let stem = Path::new(original_name)
@@ -1510,9 +1539,9 @@ fn validate_archive_child(root: &Path, path: &Path) -> anyhow::Result<()> {
             .and_then(std::ffi::OsStr::to_str)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("m4a" | "mp3" | "aac" | "flac")
+        Some("m4a" | "mp3" | "aac" | "flac" | "wav")
     ) {
-        bail!("iCloud archive item must be .m4a, .mp3, .aac, or .flac");
+        bail!("iCloud archive item must be .m4a, .mp3, .aac, .flac, or .wav");
     }
     Ok(())
 }
@@ -1887,16 +1916,21 @@ mod tests {
     }
 
     #[test]
-    fn flac_archive_keeps_the_original_flac_extension() {
+    fn lossless_archives_keep_the_original_extension_case_insensitively() {
         let result = archive_filename("Artist Track.flac", &audio("/tmp/source.FLAC")).unwrap();
         assert!(result.starts_with("Artist-Track-"));
         assert!(result.ends_with(".flac"));
-        assert!(is_flac_path(Path::new("/tmp/source.FLAC")));
-        assert!(!is_flac_path(Path::new("/tmp/source.flac.m4a")));
+        assert!(is_lossless_source_path(Path::new("/tmp/source.FLAC")));
+        assert!(is_lossless_source_path(Path::new("/tmp/source.WaV")));
+        assert!(!is_lossless_source_path(Path::new("/tmp/source.flac.m4a")));
+
+        let wav = archive_filename("Artist Track.WAV", &audio("/tmp/source.WAV")).unwrap();
+        assert!(wav.starts_with("Artist-Track-"));
+        assert!(wav.ends_with(".wav"));
     }
 
     #[test]
-    fn shared_archive_validator_accepts_flac_and_keeps_path_guards() {
+    fn shared_archive_validator_accepts_lossless_originals_and_keeps_path_guards() {
         let directory = TestDirectory::new();
         let archive_root = directory.path().join("archive");
         fs::create_dir(&archive_root).expect("create archive test directory");
@@ -1904,6 +1938,11 @@ mod tests {
         fs::write(&flac, b"original FLAC bytes").expect("create original archive fixture");
         validate_archive_child(&archive_root, &flac)
             .expect("the shared archive gate should accept an original FLAC");
+
+        let wav = archive_root.join("original.wav");
+        fs::write(&wav, b"original WAV bytes").expect("create original archive fixture");
+        validate_archive_child(&archive_root, &wav)
+            .expect("the shared archive gate should accept an original WAV");
 
         let outside = directory.path().join("outside.flac");
         fs::write(&outside, b"outside archive bytes").expect("create outside-root fixture");
@@ -1915,6 +1954,51 @@ mod tests {
             std::os::unix::fs::symlink(&flac, &symlink).expect("create archive symlink fixture");
             assert!(validate_archive_child(&archive_root, &symlink).is_err());
         }
+    }
+
+    #[test]
+    fn retained_audio_verification_rechecks_saved_hash_and_size_without_music() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("retained.wav");
+        fs::write(&path, b"retained WAV bytes").expect("create retained source fixture");
+        let mut retained = inspect_audio_bytes(&path, MAX_AUDIO_BYTES).unwrap();
+        let backend = NativeMusicBackend::new(MusicSettings {
+            max_file_bytes: MAX_AUDIO_BYTES,
+            ..MusicSettings::default()
+        });
+
+        backend
+            .verify_retained_audio(&retained)
+            .expect("unchanged retained WAV is verified without Music automation");
+        retained.sha256 = "a".repeat(64);
+        assert!(backend.verify_retained_audio(&retained).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_audio_verification_rejects_fifo_before_opening() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = TestDirectory::new();
+        let path = directory.path().join("retained.wav");
+        let encoded_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .expect("temporary path has no NUL byte");
+        assert_eq!(
+            unsafe { libc::mkfifo(encoded_path.as_ptr(), 0o600) },
+            0,
+            "create named-pipe fixture"
+        );
+        let backend = NativeMusicBackend::new(MusicSettings::default());
+        let retained = AudioBytes {
+            path,
+            sha256: "a".repeat(64),
+            size: 1,
+        };
+
+        let error = backend
+            .verify_retained_audio(&retained)
+            .expect_err("a named pipe is not a retained audio file");
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]

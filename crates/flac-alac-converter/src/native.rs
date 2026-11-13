@@ -5,6 +5,7 @@
 //! unsupported error.
 
 use crate::types::{AudioSpec, Warning};
+use crate::wav::WavSource;
 use anyhow::{Result, bail};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,42 @@ pub fn encode(
     {
         let _ = (input, output, output_bits, warnings);
         bail!("direct FLAC-to-ALAC conversion is supported only on macOS with the `native` feature")
+    }
+}
+
+/// Encode a validated WAVE PCM layout through the same AudioToolbox ALAC path
+/// used by FLAC. The original WAVE file remains read-only.
+pub fn encode_wav(
+    input: &Path,
+    output: &Path,
+    source: &WavSource,
+    controls: &mut Controls<'_>,
+) -> Result<Encoding> {
+    check_cancelled(controls)?;
+    let spec = &source.metadata.audio;
+    if source.metadata.kind != crate::metadata::SourceKind::Wav {
+        bail!("WAVE encoder received non-WAVE source metadata");
+    }
+    validate_spec(spec)?;
+    if !matches!(spec.bits_per_sample, 8 | 16 | 24 | 32)
+        || source.container_bits != spec.bits_per_sample
+    {
+        bail!(
+            "unsupported WAVE PCM precision {} bits in a {}-bit container",
+            spec.bits_per_sample,
+            source.container_bits
+        );
+    }
+    let (output_bits, warnings) =
+        plan_wav_precision(spec.bits_per_sample, controls.allow_compatibility)?;
+    #[cfg(all(feature = "native", target_os = "macos"))]
+    {
+        macos::encode_wav(input, output, source, output_bits, warnings, controls)
+    }
+    #[cfg(not(all(feature = "native", target_os = "macos")))]
+    {
+        let _ = (input, output, source, output_bits, warnings);
+        bail!("direct WAVE-to-ALAC conversion is supported only on macOS with the `native` feature")
     }
 }
 
@@ -113,6 +150,27 @@ fn plan_precision(input_bits: u32, allow_compatibility: bool) -> Result<(u32, Ve
             "precision_promoted",
             format!(
                 "Promoted {input_bits}-bit FLAC samples to {output_bits}-bit ALAC source precision without changing sample values."
+            ),
+        )],
+    ))
+}
+
+fn plan_wav_precision(input_bits: u32, allow_compatibility: bool) -> Result<(u32, Vec<Warning>)> {
+    let output_bits = alac_source_bits(input_bits)?;
+    if output_bits == input_bits {
+        return Ok((output_bits, Vec::new()));
+    }
+    if !allow_compatibility {
+        bail!(
+            "{input_bits}-bit WAVE PCM is not a direct ALAC source depth; lossless promotion to {output_bits} bits requires compatibility mode"
+        );
+    }
+    Ok((
+        output_bits,
+        vec![Warning::new(
+            "precision_promoted",
+            format!(
+                "Promoted {input_bits}-bit WAVE PCM samples to {output_bits}-bit ALAC source precision without changing sample values."
             ),
         )],
     ))

@@ -23,6 +23,8 @@ const MAX_STDOUT: usize = 512 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
 const AUDIT_MEAN: &str = "org.joey.flac-original";
 const AUDIT_RAW_MEAN: &str = "org.joey.flac-original.raw";
+const WAV_AUDIT_MEAN: &str = "org.joey.wav-original";
+const WAV_AUDIT_RAW_MEAN: &str = "org.joey.wav-original.raw";
 const BINARY: &str = env!("CARGO_BIN_EXE_flac-alac-converter");
 
 struct ProcessOutput {
@@ -290,6 +292,35 @@ fn write_wave(path: &Path, spec: Spec, pcm: &[u8]) {
     bytes.extend_from_slice(&(wave_pcm.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&wave_pcm);
     fs::write(path, bytes).expect("synthetic WAV should be written");
+}
+
+fn append_wave_chunk(path: &Path, id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut bytes = fs::read(path).expect("synthetic WAV should be readable");
+    assert_eq!(&bytes[..4], b"RIFF");
+    let length = u32::try_from(payload.len()).expect("WAVE test chunk should fit");
+    let mut record = Vec::with_capacity(payload.len() + 9);
+    record.extend_from_slice(id);
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(payload);
+    if payload.len() & 1 != 0 {
+        record.push(0);
+    }
+    bytes.extend_from_slice(&record);
+    let riff_size = u32::try_from(bytes.len() - 8).expect("synthetic WAVE should fit RIFF");
+    bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    fs::write(path, bytes).expect("WAVE metadata chunk should be appended");
+    record
+}
+
+fn info_subchunk(id: &[u8; 4], value: &str, output: &mut Vec<u8>) {
+    let length = u32::try_from(value.len() + 1).expect("INFO test value should fit");
+    output.extend_from_slice(id);
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    output.push(0);
+    if length & 1 != 0 {
+        output.push(0);
+    }
 }
 
 fn tags() -> Vec<(String, String)> {
@@ -835,6 +866,225 @@ fn eight_bit_flac_promotes_losslessly_only_in_compatibility_mode() {
         fs::read(&fixture.input).expect("source remains readable after strict rejection"),
         source_before,
         "strict-mode rejection must preserve source bytes"
+    );
+}
+
+#[test]
+fn native_wav_pcm_widths_encode_bit_exactly_and_preserve_info_and_unknown_chunks() {
+    for bits in [8, 16, 24, 32] {
+        let spec = Spec {
+            bits,
+            rate: 48_000,
+            channels: 2,
+            frames: 960,
+        };
+        let directory = TempDir::new().expect("WAVE fixture directory should be created");
+        let input = directory.path().join("source 日本語 русский café.wav");
+        let output = directory.path().join("converted Italian 🎵.m4a");
+        let decoded_path = directory.path().join("independent decode.wav");
+        let pcm = synthetic_pcm(spec);
+        let expected_pcm_sha256 = sha256(&canonical_pcm32(&pcm, bits));
+        write_wave(&input, spec, &pcm);
+
+        let mut info = b"INFO".to_vec();
+        info_subchunk(b"INAM", "标题 日本語 한국어 café français", &mut info);
+        info_subchunk(b"IART", "русский 한국어 исполнитель", &mut info);
+        info_subchunk(b"IPRD", "Italiano", &mut info);
+        let list_record = append_wave_chunk(&input, b"LIST", &info);
+        let junk_record = append_wave_chunk(&input, b"JUNK", b"opaque");
+        let source_before = fs::read(&input).expect("WAVE source should be readable");
+
+        let process = convert_request(&input, &output, 1, 1_800, false);
+        assert!(
+            process.status.success(),
+            "WAVE conversion failed for {bits}-bit PCM: stdout={} stderr={}",
+            String::from_utf8_lossy(&process.stdout),
+            String::from_utf8_lossy(&process.stderr)
+        );
+        let events = event_lines(&process);
+        let report = &events
+            .iter()
+            .find(|event| event["event"] == "completed")
+            .expect("WAVE conversion should complete")["report"];
+        let output_bits = if bits == 8 { 16 } else { bits };
+        assert_eq!(report["source"]["bits_per_sample"], bits);
+        assert_eq!(report["output"]["bits_per_sample"], output_bits);
+        assert_eq!(report["source"]["frames"], spec.frames);
+        assert_eq!(report["audio_bit_exact"], true);
+        assert_eq!(report["pcm_sha256"], expected_pcm_sha256);
+        let warnings = report["warnings"]
+            .as_array()
+            .expect("warnings should be listed");
+        assert_eq!(
+            warnings
+                .iter()
+                .any(|warning| warning["code"] == "precision_promoted"),
+            bits == 8
+        );
+        assert_eq!(
+            fs::read(&input).expect("source remains readable after conversion"),
+            source_before,
+            "WAVE source must remain byte-for-byte unchanged"
+        );
+
+        let decode = run_tool(
+            "/usr/bin/afconvert",
+            &[
+                "-f".into(),
+                "WAVE".into(),
+                "-d".into(),
+                format!("LEI{output_bits}"),
+                output.to_string_lossy().into_owned(),
+                decoded_path.to_string_lossy().into_owned(),
+            ],
+        );
+        assert!(
+            decode.status.success(),
+            "independent WAVE-to-ALAC decode failed: {}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
+        let decoded = read_decoded_wave(&decoded_path, output_bits);
+        assert_eq!(decoded.rate, spec.rate);
+        assert_eq!(decoded.channels, spec.channels);
+        assert_eq!(decoded.frames, u64::from(spec.frames));
+        let expected_encoded_pcm = if bits == 8 {
+            pcm.iter()
+                .map(|byte| (i16::from(*byte as i8) * 256).to_le_bytes())
+                .flat_map(|sample| sample.into_iter())
+                .collect::<Vec<_>>()
+        } else {
+            pcm.clone()
+        };
+        assert_eq!(decoded.pcm, expected_encoded_pcm);
+        assert_eq!(
+            sha256(&canonical_pcm32(&decoded.pcm, output_bits)),
+            expected_pcm_sha256,
+            "AudioToolbox's independent decode must match the WAVE source PCM"
+        );
+
+        let tag = Tag::read_from_path(&output).expect("converted M4A metadata should be readable");
+        for (atom, expected) in [
+            (Fourcc(*b"\xa9nam"), "标题 日本語 한국어 café français"),
+            (Fourcc(*b"\xa9ART"), "русский 한국어 исполнитель"),
+            (Fourcc(*b"\xa9alb"), "Italiano"),
+        ] {
+            assert_eq!(
+                tag.strings_of(&atom).map(str::to_owned).collect::<Vec<_>>(),
+                vec![expected.to_owned()]
+            );
+        }
+        let title_audit = FreeformIdent::new_borrowed(WAV_AUDIT_MEAN, "INFO_INAM");
+        assert_eq!(
+            tag.data_of(&title_audit).cloned().collect::<Vec<_>>(),
+            vec![Data::Utf8("标题 日本語 한국어 café français".to_owned())]
+        );
+        let list_audit =
+            FreeformIdent::new_borrowed(WAV_AUDIT_RAW_MEAN, "WAV_CHUNK_000002_4C495354");
+        let junk_audit =
+            FreeformIdent::new_borrowed(WAV_AUDIT_RAW_MEAN, "WAV_CHUNK_000003_4A554E4B");
+        assert_eq!(
+            tag.data_of(&list_audit).cloned().collect::<Vec<_>>(),
+            vec![Data::Reserved(list_record)]
+        );
+        assert_eq!(
+            tag.data_of(&junk_audit).cloned().collect::<Vec<_>>(),
+            vec![Data::Reserved(junk_record)]
+        );
+        let preserved = report["metadata"]["preserved"]
+            .as_array()
+            .expect("preserved metadata should be listed");
+        assert!(preserved.contains(&json!("WAV INFO INAM")));
+        assert!(preserved.contains(&json!("WAV chunk 2 LIST")));
+        assert!(preserved.contains(&json!("WAV chunk 3 JUNK")));
+        assert!(
+            report["metadata"]["unmapped"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("WAV chunk 3 JUNK"))
+        );
+    }
+}
+
+#[test]
+fn native_worker_rejects_float_wav_and_cancels_pcm_wav_without_publication() {
+    let failed_directory = TempDir::new().expect("failure fixture directory should be created");
+    let failed_input = failed_directory.path().join("float input.wav");
+    let failed_output = failed_directory.path().join("float output.m4a");
+    let float_spec = Spec {
+        bits: 32,
+        rate: 48_000,
+        channels: 2,
+        frames: 32,
+    };
+    write_wave(&failed_input, float_spec, &synthetic_pcm(float_spec));
+    let mut float_bytes = fs::read(&failed_input).expect("generated WAV should be readable");
+    float_bytes[20..22].copy_from_slice(&3_u16.to_le_bytes());
+    fs::write(&failed_input, float_bytes).expect("WAV format tag should be changed for fixture");
+    let failed_before = fs::read(&failed_input).expect("float WAV should be readable");
+    let failure = ConverterClient::new(BINARY)
+        .convert(
+            &ConvertRequest::new(&failed_input, &failed_output),
+            &AtomicBool::new(false),
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+    let failure_message = format!("{failure:#}");
+    assert!(
+        failure_message.contains("floating-point"),
+        "expected the worker's WAVE float rejection, got {failure_message}"
+    );
+    assert!(
+        !failed_output.exists(),
+        "unsupported float WAVE must not publish"
+    );
+    assert_eq!(
+        fs::read(&failed_input).expect("float source remains readable"),
+        failed_before,
+        "failed WAVE conversion must leave its source unchanged"
+    );
+
+    let cancel_directory =
+        TempDir::new().expect("cancellation fixture directory should be created");
+    let cancel_input = cancel_directory.path().join("large PCM source.wav");
+    let cancel_output = cancel_directory.path().join("cancelled output.m4a");
+    let cancel_spec = Spec {
+        bits: 16,
+        rate: 48_000,
+        channels: 2,
+        frames: 3_000_000,
+    };
+    write_wave(&cancel_input, cancel_spec, &synthetic_pcm(cancel_spec));
+    let cancel_before = fs::read(&cancel_input).expect("large WAVE source should be readable");
+    let mut request = ConvertRequest::new(&cancel_input, &cancel_output);
+    request.timeout_seconds = 60;
+    let cancelled = AtomicBool::new(false);
+    let saw_progress = AtomicBool::new(false);
+    let error = ConverterClient::new(BINARY)
+        .convert(&request, &cancelled, &mut |event| {
+            if matches!(event, Event::Progress { frames, .. } if *frames > 0) {
+                saw_progress.store(true, Ordering::Release);
+                cancelled.store(true, Ordering::Release);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(
+        saw_progress.load(Ordering::Acquire),
+        "WAVE encoding must report progress before cancellation"
+    );
+    let cancellation_message = format!("{error:#}");
+    assert!(
+        cancellation_message.contains("cancel"),
+        "expected cancellation, got {cancellation_message}"
+    );
+    assert!(
+        !cancel_output.exists(),
+        "cancelled WAVE conversion must not publish"
+    );
+    assert_eq!(
+        fs::read(&cancel_input).expect("cancelled WAVE source remains readable"),
+        cancel_before,
+        "cancelled WAVE conversion must leave its source unchanged"
     );
 }
 

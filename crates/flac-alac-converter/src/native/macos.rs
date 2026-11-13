@@ -1,10 +1,11 @@
 use crate::native::{Controls, Encoding, Verification, full_scale_sample};
 use crate::types::{AudioSpec, Warning};
+use crate::wav::WavSource;
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::ffi::{c_int, c_void};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -203,6 +204,181 @@ pub(super) fn encode(
         input_pcm_sha256: hex_digest(decoded.pcm_sha256),
         warnings,
     })
+}
+
+pub(super) fn encode_wav(
+    input: &Path,
+    output: &Path,
+    source: &WavSource,
+    output_bits: u32,
+    warnings: Vec<Warning>,
+    controls: &mut Controls<'_>,
+) -> Result<Encoding> {
+    check_cancelled(controls)?;
+    let spec = &source.metadata.audio;
+    let input_file = open_wav_input(input)?;
+    let input_snapshot = FileSnapshot::read(&input_file)?;
+    (controls.progress)(0).context("reporting initial conversion progress")?;
+
+    let output_path = prepare_new_output(output)?;
+    let output_url = file_url(&output_path)?;
+    let mut writer = create_alac_writer(output_url.0, spec, output_bits)?;
+    let output_file = secure_output_handle(&output_path)?;
+
+    let decoded = encode_wav_to_writer(
+        input_file,
+        input_snapshot,
+        source,
+        output_bits,
+        &mut writer,
+        controls,
+    )?;
+    writer.finish()?;
+    let output_snapshot = FileSnapshot::read(&output_file)?;
+    ensure!(
+        output_snapshot.is_regular,
+        "AudioToolbox output is not a regular file"
+    );
+
+    let output_spec = inspect_output_header(&output_path, output_bits)?;
+    ensure!(
+        output_spec.sample_rate == spec.sample_rate
+            && output_spec.channels == spec.channels
+            && output_spec.bits_per_sample == output_bits
+            && output_spec.frames == spec.frames,
+        "AudioToolbox wrote ALAC properties that do not match the requested WAVE stream"
+    );
+    Ok(Encoding {
+        output: output_spec,
+        input_pcm_sha256: hex_digest(decoded.pcm_sha256),
+        warnings,
+    })
+}
+
+fn encode_wav_to_writer(
+    mut input: File,
+    input_snapshot: FileSnapshot,
+    source: &WavSource,
+    output_bits: u32,
+    writer: &mut ExtAudioFileGuard,
+    controls: &mut Controls<'_>,
+) -> Result<DecodeResult> {
+    let spec = &source.metadata.audio;
+    let channels = usize::try_from(spec.channels).context("WAVE channel count does not fit")?;
+    let sample_bytes = usize::try_from(source.container_bits / 8)
+        .context("WAVE sample width does not fit this platform")?;
+    let block_align = usize::try_from(source.block_align)
+        .context("WAVE block alignment does not fit this platform")?;
+    ensure!(
+        block_align == sample_bytes.saturating_mul(channels),
+        "WAVE PCM layout changed after parsing"
+    );
+    let max_block_frames = 4096usize;
+    let mut hasher = Sha256::new();
+    let mut decoded_frames = 0_u64;
+
+    for chunk in &source.data_chunks {
+        check_cancelled(controls)?;
+        ensure!(
+            chunk.bytes % u64::from(source.block_align) == 0,
+            "WAVE data chunk contains an incomplete sample frame"
+        );
+        input
+            .seek(SeekFrom::Start(chunk.offset))
+            .context("seek to WAVE PCM data")?;
+        let mut remaining_frames = chunk.bytes / u64::from(source.block_align);
+        while remaining_frames > 0 {
+            check_cancelled(controls)?;
+            let frames = usize::try_from(remaining_frames.min(max_block_frames as u64))
+                .context("WAVE block frame count does not fit this platform")?;
+            let sample_count = frames
+                .checked_mul(channels)
+                .context("WAVE sample count overflow")?;
+            let input_bytes = frames
+                .checked_mul(block_align)
+                .context("WAVE input block byte size overflow")?;
+            let mut raw = Vec::new();
+            raw.try_reserve_exact(input_bytes)
+                .context("allocate bounded WAVE input block")?;
+            raw.resize(input_bytes, 0);
+            input
+                .read_exact(&mut raw)
+                .context("read complete WAVE PCM block")?;
+
+            let mut pcm = Vec::<i32>::new();
+            pcm.try_reserve_exact(sample_count)
+                .context("allocate bounded canonical WAVE PCM block")?;
+            for sample_bytes in raw.chunks_exact(sample_bytes) {
+                let sample = decode_wav_sample(sample_bytes, spec.bits_per_sample)?;
+                let full_scale = full_scale_sample(sample, spec.bits_per_sample)
+                    .context("WAVE sample is outside its declared precision")?;
+                pcm.push(full_scale);
+            }
+            ensure!(pcm.len() == sample_count, "WAVE sample block is incomplete");
+            update_pcm_hash(&mut hasher, &pcm);
+            let packed = packed_pcm_bytes(&pcm, output_bits)?;
+            let byte_size = u32::try_from(packed.len())
+                .context("packed WAVE PCM block exceeds AudioToolbox limits")?;
+            let frame_count =
+                u32::try_from(frames).context("WAVE frame block exceeds AudioToolbox limits")?;
+            let buffers = AudioBufferListOne {
+                number_buffers: 1,
+                first: AudioBuffer {
+                    number_channels: spec.channels,
+                    data_byte_size: byte_size,
+                    data: packed.as_ptr() as *mut c_void,
+                },
+            };
+            let status = unsafe { ExtAudioFileWrite(writer.0, frame_count, &buffers) };
+            check_os_status(status, "writing WAVE PCM to AudioToolbox ALAC")?;
+            decoded_frames = decoded_frames
+                .checked_add(u64::from(frame_count))
+                .context("WAVE decoded frame count overflow")?;
+            ensure!(
+                decoded_frames <= spec.frames,
+                "WAVE PCM data exceeds its declared frame count"
+            );
+            remaining_frames -= u64::from(frame_count);
+            (controls.progress)(decoded_frames).context("reporting conversion progress")?;
+        }
+    }
+    ensure!(
+        decoded_frames == spec.frames,
+        "WAVE yielded {decoded_frames} frames, expected {}",
+        spec.frames
+    );
+    ensure!(
+        FileSnapshot::read(&input)? == input_snapshot,
+        "WAVE input identity or length changed while it was being encoded"
+    );
+    Ok(DecodeResult {
+        pcm_sha256: hasher.finalize().into(),
+    })
+}
+
+fn decode_wav_sample(bytes: &[u8], bits: u32) -> Result<i32> {
+    let sample = match bits {
+        8 => {
+            ensure!(bytes.len() == 1, "WAVE 8-bit sample width changed");
+            i32::from(bytes[0]) - 128
+        }
+        16 => {
+            ensure!(bytes.len() == 2, "WAVE 16-bit sample width changed");
+            i32::from(i16::from_le_bytes(bytes.try_into().unwrap()))
+        }
+        24 => {
+            ensure!(bytes.len() == 3, "WAVE 24-bit sample width changed");
+            let unsigned =
+                u32::from(bytes[0]) | (u32::from(bytes[1]) << 8) | (u32::from(bytes[2]) << 16);
+            ((unsigned << 8) as i32) >> 8
+        }
+        32 => {
+            ensure!(bytes.len() == 4, "WAVE 32-bit sample width changed");
+            i32::from_le_bytes(bytes.try_into().unwrap())
+        }
+        _ => bail!("unsupported WAVE PCM precision {bits}"),
+    };
+    Ok(sample)
 }
 
 pub(super) fn verify(
@@ -749,6 +925,19 @@ fn open_input(path: &Path) -> Result<File> {
     ensure!(
         FileSnapshot::read(&file)?.is_regular,
         "FLAC input must be a regular file"
+    );
+    Ok(file)
+}
+
+fn open_wav_input(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening WAVE input {} read-only", path.display()))?;
+    ensure!(
+        FileSnapshot::read(&file)?.is_regular,
+        "WAVE input must be a regular file"
     );
     Ok(file)
 }

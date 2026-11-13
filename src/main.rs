@@ -297,14 +297,26 @@ async fn main() -> Result<()> {
         .first()
         .is_some_and(|arg| arg == std::ffi::OsStr::new("--music-seed-accepted"))
     {
-        if args.len() != 3 {
-            bail!("usage: --music-seed-accepted CONFIG ACCEPTED_PROOF_JSON");
+        let dry_run = args
+            .get(3)
+            .is_some_and(|arg| arg == std::ffi::OsStr::new("--dry-run"));
+        if args.len() != 3 && !(args.len() == 4 && dry_run) {
+            bail!("usage: --music-seed-accepted CONFIG ACCEPTED_PROOF_JSON [--dry-run]");
         }
         let config = AppConfig::load(Path::new(&args[1]))?;
         #[cfg(all(feature = "test-runtime", not(test)))]
         music_runtime::validate_test_profile(&config)?;
-        let seeded = music_runtime::seed_accepted_records(config, PathBuf::from(&args[2])).await?;
-        println!("{}", serde_json::json!({"seeded": seeded, "added": false}));
+        let verified =
+            music_runtime::seed_accepted_records(config, PathBuf::from(&args[2]), dry_run).await?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "seeded": if dry_run { 0 } else { verified },
+                "verified": verified,
+                "dry_run": dry_run,
+                "added": false
+            })
+        );
         return Ok(());
     }
     if let Some(mode) = args.first().and_then(|arg| {
@@ -6892,11 +6904,18 @@ fn music_upload_from_message(
     } else {
         return Ok(None);
     };
-    let inferred_extension = match mime.as_deref() {
+    let normalized_mime = mime
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let inferred_extension = match normalized_mime.as_deref() {
         Some("audio/mp4" | "audio/x-m4a") => Some("m4a"),
         Some("audio/mpeg" | "audio/mp3") => Some("mp3"),
         Some("audio/aac" | "audio/aacp" | "audio/x-aac") => Some("aac"),
         Some("audio/flac" | "audio/x-flac" | "application/x-flac") => Some("flac"),
+        Some(
+            "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" | "audio/vnd.wav"
+            | "application/wav" | "application/x-wav",
+        ) => Some("wav"),
         _ => None,
     };
     let file_name = name
@@ -6907,9 +6926,9 @@ fn music_upload_from_message(
         .and_then(|ext| ext.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac") {
+    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac" | "wav") {
         if is_audio {
-            bail!("Supported music formats are .m4a, .mp3, .aac and .flac.");
+            bail!("Supported music formats are .m4a, .mp3, .aac, .flac and .wav.");
         }
         return Ok(None);
     }
@@ -7329,7 +7348,7 @@ fn help_message() -> String {
         "",
         "Send Bilibili or YouTube links directly to download videos.",
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
-        "Send .m4a, .mp3, .aac or .flac files in the allowed private chat to import music automatically.",
+        "Send .m4a, .mp3, .aac, .flac or .wav files in the allowed private chat to import music automatically.",
         "",
         "Commands:",
         "/help - Show this help.",

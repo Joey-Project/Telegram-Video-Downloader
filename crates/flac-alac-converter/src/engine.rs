@@ -19,6 +19,20 @@ pub struct ConversionFailure {
     pub cancelled: bool,
 }
 
+enum ParsedSource {
+    Flac(metadata::SourceMetadata),
+    Wav(crate::wav::WavSource),
+}
+
+impl ParsedSource {
+    fn metadata(&self) -> &metadata::SourceMetadata {
+        match self {
+            Self::Flac(source) => source,
+            Self::Wav(source) => &source.metadata,
+        }
+    }
+}
+
 impl std::fmt::Display for ConversionFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.message.fmt(formatter)
@@ -94,7 +108,7 @@ fn convert_inner(
         .tempdir_in(&parent_canonical)
         .context("create private same-filesystem staging")?
         .keep();
-    let staged_source = directory.join("source.flac");
+    let staged_source = directory.join("source.input");
     let staged_output = directory.join("output.partial.m4a");
     *partial_output = Some(staged_output.clone());
 
@@ -102,10 +116,16 @@ fn convert_inner(
     // File Provider flag/time changes are immaterial; content and object identity matter.
     let input_snapshot = snapshot_copy(&input, &staged_source, cancelled)?;
     check_cancel(cancelled)?;
-    let source = metadata::read(&staged_source).context("read FLAC metadata")?;
+    let source = if crate::wav::is_riff_file(&staged_source)? {
+        ParsedSource::Wav(crate::wav::read(&staged_source).context("read WAVE metadata")?)
+    } else {
+        ParsedSource::Flac(metadata::read(&staged_source).context("read FLAC metadata")?)
+    };
+    let source_metadata = source.metadata();
+    let source_audio = source_metadata.audio.clone();
     observe(Event::Started {
         version: PROTOCOL_VERSION,
-        source: source.audio.clone(),
+        source: source_audio.clone(),
     })?;
     check_cancel(cancelled)?;
     let started = Instant::now();
@@ -123,14 +143,14 @@ fn convert_inner(
                 "encoded output exceeds the 8 GiB limit"
             );
         }
-        if frames == source.audio.frames
+        if frames == source_audio.frames
             || frames.saturating_sub(last_frames) >= 131_072
             || last_progress.elapsed() >= Duration::from_millis(250)
         {
             observe(Event::Progress {
                 version: PROTOCOL_VERSION,
                 frames,
-                total_frames: source.audio.frames,
+                total_frames: source_audio.frames,
             })?;
             last_frames = frames;
             last_progress = Instant::now();
@@ -142,9 +162,16 @@ fn convert_inner(
         progress: &mut progress,
         allow_compatibility: request.allow_compatibility,
     };
-    let encoding = native::encode(&staged_source, &staged_output, &source.audio, &mut controls)
-        .context("native ALAC encoding")?;
-    let metadata = metadata::write_and_verify(&source, &staged_output)
+    let encoding = match &source {
+        ParsedSource::Flac(source) => {
+            native::encode(&staged_source, &staged_output, &source.audio, &mut controls)
+        }
+        ParsedSource::Wav(source) => {
+            native::encode_wav(&staged_source, &staged_output, source, &mut controls)
+        }
+    }
+    .context("native ALAC encoding")?;
+    let metadata = metadata::write_and_verify(source_metadata, &staged_output)
         .context("migrate and verify metadata")?;
     let verification = native::verify(&staged_output, &encoding, &mut controls)
         .context("verify decoded ALAC audio")?;
@@ -180,7 +207,7 @@ fn convert_inner(
             warning: warning.clone(),
         })?;
     }
-    let mut source_spec = source.audio;
+    let mut source_spec = source_audio;
     if source_spec.frames == 0 {
         source_spec.frames = encoding.output.frames;
     }

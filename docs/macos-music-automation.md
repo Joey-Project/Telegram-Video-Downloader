@@ -39,13 +39,13 @@ Music resolves bare ffmpeg/ffprobe commands through the bot process's PATH.
 Explicit relative codec paths are resolved from the configuration directory.
 Missing tools fail the affected Music task without preventing bot startup.
 
-FLAC preparation uses a separate `libexec/flac-alac-converter` executable in the
+FLAC and PCM WAV preparation use a separate `libexec/flac-alac-converter` executable in the
 active installed profile. The bot links only its protocol/client library; the
-worker owns libFLAC decoding, AudioToolbox ALAC encoding, metadata migration and
+worker owns libFLAC/WAV decoding, AudioToolbox ALAC encoding, metadata migration and
 full decoded-PCM verification. Set `music.converter` to override the helper path
 and `music.conversion_timeout_seconds` to change the bounded conversion deadline
 (default 1800 seconds, accepted range 1–86400). Missing helpers fail the affected
-FLAC task without disabling existing M4A, MP3 or AAC imports.
+FLAC/WAV task without disabling existing M4A, MP3 or AAC imports.
 
 An explicit normal production deploy builds and installs the helper separately
 from the bot. For prebuilt artifacts, pass `--converter-binary` to
@@ -66,13 +66,21 @@ The helper statically links FLAC/Ogg, includes their notices, and is rejected by
 the installer if its Mach-O dependency list includes non-system libraries. Its
 helper signing identifier does not replace either fixed bot's Automation identity.
 
-The iCloud archive contains the original `.flac`, including all original metadata.
+The iCloud archive contains the original `.flac` or `.wav`, including all original metadata.
 The generated `.m4a` is a local import source; Music must create its own local
 copy, and that copy must pass the existing independent-copy verification before
-the archived FLAC can be evicted. Sample rate, channel count and normalized sample
+the archived original can be evicted. Sample rate, channel count and normalized sample
 values are preserved. Lossless precision promotion is allowed with a warning;
 there is no lossy encoding, resampling or downmix fallback. The first converter
 version accepts mono/stereo with a known sample count.
+
+WAV support accepts bounded RIFF/WAVE integer PCM. Supported 8-bit input is
+promoted reversibly to 16-bit ALAC with a warning; supported 16/24/32-bit input
+retains its precision. Floating-point, compressed and malformed WAV are rejected
+without altering the original. Standard INFO tags are mapped, and bounded
+non-audio chunks are preserved in namespaced audit metadata where possible;
+unrepresentable metadata is reported in the conversion warnings. See the worker
+README for exact format and size limits.
 
 Standard tags and artwork are mapped for Music; exact original tag values and
 other metadata are additionally preserved in namespaced M4A fields where possible.
@@ -105,11 +113,11 @@ credentials remain in the private file at
 0700 and file mode 0600.
 
 Repeat the matching `--apply-test` or `--apply-production` command when upgrading
-the transfer helper, including the FLAC upgrade, even if that profile's Python
+the transfer helper, including a FLAC/WAV upgrade, even if that profile's Python
 runtime already exists. Replacing the bot executable or converter alone does not
 update `libexec/music_transfer.py`.
 
-Send an `.m4a`, `.mp3`, `.aac` or `.flac` audio/document upload to the bot from the allowed
+Send an `.m4a`, `.mp3`, `.aac`, `.flac` or `.wav` audio/document upload to the bot from the allowed
 owner's private chat. Group uploads, other chats, unsupported extensions and
 files larger than the configured limit are rejected. `/music` shows the task list;
 use `/music retry TASK_ID` to resume a failed task or `/music cancel TASK_ID` to
@@ -136,8 +144,8 @@ and verify it is muted before controlled tests, then leave it muted afterward.
 The bot stages and validates the original upload, creates a separate original
 archive in iCloud Drive, and adds a verified import to Music. M4A and MP3 import
 bytes remain unchanged. Raw AAC is losslessly remuxed into an M4A import using audio
-stream copy; the original AAC remains the archive source. WAV and FLAC are not
-supported. Music's cloud status and the original archive's iCloud upload are
+stream copy; the original AAC remains the archive source. FLAC and supported WAV
+are converted to verified ALAC. Music's cloud status and the original archive's iCloud upload are
 separate checks. The task waits for Music cloud completion and verifies an
 independent local Music copy; it also waits for the archive upload to finish before
 allowing local archive bytes to be evicted. The cloud archive remains the retained
@@ -157,17 +165,33 @@ persistent ID was saved before a later status or verification failure, retry que
 that saved track and never sends another add. Use `/music` to inspect the task state
 before deciding what to do next.
 
-The optional `--music-seed-accepted CONFIG ACCEPTED_PROOF_JSON` command is an
-operator-only handover for previously accepted test records. For example:
+The optional `--music-seed-accepted CONFIG ACCEPTED_PROOF_JSON [--dry-run]` command
+is an operator-only handover for previously accepted records. First stop the
+profile's catalog owner and retain a private state backup; do not replace an
+inode-bound owner lock with a copied lock. Run the actual fixed signed binary
+for the destination profile, with its matching configuration and Music grant.
+For example, preview through the test identity:
 
 ```sh
 "$HOME/.local/lib/telegram-video-downloader-test/bin/telegram-video-downloader-test" \
-  --music-seed-accepted /path/to/test-config.toml /path/to/accepted-proof.json
+  --music-seed-accepted /path/to/test-config.toml /path/to/accepted-proof.json --dry-run
 ```
 
-It revalidates the private proof, saved native receipt, Music track and uploaded
-archive, then seeds completed records into the test queue. It reports `added: false`
-and performs no Music add. It is not part of normal startup or automatic import.
+The private schema-1 proof keeps its existing acceptance fields. An item can add
+`prepared_audio`, containing the complete saved `PreparedAudio` (`original`,
+`import`, optional `conversion`). Preserve its original/import paths, SHA-256,
+sizes and conversion report rather than pretending the FLAC/WAV and ALAC bytes
+are identical. The separate `archive_path` names the configured archive child.
+Legacy items without `prepared_audio` retain their receipt-backed M4A behavior.
+
+Preview revalidates all supplied evidence and reports `dry_run: true`,
+`seeded: 0`, `verified: N`, `added: false`. Omitting `--dry-run` commits the
+verified records in one catalog transaction. A later invalid/conflicting item
+must not leave earlier items partially seeded. Existing matching entries are
+reusable, while differing content/import/report/PID bindings are refused. No
+Music add, conversion or Telegram update polling occurs. Restart the profile
+normally and check readiness after the explicit handoff; this command is not
+part of normal startup or automatic import.
 
 ## Test installation
 

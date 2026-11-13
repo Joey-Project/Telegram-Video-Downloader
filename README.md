@@ -202,9 +202,9 @@ scripts/launch_agent.sh deploy --no-build --binary /path/to/staged/release/teleg
 
 ## 验证
 
-The independent [native FLAC-to-ALAC converter](crates/flac-alac-converter/README.md)
+The independent [native FLAC/WAV-to-ALAC converter](crates/flac-alac-converter/README.md)
 has its own JSON Lines API, typed process client and real-codec E2E suite. Automatic
-Music imports use its isolated worker for FLAC uploads, retaining the original in
+Music imports use its isolated worker for FLAC and PCM WAV uploads, retaining the original in
 iCloud Drive and importing the verified local ALAC. Workspace checks on macOS require
 `flac` and `pkg-config` (`brew install flac pkg-config`).
 
