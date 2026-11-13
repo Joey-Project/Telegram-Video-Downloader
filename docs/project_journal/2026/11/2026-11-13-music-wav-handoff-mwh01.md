@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-13
 updated: 2026-11-13
 branch: codex/music-wav-record-handoff
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/70"
 supersedes: []
 superseded_by: ""
 ---
