@@ -3,6 +3,10 @@ name = "telegram-video-downloader"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/flac-alac-converter"]
+resolver = "3"
+
 [features]
 test-runtime = []
 

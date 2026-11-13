@@ -1,0 +1,26 @@
+[package]
+name = "flac-alac-converter"
+version = "0.1.0"
+edition = "2024"
+description = "Isolated native FLAC to Apple Lossless conversion with metadata migration"
+
+[features]
+default = ["native"]
+native = ["dep:mp4ameta"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+libc = "0.2"
+mp4ameta = { version = "=0.13.0", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[[bin]]
+name = "flac-alac-converter"
+path = "src/main.rs"
+required-features = ["native"]

@@ -202,10 +202,15 @@ scripts/launch_agent.sh deploy --no-build --binary /path/to/staged/release/teleg
 
 ## 验证
 
+The independent [native FLAC-to-ALAC converter](crates/flac-alac-converter/README.md)
+has its own JSON Lines API, typed process client and real-codec E2E suite. It is
+not yet connected to automatic Music import. Workspace checks on macOS require
+`flac` and `pkg-config` (`brew install flac pkg-config`).
+
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
 scripts/test_launch_agent.sh
 python3 -B scripts/test_macos_service.py
 uv run ruff format --check

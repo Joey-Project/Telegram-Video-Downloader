@@ -30,17 +30,23 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Ensure music codec test tools
+      - name: Ensure native music codec dependencies and test tools
         run: |
+          if ! command -v flac >/dev/null || ! command -v pkg-config >/dev/null; then
+            brew install flac pkg-config
+          fi
           if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
             brew install ffmpeg
           fi
 
-      - name: Run all Rust tests, including mock Telegram E2E
-        run: cargo test --all-targets --quiet
+      - name: Run workspace Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run all Rust tests, including native codec and mock Telegram E2E
+        run: cargo test --locked --workspace --all-targets --quiet
+
+      - name: Test converter client without native dependencies
+        run: cargo test --locked -p flac-alac-converter --no-default-features --lib --quiet
 
       - name: Set up Python 3.14
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
