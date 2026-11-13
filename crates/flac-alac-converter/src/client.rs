@@ -588,23 +588,33 @@ mod tests {
     #[test]
     fn active_cancellation_still_reaches_worker_and_returns_cancelled() {
         let (_directory, client) = worker(
-            "IFS= read -r request\nIFS= read -r cancel\nprintf '%s\\n' '{\"event\":\"cancelled\",\"version\":1,\"partial_output\":null}'",
+            "IFS= read -r request\nprintf '%s\\n' '{\"event\":\"progress\",\"version\":1,\"frames\":0,\"total_frames\":1}'\nIFS= read -r cancel\ntest \"$cancel\" = '{\"command\":\"cancel\"}' || exit 3\nprintf '%s\\n' '{\"event\":\"cancelled\",\"version\":1,\"partial_output\":null}'",
         );
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let signal = Arc::clone(&cancelled);
-        let trigger = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            signal.store(true, Ordering::Release);
-        });
+        let cancelled = AtomicBool::new(false);
+        let mut request = ConvertRequest::new("unused.flac", "unused.m4a");
+        request.timeout_seconds = 8;
+        let mut worker_ready = false;
         let error = client
             .convert(
-                &ConvertRequest::new("unused.flac", "unused.m4a"),
+                &request,
                 &cancelled,
-                &mut |_| Ok(()),
+                &mut |event| {
+                    if matches!(event, Event::Progress { .. }) {
+                        worker_ready = true;
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    Ok(())
+                },
             )
             .unwrap_err();
-        trigger.join().unwrap();
-        assert!(format!("{error:#}").contains("converter cancelled"));
+        assert!(
+            worker_ready,
+            "worker did not acknowledge the request before cancellation: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("converter cancelled"),
+            "expected the active worker cancellation event, got: {error:#}"
+        );
     }
 
     #[test]
