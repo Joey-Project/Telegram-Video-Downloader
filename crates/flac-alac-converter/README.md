@@ -73,6 +73,9 @@ The default deadline is 1,800 seconds (valid range 1–86,400). Native callbacks
 cooperate with cancellation; an unresponsive native call is terminated after
 the deadline plus a five-second grace. `ConverterClient` also enforces its own
 process deadline, bounded pipes and a two-second cancellation grace.
+It keeps the worker's process identity until failure cleanup, so a wrapper that
+exits before a pipe-holding descendant cannot make reader cleanup exceed that
+deadline. Both output pipes have nonblocking, explicitly stoppable readers.
 
 ```rust,ignore
 use flac_alac_converter::{ConverterClient, ConvertRequest};

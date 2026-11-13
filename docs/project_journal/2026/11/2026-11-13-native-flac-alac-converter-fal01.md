@@ -81,7 +81,7 @@ documents protocol, limits, native dependencies and the separate integration ste
 
 ## Validation
 
-- Native crate: 20 unit tests and six real-codec E2E tests passed on macOS with
+- Native crate: 23 unit tests and six real-codec E2E tests passed on macOS with
   libFLAC 1.5.0. The E2E cases include 8-bit lossless promotion/strict rejection,
   16/24/32-bit independent PCM comparison, multilingual standard/audit fields,
   raw invalid text, PNG artwork, source changes, cancellation and no-clobber.
@@ -89,6 +89,10 @@ documents protocol, limits, native dependencies and the separate integration ste
   passed, including 1,426 main-program tests (17 existing ignored tests) and
   the new native converter suites. Client-only tests cover stalled
   workers, blocked request pipes, bounded diagnostics and protocol validation.
+  The nine-test client-only suite also covers an exited wrapper with a live
+  descendant inheriting its pipes: it must respect the deadline and terminate
+  that process group. The leader stays unreaped until failure cleanup, preserving
+  its PID/PGID identity; nonblocking pipe readers have an explicit shutdown path.
 - The approved private 24-bit/48 kHz/stereo song passed through the new native
   worker. Independent system decoding matched all 12,581,120 PCM frames; all
   24 original comment values and the 2,135,900-byte JPEG were preserved. The
