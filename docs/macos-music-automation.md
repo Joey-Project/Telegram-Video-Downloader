@@ -104,6 +104,11 @@ credentials remain in the private file at
 `~/.config/telegram-video-downloader/mtproto.json`; keep its parent directory mode
 0700 and file mode 0600.
 
+Repeat the matching `--apply-test` or `--apply-production` command when upgrading
+the transfer helper, including the FLAC upgrade, even if that profile's Python
+runtime already exists. Replacing the bot executable or converter alone does not
+update `libexec/music_transfer.py`.
+
 Send an `.m4a`, `.mp3`, `.aac` or `.flac` audio/document upload to the bot from the allowed
 owner's private chat. Group uploads, other chats, unsupported extensions and
 files larger than the configured limit are rejected. `/music` shows the task list;
