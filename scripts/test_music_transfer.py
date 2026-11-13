@@ -224,7 +224,7 @@ class MusicTransferTests(unittest.TestCase):
             setattr(FakeTransport, name, [] if name == "flood_waits" else None if name in {"file_migration", "fail_offset"} else False if name in {"file_reference_error", "cdn_redirect", "updates_response", "invalid_chunk"} else {} if name == "bot_auth_migrations" else b"")
         FakeTransport.last_calls = []
 
-    def _fixture(self, size=64, file_id=None):
+    def _fixture(self, size=64, file_id=None, extension="m4a"):
         owner = tempfile.TemporaryDirectory()
         base = Path(owner.name)
         home = base / "home"
@@ -254,7 +254,7 @@ class MusicTransferTests(unittest.TestCase):
             expected_size=size,
             staging_root=staging_root,
             job_id=job_id,
-            destination=job_dir / "original.m4a",
+            destination=job_dir / f"original.{extension}",
             deadline_seconds=30,
         )
         self.addCleanup(owner.cleanup)
@@ -325,6 +325,22 @@ class MusicTransferTests(unittest.TestCase):
         raw["destination"] = str(request.destination.parent.parent / "original.m4a")
         with self.assertRaises(transfer.TransferError):
             transfer.validate_request(raw, home)
+
+    def test_request_accepts_flac_original_destination(self):
+        home, request, _ = self._fixture(extension="flac")
+        raw = {
+            "schema": 1,
+            "bot_token": request.bot_token,
+            "credentials_path": str(request.credentials_path),
+            "file_id": request.file_id,
+            "identity_sha256": request.identity_sha256,
+            "expected_size": request.expected_size,
+            "staging_root": str(request.staging_root),
+            "destination": str(request.destination),
+            "deadline_seconds": request.deadline_seconds,
+        }
+        parsed = transfer.validate_request(raw, home)
+        self.assertEqual(parsed.destination.name, "original.flac")
 
     def test_private_credentials_require_exact_owner_mode_and_shape(self):
         home, request, _ = self._fixture()

@@ -133,6 +133,7 @@ run_agent() {
     BOT_LABEL="${label}" \
     BOT_CONFIG="${test_root}/config.toml" \
     BOT_BINARY="${test_root}/stub" \
+    BOT_CONVERTER_BINARY="${FAKE_CONVERTER_BINARY:-}" \
     BOT_LOG_DIR="${test_root}/logs" \
     bash "${repo_dir}/scripts/launch_agent.sh" "$@"
 }
@@ -168,6 +169,10 @@ grep -Fqx -- "deploy" "${helper_log}"
 grep -Fqx -- "${test_root}/input artifact" "${helper_log}"
 grep -Fqx -- "321" "${helper_log}"
 [[ ! -s "${fake_log}" ]]
+
+FAKE_CONVERTER_BINARY="${test_root}/flac converter" run_agent deploy --no-build
+grep -Fqx -- "--converter-binary" "${helper_log}"
+grep -Fqx -- "${test_root}/flac converter" "${helper_log}"
 
 run_agent rollback --backup "${test_root}/retained backup" --original-entrypoint
 grep -Fqx -- "rollback" "${helper_log}"

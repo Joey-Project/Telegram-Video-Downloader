@@ -65,6 +65,8 @@ pub struct MusicSettings {
     pub credentials_path: PathBuf,
     pub helper_python: PathBuf,
     pub transfer_helper: PathBuf,
+    pub converter: PathBuf,
+    pub conversion_timeout_seconds: u64,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub max_file_bytes: u64,
@@ -81,6 +83,8 @@ impl Default for MusicSettings {
             credentials_path: PathBuf::new(),
             helper_python: PathBuf::new(),
             transfer_helper: PathBuf::new(),
+            converter: PathBuf::new(),
+            conversion_timeout_seconds: 1800,
             ffmpeg: PathBuf::new(),
             ffprobe: PathBuf::new(),
             max_file_bytes: 512 * 1024 * 1024,
@@ -100,6 +104,8 @@ pub struct AudioBytes {
 pub struct PreparedAudio {
     pub original: AudioBytes,
     pub import: AudioBytes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversion: Option<flac_alac_converter::ConversionReport>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -135,6 +141,10 @@ impl MusicCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn atomic(&self) -> &AtomicBool {
+        &self.0
     }
 }
 

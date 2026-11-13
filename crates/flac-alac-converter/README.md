@@ -5,8 +5,9 @@ the official libFLAC API, encodes Apple Lossless in M4A through AudioToolbox, th
 reopens and decodes the result to verify the complete PCM SHA-256. It does not
 launch Music, play audio, import tracks, use Telegram or contact a server.
 
-The bot is not connected to this tool yet. Its eventual iCloud archive must keep
-the original upload, not the converted M4A. Match's cloud delivery quality is
+The bot invokes this worker before automatically importing FLAC uploads into
+Music. Its iCloud archive keeps the original upload; the converted M4A remains
+the local Music import source. Match's cloud delivery quality is
 independent of this converter's local losslessness guarantee.
 
 ## Build and test
@@ -16,9 +17,10 @@ qaac or external encoder is used by the worker. E2E fixtures use the official
 `flac`/`metaflac` CLI, and the independent verifier uses Apple's `afconvert` and
 `ffprobe`.
 
-This is a separate executable, not yet a self-contained distribution: the
-development build links the installed libFLAC. Bundling, signing and installing
-it alongside the production bot belong to the later integration step.
+This is a separate executable. Native builds statically link the installed
+libFLAC and Ogg archives; the installed helper requires only system libraries
+and frameworks. Explicit profile installation validates that dependency boundary
+and signs a staged copy without changing the bot's Music automation identity.
 
 ```sh
 brew install flac pkg-config ffmpeg

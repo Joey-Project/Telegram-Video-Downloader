@@ -28,6 +28,7 @@ mod metadata_recovery_bot;
 #[cfg(test)]
 mod metadata_recovery_e2e_tests;
 mod music_automation;
+mod music_conversion;
 mod music_import;
 mod music_manager;
 mod music_native;
@@ -6895,6 +6896,7 @@ fn music_upload_from_message(
         Some("audio/mp4" | "audio/x-m4a") => Some("m4a"),
         Some("audio/mpeg" | "audio/mp3") => Some("mp3"),
         Some("audio/aac" | "audio/aacp" | "audio/x-aac") => Some("aac"),
+        Some("audio/flac" | "audio/x-flac" | "application/x-flac") => Some("flac"),
         _ => None,
     };
     let file_name = name
@@ -6905,9 +6907,9 @@ fn music_upload_from_message(
         .and_then(|ext| ext.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac") {
+    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac") {
         if is_audio {
-            bail!("Supported music formats are .m4a, .mp3 and .aac.");
+            bail!("Supported music formats are .m4a, .mp3, .aac and .flac.");
         }
         return Ok(None);
     }
@@ -7327,7 +7329,7 @@ fn help_message() -> String {
         "",
         "Send Bilibili or YouTube links directly to download videos.",
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
-        "Send .m4a, .mp3 or .aac files in the allowed private chat to import music automatically.",
+        "Send .m4a, .mp3, .aac or .flac files in the allowed private chat to import music automatically.",
         "",
         "Commands:",
         "/help - Show this help.",

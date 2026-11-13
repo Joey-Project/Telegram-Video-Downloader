@@ -868,8 +868,11 @@ impl MusicManager {
         let extension = match supported_extension(&job.upload.file_name) {
             Some(extension) => extension,
             None => {
-                self.fail_job(job_id, "Only .m4a, .mp3, and .aac files are accepted.")
-                    .await;
+                self.fail_job(
+                    job_id,
+                    "Only .m4a, .mp3, .aac, and .flac files are accepted.",
+                )
+                .await;
                 return;
             }
         };
@@ -1037,7 +1040,7 @@ impl MusicManager {
                     });
                     let _ = self.update_status(job_id).await;
                 } else {
-                    self.fail_job(job_id, "Audio preparation failed; retry is available.")
+                    self.fail_job(job_id, "Audio preparation failed; the original and any partial conversion are retained. Retry is available.")
                         .await;
                 }
                 return;
@@ -1761,6 +1764,9 @@ fn validate_settings(settings: &MusicSettings) -> Result<()> {
     if !(1..=3_600).contains(&settings.cloud_poll_seconds) {
         bail!("music cloud_poll_seconds must be between 1 and 3600");
     }
+    if !(1..=86_400).contains(&settings.conversion_timeout_seconds) {
+        bail!("music conversion_timeout_seconds must be between 1 and 86400");
+    }
     for path in [
         &settings.state_dir,
         &settings.staging_dir,
@@ -1809,7 +1815,7 @@ fn validate_upload(upload: &MusicUpload, settings: &MusicSettings) -> Result<()>
         || upload.file_name.chars().any(char::is_control)
         || supported_extension(&upload.file_name).is_none()
     {
-        bail!("music upload filename must end in .m4a, .mp3, or .aac");
+        bail!("music upload filename must end in .m4a, .mp3, .aac, or .flac");
     }
     if upload.file_size == 0 || upload.file_size > settings.max_file_bytes {
         bail!("music upload size is outside the configured limit");
@@ -1832,6 +1838,8 @@ fn supported_extension(file_name: &str) -> Option<&'static str> {
         Some("mp3")
     } else if extension.eq_ignore_ascii_case("aac") {
         Some("aac")
+    } else if extension.eq_ignore_ascii_case("flac") {
+        Some("flac")
     } else {
         None
     }
@@ -1964,6 +1972,26 @@ fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
 fn validate_prepared_audio(audio: &PreparedAudio, max_original_bytes: u64) -> Result<()> {
     validate_audio_bytes(&audio.original, max_original_bytes)?;
     validate_audio_bytes(&audio.import, MAX_IMPORT_BYTES)?;
+    if let Some(report) = &audio.conversion {
+        if report.version != flac_alac_converter::types::PROTOCOL_VERSION
+            || !report.audio_bit_exact
+            || report.input_sha256 != audio.original.sha256
+            || report.output_sha256 != audio.import.sha256
+            || report.output_path != audio.import.path
+            || report.source.frames == 0
+            || report.source.frames != report.output.frames
+            || report.source.sample_rate == 0
+            || report.source.sample_rate != report.output.sample_rate
+            || !(1..=2).contains(&report.source.channels)
+            || report.source.channels != report.output.channels
+            || !(4..=32).contains(&report.source.bits_per_sample)
+            || report.source.bits_per_sample > report.output.bits_per_sample
+            || !matches!(report.output.bits_per_sample, 16 | 20 | 24 | 32)
+        {
+            bail!("prepared conversion report does not bind verified lossless audio");
+        }
+        normalize_sha256(&report.pcm_sha256)?;
+    }
     Ok(())
 }
 
@@ -2172,14 +2200,35 @@ pub(crate) fn validate_upload_shape(upload: &MusicUpload, max_file_bytes: u64) -
 }
 
 fn render_status(job: &StoredJob) -> String {
-    match &job.error {
+    let mut text = match &job.error {
         Some(error) => format!(
             "Music upload {}: {}. {error}",
             job.job_id,
             job.stage.label()
         ),
         None => format!("Music upload {}: {}.", job.job_id, job.stage.label()),
+    };
+    if let Some(report) = job
+        .prepared
+        .as_ref()
+        .and_then(|audio| audio.conversion.as_ref())
+    {
+        text.push_str("\nFLAC → ALAC: verified lossless.");
+        for warning in report.warnings.iter().take(3) {
+            let message: String = warning
+                .message
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect();
+            text.push_str("\nWarning: ");
+            text.push_str(&message);
+        }
+        if report.warnings.len() > 3 {
+            text.push_str("\nAdditional warnings are retained in the local conversion report.");
+        }
     }
+    text
 }
 
 fn status_schedule(job: &StoredJob, now: u64) -> StatusSchedule {

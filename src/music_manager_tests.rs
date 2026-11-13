@@ -423,6 +423,7 @@ impl MusicBackend for MockBackend {
         let import_path = working_dir.join("prepared.m4a");
         fs::write(&import_path, b"prepared import bytes")?;
         Ok(PreparedAudio {
+            conversion: None,
             original: AudioBytes {
                 path: original.to_path_buf(),
                 sha256: self
@@ -517,6 +518,273 @@ impl MusicBackend for MockBackend {
             ..archive.clone()
         })
     }
+}
+
+#[cfg(target_os = "macos")]
+struct NativeFlacConversionBackend {
+    native: crate::music_native::NativeMusicBackend,
+    source_fixture: PathBuf,
+    archive_root: PathBuf,
+    music_copy: PathBuf,
+    downloads: AtomicUsize,
+    preparations: AtomicUsize,
+    readiness_checks: AtomicUsize,
+    adds: AtomicUsize,
+    verifications: AtomicUsize,
+    evictions: AtomicUsize,
+    prepare_summary: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeFlacConversionBackend {
+    fn new(settings: MusicSettings, source_fixture: PathBuf, root: &Path) -> Self {
+        Self {
+            native: crate::music_native::NativeMusicBackend::new(settings.clone()),
+            source_fixture,
+            archive_root: settings.archive_dir,
+            music_copy: root.join("mock-music-library/converted.m4a"),
+            downloads: AtomicUsize::new(0),
+            preparations: AtomicUsize::new(0),
+            readiness_checks: AtomicUsize::new(0),
+            adds: AtomicUsize::new(0),
+            verifications: AtomicUsize::new(0),
+            evictions: AtomicUsize::new(0),
+            prepare_summary: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MusicBackend for NativeFlacConversionBackend {
+    fn download(
+        &self,
+        _upload: &MusicUpload,
+        destination: &Path,
+        _cancel: &MusicCancellation,
+    ) -> Result<()> {
+        self.downloads.fetch_add(1, Ordering::Relaxed);
+        fs::copy(&self.source_fixture, destination)?;
+        Ok(())
+    }
+
+    fn prepare(
+        &self,
+        original: &Path,
+        working_dir: &Path,
+        cancel: &MusicCancellation,
+    ) -> Result<PreparedAudio> {
+        self.preparations.fetch_add(1, Ordering::Relaxed);
+        let result = self.native.prepare(original, working_dir, cancel);
+        let summary = match &result {
+            Ok(prepared) => match &prepared.conversion {
+                Some(report) => format!(
+                    "Ok: original={} bytes sha256={}, import={} bytes sha256={}, converter={} -> {} bits, {} Hz, {} channels, {} frames, bit_exact={}, output_path={}, warnings={:?}, mapped={:?}, preserved={:?}",
+                    prepared.original.size,
+                    prepared.original.sha256,
+                    prepared.import.size,
+                    prepared.import.sha256,
+                    report.source.bits_per_sample,
+                    report.output.bits_per_sample,
+                    report.source.sample_rate,
+                    report.source.channels,
+                    report.source.frames,
+                    report.audio_bit_exact,
+                    report.output_path.display(),
+                    report.warnings,
+                    report.metadata.mapped,
+                    report.metadata.preserved,
+                ),
+                None => format!(
+                    "Ok without conversion report: original={} bytes, import={} bytes",
+                    prepared.original.size, prepared.import.size
+                ),
+            },
+            Err(error) => format!("Err: {error:#}"),
+        };
+        *self
+            .prepare_summary
+            .lock()
+            .expect("prepare summary should not be poisoned") = Some(summary);
+        result
+    }
+
+    fn archive(&self, audio: &PreparedAudio, original_name: &str) -> Result<ArchiveState> {
+        if !original_name.ends_with(".flac") {
+            bail!("the original FLAC extension was not retained for the archive");
+        }
+        fs::create_dir_all(&self.archive_root)?;
+        let path = self.archive_root.join(original_name);
+        fs::copy(&audio.original.path, &path)?;
+        Ok(ArchiveState {
+            path,
+            uploaded: true,
+            uploading: false,
+            downloading: false,
+            conflicts: false,
+            local_bytes: true,
+        })
+    }
+
+    fn check_music_ready(&self) -> Result<()> {
+        if self.readiness_checks.fetch_add(1, Ordering::Relaxed) == 0 {
+            bail!("synthetic Music readiness failure before add intent");
+        }
+        Ok(())
+    }
+
+    fn check_import_source(&self, audio: &PreparedAudio) -> Result<()> {
+        if !audio
+            .import
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("m4a"))
+            || fs::metadata(&audio.import.path)?.len() == 0
+        {
+            bail!("converted ALAC import file is missing");
+        }
+        Ok(())
+    }
+
+    fn add_track(&self, audio: &PreparedAudio) -> Result<String> {
+        self.adds.fetch_add(1, Ordering::Relaxed);
+        if !audio
+            .import
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("m4a"))
+        {
+            bail!("Music received a non-M4A import file");
+        }
+        fs::create_dir_all(self.music_copy.parent().unwrap())?;
+        fs::copy(&audio.import.path, &self.music_copy)?;
+        Ok("persistent-id-1".to_string())
+    }
+
+    fn query_track(&self, persistent_id: &str) -> Result<MusicTrack> {
+        Ok(MusicTrack {
+            persistent_id: persistent_id.to_string(),
+            location: Some(self.music_copy.clone()),
+            cloud_status: "uploaded".to_string(),
+        })
+    }
+
+    fn verify_copy(&self, audio: &PreparedAudio, track: &MusicTrack) -> Result<()> {
+        self.verifications.fetch_add(1, Ordering::Relaxed);
+        let location = track
+            .location
+            .as_deref()
+            .context("mock Music track has no local file")?;
+        if fs::read(&audio.import.path)? != fs::read(location)? {
+            bail!("mock Music copy differs from the converted ALAC bytes");
+        }
+        Ok(())
+    }
+
+    fn archive_status(&self, path: &Path) -> Result<ArchiveState> {
+        Ok(ArchiveState {
+            path: path.to_path_buf(),
+            uploaded: true,
+            uploading: false,
+            downloading: false,
+            conflicts: false,
+            local_bytes: true,
+        })
+    }
+
+    fn evict_archive(&self, archive: &ArchiveState, _track: &MusicTrack) -> Result<ArchiveState> {
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        Ok(ArchiveState {
+            local_bytes: false,
+            ..archive.clone()
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configured_flac_converter() -> Option<PathBuf> {
+    let Some(path) = std::env::var_os("FLAC_ALAC_TEST_CONVERTER").map(PathBuf::from) else {
+        if std::env::var_os("CI").is_some() {
+            panic!("FLAC_ALAC_TEST_CONVERTER is required in CI");
+        }
+        eprintln!("SKIP: FLAC_ALAC_TEST_CONVERTER is unset; native FLAC manager E2E was not run");
+        return None;
+    };
+    assert!(
+        path.is_file(),
+        "FLAC_ALAC_TEST_CONVERTER does not name a file: {}",
+        path.display()
+    );
+    Some(fs::canonicalize(path).expect("converter path should canonicalize"))
+}
+
+#[cfg(target_os = "macos")]
+fn absolute_test_tool(name: &str) -> PathBuf {
+    let search_path = std::env::var_os("PATH").expect("PATH should be available for test tools");
+    for directory in std::env::split_paths(&search_path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return fs::canonicalize(&candidate)
+                .unwrap_or_else(|error| panic!("test tool {name} should canonicalize: {error}"));
+        }
+    }
+    panic!("required test tool {name} was not found on PATH");
+}
+
+#[cfg(target_os = "macos")]
+fn create_eight_bit_stereo_flac(directory: &Path) -> PathBuf {
+    let wave = directory.join("lossless source.wav");
+    let flac = directory.join("lossless source.flac");
+    let channels = 2_u16;
+    let sample_rate = 48_000_u32;
+    let bits_per_sample = 8_u16;
+    let frames = 960_u32;
+    let pcm = (0..frames * u32::from(channels))
+        .map(|index| ((index * 37 + 3) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * u32::from(block_align);
+    let riff_size = 36_u32 + pcm.len() as u32;
+    let mut bytes = Vec::with_capacity(44 + pcm.len());
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&byte_rate.to_le_bytes());
+    bytes.extend_from_slice(&block_align.to_le_bytes());
+    bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&pcm);
+    fs::write(&wave, bytes).expect("test WAV should be written");
+
+    let encoded = std::process::Command::new("flac")
+        .args(["--silent", "--verify", "--output-name"])
+        .arg(&flac)
+        .arg(&wave)
+        .output()
+        .expect("flac fixture encoder should be installed");
+    assert!(
+        encoded.status.success(),
+        "flac fixture encoding failed: {}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    let tagged = std::process::Command::new("metaflac")
+        .arg("--set-tag=TITLE=FLAC integration title")
+        .arg("--set-tag=ARTIST=Native ALAC test artist")
+        .arg(&flac)
+        .output()
+        .expect("metaflac fixture tagger should be installed");
+    assert!(
+        tagged.status.success(),
+        "metaflac fixture tagging failed: {}",
+        String::from_utf8_lossy(&tagged.stderr)
+    );
+    flac
 }
 
 pub(crate) fn upload(message_id: i64, file_unique_id: &str) -> MusicUpload {
@@ -620,6 +888,7 @@ fn seed_full_completed_history(settings: &MusicSettings) -> (String, String, Pat
                         format!("{:064x}", index + 1)
                     };
                     let prepared = PreparedAudio {
+                        conversion: None,
                         original: AudioBytes {
                             path: settings.staging_dir.join(format!("source-{index}.m4a")),
                             sha256: original_sha.clone(),
@@ -860,6 +1129,7 @@ async fn lowering_admission_limit_keeps_historic_jobs_prepared_audio_and_catalog
         .await
         .unwrap();
     let prepared = PreparedAudio {
+        conversion: None,
         original: AudioBytes {
             path: settings
                 .staging_dir
@@ -1673,6 +1943,7 @@ async fn completed_catalog_seed_reuses_saved_import_and_archive_without_importin
     let archive_path = settings.archive_dir.join("old6.m4a");
     fs::write(&archive_path, b"accepted archive").unwrap();
     let audio = PreparedAudio {
+        conversion: None,
         original: AudioBytes {
             path: settings.staging_dir.join("existing-original.m4a"),
             sha256: "c".repeat(64),
@@ -1722,5 +1993,205 @@ async fn completed_catalog_seed_reuses_saved_import_and_archive_without_importin
         .await
         .expect("worker should stop")
         .expect("worker should join");
+    server.stop();
+}
+
+#[test]
+fn legacy_prepared_audio_without_conversion_report_remains_readable() {
+    let mut value = serde_json::to_value(PreparedAudio {
+        conversion: None,
+        original: AudioBytes {
+            path: PathBuf::from("/private/original.m4a"),
+            sha256: "a".repeat(64),
+            size: 24,
+        },
+        import: AudioBytes {
+            path: PathBuf::from("/private/import.m4a"),
+            sha256: "b".repeat(64),
+            size: 22,
+        },
+    })
+    .expect("prepared audio should serialize");
+    value
+        .as_object_mut()
+        .expect("prepared audio should serialize as an object")
+        .remove("conversion");
+
+    let restored: PreparedAudio =
+        serde_json::from_value(value).expect("legacy prepared audio should still deserialize");
+    assert!(restored.conversion.is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn real_flac_conversion_survives_manager_restart_and_keeps_original_archive() {
+    let Some(converter) = configured_flac_converter() else {
+        return;
+    };
+    let fixture = TestDirectory::new();
+    let canonical_root = fs::canonicalize(&fixture.0)
+        .expect("temporary music fixture root should resolve without aliases");
+    let fixture_root = canonical_root.join("native-flac-fixture");
+    fs::create_dir_all(&fixture_root).expect("FLAC fixture directory should be created");
+    let flac_path = create_eight_bit_stereo_flac(&fixture_root);
+    let source_bytes = fs::read(&flac_path).expect("generated FLAC source should be readable");
+
+    let mut settings = fixture.settings();
+    settings.state_dir = canonical_root.join("media/.music-state");
+    settings.staging_dir = canonical_root.join("media/.music-staging");
+    settings.archive_dir = canonical_root.join("media/archive");
+    settings.converter = converter;
+    settings.ffmpeg = absolute_test_tool("ffmpeg");
+    settings.ffprobe = absolute_test_tool("ffprobe");
+    let backend = Arc::new(NativeFlacConversionBackend::new(
+        settings.clone(),
+        flac_path,
+        &canonical_root,
+    ));
+    let backend_trait: Arc<dyn MusicBackend> = backend.clone();
+    let server = TestHttpServer::start().await;
+    let manager = open_manager(settings.clone(), &server, backend_trait).await;
+
+    let mut flac_upload = upload(111, "flac-manager-e2e");
+    flac_upload.file_name = "lossless upload.FLAC".to_string();
+    flac_upload.file_size = source_bytes.len() as u64;
+    flac_upload.mime_type = Some("audio/flac".to_string());
+    let admission = manager.enqueue(flac_upload).await.unwrap();
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let failed = wait_for_stage(&manager, &admission.job_id, JobStage::Failed).await;
+
+    let prepared = failed.prepared.as_ref().unwrap_or_else(|| {
+        let attempt_directory = settings
+            .staging_dir
+            .join(&admission.job_id)
+            .join(format!("prepare-attempt-{}", failed.prepare_attempt));
+        let failure_record = fs::read_to_string(attempt_directory.join("conversion-failure.json"))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        let backend_prepare = backend
+            .prepare_summary
+            .lock()
+            .expect("prepare summary should not be poisoned")
+            .clone()
+            .unwrap_or_else(|| "not called".to_string());
+        panic!(
+            "native conversion should be persisted before the retryable Music preflight; stage={:?}, manager_error={:?}, download_complete={}, prepare_attempt={}, download_path={:?}, backend_prepare={backend_prepare}, conversion_failure={failure_record}",
+            failed.stage,
+            failed.error,
+            failed.download_complete,
+            failed.prepare_attempt,
+            failed.download_path,
+        );
+    });
+    let report = prepared
+        .conversion
+        .as_ref()
+        .expect("native FLAC conversion report should be persisted");
+    assert!(report.audio_bit_exact);
+    assert_eq!(report.source.bits_per_sample, 8);
+    assert_eq!(report.output.bits_per_sample, 16);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "precision_promoted")
+    );
+    assert!(report.metadata.mapped.iter().any(|field| field == "title"));
+    assert!(
+        report
+            .metadata
+            .preserved
+            .iter()
+            .any(|field| field == "FLAC comment TITLE")
+    );
+    let archive = failed
+        .archive
+        .as_ref()
+        .expect("original should be archived before import");
+    assert!(
+        archive
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".flac")
+    );
+    assert_eq!(fs::read(&archive.path).unwrap(), source_bytes);
+    assert_eq!(fs::read(&prepared.original.path).unwrap(), source_bytes);
+    assert_eq!(
+        prepared
+            .import
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("m4a")
+    );
+    assert_ne!(prepared.original.sha256, prepared.import.sha256);
+    assert!(
+        server
+            .wait_for_text("Promoted 8-bit FLAC samples to 16-bit ALAC")
+            .await,
+        "the precision promotion warning should be visible in Telegram status"
+    );
+    let warning_edits_before_restart = server.count_text_for_method(
+        "editMessageText",
+        "Promoted 8-bit FLAC samples to 16-bit ALAC",
+    );
+
+    let mut tampered = prepared.clone();
+    tampered.conversion.as_mut().unwrap().output_sha256 = "0".repeat(64);
+    assert!(validate_prepared_audio(&tampered, settings.max_file_bytes).is_err());
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("first manager worker should stop")
+        .expect("first manager worker should join");
+    drop(manager);
+
+    let reopened = open_manager(settings, &server, backend.clone() as Arc<dyn MusicBackend>).await;
+    let persisted = reopened
+        .store
+        .job(&admission.job_id)
+        .unwrap()
+        .expect("failed job should survive a process restart");
+    assert_eq!(persisted.stage, JobStage::Failed);
+    assert!(persisted.prepared.as_ref().unwrap().conversion.is_some());
+    reopened.retry(42, &admission.job_id).await.unwrap();
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = reopened.start(receiver);
+    let complete = wait_for_complete(&reopened, &admission.job_id).await;
+    let completed_audio = complete.prepared.as_ref().unwrap();
+    assert!(completed_audio.conversion.as_ref().unwrap().audio_bit_exact);
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    assert!(backend.verifications.load(Ordering::Relaxed) >= 2);
+    assert_eq!(backend.evictions.load(Ordering::Relaxed), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.count_text_for_method(
+            "editMessageText",
+            "Promoted 8-bit FLAC samples to 16-bit ALAC",
+        ) <= warning_edits_before_restart
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the persisted conversion warning should be edited again after restart and retry");
+    assert_eq!(
+        fs::read(&complete.archive.as_ref().unwrap().path).unwrap(),
+        source_bytes
+    );
+    assert_eq!(
+        fs::read(&backend.music_copy).unwrap(),
+        fs::read(&completed_audio.import.path).unwrap()
+    );
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("reopened manager worker should stop")
+        .expect("reopened manager worker should join");
     server.stop();
 }

@@ -30,6 +30,9 @@ class MusicTestRuntimeTests(unittest.TestCase):
         self.binary.parent.mkdir(parents=True)
         self.binary.write_bytes(b"synthetic executable")
         self.binary.chmod(0o700)
+        self.converter = self.root / "cargo/release/flac-alac-converter"
+        self.converter.write_bytes(b"synthetic converter executable")
+        self.converter.chmod(0o700)
         self.patches = [
             mock.patch.object(Path, "home", return_value=self.home),
             mock.patch.object(runtime, "_real_home", return_value=self.home),
@@ -49,6 +52,19 @@ class MusicTestRuntimeTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["installed"])
         self.assertEqual(result["identifier"], "io.github.telegram-local-downloader.bot.test")
+
+    def test_plan_accepts_an_explicit_converter_source_without_mutation(self):
+        with mock.patch.object(runtime, "_run") as run:
+            result = runtime.plan(converter_binary=self.converter)
+        self.assertEqual(result["converter_source"], str(self.converter))
+        self.assertEqual(
+            result["converter_destination"],
+            str(self.home / ".local/lib/telegram-video-downloader-test/libexec/flac-alac-converter"),
+        )
+        arguments = run.call_args.args[0]
+        self.assertIn("--profile", arguments)
+        self.assertIn("test", arguments)
+        self.assertNotIn("--apply", arguments)
 
     def test_otool_fixture_decodes_words_in_mach_o_byte_order(self):
         # Captured from the public /usr/bin/osascript binary; no private plist values.
@@ -116,6 +132,35 @@ class MusicTestRuntimeTests(unittest.TestCase):
         self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
         self.assertTrue(any("--sign" in call for call in calls))
         self.assertNotEqual(installed, self.home / runtime.PRODUCTION_BINARY)
+
+    def test_install_can_explicitly_install_converter_for_test_profile(self):
+        entitlements = self.root / "entitlements.plist"
+        entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events": True}))
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append([str(value) for value in argv])
+            if "find-identity" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout=runtime.TRUSTED_FINGERPRINT, stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(runtime, "ENTITLEMENTS", entitlements),
+            mock.patch.object(runtime, "_run", side_effect=fake_run),
+            mock.patch.object(runtime, "_require_test_requirement"),
+            mock.patch.object(runtime, "_active_test_process", return_value=False),
+        ):
+            result = runtime.install(self.binary, self.converter)
+
+        installer_calls = [call for call in calls if call[0] == sys.executable]
+        self.assertEqual(len(installer_calls), 2)
+        self.assertNotIn("--apply", installer_calls[0])
+        self.assertIn("--apply", installer_calls[1])
+        self.assertIn("test", installer_calls[1])
+        self.assertEqual(
+            result["converter"],
+            str(self.home / ".local/lib/telegram-video-downloader-test/libexec/flac-alac-converter"),
+        )
 
     def test_active_or_unknown_job_is_reported_pending_without_restart(self):
         state, stdout_path, _ = runtime._private_paths()

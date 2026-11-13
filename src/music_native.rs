@@ -19,6 +19,7 @@ use crate::music_types::{
 };
 
 const MAX_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_IMPORT_BYTES: u64 = 1024 * 1024 * 1024;
 const TOOL_STDOUT_LIMIT: usize = 64 * 1024;
 const TOOL_STDERR_LIMIT: usize = 16 * 1024;
 const AUDIO_TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -54,6 +55,7 @@ enum AudioKind {
 #[derive(Clone, Debug)]
 struct ProbeInfo {
     kind: AudioKind,
+    codec: String,
     attached_picture_indices: Vec<u64>,
 }
 
@@ -130,7 +132,7 @@ impl NativeMusicBackend {
     pub fn check_import_source(&self, audio: &PreparedAudio) -> anyhow::Result<()> {
         materialize_if_needed(&audio.import.path, &self.settings, None)
             .context("Music import needs bounded materialization before its add intent")?;
-        let file = open_verified_audio(&audio.import, self.settings.max_file_bytes)
+        let file = open_verified_audio(&audio.import, MAX_IMPORT_BYTES)
             .context("open verified Music import bytes before its add intent")?;
         let identity = file_identity(&file, &audio.import.path)?;
         let lease = PendingImportLease {
@@ -159,6 +161,61 @@ impl NativeMusicBackend {
         let source_lease = open_regular_file(original, true)?;
         let original_audio =
             inspect_open_audio(&source_lease, original, self.settings.max_file_bytes)?;
+
+        if is_flac_path(original) {
+            ensure_directory(working_dir, true)?;
+            let mut trace = crate::music_conversion::ConversionTrace::default();
+            let result = (|| {
+                let converted = crate::music_conversion::convert_flac(
+                    &original_audio,
+                    working_dir,
+                    &self.settings,
+                    cancel,
+                    &mut trace,
+                )?;
+                crate::music_conversion::persist_success_report(working_dir, &converted.report)?;
+
+                verify_open_audio(&source_lease, &original_audio, self.settings.max_file_bytes)
+                    .context("original FLAC changed while it was being converted")?;
+                materialize_if_needed(&converted.path, &self.settings, Some(cancel)).context(
+                    "converted ALAC import needs bounded materialization before verification",
+                )?;
+                let import_lease = open_regular_file(&converted.path, true)?;
+                let import = inspect_open_audio(&import_lease, &converted.path, MAX_IMPORT_BYTES)?;
+                if !same_sha256(&import.sha256, &converted.report.output_sha256) {
+                    bail!("converted ALAC output does not match its verified report SHA-256");
+                }
+                let output_probe = probe_audio(&self.settings.ffprobe, &converted.path, cancel)?;
+                if output_probe.kind != AudioKind::M4a || output_probe.codec != "alac" {
+                    bail!("FLAC conversion did not produce an ALAC M4A import file");
+                }
+                decode_audio(&self.settings.ffmpeg, &converted.path, cancel)
+                    .context("decode the complete converted ALAC import before Music import")?;
+                verify_open_audio(&import_lease, &import, MAX_IMPORT_BYTES)
+                    .context("converted ALAC import changed while it was being decoded")?;
+                check_cancelled(cancel)?;
+                Ok(PreparedAudio {
+                    original: original_audio.clone(),
+                    import,
+                    conversion: Some(converted.report),
+                })
+            })();
+            return match result {
+                Ok(prepared) => Ok(prepared),
+                Err(error) => {
+                    if let Err(record_error) =
+                        crate::music_conversion::persist_failure_record(working_dir, &trace, &error)
+                    {
+                        Err(error.context(format!(
+                            "could not persist bounded conversion failure details: {record_error:#}"
+                        )))
+                    } else {
+                        Err(error)
+                    }
+                }
+            };
+        }
+
         let probe = probe_audio(&self.settings.ffprobe, original, cancel)?;
         decode_audio(&self.settings.ffmpeg, original, cancel)?;
         verify_open_audio(&source_lease, &original_audio, self.settings.max_file_bytes)
@@ -179,14 +236,13 @@ impl NativeMusicBackend {
                 materialize_if_needed(&output, &self.settings, Some(cancel))
                     .context("remuxed import needs bounded materialization before verification")?;
                 let import_lease = open_regular_file(&output, true)?;
-                let output_audio =
-                    inspect_open_audio(&import_lease, &output, self.settings.max_file_bytes)?;
+                let output_audio = inspect_open_audio(&import_lease, &output, MAX_IMPORT_BYTES)?;
                 let remux_probe = probe_audio(&self.settings.ffprobe, &output, cancel)?;
                 if !matches!(remux_probe.kind, AudioKind::M4a) {
                     bail!("AAC remux did not produce an AAC/ALAC M4A import file");
                 }
                 decode_audio(&self.settings.ffmpeg, &output, cancel)?;
-                verify_open_audio(&import_lease, &output_audio, self.settings.max_file_bytes)
+                verify_open_audio(&import_lease, &output_audio, MAX_IMPORT_BYTES)
                     .context("remuxed import changed while it was being decoded")?;
                 output_audio
             }
@@ -195,6 +251,7 @@ impl NativeMusicBackend {
         Ok(PreparedAudio {
             original: original_audio,
             import,
+            conversion: None,
         })
     }
 
@@ -281,7 +338,7 @@ impl NativeMusicBackend {
         }
         materialize_if_needed(&audio.path, &self.settings, None)
             .context("Music import needs bounded materialization before add")?;
-        let file = open_verified_audio(audio, self.settings.max_file_bytes)
+        let file = open_verified_audio(audio, MAX_IMPORT_BYTES)
             .context("open verified import bytes for Apple Music")?;
         let identity = file_identity(&file, &audio.path)?;
         Ok(PendingImportLease {
@@ -305,7 +362,7 @@ impl NativeMusicBackend {
             bail!("Music persistent ID is invalid");
         }
         if audio.import.size == 0
-            || audio.import.size > MAX_AUDIO_BYTES
+            || audio.import.size > MAX_IMPORT_BYTES
             || !is_sha256(&audio.import.sha256)
         {
             bail!("saved import content identity is invalid");
@@ -522,6 +579,12 @@ fn check_cancelled(cancel: &MusicCancellation) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_flac_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+}
+
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -545,7 +608,7 @@ fn inspect_open_audio(
     path: &Path,
     configured_limit: u64,
 ) -> anyhow::Result<AudioBytes> {
-    let limit = configured_limit.min(MAX_AUDIO_BYTES);
+    let limit = configured_limit.min(MAX_IMPORT_BYTES);
     let before = file_identity(file, path)?;
     if before.size == 0 || before.size > limit {
         bail!("audio file must contain between 1 byte and {limit} bytes");
@@ -565,7 +628,7 @@ fn inspect_open_audio(
 fn verify_open_audio(file: &File, audio: &AudioBytes, configured_limit: u64) -> anyhow::Result<()> {
     if !is_sha256(&audio.sha256)
         || audio.size == 0
-        || audio.size > configured_limit.min(MAX_AUDIO_BYTES)
+        || audio.size > configured_limit.min(MAX_IMPORT_BYTES)
     {
         bail!("saved audio content identity is invalid");
     }
@@ -579,7 +642,7 @@ fn verify_open_audio(file: &File, audio: &AudioBytes, configured_limit: u64) -> 
 fn open_verified_audio(audio: &AudioBytes, configured_limit: u64) -> anyhow::Result<File> {
     if !is_sha256(&audio.sha256)
         || audio.size == 0
-        || audio.size > configured_limit.min(MAX_AUDIO_BYTES)
+        || audio.size > configured_limit.min(MAX_IMPORT_BYTES)
     {
         bail!("saved audio content identity is invalid");
     }
@@ -875,12 +938,13 @@ fn probe_audio(
         .get("codec_name")
         .and_then(Value::as_str)
         .context("ffprobe omitted the audio codec")?;
+    let codec = codec.to_owned();
     let extension = path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let kind = match (extension.as_str(), codec) {
+    let kind = match (extension.as_str(), codec.as_str()) {
         ("m4a", "aac" | "alac") if format_names.contains(&"m4a") => AudioKind::M4a,
         ("mp3", "mp3") if format_names.len() == 1 && format_names[0] == "mp3" => AudioKind::Mp3,
         ("aac", "aac") if format_names.len() == 1 && format_names[0] == "aac" => AudioKind::RawAac,
@@ -891,6 +955,7 @@ fn probe_audio(
     };
     Ok(ProbeInfo {
         kind,
+        codec,
         attached_picture_indices,
     })
 }
@@ -1128,7 +1193,7 @@ fn archive_filename(original_name: &str, audio: &AudioBytes) -> anyhow::Result<S
         .and_then(std::ffi::OsStr::to_str)
         .map(str::to_ascii_lowercase)
         .context("original audio filename has no extension")?;
-    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac") {
+    if !matches!(extension.as_str(), "m4a" | "mp3" | "aac" | "flac") {
         bail!("original audio extension is unsupported for archiving");
     }
     let stem = Path::new(original_name)
@@ -1444,9 +1509,9 @@ fn validate_archive_child(root: &Path, path: &Path) -> anyhow::Result<()> {
             .and_then(std::ffi::OsStr::to_str)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("m4a" | "mp3" | "aac")
+        Some("m4a" | "mp3" | "aac" | "flac")
     ) {
-        bail!("iCloud archive item must be .m4a, .mp3, or .aac");
+        bail!("iCloud archive item must be .m4a, .mp3, .aac, or .flac");
     }
     Ok(())
 }
@@ -1821,6 +1886,37 @@ mod tests {
     }
 
     #[test]
+    fn flac_archive_keeps_the_original_flac_extension() {
+        let result = archive_filename("Artist Track.flac", &audio("/tmp/source.FLAC")).unwrap();
+        assert!(result.starts_with("Artist-Track-"));
+        assert!(result.ends_with(".flac"));
+        assert!(is_flac_path(Path::new("/tmp/source.FLAC")));
+        assert!(!is_flac_path(Path::new("/tmp/source.flac.m4a")));
+    }
+
+    #[test]
+    fn shared_archive_validator_accepts_flac_and_keeps_path_guards() {
+        let directory = TestDirectory::new();
+        let archive_root = directory.path().join("archive");
+        fs::create_dir(&archive_root).expect("create archive test directory");
+        let flac = archive_root.join("original.flac");
+        fs::write(&flac, b"original FLAC bytes").expect("create original archive fixture");
+        validate_archive_child(&archive_root, &flac)
+            .expect("the shared archive gate should accept an original FLAC");
+
+        let outside = directory.path().join("outside.flac");
+        fs::write(&outside, b"outside archive bytes").expect("create outside-root fixture");
+        assert!(validate_archive_child(&archive_root, &outside).is_err());
+
+        #[cfg(unix)]
+        {
+            let symlink = archive_root.join("linked.flac");
+            std::os::unix::fs::symlink(&flac, &symlink).expect("create archive symlink fixture");
+            assert!(validate_archive_child(&archive_root, &symlink).is_err());
+        }
+    }
+
+    #[test]
     fn archive_name_is_byte_bounded_for_long_unicode_source_names() {
         let original_name = format!("🎵{}🎵.mp3", "A".repeat(200));
         let result = archive_filename(&original_name, &audio("/tmp/source.mp3")).unwrap();
@@ -1986,6 +2082,7 @@ mod tests {
             ffprobe: ffprobe.to_path_buf(),
             max_file_bytes: MAX_AUDIO_BYTES,
             cloud_poll_seconds: 1,
+            ..MusicSettings::default()
         }
     }
 
@@ -2078,6 +2175,7 @@ mod tests {
         assert_eq!(prepared_m4a.import.sha256, prepared_m4a.original.sha256);
         assert_eq!(prepared_m4a.import.size, prepared_m4a.original.size);
         assert_eq!(prepared_m4a.import.path.as_path(), m4a.as_path());
+        assert!(prepared_m4a.conversion.is_none());
 
         if mp3_available {
             let prepared = backend
@@ -2087,6 +2185,7 @@ mod tests {
             assert_eq!(prepared.import.sha256, prepared.original.sha256);
             assert_eq!(prepared.import.size, prepared.original.size);
             assert_eq!(prepared.import.path.as_path(), mp3.as_path());
+            assert!(prepared.conversion.is_none());
         }
 
         let original_aac = fs::read(&aac).expect("read raw AAC before prepare");
@@ -2110,6 +2209,7 @@ mod tests {
         assert_ne!(prepared_aac.import.path, prepared_aac.original.path);
         assert_ne!(prepared_aac.import.sha256, prepared_aac.original.sha256);
         assert_ne!(prepared_aac.import.size, prepared_aac.original.size);
+        assert!(prepared_aac.conversion.is_none());
 
         let corrupt = directory.path().join("corrupt.m4a");
         fs::write(&corrupt, b"not an audio container")

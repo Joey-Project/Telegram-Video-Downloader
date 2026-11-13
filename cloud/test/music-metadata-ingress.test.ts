@@ -36,13 +36,18 @@ function audioUpdate(updateId = 81001, fromId = ownerId) {
   });
 }
 
-function documentUpdate(updateId = 81002, fromId = ownerId) {
+function documentUpdate(
+  updateId = 81002,
+  fromId = ownerId,
+  fileName = "fixture-track.mp3",
+  mimeType = "audio/mpeg",
+) {
   return privateMessageUpdate(updateId, fromId, {
     document: {
       file_id: "fixture-document-file-id",
       file_unique_id: "fixture-document-unique-id",
-      file_name: "fixture-track.mp3",
-      mime_type: "audio/mpeg",
+      file_name: fileName,
+      mime_type: mimeType,
       file_size: 2_147_483_777,
     },
   });
@@ -115,6 +120,32 @@ describe("large Telegram music metadata ingress", () => {
     const message = inbox.requests[0]?.payload.message as { document: { file_size: number } };
     expect(message.document.file_size).toBeGreaterThan(20 * 1024 * 1024);
     expect(message.document.file_size).toBeGreaterThan(2 ** 31);
+  });
+
+  it("durably exposes owner FLAC documents without rewriting metadata", async () => {
+    const update = documentUpdate(81004, ownerId, "original.flac", "audio/flac");
+    const first = await postWebhook(update);
+    const retry = await postWebhook(update);
+
+    expect(first.status).toBe(200);
+    expect(retry.status).toBe(200);
+    expect(await first.json()).toMatchObject({ stored: true, duplicate: false });
+    expect(await retry.json()).toMatchObject({ stored: true, duplicate: true });
+
+    const inbox = await fetchDesktopInbox();
+    expect(inbox.requests).toHaveLength(1);
+    expect(inbox.requests[0]).toMatchObject({ kind: "telegram", request_id: "tg:81004" });
+    expect(inbox.requests[0]?.payload).toEqual(update);
+    const message = inbox.requests[0]?.payload.message as { document: {
+      file_name: string;
+      mime_type: string;
+      file_size: number;
+    } };
+    expect(message.document).toMatchObject({
+      file_name: "original.flac",
+      mime_type: "audio/flac",
+      file_size: 2_147_483_777,
+    });
   });
 
   it("does not persist metadata sent by a foreign Telegram account", async () => {

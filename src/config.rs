@@ -350,6 +350,7 @@ impl AppConfig {
             PathBuf::from("~/.config/telegram-video-downloader/mtproto.json"),
             runtime_root.join("music-runtime/bin/python3"),
             runtime_root.join("libexec/music_transfer.py"),
+            runtime_root.join("libexec/flac-alac-converter"),
         ];
         let project = self.project_dir.clone();
         let paths = [
@@ -359,6 +360,7 @@ impl AppConfig {
             &mut self.music.credentials_path,
             &mut self.music.helper_python,
             &mut self.music.transfer_helper,
+            &mut self.music.converter,
         ];
         for (path, default) in paths.into_iter().zip(defaults) {
             let expanded = expand_home_path(if path.as_os_str().is_empty() {
@@ -421,6 +423,9 @@ impl AppConfig {
             }
             if !(10..=3600).contains(&self.music.cloud_poll_seconds) {
                 bail!("music.cloud_poll_seconds must be between 10 and 3600");
+            }
+            if !(1..=86_400).contains(&self.music.conversion_timeout_seconds) {
+                bail!("music.conversion_timeout_seconds must be between 1 and 86400");
             }
             for (left, right) in [
                 (&self.music.state_dir, &self.music.staging_dir),
@@ -1193,6 +1198,13 @@ mod tests {
         assert_eq!(config.music.enabled, cfg!(target_os = "macos"));
         assert_eq!(config.music.max_file_bytes, 512 * 1024 * 1024);
         assert_eq!(config.music.cloud_poll_seconds, 60);
+        assert_eq!(config.music.conversion_timeout_seconds, 1800);
+        assert!(
+            config
+                .music
+                .converter
+                .ends_with("libexec/flac-alac-converter")
+        );
         assert_eq!(
             config.music.state_dir,
             config
@@ -1396,6 +1408,15 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("between 10 and 3600")
+        );
+        config.music.cloud_poll_seconds = 60;
+        config.music.conversion_timeout_seconds = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("between 1 and 86400")
         );
     }
 

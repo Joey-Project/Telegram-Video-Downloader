@@ -11,6 +11,7 @@ fn main() {
 
     pkg_config::Config::new()
         .atleast_version("1.4.0")
+        .statik(true)
         .probe("flac")
         .unwrap_or_else(|error| {
             panic!("the macOS `native` feature requires libFLAC via pkg-config: {error}")
