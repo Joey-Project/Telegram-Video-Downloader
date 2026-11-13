@@ -1509,9 +1509,9 @@ fn validate_archive_child(root: &Path, path: &Path) -> anyhow::Result<()> {
             .and_then(std::ffi::OsStr::to_str)
             .map(str::to_ascii_lowercase)
             .as_deref(),
-        Some("m4a" | "mp3" | "aac")
+        Some("m4a" | "mp3" | "aac" | "flac")
     ) {
-        bail!("iCloud archive item must be .m4a, .mp3, or .aac");
+        bail!("iCloud archive item must be .m4a, .mp3, .aac, or .flac");
     }
     Ok(())
 }
@@ -1892,6 +1892,28 @@ mod tests {
         assert!(result.ends_with(".flac"));
         assert!(is_flac_path(Path::new("/tmp/source.FLAC")));
         assert!(!is_flac_path(Path::new("/tmp/source.flac.m4a")));
+    }
+
+    #[test]
+    fn shared_archive_validator_accepts_flac_and_keeps_path_guards() {
+        let directory = TestDirectory::new();
+        let archive_root = directory.path().join("archive");
+        fs::create_dir(&archive_root).expect("create archive test directory");
+        let flac = archive_root.join("original.flac");
+        fs::write(&flac, b"original FLAC bytes").expect("create original archive fixture");
+        validate_archive_child(&archive_root, &flac)
+            .expect("the shared archive gate should accept an original FLAC");
+
+        let outside = directory.path().join("outside.flac");
+        fs::write(&outside, b"outside archive bytes").expect("create outside-root fixture");
+        assert!(validate_archive_child(&archive_root, &outside).is_err());
+
+        #[cfg(unix)]
+        {
+            let symlink = archive_root.join("linked.flac");
+            std::os::unix::fs::symlink(&flac, &symlink).expect("create archive symlink fixture");
+            assert!(validate_archive_child(&archive_root, &symlink).is_err());
+        }
     }
 
     #[test]

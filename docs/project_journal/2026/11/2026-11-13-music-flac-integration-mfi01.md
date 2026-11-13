@@ -72,13 +72,14 @@ requires an explicit converter input; normal builds/tests never install it.
   FLAC: source archive bytes/extension, ALAC import/copy, precision warning,
   retry after pre-add failure, restart recovery and exactly one preparation/add.
   The test also rejects a mismatched report and reads legacy prepared JSON.
-- Full workspace validation passed: 1,435 main-program tests, 23 converter unit
-  tests and six real native-codec E2E tests; 17 existing tests remain ignored.
-  The converter suite covers Chinese, Japanese, Korean, Russian, French, Italian,
-  mixed Unicode, repeated values and artwork; the manager test covers orchestration.
-- Workspace Clippy passed with warnings denied.
-- Client-only tests passed 9/9; the fixed test-runtime feature's Music suite
-  passed 72/72, including the real-converter manager recovery test.
+- The full workspace and test-runtime suites cover main-program regression,
+  client-only process supervision and real native-codec E2E. The converter suite
+  covers Chinese, Japanese, Korean, Russian, French, Italian, mixed Unicode,
+  repeated values and artwork; the manager test covers orchestration. Final
+  check results are attached to the linked PR, including Clippy with warnings denied.
+- The focused Music suite passed 64/64 after adding the native shared archive
+  validator regression. That path now accepts the original FLAC for status and
+  eviction while continuing to reject outside-root and symlink paths.
 - Cloudflare metadata ingress: four tests passed; full TypeScript/syntax checks
   passed. The helper links only system libraries/frameworks under `otool -L`.
 - Packaging/runtime/service Python suites: 135 tests passed; all 27 offline
