@@ -595,17 +595,13 @@ mod tests {
         request.timeout_seconds = 8;
         let mut worker_ready = false;
         let error = client
-            .convert(
-                &request,
-                &cancelled,
-                &mut |event| {
-                    if matches!(event, Event::Progress { .. }) {
-                        worker_ready = true;
-                        cancelled.store(true, Ordering::Release);
-                    }
-                    Ok(())
-                },
-            )
+            .convert(&request, &cancelled, &mut |event| {
+                if matches!(event, Event::Progress { .. }) {
+                    worker_ready = true;
+                    cancelled.store(true, Ordering::Release);
+                }
+                Ok(())
+            })
             .unwrap_err();
         assert!(
             worker_ready,
