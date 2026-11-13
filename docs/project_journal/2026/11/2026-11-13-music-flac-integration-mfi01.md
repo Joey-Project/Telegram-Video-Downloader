@@ -92,9 +92,25 @@ requires an explicit converter input; normal builds/tests never install it.
   sandbox. New fixture paths and tool paths are canonical/absolute, preserving
   the product's existing path restrictions. System audio was verified muted.
 
+## Live test profile
+
+The signed test helper and fixed test executable were installed and verified
+against the existing designated requirement. Music permission was reused. A real
+FLAC larger than the cloud Bot API download limit arrived through the independent
+test Worker and downloaded directly on the Mac with its original SHA-256 intact.
+Native conversion reported bit-exact PCM, preserving sample rate, precision and
+channel count. The original task recovered through archive verification and
+saved its first Music persistent ID without another upload or conversion.
+
+This exposed a shared archive-stack issue, covered by the
+[archive stack safety follow-up](2026-11-13-music-archive-stack-safety-mas01.md).
+The test profile's old Python transfer helper also needed the explicit runtime
+upgrade; replacing the executable/converter alone does not replace that helper.
+
 ## Next steps
 
-Before production rollout, verify the signed helper installation and a real
-FLAC-to-Music import through the fixed
-test identity. No new real Music track or production service update has been
-performed by this integration workstream so far.
+Production rollout remains a separate explicit gate. Include the matching
+Python-runtime update, fixed signed bot and static helper, verify Music grant
+reuse, and retain rollback. Music cloud status, verified independent copy and
+iCloud-original upload/eviction are independently checked by the private live
+acceptance proof; a successful add alone is insufficient.

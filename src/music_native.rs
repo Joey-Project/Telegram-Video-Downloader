@@ -20,6 +20,7 @@ use crate::music_types::{
 
 const MAX_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IMPORT_BYTES: u64 = 1024 * 1024 * 1024;
+const AUDIO_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const TOOL_STDOUT_LIMIT: usize = 64 * 1024;
 const TOOL_STDERR_LIMIT: usize = 16 * 1024;
 const AUDIO_TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -754,7 +755,7 @@ fn hash_open_file(file: &File) -> anyhow::Result<String> {
         .context("clone open file descriptor for hashing")?;
     reader.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; AUDIO_IO_BUFFER_BYTES];
     loop {
         let count = reader
             .read(&mut buffer)
@@ -1448,7 +1449,7 @@ fn copy_create_only(
     reader.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; AUDIO_IO_BUFFER_BYTES];
     loop {
         let count = reader
             .read(&mut buffer)
@@ -1914,6 +1915,59 @@ mod tests {
             std::os::unix::fs::symlink(&flac, &symlink).expect("create archive symlink fixture");
             assert!(validate_archive_child(&archive_root, &symlink).is_err());
         }
+    }
+
+    #[test]
+    fn archive_copy_and_nested_readback_hash_fit_a_small_thread_stack() {
+        let directory = TestDirectory::new();
+        let archive_root = directory.path().join("archive");
+        fs::create_dir(&archive_root).expect("create archive test directory");
+        let source_path = directory.path().join("original.flac");
+        let alternate_path = directory.path().join("alternate.flac");
+        let destination = archive_root.join("archived-original.flac");
+        let byte_count = AUDIO_IO_BUFFER_BYTES * 2 + 137;
+        let original_bytes = (0..byte_count)
+            .map(|index| ((index.wrapping_mul(131).wrapping_add(17)) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let alternate_bytes = (0..byte_count)
+            .map(|index| ((index.wrapping_mul(73).wrapping_add(29)) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        fs::write(&source_path, &original_bytes).expect("write original copy fixture");
+        fs::write(&alternate_path, &alternate_bytes).expect("write alternate copy fixture");
+        let original_sha256 = independently_hash(&source_path);
+        let settings = MusicSettings {
+            max_file_bytes: MAX_AUDIO_BYTES,
+            ..MusicSettings::default()
+        };
+
+        std::thread::Builder::new()
+            .name("music-native-small-stack-archive-test".into())
+            .stack_size(512 * 1024)
+            .spawn(move || -> anyhow::Result<()> {
+                let original = inspect_audio_bytes(&source_path, MAX_AUDIO_BYTES)?;
+                assert_eq!(original.sha256, original_sha256);
+                let original_file = open_verified_audio(&original, MAX_AUDIO_BYTES)?;
+                copy_create_only(&original_file, &destination, &original, &settings)?;
+
+                let archived = inspect_audio_bytes(&destination, MAX_AUDIO_BYTES)?;
+                assert_eq!(archived.sha256, original_sha256);
+                assert_eq!(archived.size, byte_count as u64);
+                assert_eq!(fs::read(&destination)?, original_bytes);
+
+                let alternate = inspect_audio_bytes(&alternate_path, MAX_AUDIO_BYTES)?;
+                let alternate_file = open_verified_audio(&alternate, MAX_AUDIO_BYTES)?;
+                assert!(
+                    copy_create_only(&alternate_file, &destination, &alternate, &settings).is_err()
+                );
+                let preserved = inspect_audio_bytes(&destination, MAX_AUDIO_BYTES)?;
+                assert_eq!(preserved.sha256, original_sha256);
+                assert_eq!(fs::read(&destination)?, original_bytes);
+                Ok(())
+            })
+            .expect("spawn small-stack archive worker")
+            .join()
+            .expect("archive path must not overflow a 512 KiB stack")
+            .expect("archive copy and verification should succeed");
     }
 
     #[test]
