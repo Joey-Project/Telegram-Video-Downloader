@@ -491,19 +491,52 @@ mod tests {
             "IFS= read -r request\n/bin/sleep 30 &\necho $! > {quoted_pid_file}\nexit 0"
         ));
         let mut request = ConvertRequest::new("unused.flac", "unused.m4a");
-        request.timeout_seconds = 1;
+        request.timeout_seconds = 5;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         let started = Instant::now();
-        let error = client
-            .convert(&request, &AtomicBool::new(false), &mut |_| Ok(()))
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("deadline exceeded"));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let conversion = std::thread::spawn(move || {
+            client.convert(&request, &worker_cancelled, &mut |_| Ok(()))
+        });
 
-        let pid: libc::pid_t = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // The pipe deadline includes process startup. Observe the marker from the
+        // wrapper before awaiting timeout, so the test proves a pipe-holding child
+        // existed and was not merely testing a worker that never got scheduled.
+        let startup_deadline = started + Duration::from_secs(4);
+        let mut descendant_pid = None;
+        while descendant_pid.is_none()
+            && !conversion.is_finished()
+            && Instant::now() < startup_deadline
+        {
+            descendant_pid = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<libc::pid_t>().ok());
+            if descendant_pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_started = descendant_pid.is_some();
+        let descendant_was_running = descendant_pid.is_some_and(process_is_running);
+        if !descendant_started {
+            // Ensure a delayed or wedged fixture is still cleaned up before the
+            // assertion reports that its startup handshake failed.
+            cancelled.store(true, Ordering::Release);
+        }
+        let result = conversion.join().unwrap();
+        assert!(
+            descendant_started,
+            "fixture did not start its descendant in time"
+        );
+        assert!(
+            descendant_was_running,
+            "fixture descendant was not running at startup"
+        );
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("deadline exceeded"));
+        assert!(started.elapsed() < Duration::from_secs(7));
+
+        let pid = descendant_pid.unwrap();
         assert!(
             !process_is_running(pid),
             "descendant {pid} is still running"
