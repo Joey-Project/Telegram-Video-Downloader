@@ -38,6 +38,7 @@ mod music_bot_tests {
             config: Arc::new(config),
             telegram,
             music,
+            torrent: None,
             job_dispatch: JobDispatch {
                 download_semaphore: Arc::new(Semaphore::new(1)),
                 duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),

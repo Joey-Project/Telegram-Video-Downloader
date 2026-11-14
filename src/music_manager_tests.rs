@@ -1,9 +1,11 @@
 use super::*;
 
 use std::collections::VecDeque;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -893,13 +895,44 @@ pub(crate) fn upload(message_id: i64, file_unique_id: &str) -> MusicUpload {
     }
 }
 
+fn capture_local_file(
+    source_root: &Path,
+    relative_path: &str,
+    source_key: &str,
+    max_file_bytes: u64,
+) -> LocalMusicFile {
+    LocalMusicFile::capture(
+        source_key.to_string(),
+        source_root.to_path_buf(),
+        PathBuf::from(relative_path),
+        max_file_bytes,
+        &MusicCancellation::default(),
+    )
+    .expect("local source proof should be captured")
+}
+
+fn local_batch(
+    chat_id: i64,
+    user_id: i64,
+    batch_id: &str,
+    files: Vec<LocalMusicFile>,
+) -> LocalMusicBatch {
+    LocalMusicBatch {
+        chat_id,
+        user_id,
+        batch_id: batch_id.to_string(),
+        files,
+    }
+}
+
 fn stored_job(upload: MusicUpload, stage: JobStage, created_at: u64) -> StoredJob {
     let (job_id, origin_key) = job_identity(&upload);
     let staging_cleanup_completed = stage == JobStage::Complete;
     StoredJob {
         job_id,
         origin_key,
-        upload,
+        upload: Some(upload),
+        local_source: None,
         stage,
         created_at,
         updated_at: created_at,
@@ -983,7 +1016,13 @@ fn insert_completed_cleanup_job(
             job.track = Some(track.clone());
             job.local_copy_verified = true;
             job.add_intent = true;
-            job.status_message_id = Some(900 + job.upload.message_id);
+            job.status_message_id = Some(
+                900 + job
+                    .upload
+                    .as_ref()
+                    .expect("Telegram fixture should retain its upload")
+                    .message_id,
+            );
             job.status_send_attempted = true;
             job.status_text = Some(render_status(&job));
             job.staging_cleanup_completed = false;
@@ -1882,7 +1921,14 @@ async fn lowering_admission_limit_keeps_historic_jobs_prepared_audio_and_catalog
         .expect("retained job should read")
         .expect("retained job should remain in history");
     assert_eq!(retained.stage, JobStage::Complete);
-    assert_eq!(retained.upload.file_size, 24);
+    assert_eq!(
+        retained
+            .upload
+            .as_ref()
+            .expect("retained fixture should be a Telegram job")
+            .file_size,
+        24
+    );
     assert_eq!(retained.prepared.as_ref().unwrap().original.size, 24);
     assert_eq!(
         reopened.store.snapshot().unwrap().content_catalog.len(),
@@ -3104,5 +3150,454 @@ async fn real_flac_conversion_survives_manager_restart_and_keeps_original_archiv
         .await
         .expect("reopened manager worker should stop")
         .expect("reopened manager worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn local_batch_replay_is_owner_scoped_and_metadata_conflicts_are_atomic() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("downloads");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        source_root.join("selected.m4a"),
+        b"complete original audio!",
+    )
+    .unwrap();
+    let file = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:0",
+        settings.max_file_bytes,
+    );
+    let server = TestHttpServer::start().await;
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        MockBackend::new(settings.archive_dir.clone()),
+    )
+    .await;
+
+    let first = manager
+        .enqueue_local_batch(local_batch(42, 42, "batch-first", vec![file.clone()]))
+        .await
+        .expect("local batch should be admitted");
+    let replay = manager
+        .enqueue_local_batch(local_batch(42, 42, "batch-replayed", vec![file.clone()]))
+        .await
+        .expect("same owner and source key should replay idempotently");
+    assert_eq!(first, replay);
+    assert_eq!(manager.store.snapshot().unwrap().jobs.len(), 1);
+
+    let mut conflicting_file = file.clone();
+    conflicting_file.relative_path = PathBuf::from("moved/selected.m4a");
+    let conflict = manager
+        .enqueue_local_batch(local_batch(
+            42,
+            42,
+            "batch-conflict",
+            vec![file.clone(), conflicting_file],
+        ))
+        .await;
+    assert!(conflict.is_err());
+    assert_eq!(manager.store.snapshot().unwrap().jobs.len(), 1);
+
+    let other_owner = manager
+        .enqueue_local_batch(local_batch(43, 43, "batch-other-owner", vec![file.clone()]))
+        .await
+        .expect("the same source key is scoped to a different owner");
+    assert_ne!(first[0].job_id, other_owner[0].job_id);
+    assert_eq!(
+        manager
+            .local_job_status(
+                42,
+                &[first[0].job_id.clone(), other_owner[0].job_id.clone()]
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|status| status.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first[0].job_id.as_str()]
+    );
+    assert_eq!(
+        manager
+            .local_job_status(
+                43,
+                &[first[0].job_id.clone(), other_owner[0].job_id.clone()]
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|status| status.job_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![other_owner[0].job_id.as_str()]
+    );
+
+    let staged_source = settings.staging_dir.join("qbt-output.m4a");
+    fs::write(&staged_source, b"complete original audio!").unwrap();
+    let staged_file = capture_local_file(
+        &settings.staging_dir,
+        "qbt-output.m4a",
+        "managed-path:0",
+        settings.max_file_bytes,
+    );
+    let before_managed_path_rejection = manager.store.snapshot().unwrap().jobs.len();
+    assert!(
+        manager
+            .enqueue_local_batch(local_batch(42, 42, "managed-path", vec![staged_file]))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        manager.store.snapshot().unwrap().jobs.len(),
+        before_managed_path_rejection
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(settings.state_dir.join(STATE_FILE)).unwrap()).unwrap();
+    let local_job = &state["jobs"][&first[0].job_id];
+    assert!(local_job["upload"].is_null());
+    assert_eq!(
+        local_job["local_source"]["file"]["source_key"],
+        "torrent-hash:0"
+    );
+    assert!(serde_json::from_value::<MusicUpload>(local_job["upload"].clone()).is_err());
+    server.stop();
+}
+
+#[tokio::test]
+async fn local_batch_capacity_failure_admits_no_partial_jobs() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    seed_full_active_queue(&settings);
+    let source_root = fixture.0.join("downloads");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(source_root.join("one.m4a"), b"complete original audio!").unwrap();
+    fs::write(source_root.join("two.m4a"), b"complete original audio!").unwrap();
+    let files = vec![
+        capture_local_file(
+            &source_root,
+            "one.m4a",
+            "torrent-hash:0",
+            settings.max_file_bytes,
+        ),
+        capture_local_file(
+            &source_root,
+            "two.m4a",
+            "torrent-hash:1",
+            settings.max_file_bytes,
+        ),
+    ];
+    let server = TestHttpServer::start().await;
+    let manager = open_manager(
+        settings,
+        &server,
+        MockBackend::new(fixture.settings().archive_dir),
+    )
+    .await;
+    let before = manager.store.snapshot().unwrap();
+    let result = manager
+        .enqueue_local_batch(local_batch(42, 42, "over-capacity", files))
+        .await;
+    assert!(result.is_err());
+    let after = manager.store.snapshot().unwrap();
+    assert_eq!(after.jobs.len(), before.jobs.len());
+    assert!(after.jobs.values().all(|job| job.local_source.is_none()));
+    server.stop();
+}
+
+#[test]
+fn local_snapshot_copies_bounded_bytes_without_changing_or_linking_source() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("downloads");
+    let destination_root = settings.staging_dir.join("snapshot-test");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::create_dir_all(&destination_root).unwrap();
+    let source_path = source_root.join("selected.m4a");
+    let source_bytes = b"complete original audio!";
+    fs::write(&source_path, source_bytes).unwrap();
+    let before = fs::symlink_metadata(&source_path).unwrap();
+    let source = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:0",
+        settings.max_file_bytes,
+    );
+    let destination = destination_root.join("original.m4a");
+
+    source
+        .copy_verified_snapshot(
+            &destination,
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .expect("selected bytes should copy into a private independent file");
+    source
+        .verify_existing_snapshot(
+            &destination,
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .expect("private snapshot should match the selected source proof");
+    let after = fs::symlink_metadata(&source_path).unwrap();
+    let copied = fs::symlink_metadata(&destination).unwrap();
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(fs::read(&destination).unwrap(), source_bytes);
+    assert_eq!(
+        (before.dev(), before.ino(), before.len()),
+        (after.dev(), after.ino(), after.len())
+    );
+    assert_ne!((before.dev(), before.ino()), (copied.dev(), copied.ino()));
+    assert_eq!(copied.nlink(), 1);
+
+    let source_hard_link = source_root.join("selected-hard-link.m4a");
+    fs::hard_link(&source_path, &source_hard_link).unwrap();
+    let linked_source = capture_local_file(
+        &source_root,
+        "selected-hard-link.m4a",
+        "torrent-hard-link:0",
+        settings.max_file_bytes,
+    );
+    let linked_destination = destination_root.join("hard-linked-source-copy.m4a");
+    linked_source
+        .copy_verified_snapshot(
+            &linked_destination,
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .expect("a read-only source hard link should still produce a separate Music copy");
+    let linked_copy_metadata = fs::symlink_metadata(linked_destination).unwrap();
+    assert_eq!(fs::symlink_metadata(&source_path).unwrap().nlink(), 2);
+    assert_eq!(linked_copy_metadata.nlink(), 1);
+}
+
+#[test]
+fn local_snapshot_rejects_symlinks_escapes_and_replaced_source_objects() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("downloads");
+    fs::create_dir_all(source_root.join("nested")).unwrap();
+    let source_path = source_root.join("selected.m4a");
+    fs::write(&source_path, b"complete original audio!").unwrap();
+    let outside = fixture.0.join("outside.m4a");
+    fs::write(&outside, b"complete original audio!").unwrap();
+    symlink(&outside, source_root.join("linked-file.m4a")).unwrap();
+    symlink(&fixture.0, source_root.join("linked-directory")).unwrap();
+
+    assert!(
+        LocalMusicFile::capture(
+            "escape:0".into(),
+            source_root.clone(),
+            PathBuf::from("../outside.m4a"),
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        LocalMusicFile::capture(
+            "symlink-file:0".into(),
+            source_root.clone(),
+            PathBuf::from("linked-file.m4a"),
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        LocalMusicFile::capture(
+            "symlink-dir:0".into(),
+            source_root.clone(),
+            PathBuf::from("linked-directory/outside.m4a"),
+            settings.max_file_bytes,
+            &MusicCancellation::default(),
+        )
+        .is_err()
+    );
+
+    let selected = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "replaced:0",
+        settings.max_file_bytes,
+    );
+    let old_path = source_root.join("old-selected.m4a");
+    fs::rename(&source_path, &old_path).unwrap();
+    fs::write(&source_path, b"replacement audio bytes!").unwrap();
+    let destination_root = settings.staging_dir.join("replacement-test");
+    fs::create_dir_all(&destination_root).unwrap();
+    let destination = destination_root.join("original.m4a");
+    assert!(
+        selected
+            .copy_verified_snapshot(
+                &destination,
+                settings.max_file_bytes,
+                &MusicCancellation::default(),
+            )
+            .is_err()
+    );
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&source_path).unwrap(), b"replacement audio bytes!");
+
+    let mutating_path = source_root.join("mutating.m4a");
+    fs::write(&mutating_path, b"complete original audio!").unwrap();
+    let mutating_proof = capture_local_file(
+        &source_root,
+        "mutating.m4a",
+        "mutated-content:0",
+        settings.max_file_bytes,
+    );
+    let before_mutation = fs::symlink_metadata(&mutating_path).unwrap();
+    fs::write(&mutating_path, b"xxxxxxxxxxxxxxxxxxxxxxxx").unwrap();
+    let after_mutation = fs::symlink_metadata(&mutating_path).unwrap();
+    assert_eq!(
+        (
+            before_mutation.dev(),
+            before_mutation.ino(),
+            before_mutation.len()
+        ),
+        (
+            after_mutation.dev(),
+            after_mutation.ino(),
+            after_mutation.len()
+        )
+    );
+    let mutation_destination = destination_root.join("mutated-content.m4a");
+    fs::create_dir_all(&destination_root).unwrap();
+    assert!(
+        mutating_proof
+            .copy_verified_snapshot(
+                &mutation_destination,
+                settings.max_file_bytes,
+                &MusicCancellation::default(),
+            )
+            .is_err()
+    );
+    assert!(mutation_destination.exists());
+    assert_eq!(
+        fs::read(mutation_destination).unwrap(),
+        b"xxxxxxxxxxxxxxxxxxxxxxxx"
+    );
+}
+
+#[tokio::test]
+async fn local_import_preserves_torrent_and_cleanup_removes_only_private_job_staging() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("downloads");
+    fs::create_dir_all(&source_root).unwrap();
+    let source_path = source_root.join("selected.m4a");
+    let source_bytes = b"complete original audio!";
+    fs::write(&source_path, source_bytes).unwrap();
+    let source_before = fs::symlink_metadata(&source_path).unwrap();
+    let source_sha = format!("{:x}", Sha256::digest(source_bytes));
+    let file = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:0",
+        settings.max_file_bytes,
+    );
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    *backend.original_sha.lock().unwrap() = source_sha;
+    *backend.cleanup_staging_root.lock().unwrap() = Some(settings.staging_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let sibling = settings.staging_dir.join("unrelated-job");
+    fs::create_dir_all(&sibling).unwrap();
+    fs::write(sibling.join("keep.txt"), b"keep").unwrap();
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let admitted = manager
+        .enqueue_local_batch(local_batch(42, 42, "batch-import", vec![file]))
+        .await
+        .expect("local source batch should be durably admitted");
+    let completed = wait_for_cleanup_complete(&manager, &admitted[0].job_id).await;
+
+    let source_after = fs::symlink_metadata(&source_path).unwrap();
+    assert_eq!(fs::read(&source_path).unwrap(), source_bytes);
+    assert_eq!(
+        (
+            source_before.dev(),
+            source_before.ino(),
+            source_before.len()
+        ),
+        (source_after.dev(), source_after.ino(), source_after.len())
+    );
+    assert!(!settings.staging_dir.join(&admitted[0].job_id).exists());
+    assert_eq!(fs::read(sibling.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    assert!(completed.staging_cleanup_completed);
+    assert_eq!(server.count_method("sendMessage"), 0);
+    assert_eq!(server.count_method("editMessageText"), 0);
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("local Music worker should stop")
+        .expect("local Music worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn local_add_intent_survives_restart_without_a_second_music_add() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("downloads");
+    fs::create_dir_all(&source_root).unwrap();
+    let source_path = source_root.join("selected.m4a");
+    let source_bytes = b"complete original audio!";
+    fs::write(&source_path, source_bytes).unwrap();
+    let file = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:0",
+        settings.max_file_bytes,
+    );
+    let batch = local_batch(42, 42, "batch-restart", vec![file]);
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    *backend.original_sha.lock().unwrap() = format!("{:x}", Sha256::digest(source_bytes));
+    backend.add_failure.store(true, Ordering::Release);
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let first = manager
+        .enqueue_local_batch(batch.clone())
+        .await
+        .expect("local source should be admitted");
+    let unknown = wait_for_stage(&manager, &first[0].job_id, JobStage::OutcomeUnknown).await;
+    assert!(unknown.add_intent);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("first local Music worker should stop")
+        .expect("first local Music worker should join");
+    drop(manager);
+
+    let restarted = open_manager(settings, &server, backend.clone() as Arc<dyn MusicBackend>).await;
+    let replay = restarted
+        .enqueue_local_batch(batch)
+        .await
+        .expect("replayed source should resolve to its durable job");
+    assert_eq!(replay[0].job_id, first[0].job_id);
+    let persisted = restarted.store.job(&first[0].job_id).unwrap().unwrap();
+    assert_eq!(persisted.stage, JobStage::OutcomeUnknown);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    assert_eq!(server.count_method("sendMessage"), 0);
+    assert_eq!(server.count_method("editMessageText"), 0);
     server.stop();
 }

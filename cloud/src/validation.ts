@@ -1021,6 +1021,27 @@ export function isOwnerPrivateTelegramUpdate(
     const correctChat = (typeof chatId === "number" && Number.isSafeInteger(chatId) && chatId === ownerId) || chatId === ownerUserId;
     return correctChat;
   };
+  const isOwnerPrivateWidgetQuery = (value: unknown): boolean => {
+    if (!isRecord(value) || Object.hasOwn(value, "inline_message_id") || Object.hasOwn(value, "widget_id") ||
+      Object.hasOwn(value, "chat_type") || !isOwner(value.from) || !isOwnerPrivateChat({ chat: value.chat })) {
+      return false;
+    }
+    if (typeof value.id !== "string" || value.id.length === 0 || value.id.length > 256 ||
+      !Number.isSafeInteger(value.message_id) || (value.message_id as number) <= 0 ||
+      !isRecord(value.type) || value.type.type !== "data" || typeof value.data !== "string") {
+      return false;
+    }
+    const dataBytes = new TextEncoder().encode(value.data).byteLength;
+    return dataBytes >= 1 && dataBytes <= 64 && typeof value.chat_instance === "string" &&
+      value.chat_instance.length > 0 && value.chat_instance.length <= 256;
+  };
+
+  // A widget query takes precedence when present so an update cannot smuggle a
+  // malformed widget alongside an otherwise valid owner message.
+  if (Object.hasOwn(update, "shared_widget_query")) return false;
+  if (Object.hasOwn(update, "widget_query")) {
+    return isOwnerPrivateWidgetQuery(update.widget_query);
+  }
   if (isOwnerPrivateChat(update.message) && isOwner((update.message as Record<string, unknown>).from)) return true;
   if (!isRecord(update.callback_query) || !isOwner(update.callback_query.from)) return false;
   return isOwnerPrivateChat(update.callback_query.message);

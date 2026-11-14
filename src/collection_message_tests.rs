@@ -118,6 +118,7 @@ mod collection_message_tests {
             queue,
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         }
     }
 
@@ -1506,6 +1507,7 @@ mod collection_message_tests {
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: Duration::ZERO,
                 music: None,
+                torrent: None,
             },
             chat_id,
             job_id,
@@ -2008,6 +2010,7 @@ mod collection_message_tests {
         handle_callback_query(
             bot_context(telegram.clone(), config, Arc::clone(&queue), 64),
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "all-present-details-page".to_string(),
                 data: Some(collection_details_callback_data(details_token, 1)),
                 message: Some(crate::telegram::Message {
@@ -2101,6 +2104,7 @@ mod collection_message_tests {
         let callback = tokio::spawn(handle_callback_query(
             callback_context,
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "details-running-edit-held".to_string(),
                 data: Some(collection_details_callback_data(details_token, 1)),
                 message: Some(crate::telegram::Message {
@@ -2265,6 +2269,7 @@ mod collection_message_tests {
         let completed_callback = tokio::spawn(handle_callback_query(
             completed_context,
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "details-terminal-page-back".to_string(),
                 data: Some(collection_details_callback_data(details_token, 0)),
                 message: Some(crate::telegram::Message {
@@ -2410,6 +2415,7 @@ mod collection_message_tests {
         let stale_callback = tokio::spawn(handle_callback_query(
             bot_context(telegram, config, Arc::clone(&queue), 67),
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "late-old-selection-callback".to_string(),
                 data: Some(old_callback_data),
                 message: Some(crate::telegram::Message {
@@ -2564,6 +2570,7 @@ mod collection_message_tests {
         let stale_callback = tokio::spawn(handle_callback_query(
             bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 69),
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "old-duplicate-cancel".to_string(),
                 data: Some(first_cancel_callback),
                 message: Some(crate::telegram::Message {
@@ -2941,6 +2948,7 @@ mod collection_message_tests {
                 .expect("current task should exist before stale callback");
             let context = bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 80);
             let callback = crate::telegram::CallbackQuery {
+                from: None,
                 id: format!("stale-queue-action-{index}"),
                 data: Some(queue_callback_data(action, id, 0)),
                 message: Some(crate::telegram::Message {

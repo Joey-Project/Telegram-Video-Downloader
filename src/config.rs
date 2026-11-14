@@ -31,6 +31,8 @@ pub struct AppConfig {
     pub bot: BotConfig,
     #[serde(default)]
     pub music: crate::music_types::MusicSettings,
+    #[serde(default)]
+    pub torrent: crate::torrent_types::TorrentSettings,
     #[serde(skip)]
     project_dir: PathBuf,
     #[serde(skip)]
@@ -218,6 +220,7 @@ impl AppConfig {
                 enabled: false,
                 ..Default::default()
             },
+            torrent: crate::torrent_types::TorrentSettings::default(),
             project_dir: PathBuf::from("."),
             config_file: None,
             video_storage_root: None,
@@ -321,6 +324,13 @@ impl AppConfig {
         let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
         self.bilibili.auth.credential_file = self.resolve_project_path(&credential_file);
         self.expand_music_paths();
+        let torrent_state = if self.torrent.state_dir.as_os_str().is_empty() {
+            self.video_storage_root()
+                .join(".telegram-video-downloader-torrents")
+        } else {
+            expand_home_path(&self.torrent.state_dir)
+        };
+        self.torrent.state_dir = self.resolve_project_path(&torrent_state);
     }
 
     fn expand_music_paths(&mut self) {
@@ -436,6 +446,22 @@ impl AppConfig {
                 let right = normalize_path_for_comparison(right)?;
                 if left.starts_with(&right) || right.starts_with(&left) {
                     bail!("music state, staging and original archive directories must not overlap");
+                }
+            }
+        }
+        if self.torrent.enabled {
+            self.torrent.validate()?;
+            let torrent_state = normalize_path_for_comparison(&self.torrent.state_dir)?;
+            for protected in [
+                &self.music.state_dir,
+                &self.music.staging_dir,
+                &self.music.archive_dir,
+            ] {
+                let protected = normalize_path_for_comparison(protected)?;
+                if torrent_state.starts_with(&protected) || protected.starts_with(&torrent_state) {
+                    bail!(
+                        "torrent state must not overlap Music state, staging or original archives"
+                    );
                 }
             }
         }
@@ -1188,6 +1214,16 @@ mod tests {
         assert_eq!(config.bot.command_timeout_seconds, 7200);
         assert_eq!(config.bot.command_idle_timeout_seconds, 300);
         assert!(config.cloud.is_none());
+        assert!(!config.torrent.enabled);
+        assert_eq!(config.torrent.base_url, "http://127.0.0.1:8080");
+        assert_eq!(config.torrent.max_torrent_bytes, 4 * 1024 * 1024);
+        assert_eq!(
+            config.torrent.state_dir,
+            config
+                .downloads
+                .video_dir
+                .join(".telegram-video-downloader-torrents")
+        );
         assert_eq!(config.pdf.auto_domains, vec!["mp.weixin.qq.com"]);
         assert_eq!(
             config.video.subtitle_languages,
@@ -1371,6 +1407,65 @@ mod tests {
             .expect("missing optional media tools should not fail bot startup");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn torrent_config_resolves_private_state_without_enabling_music() {
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+            [music]
+            enabled = false
+            [torrent]
+            enabled = true
+            state_dir = "torrent-control"
+            "#,
+            PathBuf::from("/tmp/torrent-config-project"),
+        )
+        .expect("independent local torrent support should load");
+        assert!(config.torrent.enabled);
+        assert!(!config.music.enabled);
+        assert_eq!(
+            config.torrent.state_dir,
+            PathBuf::from("/tmp/torrent-config-project/torrent-control")
+        );
+    }
+
+    #[test]
+    fn torrent_control_state_cannot_overlap_music_owned_paths() {
+        let mut config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+            [music]
+            enabled = false
+            state_dir = "/tmp/torrent-config-music/state"
+            staging_dir = "/tmp/torrent-config-music/staging"
+            archive_dir = "/tmp/torrent-config-music/archive"
+            [torrent]
+            enabled = true
+            state_dir = "/tmp/torrent-config-control"
+            "#,
+            PathBuf::from("/tmp/torrent-config-project"),
+        )
+        .expect("initial paths should be independent");
+        for protected in [
+            config.music.state_dir.clone(),
+            config.music.staging_dir.clone(),
+            config.music.archive_dir.clone(),
+        ] {
+            config.torrent.state_dir = protected.join("torrent-control");
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must not overlap")
+            );
+        }
     }
 
     #[test]

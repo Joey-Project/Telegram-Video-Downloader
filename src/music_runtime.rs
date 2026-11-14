@@ -15,8 +15,8 @@ use crate::music_manager::{Admission, MusicManager, validate_prepared_audio};
 use crate::music_native::NativeMusicBackend;
 use crate::music_transfer::MusicTransfer;
 use crate::music_types::{
-    ArchiveState, AudioBytes, MusicBackend, MusicCancellation, MusicSettings, MusicTrack,
-    MusicUpload, PreparedAudio,
+    ArchiveState, AudioBytes, LocalMusicBatch, LocalMusicJobRef, LocalMusicJobStatus, MusicBackend,
+    MusicCancellation, MusicSettings, MusicTrack, MusicUpload, PreparedAudio,
 };
 use crate::telegram::TelegramClient;
 
@@ -128,6 +128,26 @@ impl MusicService {
 
     pub async fn enqueue(&self, upload: MusicUpload) -> Result<Admission> {
         self.manager().await?.enqueue(upload).await
+    }
+
+    /// Durably admits a selected local batch or returns an error without partial admission.
+    pub async fn enqueue_local_batch(
+        &self,
+        batch: LocalMusicBatch,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        self.manager().await?.enqueue_local_batch(batch).await
+    }
+
+    /// Reads selected local job states without contacting Music or sending per-track messages.
+    pub async fn local_job_status(
+        &self,
+        chat_id: i64,
+        job_ids: &[String],
+    ) -> Result<Vec<LocalMusicJobStatus>> {
+        self.manager()
+            .await?
+            .local_job_status(chat_id, job_ids)
+            .await
     }
 
     pub async fn summary(&self, chat_id: i64) -> Result<String> {

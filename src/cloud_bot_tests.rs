@@ -1510,6 +1510,7 @@ pub(super) fn make_runtime(
             queue,
             queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             music: None,
+            torrent: None,
         },
         client: CloudClient::with_test_base_url("http://127.0.0.1:1")
             .expect("test cloud client should construct"),

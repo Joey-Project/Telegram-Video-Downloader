@@ -1218,6 +1218,22 @@ function ownerMessage(updateId: number, text = "/scan", fromId = ownerId, chatId
   };
 }
 
+function ownerWidgetUpdate(updateId: number, overrides: Record<string, unknown> = {}) {
+  return {
+    update_id: updateId,
+    widget_query: {
+      id: `widget-query-${updateId}`,
+      from: { id: ownerId, is_bot: false, first_name: "Owner" },
+      chat: { id: ownerId, type: "private", first_name: "Owner" },
+      message_id: updateId + 1,
+      chat_instance: `private-${ownerId}`,
+      type: { type: "data" },
+      data: "t1:0123456789abcdef0123456789abcdef:0000000000000001:r",
+      ...overrides,
+    },
+  };
+}
+
 async function webhook(update: unknown, secret: string = webhookToken): Promise<Response> {
   return SELF.fetch(new Request(`${workerUrl}/webhook`, {
     method: "POST",
@@ -1694,6 +1710,42 @@ describe("durable Telegram ingress", () => {
     expect(unsupported.status).toBe(200);
     expect(callback.status).toBe(200);
     expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toHaveLength(1);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(1);
+  });
+
+  it("durably accepts only well-formed owner private widget queries", async () => {
+    const acceptedUpdate = ownerWidgetUpdate(70);
+    const accepted = await webhook(acceptedUpdate);
+    expect(accepted.status).toBe(200);
+    expect(await responseJson<{ stored: boolean }>(accepted)).toMatchObject({ stored: true });
+
+    const rejectedUpdates = [
+      ownerWidgetUpdate(71, { from: { id: ownerId + 1, is_bot: false } }),
+      ownerWidgetUpdate(72, { chat: { id: -100123, type: "group" } }),
+      ownerWidgetUpdate(73, {
+        chat: undefined,
+        message_id: undefined,
+        inline_message_id: "inline-message",
+        chat_type: "private",
+      }),
+      ownerWidgetUpdate(74, { data: "x".repeat(65) }),
+      ownerWidgetUpdate(75, { type: { type: "unknown_future_shape" } }),
+      { update_id: 76, shared_widget_query: { id: "shared", from: { id: ownerId }, data: "t1:ignored" } },
+      { ...ownerWidgetUpdate(77), widget_query: { id: "missing-context", from: { id: ownerId }, data: "t1:ignored" } },
+      { ...ownerWidgetUpdate(78), shared_widget_query: { id: "shared", from: { id: ownerId }, data: "t1:ignored" } },
+    ];
+    for (const update of rejectedUpdates) {
+      const response = await webhook(update);
+      expect(response.status).toBe(200);
+      expect((await responseJson<{ stored: boolean; ignored: boolean }>(response))).toMatchObject({
+        stored: false,
+        ignored: true,
+      });
+    }
+
+    const queued = await responseJson<{ requests: Array<{ payload: Record<string, unknown> }> }>(await localRequests());
+    expect(queued.requests).toHaveLength(1);
+    expect(queued.requests[0]?.payload).toEqual(acceptedUpdate);
     expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(1);
   });
 

@@ -8,6 +8,9 @@ use std::{error::Error, fmt};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[path = "music_local.rs"]
+mod local_snapshot;
+
 /// Recognized Telegram download outcomes safe to show to the upload owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MusicDownloadFailure {
@@ -53,6 +56,160 @@ pub struct MusicUpload {
     pub file_name: String,
     pub file_size: u64,
     pub mime_type: Option<String>,
+}
+
+/// A batch of complete files selected from a local torrent client for Music import.
+#[derive(Clone, Debug)]
+pub struct LocalMusicBatch {
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub batch_id: String,
+    pub files: Vec<LocalMusicFile>,
+}
+
+/// A selected local file and the source-object proof captured by the server.
+///
+/// The proof field is private so callers cannot turn client-provided metadata into an
+/// authorization to import an arbitrary path. Use [`LocalMusicFile::capture`] on a blocking
+/// worker after the torrent client reports the selected file complete.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalMusicFile {
+    pub source_key: String,
+    pub source_root: PathBuf,
+    pub relative_path: PathBuf,
+    pub file_name: String,
+    pub file_size: u64,
+    proof: local_snapshot::SourceProof,
+}
+
+impl LocalMusicFile {
+    /// Capture a bounded proof for a regular file reached below `source_root` without symlinks.
+    ///
+    /// This reads the selected file once to bind its SHA-256, size, and object identity. Call it
+    /// off the async update loop and only after the torrent client reports the file complete.
+    pub fn capture(
+        source_key: String,
+        source_root: PathBuf,
+        relative_path: PathBuf,
+        max_file_bytes: u64,
+        cancel: &MusicCancellation,
+    ) -> Result<Self> {
+        let file_name = relative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("selected local file name is not valid UTF-8"))?
+            .to_string();
+        let proof =
+            local_snapshot::capture_source(&source_root, &relative_path, max_file_bytes, cancel)?;
+        let file = Self {
+            source_key,
+            source_root,
+            relative_path,
+            file_name,
+            file_size: proof.file_size,
+            proof,
+        };
+        file.validate_shape(max_file_bytes)?;
+        Ok(file)
+    }
+
+    pub(crate) fn validate_shape(&self, max_file_bytes: u64) -> Result<()> {
+        local_snapshot::validate_source_shape(self, max_file_bytes)
+    }
+
+    pub(crate) fn copy_verified_snapshot(
+        &self,
+        destination: &Path,
+        max_file_bytes: u64,
+        cancel: &MusicCancellation,
+    ) -> Result<()> {
+        local_snapshot::copy_verified_snapshot(self, destination, max_file_bytes, cancel)
+    }
+
+    pub(crate) fn verify_existing_snapshot(
+        &self,
+        destination: &Path,
+        max_file_bytes: u64,
+        cancel: &MusicCancellation,
+    ) -> Result<()> {
+        local_snapshot::verify_existing_snapshot(self, destination, max_file_bytes, cancel)
+    }
+
+    pub(crate) fn matches_content(&self, sha256: &str, size: u64) -> bool {
+        self.file_size == size && self.proof.sha256.eq_ignore_ascii_case(sha256)
+    }
+
+    pub(crate) fn resolved_path(&self) -> PathBuf {
+        self.proof.resolved_root.join(&self.relative_path)
+    }
+}
+
+/// Durable reference to a local Music job. The source key is stable across batch replays.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalMusicJobRef {
+    pub source_key: String,
+    pub job_id: String,
+}
+
+/// Read-only local Music job state returned to the aggregate torrent widget.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalMusicJobStatus {
+    pub job_id: String,
+    pub source_key: String,
+    pub stage: JobStage,
+    pub error: Option<String>,
+}
+
+/// Durable stage shared by Telegram and local Music jobs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStage {
+    Queued,
+    Downloading,
+    Preparing,
+    Archiving,
+    CatalogDedupe,
+    Importing,
+    Querying,
+    WaitingMusicCloud,
+    VerifyingCopy,
+    ArchiveUploading,
+    WaitingArchiveCloud,
+    Evicting,
+    Complete,
+    Failed,
+    Cancelled,
+    OutcomeUnknown,
+}
+
+impl JobStage {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Failed | Self::Cancelled | Self::OutcomeUnknown
+        )
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Downloading => "downloading",
+            Self::Preparing => "preparing audio",
+            Self::Archiving => "saving archive copy",
+            Self::CatalogDedupe => "checking existing music",
+            Self::Importing => "importing into Music",
+            Self::Querying => "checking Music",
+            Self::WaitingMusicCloud => "waiting for Music cloud sync",
+            Self::VerifyingCopy => "verifying the Music copy",
+            Self::ArchiveUploading => "waiting for archive upload",
+            Self::WaitingArchiveCloud => "waiting for archive upload",
+            Self::Evicting => "evicting verified archive bytes",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::OutcomeUnknown => "import outcome unknown; no automatic retry",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
