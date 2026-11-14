@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-14
 updated: 2026-11-14
 branch: "codex/music-cache-cleanup"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/72"
 supersedes: []
 superseded_by: ""
 ---
