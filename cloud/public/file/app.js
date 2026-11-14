@@ -1185,7 +1185,11 @@ function reconcileAwaitingOperationResults(snapshot) {
   for (const [requestId, tracker] of state.awaitingOperationResults) {
     if (!Number.isSafeInteger(tracker.seq)) continue;
     const operation = operations.find((entry) => entry?.seq === tracker.seq && entry?.kind === tracker.kind);
-    if (!operation || !SETTLED_OPERATION_STATUSES.has(String(operation.status ?? "").toLowerCase())) continue;
+    const operationStatus = String(operation?.status ?? "").toLowerCase();
+    const stagingPreviewReadyForReview = tracker.kind === "staging_cleanup"
+      && operation?.operation === "preview"
+      && operationStatus === "awaiting_confirmation";
+    if (!operation || (!SETTLED_OPERATION_STATUSES.has(operationStatus) && !stagingPreviewReadyForReview)) continue;
     state.awaitingOperationResults.delete(requestId);
     changed = true;
   }
@@ -2733,8 +2737,8 @@ function latestStagingScan(libraryId = activeLibraryId()) {
   const invalidatedByCleanup = operations.some((entry) => entry?.kind === "staging_cleanup"
     && stagingCleanupOperationName(entry) === "confirm"
     && Number.isSafeInteger(entry.seq) && Number.isSafeInteger(latest.entry.seq) && entry.seq > latest.entry.seq
-    && String(entry.payload?.library_id ?? "") === libraryId
-    && String(entry.payload?.root_binding ?? "") === rootBinding
+    && String(entry.result?.library_id ?? "") === libraryId
+    && String(entry.result?.root_binding ?? "") === rootBinding
     && entry.result?.cleanup && typeof entry.result.cleanup === "object"
     && SETTLED_OPERATION_STATUSES.has(String(entry.status ?? "").toLowerCase()));
   return invalidatedByCleanup ? null : latest.scan;

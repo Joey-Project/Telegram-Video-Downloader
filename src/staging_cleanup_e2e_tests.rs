@@ -318,6 +318,19 @@ async fn staging_cleanup_confirm_after_restart_removes_only_reviewed_partial_fil
         "{:?}",
         confirm.error
     );
+    let snapshot = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("confirmed cleanup snapshot should build")
+        .expect("cloud state should exist");
+    let receipt = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 3)
+        .expect("confirmation receipt should be published");
+    assert!(receipt.get("payload").is_none());
+    assert_eq!(receipt["result"]["operation"], "confirm");
+    assert_eq!(receipt["result"]["library_id"], fixture.source_library_id);
+    assert_eq!(receipt["result"]["root_binding"], binding);
     assert!(
         !selected.exists(),
         "confirmed partial directory should be removed"

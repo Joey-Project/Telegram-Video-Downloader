@@ -63,6 +63,10 @@ superseded_by: ""
   bounded sample and exact bindings, never the private identity proofs.
 - D1 migration 0007 adds the request kind while preserving pending/acknowledged
   messages, payload hashes, deduplication IDs, sequence high-water and epoch.
+- A prepared preview stops waiting for computation while remaining available for
+  confirmation or cancellation. Leaving Requests therefore releases its operation
+  subscription. Confirmation receipts publish the library/root identity used to
+  invalidate the previous scan without exposing the private request payload.
 
 ## Validation
 
@@ -79,3 +83,6 @@ superseded_by: ""
 - Worker/D1: 405 tests pass; mounted Mini App: 92 tests pass. Type checking,
   migration preservation checks and deployment dry-run pass. Existing CI
   automatically discovers the new Rust and Mini App tests.
+- Mounted UI regressions cover releasing preview-result interest on navigation,
+  retaining review controls and invalidating scans using the real public receipt
+  shape. The restart-confirmation E2E verifies that shape from the Rust snapshot.

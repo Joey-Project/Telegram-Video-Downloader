@@ -285,6 +285,8 @@ pub(super) async fn dispatch(
                 status: InboxStatus::Completed,
                 result: Some(json!({
                     "operation": "confirm",
+                    "library_id": payload.library_id,
+                    "root_binding": payload.root_binding,
                     "preview_id": preview_id,
                     "revision": revision,
                     "cleanup": cleanup,

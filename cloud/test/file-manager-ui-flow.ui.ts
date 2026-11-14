@@ -4045,6 +4045,17 @@ describe("file manager UI flow", () => {
     expect(document.body.textContent).not.toContain("must not appear in public UI");
     await vi.waitFor(() => expect(storage.getItem("file-manager.actions.v1")).toBe("[]"));
 
+    const firstPageSocket = latestOpenSocket(firstPage.sockets);
+    expect(firstPageSocket).toBeDefined();
+    element<HTMLButtonElement>('[data-view="library"]').click();
+    await vi.waitFor(() => {
+      expect(firstPageSocket?.sentFrames.filter((frame) => frame.type === "interest").at(-1)?.watch).toBe(false);
+    });
+    expect(firstPage.currentSnapshot.operations.find((entry: Record<string, any>) => entry.operation === "preview")?.status)
+      .toBe("awaiting_confirmation");
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLButtonElement>(`[data-staging-cleanup-cancel="${STAGING_PREVIEW_ID}"]`).disabled).toBe(false);
+
     const previewSnapshot = firstPage.currentSnapshot;
     let cancellationSnapshot = previewSnapshot;
     const previewOperation = previewSnapshot.operations.find((entry: Record<string, any>) => entry.operation === "preview");
@@ -4145,11 +4156,12 @@ describe("file manager UI flow", () => {
         operation: "confirm",
         status: "completed",
         created_at: Math.floor(Date.now() / 1_000),
-        payload: action.payload,
         result: {
           operation: "confirm",
           preview_id: STAGING_PREVIEW_ID,
           revision: STAGING_PREVIEW_REVISION,
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
           cleanup: { removed: ["video-stage-eligible"], failed: [], bytes: 4_096 },
         },
       };
