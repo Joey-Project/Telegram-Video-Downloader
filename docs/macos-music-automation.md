@@ -149,9 +149,18 @@ are converted to verified ALAC. Music's cloud status and the original archive's 
 separate checks. The task waits for Music cloud completion and verifies an
 independent local Music copy; it also waits for the archive upload to finish before
 allowing local archive bytes to be evicted. The cloud archive remains the retained
-original. Completed download staging is retained in this first implementation;
-archive eviction does not remove those separate staging files. A later explicit
-staging-cleanup feature must protect active tasks and Music playback dependencies.
+original. Once the job is durably complete, the bot separately cleans its private
+download and conversion staging directory. Cleanup checks the uploaded archive
+and independently verifies the current Music-owned copy before deleting staging.
+It preserves the iCloud original, Music library files and content catalog.
+
+Cleanup completion is durable. If cleanup is interrupted or a file is temporarily
+inaccessible, the completed import remains complete and cleanup retries with
+backoff, including after restart; it does not download or add the track again.
+Incomplete, failed and cancelled tasks retain their files for recovery. Cleanup
+rejects links, unsafe paths and replaced filesystem objects rather than following
+them outside the selected job directory. Earlier ad-hoc test source directories
+and catalog-only legacy imports are not recursively swept by this mechanism.
 
 New original archives retain the filename received from Telegram, including
 multilingual titles, spaces and safe punctuation. Filesystem separators and

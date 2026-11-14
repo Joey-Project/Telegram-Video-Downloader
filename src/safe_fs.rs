@@ -101,6 +101,15 @@ pub(crate) struct BoundFile {
     identity: EntryIdentity,
 }
 
+/// A no-follow regular-file descriptor exposed only through metadata operations. On macOS this
+/// uses `O_EVTONLY`; on Linux it uses `O_PATH`. Keep the descriptor sealed behind this type:
+/// do not add payload-reading or raw-fd APIs, since the macOS flag is not a kernel read barrier.
+#[derive(Clone)]
+pub(crate) struct BoundMetadataFile {
+    fd: Arc<OwnedFd>,
+    identity: EntryIdentity,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BoundFileAccessPolicy {
     pub(crate) owner: u32,
@@ -293,6 +302,15 @@ impl std::fmt::Debug for BoundFile {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BoundFile")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for BoundMetadataFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundMetadataFile")
             .field("identity", &self.identity)
             .finish_non_exhaustive()
     }
@@ -585,6 +603,48 @@ impl BoundFile {
             .map_err(errno_to_io)
             .context("failed to unlock bound file")?;
         self.validate_identity()
+    }
+}
+
+impl BoundMetadataFile {
+    pub(crate) fn identity(&self) -> EntryIdentity {
+        self.identity
+    }
+
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        if identity_for_fd(self.fd.as_ref())? != self.identity {
+            bail!("bound metadata-only file descriptor identity changed");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn access_policy(&self) -> Result<BoundFileAccessPolicy> {
+        self.validate_identity()?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound metadata-only file access policy")?;
+        if identity_from_stat(&stat) != self.identity {
+            bail!("bound metadata-only file identity changed while reading access policy");
+        }
+        let policy = BoundFileAccessPolicy {
+            owner: stat.st_uid,
+            group: stat.st_gid,
+            mode: (stat.st_mode & 0o7777) as u32,
+            link_count: stat.st_nlink as u64,
+        };
+        self.validate_identity()?;
+        Ok(policy)
+    }
+
+    pub(crate) fn byte_len(&self) -> Result<u64> {
+        self.validate_identity()?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound metadata-only file length")?;
+        if identity_from_stat(&stat) != self.identity {
+            bail!("bound metadata-only file identity changed while reading its length");
+        }
+        u64::try_from(stat.st_size).context("bound file has a negative length")
     }
 }
 
@@ -1055,6 +1115,48 @@ impl RootedFs {
         }
         self.validate_bound_parent(&entry.parent)?;
         Ok(BoundFile {
+            fd: Arc::new(fd),
+            identity: expected,
+        })
+    }
+
+    /// Open only file metadata while preserving the caller-selected object identity.
+    ///
+    /// This is for filesystem inventory and cleanup paths that must avoid an ordinary read open
+    /// of File Provider content. The descriptor is no-follow and anchored to the already-bound
+    /// parent; the before/open/after checks protect the regular-file identity. The returned type
+    /// exposes only metadata operations; do not add payload-reading or raw-fd APIs.
+    pub(crate) fn open_bound_metadata_file_if_identity(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<BoundMetadataFile> {
+        self.validate_bound_parent(&entry.parent)?;
+        if !expected.is_file()
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound metadata-only file identity changed before open: {}",
+                entry.path.display()
+            );
+        }
+        let fd =
+            openat_metadata_only(entry.parent.fd.as_ref(), &entry.leaf).with_context(|| {
+                format!(
+                    "failed to open metadata-only bound file {}",
+                    entry.path.display()
+                )
+            })?;
+        if identity_for_fd(&fd)? != expected
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+        {
+            bail!(
+                "bound metadata-only file identity changed during open: {}",
+                entry.path.display()
+            );
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(BoundMetadataFile {
             fd: Arc::new(fd),
             identity: expected,
         })
@@ -3179,6 +3281,50 @@ fn openat_directory(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, std::io::
         Mode::empty(),
     )
     .map_err(errno_to_io)
+}
+
+#[cfg(target_os = "macos")]
+fn openat_metadata_only(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, std::io::Error> {
+    use std::os::fd::FromRawFd;
+
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "metadata-only file name contains a NUL byte",
+        )
+    })?;
+    // Use O_EVTONLY for metadata inspection without requesting a normal data-read open. The
+    // descriptor remains private behind BoundMetadataFile; O_EVTONLY itself is not a read barrier.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_EVTONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn openat_metadata_only(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, std::io::Error> {
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(errno_to_io)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn openat_metadata_only(_parent: &OwnedFd, _name: &OsStr) -> Result<OwnedFd, std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "metadata-only bound files are supported only on macOS and Linux",
+    ))
 }
 
 fn openat_directory_cstr(parent: &OwnedFd, name: &CStr) -> Result<OwnedFd, std::io::Error> {
@@ -6886,5 +7032,65 @@ mod tests {
         drop(target_root);
         drop(source_root);
         fs::remove_dir_all(parent).expect("migration fixture should clean up");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn metadata_bound_file_uses_platform_flags_and_rejects_replacement() {
+        let directory = tempfile::tempdir().expect("metadata-only fixture should create");
+        let path = directory.path().join("payload.bin");
+        fs::write(&path, b"payload bytes").expect("fixture payload should create");
+        let rooted = RootedFs::new(directory.path()).expect("fixture root should open");
+        let entry = rooted
+            .bind_entry(&path, false)
+            .expect("payload should bind");
+        let identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("payload identity should read")
+            .expect("payload should exist");
+        let metadata = rooted
+            .open_bound_metadata_file_if_identity(&entry, identity)
+            .expect("metadata-only descriptor should open");
+        assert_eq!(
+            metadata.byte_len().expect("metadata length should read"),
+            13
+        );
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let flags = unsafe { libc::fcntl(metadata.fd.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "descriptor flags should be readable");
+            assert_ne!(
+                flags & libc::O_EVTONLY,
+                0,
+                "macOS metadata descriptor should retain O_EVTONLY"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let flags = rustix::fs::fcntl_getfl(metadata.fd.as_ref())
+                .expect("descriptor flags should be readable");
+            assert!(
+                flags.contains(OFlags::PATH),
+                "Linux metadata descriptor should retain O_PATH"
+            );
+            assert!(
+                rustix::io::read(metadata.fd.as_ref(), &mut [0_u8; 1]).is_err(),
+                "Linux O_PATH descriptor must not permit reading payload bytes"
+            );
+        }
+
+        // Keep the selected inode alive so this fixture tests object replacement,
+        // rather than allowing the filesystem to recycle an unlinked inode number.
+        fs::remove_file(&path).expect("selected payload should remove for replacement fixture");
+        fs::write(&path, b"replacement").expect("replacement payload should create");
+        assert!(
+            rooted
+                .open_bound_metadata_file_if_identity(&entry, identity)
+                .is_err(),
+            "metadata-only open must reject a replaced path"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
     }
 }

@@ -609,6 +609,16 @@ impl MusicBackend for RuntimeMusicBackend {
     fn evict_archive(&self, archive: &ArchiveState, track: &MusicTrack) -> Result<ArchiveState> {
         self.native.evict_archive(archive, track)
     }
+
+    fn cleanup_staging(
+        &self,
+        job_id: &str,
+        audio: &PreparedAudio,
+        archive: &ArchiveState,
+        track: &MusicTrack,
+    ) -> Result<()> {
+        self.native.cleanup_staging(job_id, audio, archive, track)
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +723,16 @@ mod tests {
 
         fn evict_archive(&self, _: &ArchiveState, _: &MusicTrack) -> Result<ArchiveState> {
             bail!("accepted-record verification must not evict archives")
+        }
+
+        fn cleanup_staging(
+            &self,
+            _: &str,
+            _: &PreparedAudio,
+            _: &ArchiveState,
+            _: &MusicTrack,
+        ) -> Result<()> {
+            bail!("accepted-record verification must not clean staging")
         }
     }
 

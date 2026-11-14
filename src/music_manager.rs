@@ -38,6 +38,11 @@ const MAX_UNIQUE_ID_BYTES: usize = 512;
 const MAX_IMPORT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONFIGURED_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_STATUS_EDIT_ATTEMPTS: u8 = 6;
+#[cfg(not(test))]
+const STAGING_CLEANUP_RETRY_BASE_SECONDS: u64 = 60;
+#[cfg(test)]
+const STAGING_CLEANUP_RETRY_BASE_SECONDS: u64 = 5;
+const STAGING_CLEANUP_RETRY_MAX_SECONDS: u64 = 6 * 60 * 60;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -141,6 +146,12 @@ struct StoredJob {
     status_edit_attempts: u8,
     #[serde(default)]
     status_next_attempt_at: Option<u64>,
+    #[serde(default)]
+    staging_cleanup_completed: bool,
+    #[serde(default)]
+    staging_cleanup_attempts: u8,
+    #[serde(default)]
+    staging_cleanup_next_attempt_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +310,27 @@ impl MusicStore {
         Ok(self.snapshot()?.jobs.get(job_id).cloned())
     }
 
+    fn schedule_staging_cleanup_retry(&self, job_id: &str) -> Result<bool> {
+        self.transact(|state| {
+            let job = state
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| anyhow!("music job disappeared"))?;
+            if job.stage != JobStage::Complete || job.staging_cleanup_completed {
+                return Ok(false);
+            }
+            job.staging_cleanup_attempts = job.staging_cleanup_attempts.saturating_add(1);
+            let shift = u32::from(job.staging_cleanup_attempts.saturating_sub(1)).min(16);
+            let delay = STAGING_CLEANUP_RETRY_BASE_SECONDS
+                .saturating_mul(1_u64 << shift)
+                .min(STAGING_CLEANUP_RETRY_MAX_SECONDS);
+            let now = unix_seconds();
+            job.staging_cleanup_next_attempt_at = Some(now.saturating_add(delay));
+            job.updated_at = now;
+            Ok(true)
+        })
+    }
+
     fn enqueue(&self, upload: MusicUpload, settings: &MusicSettings) -> Result<Admission> {
         validate_upload(&upload, settings)?;
         let (job_id, origin_key) = job_identity(&upload);
@@ -343,6 +375,9 @@ impl MusicStore {
                     status_pending_text: None,
                     status_edit_attempts: 0,
                     status_next_attempt_at: None,
+                    staging_cleanup_completed: false,
+                    staging_cleanup_attempts: 0,
+                    staging_cleanup_next_attempt_at: None,
                 },
             );
             make_room_for_serialized_admission(state, &job_id)?;
@@ -617,6 +652,15 @@ impl MusicStore {
         let state = self.snapshot()?;
         let mut earliest_poll = None;
         for job in state.jobs.values() {
+            if job.stage == JobStage::Complete && !job.staging_cleanup_completed {
+                match job.staging_cleanup_next_attempt_at {
+                    Some(timestamp) if timestamp > now => {
+                        earliest_poll =
+                            Some(earliest_poll.map_or(timestamp, |old: u64| old.min(timestamp)));
+                    }
+                    _ => return Ok(Some(WorkItem::Cleanup(job.job_id.clone()))),
+                }
+            }
             match status_schedule(job, now) {
                 StatusSchedule::Due => return Ok(Some(WorkItem::Status(job.job_id.clone()))),
                 StatusSchedule::At(timestamp) => {
@@ -674,6 +718,7 @@ enum ImportDecision {
 
 enum WorkItem {
     Job(String),
+    Cleanup(String),
     Status(String),
     WaitUntil(u64),
 }
@@ -805,6 +850,20 @@ impl MusicManager {
                                 let _ = task.await;
                                 if changed.is_err() || *shutdown.borrow() {
                                     return;
+                                }
+                            }
+                        }
+                    }
+                    Some(WorkItem::Cleanup(job_id)) => {
+                        if !manager.cleanup_completed_staging(&job_id).await {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                                _ = manager.notify.notified() => {},
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        manager.cancel_active_pre_import();
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -1703,6 +1762,9 @@ impl MusicManager {
                             current.stage = JobStage::Complete;
                             current.next_poll_at = None;
                             current.error = None;
+                            current.staging_cleanup_completed = false;
+                            current.staging_cleanup_attempts = 0;
+                            current.staging_cleanup_next_attempt_at = None;
                         })
                         .is_ok()
                     {
@@ -1740,12 +1802,87 @@ impl MusicManager {
                     current.local_copy_verified = true;
                     current.next_poll_at = None;
                     current.error = None;
+                    current.staging_cleanup_completed = false;
+                    current.staging_cleanup_attempts = 0;
+                    current.staging_cleanup_next_attempt_at = None;
                 })
                 .is_ok()
             {
                 let _ = self.update_status(job_id).await;
             }
         }
+    }
+
+    async fn cleanup_completed_staging(&self, job_id: &str) -> bool {
+        let state = match self.store.snapshot() {
+            Ok(state) => state,
+            Err(_) => return true,
+        };
+        let Some(job) = state.jobs.get(job_id).cloned() else {
+            return true;
+        };
+        if job.staging_cleanup_completed || job.stage != JobStage::Complete {
+            return true;
+        }
+        match self.store.schedule_staging_cleanup_retry(job_id) {
+            Ok(true) => {}
+            Ok(false) => return true,
+            Err(_) => {
+                tracing::warn!(job_id = %job_id, "unable to persist Music staging cleanup retry state");
+                // The job is still due. Yield locally before retrying a failed durable write.
+                return false;
+            }
+        }
+        let proof = completed_cleanup_proof(&state, &job);
+        let cleanup_result = match proof {
+            Some((prepared, archive, track)) => {
+                let backend = Arc::clone(&self.backend);
+                let cleanup_job_id = job_id.to_string();
+                run_blocking(move || {
+                    backend.cleanup_staging(&cleanup_job_id, &prepared, &archive, &track)
+                })
+                .await
+            }
+            None => Err(anyhow!(
+                "completed cleanup proof no longer matches the content catalog"
+            )),
+        };
+        if cleanup_result.is_ok() {
+            if self
+                .store
+                .set_job(job_id, |current| {
+                    if current.stage == JobStage::Complete && !current.staging_cleanup_completed {
+                        current.staging_cleanup_completed = true;
+                        current.staging_cleanup_attempts = 0;
+                        current.staging_cleanup_next_attempt_at = None;
+                    }
+                })
+                .is_err()
+            {
+                tracing::warn!(job_id = %job_id, "Music staging cleanup succeeded but its completion receipt could not be persisted");
+            }
+        } else if self
+            .store
+            .set_job(job_id, |current| {
+                if current.stage == JobStage::Complete && !current.staging_cleanup_completed {
+                    let shift =
+                        u32::from(current.staging_cleanup_attempts.saturating_sub(1)).min(16);
+                    let delay = STAGING_CLEANUP_RETRY_BASE_SECONDS
+                        .saturating_mul(1_u64 << shift)
+                        .min(STAGING_CLEANUP_RETRY_MAX_SECONDS);
+                    current.staging_cleanup_next_attempt_at =
+                        Some(unix_seconds().saturating_add(delay));
+                }
+            })
+            .is_err()
+        {
+            tracing::warn!(job_id = %job_id, "Music staging cleanup failed and retry metadata could not be refreshed");
+            // The pre-call deadline remains durable; avoid a tight loop if the refresh failed.
+            return false;
+        } else {
+            tracing::warn!(job_id = %job_id, "Music staging cleanup failed; retry scheduled");
+        }
+        true
     }
 
     async fn fail_job(&self, job_id: &str, safe_message: &str) {
@@ -2059,6 +2196,7 @@ fn make_room_for_serialized_admission(state: &mut StoredState, new_job_id: &str)
 
 fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
     if job.stage != JobStage::Complete
+        || !job.staging_cleanup_completed
         || !job.add_intent
         || !job.local_copy_verified
         || job.status_message_id.is_none()
@@ -2099,6 +2237,42 @@ fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
                 && entry.prepared.original.sha256 == prepared.original.sha256
                 && entry.prepared.import.sha256 == prepared.import.sha256
         })
+}
+
+fn completed_cleanup_proof(
+    state: &StoredState,
+    job: &StoredJob,
+) -> Option<(PreparedAudio, ArchiveState, MusicTrack)> {
+    if job.stage != JobStage::Complete || job.staging_cleanup_completed || !job.local_copy_verified
+    {
+        return None;
+    }
+    let (prepared, archive, persistent_id, track) = (
+        job.prepared.as_ref()?,
+        job.archive.as_ref()?,
+        job.persistent_id.as_ref()?,
+        job.track.as_ref()?,
+    );
+    if !job.add_intent
+        || !track.cloud_complete()
+        || track.persistent_id.as_str() != persistent_id.as_str()
+        || !archive.uploaded
+        || archive.uploading
+        || archive.downloading
+        || archive.conflicts
+    {
+        return None;
+    }
+    let sha = normalize_sha256(&prepared.original.sha256).ok()?;
+    let catalog = state.content_catalog.get(&sha)?;
+    if !catalog.add_intent
+        || catalog.persistent_id.as_ref() != Some(persistent_id)
+        || !same_prepared_audio_identity(&catalog.prepared, prepared).ok()?
+        || catalog.archive.path != archive.path
+    {
+        return None;
+    }
+    Some((prepared.clone(), archive.clone(), track.clone()))
 }
 
 pub(crate) fn validate_prepared_audio(
@@ -2295,6 +2469,17 @@ fn validate_stored_state(state: &StoredState, archive_dir: &Path) -> Result<()> 
             .is_some_and(|message_id| message_id <= 0)
         {
             bail!("music state contains an invalid Telegram status message ID");
+        }
+        if (job.staging_cleanup_completed && job.stage != JobStage::Complete)
+            || (job.staging_cleanup_completed
+                && (job.staging_cleanup_attempts != 0
+                    || job.staging_cleanup_next_attempt_at.is_some()))
+            || (job.staging_cleanup_attempts == 0 && job.staging_cleanup_next_attempt_at.is_some())
+            || (!job.staging_cleanup_completed
+                && job.staging_cleanup_attempts != 0
+                && job.staging_cleanup_next_attempt_at.is_none())
+        {
+            bail!("music state contains invalid staging cleanup retry metadata");
         }
     }
     for (sha, entry) in &state.content_catalog {
