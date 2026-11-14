@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-13
 updated: 2026-11-14
 branch: "codex/staging-cleanup"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/71"
 supersedes: []
 superseded_by: ""
 ---
