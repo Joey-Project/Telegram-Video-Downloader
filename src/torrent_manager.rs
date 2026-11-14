@@ -24,9 +24,9 @@ use crate::torrent_types::{
     CompletedTorrentFile, DEFAULT_MAX_FILES, DEFAULT_MAX_TORRENT_BYTES,
     MAX_TORRENT_COMPONENT_BYTES, MAX_TORRENT_PATH_BYTES, MetainfoFile, RemoteTorrentFile,
     SubmitDisposition, SubmitResult, TorrentAction, TorrentBackend, TorrentEnqueueResult,
-    TorrentFileSnapshot, TorrentFolder, TorrentMagnet, TorrentMetainfo, TorrentMusicJobRef,
-    TorrentMusicStage, TorrentPhase, TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot,
-    TorrentUpload, WIDGET_PAGE_SIZE, supports_music_import,
+    TorrentExisting, TorrentFileSnapshot, TorrentFolder, TorrentMagnet, TorrentMetainfo,
+    TorrentMusicJobRef, TorrentMusicStage, TorrentPhase, TorrentRemoteSnapshot, TorrentSettings,
+    TorrentSnapshot, TorrentUpload, WIDGET_PAGE_SIZE, supports_music_import,
 };
 
 const STATE_FILE_NAME: &str = "state.json";
@@ -125,6 +125,216 @@ impl TorrentManager {
         self.enqueue_source(origin_key, None, Some(magnet))
     }
 
+    /// Adopt one exact qBittorrent hash for a Telegram catalog request.
+    pub async fn adopt_existing(
+        &self,
+        mut source: TorrentExisting,
+        request_key: String,
+    ) -> Result<TorrentEnqueueResult> {
+        validate_existing_source(&source)?;
+        validate_request_key(&request_key)?;
+        source.hash.make_ascii_lowercase();
+        let requested_hash = source.hash.clone();
+        let prepared_id = self.prepare_existing_revalidation(&source)?;
+        let remote = match self.backend.refresh(source.hash.clone()).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                if let Some(task_id) = prepared_id.as_deref() {
+                    self.defer_existing_revalidation(task_id);
+                }
+                return Err(error);
+            }
+        };
+        if !remote.hash.eq_ignore_ascii_case(&source.hash) {
+            if let Some(task_id) = prepared_id.as_deref() {
+                self.defer_existing_revalidation(task_id);
+            }
+            bail!("qBittorrent returned a different torrent hash");
+        }
+
+        let (matched_id, created_result) = self.store.transact(|state| {
+            let matching_id = state
+                .tasks
+                .values()
+                .find(|task| task_matches_existing_hash(task, &requested_hash))
+                .map(|task| task.task_id.clone());
+            if let Some(task_id) = matching_id {
+                let task = state.tasks.get_mut(&task_id).expect("matched task exists");
+                validate_owner(task, source.chat_id, source.user_id)?;
+                if prepared_id.as_deref() != Some(task_id.as_str()) {
+                    prepare_task_for_existing_revalidation(task);
+                }
+                return Ok((Some(task_id), None));
+            }
+
+            ensure!(
+                state.tasks.len() < MAX_TASKS,
+                "torrent task capacity is full"
+            );
+            let origin_key = existing_origin_key(&source);
+            let task_id = task_id_for_origin(&origin_key);
+            let now = unix_seconds();
+            let mut pending_remote = remote.clone();
+            pending_remote.files.clear();
+            let task = StoredTorrent {
+                task_id: task_id.clone(),
+                origin_key: origin_key.clone(),
+                upload: None,
+                magnet: None,
+                existing: Some(source.clone()),
+                magnet_save_path: None,
+                raw_sha256: None,
+                metainfo: None,
+                remote: Some(pending_remote),
+                phase: TorrentPhase::DownloadingMetainfo,
+                submit_intent: false,
+                submit_result: None,
+                invalid_after_reconcile: false,
+                selected_indexes: BTreeSet::new(),
+                imports: BTreeMap::new(),
+                retry_job_ids: Vec::new(),
+                inventory_revision: 0,
+                selection_revision: 0,
+                render_revision: 1,
+                cursor_folder_id: 0,
+                cursor_page: 0,
+                review_selection: false,
+                card_generation: 0,
+                card_request_keys: vec![request_key.clone()],
+                card_send_state: CardSendState::Requested,
+                card_message_id: None,
+                card_render_pending: false,
+                next_card_update_at: 0,
+                manual_refresh: false,
+                next_action_at: now,
+                next_refresh_at: None,
+                next_music_status_at: None,
+                attempts: 0,
+                created_at: now,
+                updated_at: now,
+                error: None,
+            };
+            state.origins.insert(origin_key, task_id.clone());
+            state.tasks.insert(task_id.clone(), task);
+            let task = state.tasks.get(&task_id).expect("task was inserted");
+            Ok((
+                None,
+                Some(TorrentEnqueueResult {
+                    task_id,
+                    created: true,
+                    snapshot: task_snapshot(task),
+                }),
+            ))
+        })?;
+        if let Some(task_id) = matched_id {
+            let stored = self
+                .store
+                .task(&task_id)?
+                .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
+            if stored.metainfo.is_some() {
+                if let Err(error) = self.attach_remote(&task_id, remote.clone()) {
+                    self.defer_existing_revalidation(&task_id);
+                    return Err(error);
+                }
+                // The fresh snapshot was validated and attached before opening a new card.
+            } else if stored.existing.is_some() {
+                let mut pending_remote = remote.clone();
+                pending_remote.files.clear();
+                self.store.transact(|state| {
+                    let task = state
+                        .tasks
+                        .get_mut(&task_id)
+                        .context("matched torrent task disappeared")?;
+                    task.remote = Some(pending_remote.clone());
+                    task.phase = TorrentPhase::DownloadingMetainfo;
+                    task.manual_refresh = false;
+                    task.next_action_at = unix_seconds();
+                    task.error = None;
+                    touch(task);
+                    Ok(((), true))
+                })?;
+            } else {
+                self.defer_existing_revalidation(&task_id);
+                bail!("matched torrent task has no verified metadata to attach the refresh");
+            }
+
+            self.store.transact(|state| {
+                let task = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
+                if !task.card_request_keys.iter().any(|key| key == &request_key) {
+                    task.card_request_keys.push(request_key.clone());
+                    if task.card_request_keys.len() > MAX_REOPEN_REQUEST_KEYS {
+                        let excess = task.card_request_keys.len() - MAX_REOPEN_REQUEST_KEYS;
+                        task.card_request_keys.drain(0..excess);
+                    }
+                    task.card_generation = task.card_generation.saturating_add(1);
+                    task.card_message_id = None;
+                    task.card_send_state = CardSendState::Requested;
+                    task.card_render_pending = false;
+                    task.next_action_at = unix_seconds();
+                    touch(task);
+                }
+                Ok(((), true))
+            })?;
+            self.notify.notify_one();
+            let task = self
+                .store
+                .task(&task_id)?
+                .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
+            return Ok(TorrentEnqueueResult {
+                task_id,
+                created: false,
+                snapshot: task_snapshot(&task),
+            });
+        }
+        self.notify.notify_one();
+        Ok(created_result.expect("new task result was created"))
+    }
+
+    fn prepare_existing_revalidation(&self, source: &TorrentExisting) -> Result<Option<String>> {
+        let state = self.store.snapshot()?;
+        let Some(task_id) = state
+            .tasks
+            .values()
+            .find(|task| task_matches_existing_hash(task, &source.hash))
+            .map(|task| task.task_id.clone())
+        else {
+            return Ok(None);
+        };
+        self.store.transact(|state| {
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
+            validate_owner(task, source.chat_id, source.user_id)?;
+            prepare_task_for_existing_revalidation(task);
+            Ok(((), true))
+        })?;
+        self.notify.notify_one();
+        Ok(Some(task_id))
+    }
+
+    fn defer_existing_revalidation(&self, task_id: &str) {
+        let _ = self.store.transact(|state| {
+            let task = state
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+            task.manual_refresh = false;
+            let retry_at = unix_seconds().saturating_add(self.settings.poll_seconds);
+            task.inventory_revision = task.inventory_revision.saturating_add(1).max(1);
+            task.selection_revision = task.selection_revision.saturating_add(1).max(1);
+            task.next_refresh_at = Some(retry_at);
+            task.next_action_at = retry_at;
+            task.error =
+                Some("The fresh qBittorrent inventory could not be attached safely.".to_string());
+            touch(task);
+            Ok(((), true))
+        });
+    }
+
     fn enqueue_source(
         &self,
         origin_key: String,
@@ -152,6 +362,7 @@ impl TorrentManager {
                 origin_key: origin_key.clone(),
                 upload: upload.clone(),
                 magnet: magnet.clone(),
+                existing: None,
                 magnet_save_path: None,
                 raw_sha256: None,
                 metainfo: None,
@@ -254,6 +465,11 @@ impl TorrentManager {
                 .get_mut(task_id)
                 .ok_or_else(|| anyhow!("torrent task was not found"))?;
             validate_owner(task, chat_id, user_id)?;
+            ensure!(
+                task.phase != TorrentPhase::Invalid,
+                "torrent task is no longer available"
+            );
+            ensure!(!task.manual_refresh, "torrent inventory is being refreshed");
             ensure!(
                 task.card_message_id == Some(card_message_id),
                 "torrent card is no longer current"
@@ -514,6 +730,10 @@ impl TorrentManager {
         if task.phase == TorrentPhase::Invalid {
             return;
         }
+        if task.existing.is_some() && task.metainfo.is_none() {
+            self.process_existing(task).await;
+            return;
+        }
         if task.metainfo.is_none() {
             if task.magnet.is_some() {
                 self.process_magnet(task).await;
@@ -522,12 +742,20 @@ impl TorrentManager {
             }
             return;
         }
-        if task.remote.is_none() {
-            self.reconcile_or_submit(task).await;
+        if task.manual_refresh || task.next_refresh_at.is_some_and(|at| at <= unix_seconds()) {
+            if task.existing.is_some() {
+                self.process_existing(task).await;
+            } else {
+                self.refresh_remote(task).await;
+            }
             return;
         }
-        if task.manual_refresh || task.next_refresh_at.is_some_and(|at| at <= unix_seconds()) {
-            self.refresh_remote(task).await;
+        if task.remote.is_none() {
+            if task.existing.is_some() {
+                self.process_existing(task).await;
+            } else {
+                self.reconcile_or_submit(task).await;
+            }
             return;
         }
         if !task.retry_job_ids.is_empty() {
@@ -801,6 +1029,151 @@ impl TorrentManager {
                 result.disposition == SubmitDisposition::InvalidMetainfo;
             current.phase = TorrentPhase::ReconciliationPending;
             current.next_action_at = unix_seconds();
+            touch(current);
+            Ok(((), true))
+        });
+    }
+
+    async fn process_existing(&self, task: StoredTorrent) {
+        let Some(source) = task.existing.as_ref() else {
+            return;
+        };
+        let task_id = task.task_id.clone();
+        let requested_hash = source.hash.clone();
+        let remote = match self.backend.refresh(requested_hash.clone()).await {
+            Ok(remote) if remote.hash.eq_ignore_ascii_case(&requested_hash) => remote,
+            Ok(_) => {
+                self.mark_existing_invalid(
+                    &task_id,
+                    "qBittorrent returned a different hash for this catalog task.",
+                );
+                return;
+            }
+            Err(_) => {
+                self.mark_existing_invalid(
+                    &task_id,
+                    "The selected qBittorrent task is no longer available.",
+                );
+                return;
+            }
+        };
+
+        if let Some(metainfo) = task.metainfo.as_ref() {
+            if !remote.matches_identity(&metainfo.identity) {
+                self.mark_existing_invalid(
+                    &task_id,
+                    "qBittorrent task identity changed after adoption.",
+                );
+                return;
+            }
+            if validate_remote_inventory(&remote, metainfo).is_err() {
+                self.defer_existing(
+                    &task_id,
+                    "Waiting for qBittorrent to report a file inventory matching verified metadata.",
+                );
+                return;
+            }
+            let _ = self.attach_remote(&task_id, remote);
+            return;
+        }
+
+        let bytes = match self.backend.export_metainfo(requested_hash.clone()).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.defer_existing(
+                    &task_id,
+                    "Waiting for verified torrent metadata from qBittorrent.",
+                );
+                return;
+            }
+        };
+        let metainfo = match parse_metainfo(
+            &bytes,
+            self.settings.max_torrent_bytes,
+            self.settings.max_files,
+        ) {
+            Ok(metainfo) if remote.matches_identity(&metainfo.identity) => metainfo,
+            _ => {
+                self.mark_existing_invalid(
+                    &task_id,
+                    "Exported torrent metadata did not match the selected qBittorrent task.",
+                );
+                return;
+            }
+        };
+        if validate_remote_inventory(&remote, &metainfo).is_err() {
+            self.defer_existing(
+                &task_id,
+                "Torrent metadata is verified; waiting for a matching qBittorrent file inventory.",
+            );
+            return;
+        }
+        if self
+            .store
+            .write_metainfo_blob(&task_id, &bytes, &metainfo.raw_sha256)
+            .is_err()
+        {
+            self.defer_existing(
+                &task_id,
+                "Could not save verified torrent metadata; retry is available.",
+            );
+            return;
+        }
+        let saved = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(&task_id)
+                .context("torrent task disappeared")?;
+            if current
+                .existing
+                .as_ref()
+                .is_none_or(|existing| !existing.hash.eq_ignore_ascii_case(&requested_hash))
+            {
+                bail!("catalog source changed while metadata was being verified");
+            }
+            current.raw_sha256 = Some(metainfo.raw_sha256.clone());
+            current.metainfo = Some(metainfo.clone());
+            current.remote = None;
+            current.inventory_revision = current.inventory_revision.saturating_add(1).max(1);
+            current.selection_revision = current.selection_revision.saturating_add(1).max(1);
+            current.attempts = 0;
+            current.error = None;
+            current.next_action_at = unix_seconds();
+            touch(current);
+            Ok(((), true))
+        });
+        if saved.is_ok() {
+            let _ = self.attach_remote(&task_id, remote);
+        }
+    }
+
+    fn defer_existing(&self, task_id: &str, message: &str) {
+        let _ = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(task_id)
+                .context("torrent task disappeared")?;
+            current.phase = TorrentPhase::DownloadingMetainfo;
+            current.attempts = current.attempts.saturating_add(1);
+            current.next_action_at = unix_seconds().saturating_add(backoff(current.attempts));
+            current.error = Some(message.to_owned());
+            touch(current);
+            Ok(((), true))
+        });
+    }
+
+    fn mark_existing_invalid(&self, task_id: &str, message: &str) {
+        let _ = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(task_id)
+                .context("torrent task disappeared")?;
+            current.phase = TorrentPhase::Invalid;
+            current.selected_indexes.clear();
+            if let Some(remote) = current.remote.as_mut() {
+                remote.files.clear();
+            }
+            current.error = Some(message.to_owned());
             touch(current);
             Ok(((), true))
         });
@@ -1624,6 +1997,8 @@ struct StoredTorrent {
     #[serde(default)]
     magnet: Option<TorrentMagnet>,
     #[serde(default)]
+    existing: Option<TorrentExisting>,
+    #[serde(default)]
     magnet_save_path: Option<PathBuf>,
     raw_sha256: Option<String>,
     metainfo: Option<TorrentMetainfo>,
@@ -1666,6 +2041,11 @@ impl StoredTorrent {
             .map(|source| (source.chat_id, source.user_id, source.message_id))
             .or_else(|| {
                 self.magnet
+                    .as_ref()
+                    .map(|source| (source.chat_id, source.user_id, source.message_id))
+            })
+            .or_else(|| {
+                self.existing
                     .as_ref()
                     .map(|source| (source.chat_id, source.user_id, source.message_id))
             })
@@ -1773,6 +2153,19 @@ fn validate_upload(upload: &TorrentUpload, settings: &TorrentSettings) -> Result
     Ok(())
 }
 
+fn validate_existing_source(source: &TorrentExisting) -> Result<()> {
+    ensure!(
+        source.chat_id > 0 && source.user_id == source.chat_id && source.message_id > 0,
+        "catalog message identifiers are invalid"
+    );
+    ensure!(
+        matches!(source.hash.len(), 40 | 64)
+            && source.hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "qBittorrent hash is invalid"
+    );
+    Ok(())
+}
+
 fn validate_request_key(request_key: &str) -> Result<()> {
     ensure!(
         !request_key.is_empty() && request_key.len() <= 128,
@@ -1809,6 +2202,43 @@ fn upload_origin_key(upload: &TorrentUpload) -> String {
     format!(
         "{}:{}:{}:{}:{}",
         upload.chat_id, upload.user_id, upload.message_id, upload.update_id, upload.file_unique_id
+    )
+}
+
+fn task_matches_existing_hash(task: &StoredTorrent, hash: &str) -> bool {
+    task.existing
+        .as_ref()
+        .is_some_and(|source| source.hash.eq_ignore_ascii_case(hash))
+        || (task.metainfo.is_some()
+            && (task
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.hash.eq_ignore_ascii_case(hash))
+                || task
+                    .metainfo
+                    .as_ref()
+                    .is_some_and(|meta| meta.identity.matches_hash(hash))))
+}
+
+fn prepare_task_for_existing_revalidation(task: &mut StoredTorrent) {
+    task.next_action_at = unix_seconds();
+    task.next_refresh_at = None;
+    if task.metainfo.is_some() {
+        task.manual_refresh = true;
+        task.phase = TorrentPhase::CheckingExisting;
+    } else if task.existing.is_some() {
+        task.manual_refresh = false;
+        task.phase = TorrentPhase::DownloadingMetainfo;
+    }
+    touch(task);
+}
+
+fn existing_origin_key(source: &TorrentExisting) -> String {
+    format!(
+        "{}:{}:{}:existing",
+        source.chat_id,
+        source.user_id,
+        source.hash.to_ascii_lowercase()
     )
 }
 
@@ -1912,7 +2342,12 @@ fn task_snapshot(task: &StoredTorrent) -> TorrentSnapshot {
                                 .and_then(|parsed| parsed.display_name)
                         })
                     })
-                    .unwrap_or_else(|| "Magnet download".into())
+                    .or_else(|| {
+                        task.existing
+                            .as_ref()
+                            .and_then(|_| remote.map(|remote| remote.name.clone()))
+                    })
+                    .unwrap_or_else(|| "Torrent task".into())
             }),
         identity: metainfo
             .map(|metainfo| metainfo.identity.clone())
@@ -2291,10 +2726,10 @@ fn validate_state(
             valid_task_id(task_id) && task.task_id == *task_id,
             "torrent state task identifier is invalid"
         );
-        ensure!(
-            task.upload.is_some() != task.magnet.is_some(),
-            "torrent must have exactly one source"
-        );
+        let source_count = usize::from(task.upload.is_some())
+            + usize::from(task.magnet.is_some())
+            + usize::from(task.existing.is_some());
+        ensure!(source_count == 1, "torrent must have exactly one source");
         if let Some(upload) = &task.upload {
             validate_upload(upload, settings)?;
         }
@@ -2307,6 +2742,9 @@ fn validate_state(
                 "invalid magnet owner"
             );
             crate::torrent_magnet::parse_magnet_uri(&magnet.uri)?;
+        }
+        if let Some(existing) = &task.existing {
+            validate_existing_source(existing)?;
         }
         ensure!(
             task.imports.len() <= settings.max_files,

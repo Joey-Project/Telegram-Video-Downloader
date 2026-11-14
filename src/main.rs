@@ -51,6 +51,7 @@ mod staging_cleanup_tests;
 mod telegram;
 mod torrent_backup;
 mod torrent_bot;
+mod torrent_catalog;
 mod torrent_inline;
 mod torrent_magnet;
 mod torrent_manager;
@@ -7473,7 +7474,7 @@ fn help_message() -> String {
         "/settings - Manage media libraries and download defaults in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
         "/music - View music imports; /music retry TASK_ID or /music cancel TASK_ID.",
-        "/torrents - View torrent downloads and reopen their music selection cards.",
+        "/torrents - Manage qBittorrent tasks and choose music to import; /torrents saved shows retained imports.",
         "/magnet LINK - Download a magnet link and wait for its file list.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",

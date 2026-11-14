@@ -110,6 +110,17 @@ pub struct TorrentMagnet {
     pub uri: String,
 }
 
+/// Telegram catalog message referring to an already existing qBittorrent task.
+/// This records the real origin of the catalog entry without pretending that the
+/// task was created from an upload or a magnet URI.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TorrentExisting {
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub message_id: i64,
+    pub hash: String,
+}
+
 impl fmt::Debug for TorrentMagnet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -415,6 +426,18 @@ pub trait TorrentBackend: Send + Sync + 'static {
 
     fn lookup(&self, identity: TorrentIdentity) -> TorrentFuture<'_, Vec<TorrentRemoteSnapshot>>;
 
+    fn list_torrents(
+        &self,
+        _offset: u32,
+        _limit: u32,
+    ) -> TorrentFuture<'_, Vec<TorrentRemoteSnapshot>> {
+        Box::pin(async { anyhow::bail!("qBittorrent catalog listing is not configured") })
+    }
+
+    fn set_active(&self, _hash: String, _active: bool) -> TorrentFuture<'_, ()> {
+        Box::pin(async { anyhow::bail!("qBittorrent task control is not configured") })
+    }
+
     fn submit(&self, raw_torrent: Vec<u8>, file_name: String) -> TorrentFuture<'_, SubmitResult>;
 
     fn default_save_path(&self) -> TorrentFuture<'_, PathBuf> {
@@ -430,6 +453,10 @@ pub trait TorrentBackend: Send + Sync + 'static {
     }
 
     fn refresh(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot>;
+
+    fn task_summary(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot> {
+        self.refresh(hash)
+    }
 
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64>;
 

@@ -50,16 +50,21 @@ struct MockHttpState {
     default_save_path: PathBuf,
     files: Vec<TorrentFileFixture>,
     submitted: AtomicBool,
+    existing_task: AtomicBool,
     magnet_submission: AtomicBool,
     metadata_available: AtomicBool,
     complete: AtomicBool,
     qbit_adds: AtomicUsize,
+    qbit_controls: AtomicUsize,
+    paused: AtomicBool,
+    catalog_records: Mutex<Vec<serde_json::Value>>,
     export_attempts: AtomicUsize,
     submitted_save_path: Mutex<Option<PathBuf>>,
     submitted_magnet_uri: Mutex<Option<String>>,
     card_sends: AtomicUsize,
     card_edits: AtomicUsize,
     last_keyboard_callbacks: Mutex<Vec<String>>,
+    keyboards_by_message: Mutex<HashMap<i64, Vec<String>>>,
     send_messages: AtomicUsize,
     text_edits: AtomicUsize,
 }
@@ -90,16 +95,21 @@ impl MockHttpServer {
             save_path,
             files,
             submitted: AtomicBool::new(false),
+            existing_task: AtomicBool::new(false),
             magnet_submission: AtomicBool::new(false),
             metadata_available: AtomicBool::new(true),
             complete: AtomicBool::new(false),
             qbit_adds: AtomicUsize::new(0),
+            qbit_controls: AtomicUsize::new(0),
+            paused: AtomicBool::new(false),
+            catalog_records: Mutex::new(Vec::new()),
             export_attempts: AtomicUsize::new(0),
             submitted_save_path: Mutex::new(None),
             submitted_magnet_uri: Mutex::new(None),
             card_sends: AtomicUsize::new(0),
             card_edits: AtomicUsize::new(0),
             last_keyboard_callbacks: Mutex::new(Vec::new()),
+            keyboards_by_message: Mutex::new(HashMap::new()),
             send_messages: AtomicUsize::new(0),
             text_edits: AtomicUsize::new(0),
         });
@@ -133,6 +143,23 @@ impl MockHttpServer {
             .state
             .metadata_available
             .store(false, Ordering::Release);
+        server
+    }
+
+    async fn start_existing(
+        torrent_bytes: Vec<u8>,
+        torrent_hash: String,
+        save_path: PathBuf,
+        files: Vec<TorrentFileFixture>,
+        catalog_records: Vec<serde_json::Value>,
+    ) -> Self {
+        let server = Self::start(torrent_bytes, torrent_hash, save_path, files).await;
+        server.state.existing_task.store(true, Ordering::Release);
+        *server
+            .state
+            .catalog_records
+            .lock()
+            .expect("catalog records should not be poisoned") = catalog_records;
         server
     }
 
@@ -183,7 +210,37 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         return respond(&mut stream, 404, "text/plain", b"metadata pending").await;
     }
     if request.path.starts_with("/api/v2/torrents/info") {
-        let body = if state.submitted.load(Ordering::Acquire) {
+        if request.path.contains("filter=all") {
+            let offset = request
+                .path
+                .split_once("offset=")
+                .and_then(|(_, value)| value.split('&').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let limit = request
+                .path
+                .split_once("limit=")
+                .and_then(|(_, value)| value.split('&').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(101);
+            let body = {
+                let records = state
+                    .catalog_records
+                    .lock()
+                    .expect("catalog records should not be poisoned");
+                let page = records
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                serde_json::to_vec(&page).expect("catalog page should serialize")
+            };
+            return respond(&mut stream, 200, "application/json", &body).await;
+        }
+        let body = if state.submitted.load(Ordering::Acquire)
+            || state.existing_task.load(Ordering::Acquire)
+        {
             let complete = state.complete.load(Ordering::Acquire);
             let magnet = state.magnet_submission.load(Ordering::Acquire);
             let metadata_available = state.metadata_available.load(Ordering::Acquire);
@@ -206,7 +263,9 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
                 "hash": state.torrent_hash,
                 "info_hash_v1": state.torrent_hash,
                 "name": "Album",
-                "state": if magnet && !metadata_available {
+                "state": if state.paused.load(Ordering::Acquire) {
+                    "pausedDL"
+                } else if magnet && !metadata_available {
                     "metaDL"
                 } else if complete {
                     "uploading"
@@ -300,6 +359,47 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         state.submitted.store(true, Ordering::Release);
         return respond(&mut stream, 200, "text/plain", b"Ok.").await;
     }
+    if request.method == "POST"
+        && [
+            "/api/v2/torrents/pause",
+            "/api/v2/torrents/resume",
+            "/api/v2/torrents/start",
+            "/api/v2/torrents/stop",
+        ]
+        .iter()
+        .any(|path| request.path.starts_with(path))
+    {
+        let form = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            form.get("hashes").map(String::as_str),
+            Some(state.torrent_hash.as_str()),
+            "mock controls must target the pre-existing test task only"
+        );
+        state.qbit_controls.fetch_add(1, Ordering::Relaxed);
+        let active = request.path.ends_with("/resume") || request.path.ends_with("/start");
+        state.paused.store(!active, Ordering::Release);
+        if let Some(record) = state
+            .catalog_records
+            .lock()
+            .expect("catalog records should not be poisoned")
+            .iter_mut()
+            .find(|record| {
+                record
+                    .get("hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|hash| hash.eq_ignore_ascii_case(&state.torrent_hash))
+            })
+        {
+            record["state"] = serde_json::Value::String(if active {
+                "downloading".into()
+            } else {
+                "pausedDL".into()
+            });
+        }
+        return respond(&mut stream, 200, "text/plain", b"").await;
+    }
 
     if request.path.ends_with("/getFile") {
         let body = serde_json::to_vec(&serde_json::json!({
@@ -344,6 +444,13 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         } else {
             mock_card_message_id(generation)
         };
+        if !callbacks.is_empty() {
+            state
+                .keyboards_by_message
+                .lock()
+                .expect("mock keyboard map should not be poisoned")
+                .insert(message_id, callbacks);
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "ok": true,
             "result": {
@@ -366,6 +473,16 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
                 .lock()
                 .expect("last keyboard callbacks should not be poisoned")
                 .clone_from(&callbacks);
+            if let Some(message_id) = payload
+                .get("message_id")
+                .and_then(serde_json::Value::as_i64)
+            {
+                state
+                    .keyboards_by_message
+                    .lock()
+                    .expect("mock keyboard map should not be poisoned")
+                    .insert(message_id, callbacks);
+            }
             state.card_edits.fetch_add(1, Ordering::Relaxed);
         }
         return respond(
@@ -843,6 +960,113 @@ fn keyboard_has_callback(mock: &MockHttpServer, callback: &str) -> bool {
         .expect("last keyboard callbacks should not be poisoned")
         .iter()
         .any(|item| item == callback)
+}
+
+fn keyboard_callbacks_for(mock: &MockHttpServer, message_id: i64) -> Vec<String> {
+    mock.state
+        .keyboards_by_message
+        .lock()
+        .expect("mock keyboard map should not be poisoned")
+        .get(&message_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn catalog_callback_for(
+    mock: &MockHttpServer,
+    message_id: i64,
+    index: usize,
+    action: char,
+) -> Option<String> {
+    keyboard_callbacks_for(mock, message_id)
+        .into_iter()
+        .find(|value| {
+            let mut parts = value.split(':');
+            parts.next() == Some("q1")
+                && parts.next().is_some()
+                && parts.next().is_some()
+                && parts.next() == Some(base36_for_test(index).as_str())
+                && parts.next() == Some(action.to_string().as_str())
+                && parts.next().is_none()
+        })
+}
+
+fn base36_for_test(mut value: usize) -> String {
+    if value == 0 {
+        return "0".into();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let digit = (value % 36) as u8;
+        digits.push(if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        });
+        value /= 36;
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base36 digits are ASCII")
+}
+
+async fn wait_for_catalog_callback(
+    mock: &MockHttpServer,
+    message_id: i64,
+    index: usize,
+    action: char,
+) -> String {
+    tokio::time::timeout(MAX_TEST_WAIT, async {
+        loop {
+            if let Some(callback) = catalog_callback_for(mock, message_id, index, action) {
+                return callback;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("catalog should expose action {action:?} for row {index}"))
+}
+
+async fn process_catalog_callback(
+    context: &BotContext,
+    offset: &mut Option<i64>,
+    update_id: i64,
+    query_id: &str,
+    sender_id: i64,
+    message_id: i64,
+    callback_data: String,
+) {
+    process_update(
+        context,
+        serde_json::json!({
+            "update_id": update_id,
+            "callback_query": {
+                "id": query_id,
+                "from": {"id": sender_id},
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": CHAT_ID, "type": "private"},
+                    "text": "qBittorrent catalog",
+                },
+                "data": callback_data,
+            }
+        }),
+        offset,
+    )
+    .await;
+}
+
+fn catalog_record(hash: &str, name: &str, save_path: &Path, total_size: u64) -> serde_json::Value {
+    serde_json::json!({
+        "hash": hash,
+        "name": name,
+        "state": "downloading",
+        "progress": 0.5,
+        "save_path": save_path,
+        "content_path": save_path.join("Album"),
+        "total_size": total_size,
+        "amount_left": total_size / 2,
+    })
 }
 
 async fn wait_for_keyboard_callback(mock: &MockHttpServer, callback: &str, expected: &str) {
@@ -1757,6 +1981,490 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         Arc::clone(&backend_dyn),
     )
     .await;
+    wait_until_reopenable_torrent(torrent_settings).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn existing_qbittorrent_catalog_adopts_and_imports_without_add_or_source_mutation() {
+    // Nine catalog entries precede the existing torrent, so it is row 1 on page 2
+    // (the first page contains eight rows).
+    const EXISTING_TORRENT_ROW: usize = 1;
+
+    let root = unique_test_root();
+    let source_root = root.join("qbit-downloads");
+    fs::create_dir_all(source_root.join("Album")).expect("download folder should exist");
+    let fixture = TorrentFileFixture {
+        path: "Album/selected.m4a".into(),
+        bytes: b"pre-existing synthetic music source".to_vec(),
+    };
+    let source = source_root.join(&fixture.path);
+    fs::write(&source, &fixture.bytes).expect("existing source should exist");
+    let metadata = fs::metadata(&source).expect("source metadata should be readable");
+    let source_identity = (metadata.dev(), metadata.ino());
+    let (torrent_bytes, torrent_hash) = make_torrent(std::slice::from_ref(&fixture));
+    let mut catalog = (0..9)
+        .map(|index| {
+            catalog_record(
+                &format!("{:040x}", index + 1),
+                &format!("Other task {}", index + 1),
+                &source_root,
+                100,
+            )
+        })
+        .collect::<Vec<_>>();
+    catalog.push(catalog_record(
+        &torrent_hash,
+        "Starlight album",
+        &source_root,
+        fixture.bytes.len() as u64,
+    ));
+    catalog.push(catalog_record(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Other task 10",
+        &source_root,
+        100,
+    ));
+    let mock = MockHttpServer::start_existing(
+        torrent_bytes,
+        torrent_hash.clone(),
+        source_root.clone(),
+        vec![fixture.clone()],
+        catalog,
+    )
+    .await;
+    let telegram = mock.telegram();
+    let music_settings = private_music_settings(&root);
+    let backend = FakeMusicBackend::new(
+        music_settings.archive_dir.clone(),
+        music_settings.staging_dir.clone(),
+        root.join("fake-music-library"),
+    );
+    let backend_dyn: Arc<dyn MusicBackend> = Arc::new(backend.clone());
+    let (music_shutdown_tx, music_shutdown_rx) = watch::channel(false);
+    let music = MusicService::with_backend(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+        music_shutdown_rx,
+    );
+    music.start();
+    let torrent_settings = torrent_settings(mock.base_url.clone(), root.join("qbit-state"));
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = watch::channel(false);
+    let torrent = TorrentService::new(
+        torrent_settings.clone(),
+        telegram.clone(),
+        Some(Arc::clone(&music)),
+        music_settings.max_file_bytes,
+        torrent_shutdown_rx,
+    )
+    .expect("torrent service should use the mock qBittorrent client");
+    torrent.start();
+    let mut config = AppConfig::for_test();
+    config.telegram.allowed_chat_ids = vec![CHAT_ID];
+    config.downloads.video_dir = root.join("video-queue");
+    config.downloads.pdf_dir = root.join("pdf-queue");
+    fs::create_dir_all(&config.downloads.video_dir).expect("video queue should exist");
+    fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue should exist");
+    let context = build_context(telegram.clone(), config, Arc::clone(&torrent));
+    let mut offset = None;
+
+    process_update(&context, serde_json::json!({"update_id": 8101, "message": {"message_id": 810, "chat": {"id": CHAT_ID, "type": "private"}, "from": {"id": CHAT_ID}, "text": "/torrents"}}), &mut offset).await;
+    let list_message_id = mock_card_message_id(0);
+    let next = wait_for_catalog_callback(&mock, list_message_id, 0, 'n').await;
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8102,
+        "foreign-next",
+        CHAT_ID + 1,
+        list_message_id,
+        next.clone(),
+    )
+    .await;
+    assert!(
+        torrent
+            .list(CHAT_ID)
+            .await
+            .expect("initial local list should work")
+            .is_empty()
+    );
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8103,
+        "catalog-next",
+        CHAT_ID,
+        list_message_id,
+        next.clone(),
+    )
+    .await;
+    let open = wait_for_catalog_callback(&mock, list_message_id, EXISTING_TORRENT_ROW, 'o').await;
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8104,
+        "stale-next",
+        CHAT_ID,
+        list_message_id,
+        next,
+    )
+    .await;
+    assert_eq!(
+        open,
+        wait_for_catalog_callback(&mock, list_message_id, EXISTING_TORRENT_ROW, 'o').await
+    );
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8105,
+        "foreign-open",
+        CHAT_ID + 1,
+        list_message_id,
+        open.clone(),
+    )
+    .await;
+    assert!(
+        torrent
+            .list(CHAT_ID)
+            .await
+            .expect("foreign open must not adopt")
+            .is_empty()
+    );
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8106,
+        "open-existing",
+        CHAT_ID,
+        list_message_id,
+        open.clone(),
+    )
+    .await;
+    let adopted = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.matches_hash(&torrent_hash))
+                && snapshot
+                    .card_message_id
+                    .is_some_and(|id| id > CARD_MESSAGE_ID)
+        },
+        "existing torrent adoption",
+    )
+    .await;
+    assert!(
+        adopted
+            .identity
+            .as_ref()
+            .is_some_and(|identity| identity.matches_hash(&torrent_hash))
+    );
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8107,
+        "stale-open",
+        CHAT_ID,
+        list_message_id,
+        open,
+    )
+    .await;
+    assert_eq!(
+        torrent
+            .list(CHAT_ID)
+            .await
+            .expect("adopted task should list")
+            .len(),
+        1
+    );
+
+    let pause = wait_for_catalog_callback(&mock, list_message_id, EXISTING_TORRENT_ROW, 'p').await;
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8108,
+        "pause-mock-task",
+        CHAT_ID,
+        list_message_id,
+        pause,
+    )
+    .await;
+    let resume = wait_for_catalog_callback(&mock, list_message_id, EXISTING_TORRENT_ROW, 'r').await;
+    process_catalog_callback(
+        &context,
+        &mut offset,
+        8109,
+        "resume-mock-task",
+        CHAT_ID,
+        list_message_id,
+        resume,
+    )
+    .await;
+    assert_eq!(mock.state.qbit_controls.load(Ordering::Acquire), 2);
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 0);
+
+    let card_message_id = adopted
+        .card_message_id
+        .expect("adopted task should have a selection card");
+    let task_id = adopted.task_id.clone();
+    let album_folder_id = folder_id(&adopted, "Album");
+    let browse_action = format!("b:{album_folder_id}:0");
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, adopted.inventory_revision, &browse_action),
+        "Album folder button for the adopted task",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 8110,
+            query_id: "open-adopted-album-folder",
+            sender_id: CHAT_ID,
+            message_id: card_message_id,
+            task_id: &task_id,
+            revision: adopted.inventory_revision,
+            action: &browse_action,
+        },
+    )
+    .await;
+    let browsed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.cursor_folder_id == album_folder_id,
+        "opened Album folder in the adopted task card",
+    )
+    .await;
+    let select_action = "f:0:1";
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, browsed.inventory_revision, select_action),
+        "selectable existing music file",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 8111,
+            query_id: "select-existing-file",
+            sender_id: CHAT_ID,
+            message_id: card_message_id,
+            task_id: &task_id,
+            revision: browsed.inventory_revision,
+            action: select_action,
+        },
+    )
+    .await;
+    let selected = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.files[0].selected,
+        "selected existing music file",
+    )
+    .await;
+    mock.state.complete.store(true, Ordering::Release);
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 8112,
+            query_id: "refresh-existing-task",
+            sender_id: CHAT_ID,
+            message_id: card_message_id,
+            task_id: &task_id,
+            revision: selected.inventory_revision,
+            action: "r",
+        },
+    )
+    .await;
+    let complete = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.files[0].complete,
+        "completed existing music file",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, complete.selection_revision, "v:0"),
+        "review button for the completed existing file",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 8113,
+            query_id: "review-existing-selection",
+            sender_id: CHAT_ID,
+            message_id: card_message_id,
+            task_id: &task_id,
+            revision: complete.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let review = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "existing task import review",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, review.selection_revision, "i"),
+        "confirmation button for the existing file",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 8114,
+            query_id: "confirm-existing-import",
+            sender_id: CHAT_ID,
+            message_id: card_message_id,
+            task_id: &task_id,
+            revision: review.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    let _job_id = wait_for_music_cleanup(&backend).await;
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 0);
+    assert_eq!(mock.state.qbit_controls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should work")
+            .as_slice(),
+        std::slice::from_ref(&fixture.bytes)
+    );
+    let after = fs::metadata(&source).expect("source remains present");
+    assert_eq!((after.dev(), after.ino()), source_identity);
+    assert_eq!(
+        fs::read(&source).expect("source remains readable"),
+        fixture.bytes
+    );
+
+    let manager = torrent
+        .manager()
+        .await
+        .expect("torrent manager should remain available");
+    manager.refresh_music_status_for_test(&task_id).await;
+    let imported = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.phase == TorrentPhase::Imported,
+        "imported existing task",
+    )
+    .await;
+    drop(manager);
+    let _ = torrent_shutdown_tx.send(true);
+    drop(context);
+    drop(torrent);
+    wait_until_reopenable_torrent(torrent_settings.clone()).await;
+    let (restarted_shutdown_tx, restarted_shutdown_rx) = watch::channel(false);
+    let restarted = TorrentService::new(
+        torrent_settings.clone(),
+        telegram.clone(),
+        Some(Arc::clone(&music)),
+        music_settings.max_file_bytes,
+        restarted_shutdown_rx,
+    )
+    .expect("torrent service should restart from the adopted task");
+    restarted.start();
+    let mut restarted_config = AppConfig::for_test();
+    restarted_config.telegram.allowed_chat_ids = vec![CHAT_ID];
+    restarted_config.downloads.video_dir = root.join("video-queue");
+    restarted_config.downloads.pdf_dir = root.join("pdf-queue");
+    let restarted_context =
+        build_context(telegram.clone(), restarted_config, Arc::clone(&restarted));
+    let mut restarted_offset = None;
+    process_update(&restarted_context, serde_json::json!({"update_id": 8115, "message": {"message_id": 811, "chat": {"id": CHAT_ID, "type": "private"}, "from": {"id": CHAT_ID}, "text": format!("/torrents {}", imported.task_id)}}), &mut restarted_offset).await;
+    let reopened = wait_for_snapshot(
+        &restarted,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && snapshot
+                    .card_message_id
+                    .is_some_and(|id| id > card_message_id)
+        },
+        "existing task card after restart",
+    )
+    .await;
+    let reopened_card = reopened
+        .card_message_id
+        .expect("reopened card should exist");
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, reopened.selection_revision, "v:0"),
+        "review button on the reopened imported task",
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 8116,
+            query_id: "replay-review",
+            sender_id: CHAT_ID,
+            message_id: reopened_card,
+            task_id: &task_id,
+            revision: reopened.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let replay_review = wait_for_snapshot(
+        &restarted,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "reopened import review",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, replay_review.selection_revision, "i"),
+        "confirmation button on the reopened import review",
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 8117,
+            query_id: "replay-confirm",
+            sender_id: CHAT_ID,
+            message_id: reopened_card,
+            task_id: &task_id,
+            revision: replay_review.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 0);
+    assert_eq!(mock.state.qbit_controls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        fs::read(&source).expect("source remains unchanged after restart"),
+        fixture.bytes
+    );
+
+    let _ = restarted_shutdown_tx.send(true);
+    let _ = music_shutdown_tx.send(true);
+    drop(restarted_context);
+    drop(restarted);
+    drop(music);
     wait_until_reopenable_torrent(torrent_settings).await;
     let _ = fs::remove_dir_all(&root);
 }

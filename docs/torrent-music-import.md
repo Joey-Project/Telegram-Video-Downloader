@@ -7,6 +7,28 @@ download progress and supports folder navigation, file selection and explicit
 Music import. A torrent without supported audio remains an ordinary qBittorrent
 download.
 
+`/torrents` opens a paginated catalog of existing qBittorrent tasks, including
+per-task progress. On a task, tap **Choose music** to adopt that exact task in the bot's
+local records and open its existing selection card. Adoption reads and validates
+the selected task; it does not submit another torrent, change its save location
+or file priorities, or move or delete payload files. **Pause** and **Resume** act
+on only the selected qBittorrent task. Pausing temporarily stops its download or
+seeding activity; resuming returns it to qBittorrent's existing task settings.
+Bot-submitted torrents request every file; adopting an existing qBittorrent task
+preserves its current priorities. Music selection does not change those
+priorities, and the payload remains available for seeding when the task is active.
+
+The catalog list is a private, in-memory view bound to the authorized owner and
+the Telegram list message. Its callback session expires after one hour idle and the
+process retains at most 48 sessions; a new `/torrents` request creates a fresh
+list message, and its **Refresh** button updates that message. The catalog view
+itself is not durable. Bot task records and Music selections are saved locally,
+so `/torrents saved` lists those retained records even when qBittorrent is
+unavailable. Use `/torrents TASK_ID` to reopen a saved task card. Catalog actions
+do not submit another torrent after an uncertain result. If a pause or resume
+result cannot be confirmed, send `/torrents` to read the current state before
+acting again.
+
 New magnet tasks use `<qBittorrent default save path>/Telegram Downloads/<task ID>`
 until their metadata can be validated. The bot removes magnet `so` download-selection
 parameters so every file downloads. Metadata is exported from qBittorrent and checked
@@ -100,9 +122,18 @@ Telegram currently restricts Widgets for ordinary bots, including private chats.
 The live API returned `INPUT_MEDIA_WIDGET_NOT_ALLOWED`; the restriction is also
 [confirmed by Telegram's maintainer](https://github.com/tdlib/telegram-bot-api/issues/947).
 
-`/torrents` lists retained tasks. Choose a task or use `/torrents TASK_ID` to open a
-new card generation while keeping its download/import state. Ordinary retries and
-replayed updates do not automatically create another card or another download.
+`/torrents` browses the qBittorrent task catalog eight tasks per page (up to
+20,000 tasks). Its summary shows
+task name, state, progress and size without exposing save paths. **Choose music**
+opens the native selection card for that existing task; the card then supports
+folder/file selection, review and explicit import confirmation. It does not add
+the torrent again. Use `/torrents saved` to browse durable bot task records, or
+`/torrents TASK_ID` to open a new card generation while keeping that task's
+download/import state. The catalog list and callback revisions are ephemeral;
+the adopted task association and saved Music selection survive restart.
+Pagination and refresh are explicit, with no idle qBittorrent polling. Ordinary
+retries and replayed updates do not automatically create another card or another
+download.
 
 A changed inventory invalidates old selection controls. Refresh before confirming
 the new list. Import confirmation also binds the selection shown at confirmation;

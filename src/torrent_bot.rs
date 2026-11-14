@@ -300,6 +300,12 @@ pub(crate) async fn handle_command(
     if !is_owner(context, chat_id, user_id, private) {
         return true;
     }
+    if matches!(parts.as_slice(), [_] | [_, "list"]) {
+        if let Some(user_id) = user_id {
+            crate::torrent_catalog::open_catalog(context, update_id, user_id, chat_id).await;
+        }
+        return true;
+    }
     let Some(service) = &context.torrent else {
         send_or_log(
             &context.telegram,
@@ -310,7 +316,7 @@ pub(crate) async fn handle_command(
         return true;
     };
     match parts.as_slice() {
-        [_] | [_, "list"] => match service.list(chat_id).await {
+        [_, "saved"] => match service.list(chat_id).await {
             Ok(mut tasks) => {
                 if tasks.is_empty() {
                     send_or_log(&context.telegram, chat_id, "No torrent tasks yet. Send a .torrent file to download its contents and choose music to import.".into()).await;
@@ -335,7 +341,7 @@ pub(crate) async fn handle_command(
                     tracing::warn!(error = %error, "could not send torrent task list");
                 }
             }
-            Err(_) => send_or_log(&context.telegram, chat_id, "Torrent tasks are temporarily unavailable. Existing downloads and selections are retained; try /torrents again shortly.".into()).await,
+            Err(_) => send_or_log(&context.telegram, chat_id, "Saved torrent tasks are temporarily unavailable. Existing downloads and selections are retained; try /torrents saved again shortly.".into()).await,
         },
         [_, task_id] if valid_task_id(task_id) => {
             let result = service.reopen_card(chat_id, chat_id, (*task_id).into(), format!("update:{update_id}")).await;
@@ -349,6 +355,9 @@ pub(crate) async fn handle_command(
 }
 
 pub(crate) async fn handle_callback(context: &BotContext, query: &CallbackQuery) -> bool {
+    if crate::torrent_catalog::handle_callback(context, query).await {
+        return true;
+    }
     if query
         .data
         .as_deref()

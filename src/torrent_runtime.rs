@@ -17,9 +17,9 @@ use crate::telegram::TelegramClient;
 use crate::torrent_manager::TorrentManager;
 use crate::torrent_types::{
     CompletedTorrentFile, SubmitResult, TorrentAction, TorrentBackend, TorrentEnqueueResult,
-    TorrentFuture, TorrentIdentity, TorrentMagnet, TorrentMusicJobRef, TorrentMusicJobStatus,
-    TorrentMusicStage, TorrentPhase, TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot,
-    TorrentUpload,
+    TorrentExisting, TorrentFuture, TorrentIdentity, TorrentMagnet, TorrentMusicJobRef,
+    TorrentMusicJobStatus, TorrentMusicStage, TorrentPhase, TorrentRemoteSnapshot, TorrentSettings,
+    TorrentSnapshot, TorrentUpload,
 };
 use crate::torrent_widget::{
     TorrentWidgetPresentation, TorrentWidgetView, WidgetEntry, WidgetMusicStage,
@@ -212,6 +212,44 @@ impl TorrentService {
         .context("torrent card worker stopped")?
     }
 
+    /// Read one bounded page of qBittorrent task summaries for the private catalog.
+    pub async fn list_torrents(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<TorrentRemoteSnapshot>> {
+        self.backend.list_torrents(offset, limit).await
+    }
+
+    /// Read back one exact task without exposing qBittorrent paths to the UI.
+    pub async fn remote_snapshot(&self, hash: String) -> Result<TorrentRemoteSnapshot> {
+        self.backend.task_summary(hash).await
+    }
+
+    /// Issue one pause or resume request. A caller must read back the result and must not retry
+    /// when the transport outcome is uncertain.
+    pub async fn set_active(&self, hash: String, active: bool) -> Result<()> {
+        self.backend.set_active(hash, active).await
+    }
+
+    /// Adopt an already-existing task. Manager filesystem work runs on a blocking thread while
+    /// the state permit remains owned through completion.
+    pub async fn adopt_existing(
+        &self,
+        source: TorrentExisting,
+        request_key: String,
+    ) -> Result<TorrentEnqueueResult> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(manager.adopt_existing(source, request_key))
+        })
+        .await
+        .context("torrent catalog adoption worker stopped")?
+    }
+
     fn reserve_state_operation(&self) -> Result<OwnedSemaphorePermit> {
         // A timed-out Widget answer must not release this permit while its blocking
         // filesystem operation is still alive. The closure owns it until completion.
@@ -282,6 +320,22 @@ impl TorrentBackend for RuntimeTorrentBackend {
 
     fn refresh(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot> {
         Box::pin(async move { self.qbit.refresh(&hash).await })
+    }
+
+    fn task_summary(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot> {
+        Box::pin(async move { self.qbit.task_summary(&hash).await })
+    }
+
+    fn list_torrents(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> TorrentFuture<'_, Vec<TorrentRemoteSnapshot>> {
+        Box::pin(async move { self.qbit.list_torrents(offset, limit).await })
+    }
+
+    fn set_active(&self, hash: String, active: bool) -> TorrentFuture<'_, ()> {
+        Box::pin(async move { self.qbit.set_active(&hash, active).await })
     }
 
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64> {

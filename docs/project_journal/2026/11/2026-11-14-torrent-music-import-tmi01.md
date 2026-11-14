@@ -58,6 +58,16 @@ superseded_by: ""
   review pages, stale-card rejection and direct edits from the Mac. Telegram's
   ordinary-bot Widget restriction was confirmed by a minimal live API probe, so
   no production UI depends on Widget availability.
+- Added `/torrents` as a paginated qBittorrent catalog, up to the bounded 20,000-task
+  list limit, with progress and exact-task pause/resume. Choosing Music adopts the
+  existing task into local bot records and opens its current selection card; it
+  does not resubmit the task, move payloads or change file priorities. Bot-submitted
+  torrents request every file; adoption preserves an existing task's priorities.
+  Music import remains separate and explicit, with payload retained for seeding.
+- Added `/torrents saved` for locally retained bot tasks and preserved
+  `/torrents TASK_ID` card recovery. The catalog list is ephemeral and bound to
+  its private owner, message and revision (one-hour idle TTL, at most 48 cached
+  sessions); adopted task records and Music selections remain durable locally.
 - Magnet submission persists a single add intent and a scoped save path before
   the mutating request. Reconciliation/export validates metadata before selection;
   old local qBittorrent installations can explicitly enable a read-only BT_backup
@@ -109,6 +119,32 @@ superseded_by: ""
   import confirmation; real Music import was not repeated during this acceptance.
 - Only the fixed signed test executable was updated. Production deployment was
   left unchanged; normal build and validation commands do not deploy the bot.
+
+## qBittorrent catalog extension
+
+- The catalog UI and documentation are included in this completed workstream.
+  Opening a catalog row performs read-only exact-task verification before local
+  adoption; pause/resume is scoped to one exact hash, followed by a fresh state
+  read. No catalog action deletes a task or changes its path or file priorities.
+- Existing-source records validate and reopen after restart, then use the common
+  Music admission/status worker after metadata verification. Opening an unchanged
+  task preserves confirmations; changed source inventory invalidates them.
+- The final torrent-focused suite passed 56 tests, including all three mocked
+  Telegram/qBittorrent/Music E2Es. The separate qBittorrent HTTP/parser suite passed
+  13 tests. Strict workspace/all-targets Clippy and formatting passed.
+- A broader local run passed 1,585 bot tests with 17 existing ignores. It exposed
+  a catalog fixture issue corrected by the final E2E run, and an unchanged Cloud
+  413 test exceeded its 20-second wait; that test passed in isolation. This was
+  not a wholly green local full-suite run.
+- Real independent-bot acceptance browsed the local catalog, adopted the private
+  sample in place, selected and reviewed one approved completed FLAC, and
+  resumed its single saved confirmation after a test-process restart. Its
+  conversion report confirmed bit-exact PCM and Music returned a persistent ID.
+  Music cloud status is asynchronous; adding a track alone does not establish
+  cloud completion, independent-copy verification or completed staging cleanup.
+- Both real samples reached 100% with every file downloaded and remained active
+  for seeding. Actual pause/resume was not exercised on these retained samples;
+  the mocked catalog E2E verifies both controls without changing live tasks.
 
 ## Official interface references
 

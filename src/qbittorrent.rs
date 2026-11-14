@@ -21,6 +21,7 @@ const MAX_AUTH_RESPONSE_BYTES: usize = 1_024;
 const MAX_VERSION_RESPONSE_BYTES: usize = 128;
 const MAX_API_STRING_BYTES: usize = 4_096;
 const MAX_API_FILE_NAME_BYTES: usize = 4_096;
+const MAX_CATALOG_PAGE_SIZE: u32 = 101;
 
 #[derive(Clone)]
 pub struct QbittorrentClient {
@@ -131,6 +132,77 @@ impl QbittorrentClient {
             snapshots.push(self.finish_snapshot(candidate).await?);
         }
         Ok(snapshots)
+    }
+
+    /// Return one bounded page of the existing qBittorrent catalog without fetching per-torrent
+    /// file inventories. The UI can request another page using the next offset.
+    pub async fn list_torrents(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<TorrentRemoteSnapshot>> {
+        ensure!(
+            (offset as usize) < MAX_API_TORRENTS,
+            "qBittorrent catalog offset exceeds the configured limit"
+        );
+        ensure!(limit > 0, "qBittorrent catalog page size must be positive");
+        let remaining = u32::try_from(MAX_API_TORRENTS - offset as usize)
+            .context("qBittorrent catalog limit is unsupported")?;
+        let limit = limit.min(MAX_CATALOG_PAGE_SIZE).min(remaining);
+        let offset_text = offset.to_string();
+        let limit_text = limit.to_string();
+        let values = self
+            .api_json(
+                Method::GET,
+                "torrents/info",
+                Some(&[
+                    ("filter", "all"),
+                    ("sort", "added_on"),
+                    ("reverse", "true"),
+                    ("offset", offset_text.as_str()),
+                    ("limit", limit_text.as_str()),
+                ]),
+            )
+            .await?;
+        let records = values
+            .as_array()
+            .ok_or_else(|| anyhow!("qBittorrent returned an invalid torrent list"))?;
+        ensure!(
+            records.len() <= limit as usize && records.len() <= MAX_API_TORRENTS,
+            "qBittorrent returned too many torrents"
+        );
+        records.iter().map(parse_torrent_info).collect()
+    }
+
+    /// Pause or resume one exact existing task. The control request is sent once because a
+    /// transport failure can leave the remote result unknown; callers must refresh the task.
+    pub async fn set_active(&self, hash: &str, active: bool) -> Result<()> {
+        validate_hash_parameter(hash)?;
+        let major = self.version_major().await?;
+        let endpoint = match (major >= 5, active) {
+            (true, true) => "torrents/start",
+            (true, false) => "torrents/stop",
+            (false, true) => "torrents/resume",
+            (false, false) => "torrents/pause",
+        };
+        let response = self
+            .request_with_auth(
+                |sid| {
+                    self.request(Method::POST, endpoint)
+                        .maybe_cookie(sid)
+                        .form(&[("hashes", hash)])
+                },
+                false,
+            )
+            .await?;
+        let status = response.status();
+        let _body = read_limited(response, MAX_AUTH_RESPONSE_BYTES).await?;
+        ensure!(
+            status.is_success(),
+            "qBittorrent task control failed with HTTP {}",
+            status.as_u16()
+        );
+        Ok(())
     }
 
     /// Submit exactly once. Callers must reconcile the identity with `lookup` regardless of
@@ -299,6 +371,27 @@ impl QbittorrentClient {
             })
             .ok_or_else(|| anyhow!("qBittorrent torrent was not found"))?;
         self.finish_snapshot(parse_torrent_info(record)?).await
+    }
+
+    /// Read the bounded summary for one exact hash without fetching its file inventory.
+    pub async fn task_summary(&self, hash: &str) -> Result<TorrentRemoteSnapshot> {
+        validate_hash_parameter(hash)?;
+        let response = self
+            .api_json(Method::GET, "torrents/info", Some(&[("hashes", hash)]))
+            .await?;
+        let records = response
+            .as_array()
+            .ok_or_else(|| anyhow!("qBittorrent returned an invalid torrent list"))?;
+        let record = records
+            .iter()
+            .find(|record| {
+                record
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(hash))
+            })
+            .ok_or_else(|| anyhow!("qBittorrent torrent was not found"))?;
+        parse_torrent_info(record)
     }
 
     async fn finish_snapshot(
@@ -1552,6 +1645,149 @@ mod tests {
         assert!(parse_torrent_info(&record("downloading", -1, -1)).is_err());
         assert!(parse_torrent_info(&record("checkingResumeData", -2, -1)).is_err());
         assert!(parse_torrent_info(&record("metaDL", -1, -2)).is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_listing_is_paged_and_does_not_fetch_file_lists() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let file_requests = Arc::new(AtomicUsize::new(0));
+        let file_requests_copy = Arc::clone(&file_requests);
+        let (base_url, server) = serve(move |request| {
+            if request.line.starts_with("GET /api/v2/torrents/info?") {
+                assert!(request.line.contains("filter=all"));
+                assert!(request.line.contains("sort=added_on"));
+                assert!(request.line.contains("reverse=true"));
+                assert!(request.line.contains("offset=7"));
+                assert!(request.line.contains("limit=101"));
+                let record = serde_json::json!({
+                    "hash": HASH,
+                    "name": "Existing album",
+                    "state": "downloading",
+                    "progress": 0.25,
+                    "save_path": "/tmp/downloads",
+                    "content_path": "/tmp/downloads/Existing album",
+                    "total_size": 100,
+                    "amount_left": 75,
+                });
+                (200, vec![], serde_json::to_vec(&vec![record]).unwrap())
+            } else if request.line.starts_with("GET /api/v2/torrents/files") {
+                file_requests_copy.fetch_add(1, Ordering::Relaxed);
+                (200, vec![], b"[]".to_vec())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        let page = client.list_torrents(7, 500).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].hash, HASH);
+        assert_eq!(page[0].name, "Existing album");
+        assert!(page[0].files.is_empty());
+        assert_eq!(file_requests.load(Ordering::Relaxed), 0);
+        assert!(
+            client
+                .list_torrents(MAX_API_TORRENTS as u32, 1)
+                .await
+                .is_err()
+        );
+        assert!(client.list_torrents(0, 0).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn task_summary_reads_one_hash_without_fetching_files() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let file_requests = Arc::new(AtomicUsize::new(0));
+        let file_requests_copy = Arc::clone(&file_requests);
+        let (base_url, server) = serve(move |request| {
+            if request.line.starts_with("GET /api/v2/torrents/info?") {
+                assert!(request.line.contains(&format!("hashes={HASH}")));
+                let record = serde_json::json!({
+                    "hash": HASH,
+                    "name": "Existing task",
+                    "state": "pausedDL",
+                    "progress": 0.75,
+                    "save_path": "/tmp/downloads",
+                    "content_path": "/tmp/downloads/Existing task",
+                    "total_size": 100,
+                    "amount_left": 25,
+                });
+                (200, vec![], serde_json::to_vec(&vec![record]).unwrap())
+            } else if request.line.starts_with("GET /api/v2/torrents/files") {
+                file_requests_copy.fetch_add(1, Ordering::Relaxed);
+                (200, vec![], b"[]".to_vec())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        let summary = client.task_summary(HASH).await.unwrap();
+        assert_eq!(summary.hash, HASH);
+        assert_eq!(summary.state, "pausedDL");
+        assert!(summary.files.is_empty());
+        assert_eq!(file_requests.load(Ordering::Relaxed), 0);
+        assert!(client.task_summary("all").await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn task_controls_use_versioned_endpoints_once_and_reject_invalid_hashes() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        for (version, expected) in [
+            ("v4.3.9", ["resume", "pause"]),
+            ("v5.0.0", ["start", "stop"]),
+        ] {
+            let control_requests = Arc::new(AtomicUsize::new(0));
+            let control_requests_copy = Arc::clone(&control_requests);
+            let (base_url, server) = serve(move |request| {
+                if request.line.starts_with("GET /api/v2/app/version") {
+                    (200, vec![], version.as_bytes().to_vec())
+                } else if request.line.starts_with("POST /api/v2/torrents/") {
+                    let ordinal = control_requests_copy.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        request
+                            .line
+                            .contains(&format!("/api/v2/torrents/{} ", expected[ordinal]))
+                    );
+                    let form = url::form_urlencoded::parse(&request.body)
+                        .into_owned()
+                        .collect::<HashMap<_, _>>();
+                    assert_eq!(form.get("hashes").map(String::as_str), Some(HASH));
+                    (200, vec![], Vec::new())
+                } else {
+                    (404, vec![], Vec::new())
+                }
+            })
+            .await;
+            let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+            assert!(client.set_active(HASH, true).await.is_ok());
+            assert!(client.set_active(HASH, false).await.is_ok());
+            assert_eq!(control_requests.load(Ordering::Relaxed), 2);
+            assert!(client.set_active("all", true).await.is_err());
+            assert!(client.set_active("0123", false).await.is_err());
+            assert_eq!(control_requests.load(Ordering::Relaxed), 2);
+            server.abort();
+        }
+
+        let control_requests = Arc::new(AtomicUsize::new(0));
+        let control_requests_copy = Arc::clone(&control_requests);
+        let (base_url, server) = serve(move |request| {
+            if request.line.starts_with("GET /api/v2/app/version") {
+                (200, vec![], b"v4.3.9".to_vec())
+            } else if request.line.starts_with("POST /api/v2/torrents/resume") {
+                control_requests_copy.fetch_add(1, Ordering::Relaxed);
+                (500, vec![], b"unknown result".to_vec())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        assert!(client.set_active(HASH, true).await.is_err());
+        assert_eq!(control_requests.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 
     #[test]

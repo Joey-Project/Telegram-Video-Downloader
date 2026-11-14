@@ -1,5 +1,7 @@
 use super::*;
-use crate::torrent_types::{TorrentIdentity, TorrentMagnet, TorrentMusicJobStatus};
+use crate::torrent_types::{
+    TorrentExisting, TorrentIdentity, TorrentMagnet, TorrentMusicJobStatus, TorrentMusicStage,
+};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -19,6 +21,7 @@ struct TestBackendState {
     sent_cards: usize,
     updated_cards: Vec<TorrentSnapshot>,
     music_batches: Vec<(String, Vec<CompletedTorrentFile>)>,
+    complete_music_status: bool,
 }
 
 struct TestBackend {
@@ -48,6 +51,7 @@ impl TestBackend {
                 sent_cards: 0,
                 updated_cards: Vec::new(),
                 music_batches: Vec::new(),
+                complete_music_status: false,
             }),
             next_card_id: AtomicI64::new(100),
         }
@@ -79,6 +83,14 @@ impl TestBackend {
 
     fn export_count(&self) -> usize {
         self.state.lock().unwrap().export_count
+    }
+
+    fn set_visible_candidate(&self, remote: TorrentRemoteSnapshot) {
+        self.state.lock().unwrap().visible_candidates = vec![remote];
+    }
+
+    fn report_music_complete(&self) {
+        self.state.lock().unwrap().complete_music_status = true;
     }
 }
 
@@ -198,9 +210,26 @@ impl TorrentBackend for TestBackend {
     fn music_status(
         &self,
         _chat_id: i64,
-        _job_ids: Vec<String>,
+        job_ids: Vec<String>,
     ) -> crate::torrent_types::TorrentFuture<'_, Vec<TorrentMusicJobStatus>> {
-        Box::pin(async { Ok(Vec::new()) })
+        let state = self.state.lock().unwrap();
+        let statuses = if state.complete_music_status {
+            state
+                .music_batches
+                .iter()
+                .flat_map(|(_, files)| files.iter().enumerate())
+                .map(|(index, file)| TorrentMusicJobStatus {
+                    job_id: format!("music-job-{index}"),
+                    source_key: file.source_key.clone(),
+                    stage: TorrentMusicStage::Complete,
+                    error: None,
+                })
+                .filter(|status| job_ids.contains(&status.job_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Box::pin(async move { Ok(statuses) })
     }
 }
 
@@ -268,6 +297,10 @@ impl Fixture {
 }
 
 fn two_file_torrent() -> Vec<u8> {
+    two_file_torrent_with_private(false)
+}
+
+fn two_file_torrent_with_private(private: bool) -> Vec<u8> {
     let files = vec![
         dict(vec![
             (b"length".to_vec(), integer(4)),
@@ -284,12 +317,16 @@ fn two_file_torrent() -> Vec<u8> {
             ),
         ]),
     ];
-    let info = dict(vec![
+    let mut info_entries = vec![
         (b"files".to_vec(), list(files)),
         (b"name".to_vec(), text("release")),
         (b"piece length".to_vec(), integer(16_384)),
         (b"pieces".to_vec(), bencode_bytes(&[7; 20])),
-    ]);
+    ];
+    if private {
+        info_entries.push((b"private".to_vec(), integer(1)));
+    }
+    let info = dict(info_entries);
     dict(vec![(b"info".to_vec(), info)])
 }
 
@@ -388,6 +425,15 @@ fn magnet_upload(fixture: &Fixture, update_id: i64, message_id: i64) -> TorrentM
     }
 }
 
+fn existing_source(_fixture: &Fixture, hash: String, user_id: i64) -> TorrentExisting {
+    TorrentExisting {
+        chat_id: user_id,
+        user_id,
+        message_id: 900,
+        hash,
+    }
+}
+
 fn alternate_single_file_torrent() -> Vec<u8> {
     let info = dict(vec![
         (b"length".to_vec(), integer(3)),
@@ -431,6 +477,431 @@ async fn existing_or_ambiguous_qbittorrent_candidates_are_never_submitted() {
         .unwrap();
     assert_eq!(snapshot.phase, TorrentPhase::Ambiguous);
     assert_eq!(duplicate_backend.submitted_count(), 0);
+}
+
+#[tokio::test]
+async fn existing_catalog_adoption_is_read_only_verified_and_replay_safe() {
+    let fixture = Fixture::new();
+    let private_raw = two_file_torrent_with_private(true);
+    let private_meta = parse_metainfo(&private_raw, DEFAULT_MAX_TORRENT_BYTES, DEFAULT_MAX_FILES)
+        .expect("parse private torrent fixture");
+    let existing = remote_snapshot(&private_meta, &fixture.source_root, &[0.5, 1.0], 0.7, 2);
+    let expected_hash = existing.hash.clone();
+    let expected_path = existing.save_path.clone();
+    let backend = Arc::new(TestBackend::new(private_raw.clone(), vec![existing], None));
+    backend.configure_magnet(fixture.source_root.clone(), Some(private_raw), 0);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+
+    let first = manager
+        .adopt_existing(
+            existing_source(&fixture, expected_hash.clone(), fixture.upload.user_id),
+            "catalog:request-1".to_string(),
+        )
+        .await
+        .expect("adopt existing qBittorrent task");
+    assert!(first.created);
+    assert_eq!(first.snapshot.upload_message_id, 900);
+    assert_eq!(first.snapshot.phase, TorrentPhase::DownloadingMetainfo);
+    assert!(first.snapshot.files.is_empty());
+    let initial_generation = manager
+        .store
+        .task(&first.task_id)
+        .unwrap()
+        .unwrap()
+        .card_generation;
+
+    let replay = manager
+        .adopt_existing(
+            existing_source(&fixture, expected_hash.clone(), fixture.upload.user_id),
+            "catalog:request-1".to_string(),
+        )
+        .await
+        .expect("replay catalog request");
+    assert_eq!(replay.task_id, first.task_id);
+    assert_eq!(
+        manager
+            .store
+            .task(&replay.task_id)
+            .unwrap()
+            .unwrap()
+            .card_generation,
+        initial_generation
+    );
+
+    let next_generation = manager
+        .adopt_existing(
+            existing_source(&fixture, expected_hash.clone(), fixture.upload.user_id),
+            "catalog:request-2".to_string(),
+        )
+        .await
+        .expect("open another catalog generation");
+    assert_eq!(next_generation.task_id, first.task_id);
+    assert_eq!(
+        manager
+            .store
+            .task(&next_generation.task_id)
+            .unwrap()
+            .unwrap()
+            .card_generation,
+        initial_generation + 1
+    );
+
+    assert!(
+        manager
+            .adopt_existing(
+                existing_source(&fixture, expected_hash.clone(), fixture.upload.user_id + 1),
+                "catalog:wrong-owner".to_string()
+            )
+            .await
+            .is_err()
+    );
+
+    manager.process_task_once_for_test(&first.task_id).await;
+    manager.process_task_once_for_test(&first.task_id).await;
+    let verified = manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &first.task_id,
+        )
+        .expect("read verified task");
+    let stored = manager
+        .store
+        .task(&first.task_id)
+        .expect("read task state")
+        .expect("task exists");
+    assert_eq!(verified.phase, TorrentPhase::Downloading);
+    assert_eq!(stored.remote.as_ref().unwrap().save_path, expected_path);
+    assert!(stored.metainfo.as_ref().unwrap().private);
+    assert_eq!(backend.submitted_count(), 0);
+    assert!(backend.magnet_submissions().is_empty());
+
+    let replayed_verified = manager
+        .adopt_existing(
+            existing_source(&fixture, expected_hash.clone(), fixture.upload.user_id),
+            "catalog:request-2".to_string(),
+        )
+        .await
+        .expect("replay the current catalog generation");
+    assert_eq!(
+        replayed_verified.snapshot.inventory_revision,
+        verified.inventory_revision
+    );
+    assert_eq!(
+        replayed_verified.snapshot.selection_revision,
+        verified.selection_revision
+    );
+
+    let card_id = verified.card_message_id.expect("delivered task card");
+    let selected = manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            card_id,
+            &first.task_id,
+            verified.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: true,
+            },
+        )
+        .expect("select one file");
+    let confirmed = manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            card_id,
+            &first.task_id,
+            selected.selection_revision,
+            TorrentAction::ImportSelected,
+        )
+        .expect("confirm the current inventory");
+    let old_inventory_revision = confirmed.inventory_revision;
+    let old_selection_revision = confirmed.selection_revision;
+
+    let moved_path = fixture.source_root.join("moved-downloads");
+    let moved_remote = remote_snapshot(&private_meta, &moved_path, &[1.0, 1.0], 1.0, 0);
+    backend.set_visible_candidate(moved_remote);
+    let refreshed = manager
+        .adopt_existing(
+            existing_source(&fixture, expected_hash, fixture.upload.user_id),
+            "catalog:request-3".to_string(),
+        )
+        .await
+        .expect("reopen card after qBittorrent moved the task");
+    assert_eq!(refreshed.snapshot.phase, TorrentPhase::Completed);
+    assert_eq!(refreshed.snapshot.progress, 1.0);
+    assert!(refreshed.snapshot.inventory_revision > old_inventory_revision);
+    assert!(refreshed.snapshot.selection_revision > old_selection_revision);
+    assert_eq!(
+        manager
+            .store
+            .task(&first.task_id)
+            .unwrap()
+            .unwrap()
+            .remote
+            .unwrap()
+            .save_path,
+        moved_path
+    );
+    let stored_after_refresh = manager.store.task(&first.task_id).unwrap().unwrap();
+    let old_confirmation = stored_after_refresh.imports.get(&0).unwrap();
+    assert_ne!(
+        old_confirmation.confirmed_inventory_revision,
+        stored_after_refresh.inventory_revision
+    );
+    manager.process_task_once_for_test(&first.task_id).await;
+    manager.process_task_once_for_test(&first.task_id).await;
+    assert!(
+        backend.music_batches().is_empty(),
+        "a previous inventory confirmation cannot enqueue files after revalidation"
+    );
+}
+
+#[tokio::test]
+async fn existing_catalog_missing_or_unverified_metadata_stays_unselectable() {
+    let fixture = Fixture::new();
+    let missing_backend = fixture.backend(Vec::new(), None);
+    let missing_manager = TorrentManager::open(
+        TorrentSettings {
+            state_dir: fixture.state_dir.join("missing-existing"),
+            ..fixture.settings()
+        },
+        missing_backend,
+    )
+    .expect("open missing task manager");
+    assert!(
+        missing_manager
+            .adopt_existing(
+                existing_source(
+                    &fixture,
+                    fixture.metainfo.identity.v1.clone().unwrap(),
+                    fixture.upload.user_id
+                ),
+                "catalog:missing".to_string()
+            )
+            .await
+            .is_err()
+    );
+
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[0.0, 0.0], 0.0, 9);
+    let pending_backend = fixture.backend(vec![remote], None);
+    pending_backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        1,
+    );
+    let pending_manager = TorrentManager::open(
+        TorrentSettings {
+            state_dir: fixture.state_dir.join("pending-existing"),
+            ..fixture.settings()
+        },
+        pending_backend.clone(),
+    )
+    .expect("open pending metadata manager");
+    let queued = pending_manager
+        .adopt_existing(
+            existing_source(
+                &fixture,
+                fixture.metainfo.identity.v1.clone().unwrap(),
+                fixture.upload.user_id,
+            ),
+            "catalog:pending".to_string(),
+        )
+        .await
+        .expect("adopt task waiting for metadata");
+    pending_manager
+        .process_task_once_for_test(&queued.task_id)
+        .await;
+    pending_manager
+        .process_task_once_for_test(&queued.task_id)
+        .await;
+    let waiting = pending_manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &queued.task_id,
+        )
+        .expect("read waiting task");
+    assert_eq!(waiting.phase, TorrentPhase::DownloadingMetainfo);
+    assert!(waiting.files.is_empty());
+    assert_eq!(waiting.selected_count, 0);
+    assert_eq!(pending_backend.submitted_count(), 0);
+
+    let wrong_export = fixture.backend(
+        vec![remote_snapshot(
+            &fixture.metainfo,
+            &fixture.source_root,
+            &[1.0, 1.0],
+            1.0,
+            0,
+        )],
+        None,
+    );
+    wrong_export.configure_magnet(
+        fixture.source_root.clone(),
+        Some(alternate_single_file_torrent()),
+        0,
+    );
+    let wrong_manager = TorrentManager::open(
+        TorrentSettings {
+            state_dir: fixture.state_dir.join("wrong-existing-metadata"),
+            ..fixture.settings()
+        },
+        wrong_export.clone(),
+    )
+    .expect("open identity mismatch manager");
+    let wrong = wrong_manager
+        .adopt_existing(
+            existing_source(
+                &fixture,
+                fixture.metainfo.identity.v1.clone().unwrap(),
+                fixture.upload.user_id,
+            ),
+            "catalog:wrong-export".to_string(),
+        )
+        .await
+        .expect("adopt task before export validation");
+    wrong_manager
+        .process_task_once_for_test(&wrong.task_id)
+        .await;
+    wrong_manager
+        .process_task_once_for_test(&wrong.task_id)
+        .await;
+    let rejected = wrong_manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &wrong.task_id,
+        )
+        .expect("read rejected task");
+    assert_eq!(rejected.phase, TorrentPhase::Invalid);
+    assert!(rejected.files.is_empty());
+    assert_eq!(wrong_export.submitted_count(), 0);
+}
+
+#[tokio::test]
+async fn verified_existing_catalog_task_can_import_and_refresh_music_status() {
+    let fixture = Fixture::new();
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    let hash = remote.hash.clone();
+    let backend = fixture.backend(vec![remote], None);
+    backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        0,
+    );
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let queued = manager
+        .adopt_existing(
+            existing_source(&fixture, hash, fixture.upload.user_id),
+            "catalog:music-import".to_string(),
+        )
+        .await
+        .expect("adopt existing task");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    let ready = manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &queued.task_id,
+        )
+        .expect("read verified task");
+    let card_id = ready.card_message_id.expect("task card delivered");
+    let selected = manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            card_id,
+            &queued.task_id,
+            ready.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: true,
+            },
+        )
+        .expect("select music file");
+    manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            card_id,
+            &queued.task_id,
+            selected.selection_revision,
+            TorrentAction::ImportSelected,
+        )
+        .expect("confirm selected file");
+
+    manager.process_task_once_for_test(&queued.task_id).await;
+    assert_eq!(backend.music_batches().len(), 1);
+    backend.report_music_complete();
+    manager.refresh_music_status_for_test(&queued.task_id).await;
+    let imported = manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &queued.task_id,
+        )
+        .expect("read completed import");
+    assert_eq!(
+        imported.files[0].music_stage,
+        Some(TorrentMusicStage::Complete)
+    );
+    assert_eq!(backend.submitted_count(), 0);
+}
+
+#[test]
+fn queue_state_without_the_existing_source_field_still_loads() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend).expect("open manager");
+    manager
+        .enqueue(fixture.upload.clone())
+        .expect("enqueue upload");
+    let mut old_state = serde_json::to_value(manager.store.snapshot().expect("read state"))
+        .expect("serialize current state");
+    for task in old_state["tasks"].as_object_mut().unwrap().values_mut() {
+        task.as_object_mut().unwrap().remove("existing");
+    }
+    let restored: StoredState =
+        serde_json::from_value(old_state).expect("load state written before existing was added");
+    assert!(restored.tasks.values().all(|task| task.existing.is_none()));
+}
+
+#[tokio::test]
+async fn existing_catalog_task_survives_manager_restart() {
+    let fixture = Fixture::new();
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[0.0, 0.0], 0.0, 9);
+    let hash = remote.hash.clone();
+    let backend = fixture.backend(vec![remote], None);
+    let settings = fixture.settings();
+    let manager = TorrentManager::open(settings.clone(), backend.clone()).expect("open manager");
+    let queued = manager
+        .adopt_existing(
+            existing_source(&fixture, hash, fixture.upload.user_id),
+            "catalog:restart".to_string(),
+        )
+        .await
+        .expect("adopt existing catalog task");
+
+    let state = manager.store.snapshot().expect("read persisted state");
+    validate_state(&state, &manager.settings, &manager.store.metainfo_dir)
+        .expect("validate state containing exactly one existing source");
+    drop(manager);
+
+    let restarted =
+        TorrentManager::open(settings, backend).expect("reopen manager with existing task");
+    let restored = restarted
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &queued.task_id,
+        )
+        .expect("read restored catalog task");
+    assert_eq!(restored.upload_message_id, 900);
+    assert_eq!(restored.phase, TorrentPhase::DownloadingMetainfo);
+    assert!(restored.files.is_empty());
 }
 
 #[tokio::test]
