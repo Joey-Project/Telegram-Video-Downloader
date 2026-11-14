@@ -1,6 +1,5 @@
 # Project TODO
 
-- [pending] Add a file-manager view of temporary directories belonging to interrupted, unfinished downloads, with explicit bulk selection and cleanup. Protect active writers, finished media, queue/control identities and recovery bindings; permanent retention remains the default until the user requests cleanup.
 - [pending] Integrate a reusable `BBDown-rust danmaku update` action for existing videos, collections and whole libraries without downloading media again. Refresh must append/merge without losing previously saved comments. The one-time offline recovery is complete; see [the closed recovery workstream](project_journal/2026/10/2026-10-16-bilibili-danmaku-deflate-bdd01.md).
 - [pending] Support uploaded `.torrent` files by submitting them to the existing local qBittorrent service.
 - [pending] Integrate login status and login operations into the `/settings` Mini App; library settings and migration already exist.

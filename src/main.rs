@@ -40,6 +40,10 @@ mod queue;
 mod redaction;
 mod router;
 mod safe_fs;
+mod staging_cleanup;
+mod staging_cleanup_bot;
+#[cfg(test)]
+mod staging_cleanup_tests;
 mod telegram;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::RandomState};
@@ -3076,8 +3080,12 @@ async fn build_cloud_state_snapshot(
     let scan_warning = runtime.library_scan_warning.lock().await.clone();
     let (mut records, omitted_preview_count) =
         cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
-    let (unconfirmable_preview_sequences, preview_check_failed) =
+    let (mut unconfirmable_preview_sequences, mut preview_check_failed) =
         media_library_bot::unconfirmable_previews(runtime, &records).await;
+    let (staging_preview_sequences, staging_preview_check_failed) =
+        staging_cleanup_bot::unconfirmable_previews(runtime, &records).await;
+    unconfirmable_preview_sequences.extend(staging_preview_sequences);
+    preview_check_failed |= staging_preview_check_failed;
     for record in &mut records {
         if record.status != InboxStatus::AwaitingConfirmation
             || !matches!(
@@ -4287,6 +4295,16 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
     } else {
         match dispatch_cloud_management(&runtime, &record.request).await {
             Err(error) if is_file_provider_access_error(&error) => Err(error),
+            Err(error)
+                if record.request.kind == "staging_cleanup"
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<staging_cleanup::StagingCleanupBusy>()
+                            .is_some()
+                    }) =>
+            {
+                Err(error)
+            }
             Err(error) => Ok(cloud_dispatch_failure(format!("{error:#}"))),
             outcome => outcome,
         }
@@ -4559,12 +4577,19 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
+    if request.kind == "staging_cleanup"
+        && request
+            .staging_cleanup_operation()
+            .is_some_and(|operation| operation == "cancel")
+    {
+        return staging_cleanup_bot::dispatch_cancel(runtime, request).await;
+    }
     if request.kind == "preview_cancel" {
         return dispatch_cloud_preview_cancel(runtime, request).await;
     }
     if !matches!(
         request.kind.as_str(),
-        "file_preview" | "file_confirm" | "legacy_import"
+        "file_preview" | "file_confirm" | "legacy_import" | "staging_cleanup"
     ) {
         media_library_bot::refresh_library_bindings(runtime).await?;
     }
@@ -4577,7 +4602,7 @@ async fn dispatch_cloud_management(
     let mut owned_request = request.clone();
     let binding_scoped_action = matches!(
         request.kind.as_str(),
-        "file_preview" | "legacy_import" | "metadata_recover"
+        "file_preview" | "legacy_import" | "metadata_recover" | "staging_cleanup"
     );
     let requested_library_id_value = if binding_scoped_action {
         owned_request
@@ -4625,7 +4650,7 @@ async fn dispatch_cloud_management(
     };
     let selected = if matches!(
         request.kind.as_str(),
-        "library_scan" | "file_preview" | "legacy_import" | "metadata_recover"
+        "library_scan" | "file_preview" | "legacy_import" | "metadata_recover" | "staging_cleanup"
     ) {
         match media_library_bot::scoped_runtime(runtime, requested_library_id.as_deref()) {
             Ok(selected) => Some(selected),
@@ -4649,6 +4674,19 @@ async fn dispatch_cloud_management(
             requested_root_binding
                 .as_deref()
                 .expect("metadata recovery requires root_binding"),
+        )
+        .await;
+    }
+    if request.kind == "staging_cleanup" {
+        return staging_cleanup_bot::dispatch(
+            runtime,
+            request,
+            requested_library_id
+                .as_deref()
+                .expect("staging cleanup requires library_id"),
+            requested_root_binding
+                .as_deref()
+                .expect("staging cleanup requires root_binding"),
         )
         .await;
     }

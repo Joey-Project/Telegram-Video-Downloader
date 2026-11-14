@@ -51,6 +51,7 @@
           <nav class="view-tabs" aria-label="Library sections">
             <button class="view-tab active" data-view="library" type="button" aria-current="page">Library <span id="library-count" class="tab-count">—</span></button>
             <button class="view-tab" data-view="needs" type="button">Needs organizing <span id="needs-count" class="tab-count">0</span></button>
+            <button class="view-tab" data-view="temporary" type="button">Video staging <span id="staging-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="waiting" type="button">Requests <span id="waiting-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="organizing" type="button">Organizing <span id="organizing-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="history" type="button">History <span id="history-count" class="tab-count">0</span></button>
@@ -72,6 +73,23 @@
             <div id="library-list" class="library-list" aria-live="polite"></div>
           </section>
 
+          <section id="view-temporary" class="view-panel hidden">
+            <div class="panel-heading"><div><p class="eyebrow">RETAINED ON YOUR COMPUTER</p><h2>Retained video staging</h2><p>Review recorded video staging for interrupted or unfinished download attempts. PDF downloads, Music originals and playback dependencies, and unknown or unowned directories are outside this view. Nothing is removed automatically; permanent cleanup requires a preview and your confirmation.</p></div></div>
+            <div class="library-context"><span id="staging-library-label" class="badge">Choose a media library</span><span id="staging-scan-age" class="field-hint"></span><button id="staging-scan" class="secondary-button" type="button">Scan staging</button></div>
+            <p id="staging-status" class="section-summary" aria-live="polite"></p>
+            <div id="staging-warnings" class="operation-warnings"></div>
+            <div class="toolbar staging-toolbar">
+              <label class="search-box"><span aria-hidden="true">⌕</span><input id="staging-search" type="search" placeholder="Search titles, paths, or task IDs" autocomplete="off" aria-label="Search temporary downloads"></label>
+              <button id="staging-select-visible" class="quiet-button" type="button">Select this page</button>
+              <button id="staging-clear-selection" class="quiet-button" type="button">Clear selection</button>
+            </div>
+            <div id="staging-list" class="staging-list" aria-live="polite"></div>
+            <nav id="staging-pagination" class="toolbar library-pagination hidden" aria-label="Video staging pages"><button id="staging-previous" class="quiet-button" type="button">Previous</button><span id="staging-page-label" class="field-hint"></span><button id="staging-next" class="quiet-button" type="button">Next</button></nav>
+            <aside id="staging-selection-actions" class="selection-actions hidden" role="region" aria-label="Video staging selection" aria-live="polite">
+              <div class="selection-actions-inner"><span id="staging-selection-count" class="selection-count"></span><button id="staging-preview" class="primary-button" type="button">Preview cleanup</button></div>
+            </aside>
+          </section>
+
           <section id="view-needs" class="view-panel hidden">
             <div class="panel-heading"><div><p class="eyebrow">NEEDS A LOOK</p><h2>Needs organizing</h2><p>Items with incomplete details, uncertain matches, or no collection.</p></div></div>
             <div id="needs-summary" class="section-summary"></div>
@@ -85,8 +103,9 @@
           </section>
 
           <section id="view-waiting" class="view-panel hidden">
-            <div class="panel-heading"><div><p class="eyebrow">REQUESTS</p><h2>Review and follow up</h2><p>Review file and library migration previews, then confirm or cancel them. Other requests stay here until your computer handles them.</p></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">REQUESTS</p><h2>Review and follow up</h2><p>Review file, migration, and temporary cleanup previews, then confirm or cancel them. Other requests stay here until your computer handles them.</p></div></div>
             <div id="review-navigation-list" class="stack-list"></div>
+            <section class="staging-review-section"><div class="panel-heading"><div><p class="eyebrow">PERMANENT CLEANUP</p><h3>Video staging cleanup previews</h3><p>Confirm only after reviewing which recorded video staging entries will be permanently removed.</p></div></div><div id="staging-cleanup-preview-list" class="stack-list"></div></section>
             <div id="migration-preview-list" class="stack-list"></div>
             <div id="preview-list" class="stack-list"></div>
             <div id="waiting-list" class="stack-list"></div>

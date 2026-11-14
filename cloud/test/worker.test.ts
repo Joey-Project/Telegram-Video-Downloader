@@ -2566,6 +2566,35 @@ describe("Mini App identity and actions", () => {
     expect(desktopBacklog.requests[0]?.payload.item_ids).toEqual(["private-item"]);
   });
 
+  it("publishes only bounded staging preview identity while accepted actions wait for the desktop", async () => {
+    const initData = await signInitData();
+    const identity = { library_id: "library-staging", root_binding: `v1:${"a".repeat(64)}` };
+    const preview = { preview_seq: 10, preview_id: "staging-preview-10", revision: "staging-revision-10" };
+    const operations = ["scan", "preview", "confirm", "cancel"] as const;
+    for (const [index, operation] of operations.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-00000000002${index}`,
+          kind: "staging_cleanup",
+          payload: { operation, ...identity,
+            ...(operation === "preview" ? { item_ids: ["private-staging-selection"] } : {}),
+            ...(operation === "confirm" || operation === "cancel" ? preview : {}) },
+        }),
+      });
+      expect(response.status).toBe(202);
+    }
+    const state = await responseJson<{ pending_requests: Array<Record<string, unknown>> }>(
+      await ownerRequest("/api/state", initData),
+    );
+    expect(state.pending_requests).toEqual(operations.map((operation, index) => ({
+      seq: index + 1, kind: "staging_cleanup", created_at: expect.any(Number), status: "waiting_for_local",
+      operation, ...identity, ...(operation === "confirm" || operation === "cancel" ? preview : {}),
+    })));
+    expect(JSON.stringify(state.pending_requests)).not.toContain("private-staging-selection");
+    expect(state.pending_requests.every((entry) => !("payload" in entry))).toBe(true);
+  });
+
   it("preserves legacy line separators while enforcing decoded UTF-8 text bounds before enqueueing", async () => {
     const initData = await signInitData();
     const separatorText = "Line 1\r\n\tLine 2\n";

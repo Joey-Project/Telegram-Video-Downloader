@@ -80,6 +80,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "library_migration_preview",
   "library_migration_confirm",
   "library_migration_control",
+  "staging_cleanup",
 ]);
 
 function isRequestKind(value: unknown): value is RequestKind {

@@ -20,6 +20,8 @@ use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::library::PhysicalItemIdentity;
+
 const REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
 const REMOVE_QUARANTINE_MANIFEST_NAME: &str = "manifest.json";
 const REMOVE_QUARANTINE_TOMBSTONE_SUFFIX: &str = ".cleanup.json";
@@ -27,6 +29,7 @@ const REMOVE_QUARANTINE_MANIFEST_VERSION: u32 = 3;
 const REMOVE_QUARANTINE_PREVIOUS_MANIFEST_VERSION: u32 = 2;
 const REMOVE_QUARANTINE_LEGACY_MANIFEST_VERSION: u32 = 1;
 const REMOVE_QUARANTINE_MANIFEST_LIMIT: usize = 1024;
+const MAX_REMOVE_QUARANTINE_SCAN_ENTRIES: usize = 10_000;
 static REMOVE_QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +280,13 @@ impl RemoveQuarantinePolicy {
             post_failure: PostQuarantineFailure::Restore,
         }
     }
+
+    fn restore_directory() -> Self {
+        Self {
+            recursive: true,
+            post_failure: PostQuarantineFailure::Restore,
+        }
+    }
 }
 
 impl std::fmt::Debug for BoundFile {
@@ -315,6 +325,17 @@ impl BoundFile {
             bail!("bound file descriptor identity changed");
         }
         Ok(())
+    }
+
+    /// Capture the persistent physical identity from this already-open, no-follow descriptor.
+    /// Device/inode select the object and birth time prevents inode reuse from making a later
+    /// replacement look like the same file. Mutable timestamps and file contents are excluded.
+    pub(crate) fn physical_identity(&self) -> Result<PhysicalItemIdentity> {
+        self.validate_identity()?;
+        let file = self.duplicate_std_file()?;
+        let identity = physical_identity_for_open_file(&file, self.identity)?;
+        self.validate_identity()?;
+        Ok(identity)
     }
 
     fn access_policy_snapshot(&self) -> Result<BoundFileAccessPolicy> {
@@ -592,6 +613,20 @@ impl BoundDirectory {
         Ok(())
     }
 
+    /// Capture the persistent physical identity from this already-open directory descriptor.
+    /// Directory mtime/ctime are intentionally not part of the identity because child churn is
+    /// expected while the object remains the same.
+    pub(crate) fn physical_identity(&self) -> Result<PhysicalItemIdentity> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::dup(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound directory for physical identity")?;
+        let file = File::from(duplicate);
+        let identity = physical_identity_for_open_file(&file, self.identity)?;
+        self.validate_identity()?;
+        Ok(identity)
+    }
+
     pub(crate) fn sync_all(&self) -> Result<()> {
         self.validate_identity()?;
         sync_directory(self.fd.as_ref())?;
@@ -672,6 +707,22 @@ impl RootedFs {
         self.root_identity
     }
 
+    /// Capture the persistent identity from the configured root's held directory descriptor.
+    pub(crate) fn root_physical_identity(&self) -> Result<PhysicalItemIdentity> {
+        if identity_for_fd(self.root_fd.as_ref())? != self.root_identity {
+            bail!("bound filesystem root descriptor identity changed");
+        }
+        let duplicate = rustix::io::dup(self.root_fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound filesystem root for physical identity")?;
+        let file = File::from(duplicate);
+        let identity = physical_identity_for_open_file(&file, self.root_identity)?;
+        if identity_for_fd(self.root_fd.as_ref())? != self.root_identity {
+            bail!("bound filesystem root descriptor identity changed");
+        }
+        Ok(identity)
+    }
+
     pub(crate) fn logical_root_path(&self) -> &Path {
         &self.logical_root
     }
@@ -731,6 +782,23 @@ impl RootedFs {
             self.root_fd.as_ref(),
             self.root_identity,
             &self.logical_root,
+        )?;
+        self.validate_root()?;
+        Ok(entries)
+    }
+
+    pub(crate) fn list_root_directory_until(
+        &self,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        self.validate_root()?;
+        let entries = list_directory_entries_until(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            limit,
+            deadline,
         )?;
         self.validate_root()?;
         Ok(entries)
@@ -1755,6 +1823,60 @@ impl RootedFs {
         Ok(entries)
     }
 
+    pub(crate) fn list_bound_directory_until(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        let directory = self.open_bound_directory(entry, expected)?;
+        let entries = list_directory_entries_until(
+            directory.fd.as_ref(),
+            expected,
+            &entry.path,
+            limit,
+            deadline,
+        )?;
+        if self.bound_entry_identity(entry)? != Some(expected) {
+            bail!("bound directory identity changed during bounded listing");
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(entries)
+    }
+
+    fn list_bound_directory_bounded(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        mode: u16,
+        limit: usize,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        let mut cursor = self.start_bound_directory_cursor(entry, expected, mode)?;
+        let mut entries = Vec::new();
+        loop {
+            let page = self.peek_bound_directory_cursor(&mut cursor, 128, mode)?;
+            match page.entry {
+                Some(BoundDirectoryCursorEntry::Present { name, identity }) => {
+                    if entries.len() >= limit {
+                        bail!("bound directory contains too many entries to inspect safely");
+                    }
+                    entries.push((name, identity));
+                    self.consume_bound_directory_cursor_entry(&mut cursor);
+                }
+                Some(BoundDirectoryCursorEntry::Unreadable { name, error }) => {
+                    bail!(
+                        "could not inspect bound directory entry {}: {error}",
+                        name.to_string_lossy()
+                    );
+                }
+                None if page.exhausted => break,
+                None => continue,
+            }
+        }
+        Ok(entries)
+    }
+
     pub(crate) fn start_bound_directory_cursor(
         &self,
         entry: &BoundEntry,
@@ -1994,7 +2116,7 @@ impl RootedFs {
             AtFlags::empty(),
             RemoveQuarantinePolicy::restore_file(),
             || {},
-            validate_quarantined_identity,
+            |_| validate_quarantined_identity(),
         )
     }
 
@@ -2013,6 +2135,36 @@ impl RootedFs {
             &entry.leaf,
             expected,
             RemoveQuarantinePolicy::restore_file(),
+        )?;
+        renameat_noreplace(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            &quarantine.directory,
+            OsStr::new("entry"),
+        )?;
+        sync_directory(entry.parent.fd.as_ref())?;
+        sync_directory(&quarantine.directory)?;
+        if identity_at(&quarantine.directory, OsStr::new("entry"))? != Some(expected) {
+            bail!("test validated-removal quarantine identity changed");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn leave_validated_tree_removal_quarantined_for_test(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        if self.bound_entry_identity(entry)? != Some(expected) || !expected.is_dir() {
+            bail!("test validated-removal target identity changed");
+        }
+        let quarantine = create_private_remove_quarantine(
+            &entry.parent,
+            &entry.leaf,
+            expected,
+            RemoveQuarantinePolicy::restore_directory(),
         )?;
         renameat_noreplace(
             entry.parent.fd.as_ref(),
@@ -2080,8 +2232,213 @@ impl RootedFs {
             AtFlags::REMOVEDIR,
             RemoveQuarantinePolicy::retain(true),
             || {},
-            || Ok(()),
+            |_| Ok(()),
         )
+    }
+
+    /// Removes the exact recursively selected directory only after the caller revalidates the
+    /// quarantined object. The callback runs after the original name is atomically moved, while
+    /// the object remains reachable through a private quarantine path, and before any child is
+    /// unlinked.
+    pub(crate) fn remove_bound_tree_durably_if_identity_with_validation<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        validate_quarantined_entry: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        self.remove_bound_entry_if_identity_with_hooks(
+            entry,
+            expected,
+            AtFlags::REMOVEDIR,
+            RemoveQuarantinePolicy::restore_directory(),
+            || {},
+            validate_quarantined_entry,
+        )
+    }
+
+    /// Reports an exact durable-removal quarantine for a previously selected directory without
+    /// reconciling or deleting it. A pending quarantine means a previous confirmed removal did
+    /// not reach its terminal cleanup record and must not be reported as completed.
+    pub(crate) fn has_pending_remove_quarantine_for_directory(
+        &self,
+        parent_path: &Path,
+        original_name: &OsStr,
+        expected: PhysicalItemIdentity,
+    ) -> Result<bool> {
+        let parent_entry = self.bind_entry(parent_path, false)?;
+        let parent_identity = self
+            .bound_entry_identity(&parent_entry)?
+            .context("remove-quarantine parent directory is missing")?;
+        if !parent_identity.is_dir() {
+            bail!("remove-quarantine parent is not a directory");
+        }
+        self.validate_private_bound_directory(&parent_entry, parent_identity, 0o700)?;
+
+        for (name, quarantine_identity) in self.list_bound_directory_bounded(
+            &parent_entry,
+            parent_identity,
+            0o700,
+            MAX_REMOVE_QUARANTINE_SCAN_ENTRIES,
+        )? {
+            let name_bytes = name.as_encoded_bytes();
+            if !name_bytes.starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes()) {
+                continue;
+            }
+            if name_bytes.ends_with(REMOVE_QUARANTINE_TOMBSTONE_SUFFIX.as_bytes()) {
+                bail!("an interrupted remove-quarantine tombstone requires recovery");
+            }
+            if !quarantine_identity.is_dir() {
+                bail!("an interrupted remove-quarantine entry is not a directory");
+            }
+            let quarantine_path = parent_path.join(&name);
+            let quarantine_entry = self.bind_entry(&quarantine_path, false)?;
+            if self.bound_entry_identity(&quarantine_entry)? != Some(quarantine_identity) {
+                bail!("remove-quarantine directory identity changed during inspection");
+            }
+            let quarantine_directory =
+                self.open_bound_directory(&quarantine_entry, quarantine_identity)?;
+            let (owner, _, mode) = quarantine_directory.access_policy()?;
+            if owner != unsafe { libc::geteuid() } || mode & 0o777 != 0o700 {
+                bail!("remove-quarantine directory is not owner-private");
+            }
+
+            let manifest_path = quarantine_path.join(REMOVE_QUARANTINE_MANIFEST_NAME);
+            let manifest_file = self
+                .open_bound_file(&manifest_path)?
+                .context("interrupted remove-quarantine manifest is missing")?;
+            manifest_file.validate_private_single_link(0o600)?;
+            let manifest: RemoveQuarantineManifest = serde_json::from_slice(
+                &manifest_file.read_limited(REMOVE_QUARANTINE_MANIFEST_LIMIT)?,
+            )
+            .context("failed to parse interrupted remove-quarantine manifest")?;
+            let quarantine_name = CString::new(name.as_encoded_bytes())
+                .context("remove-quarantine name contains an invalid NUL")?;
+            validate_remove_quarantine_manifest(
+                &manifest,
+                &quarantine_name,
+                parent_identity,
+                quarantine_identity,
+                true,
+            )?;
+
+            if !manifest.entry_is_directory || !manifest.recursive {
+                continue;
+            }
+            let Some(encoded_name) = manifest.original_name_hex.as_deref() else {
+                bail!("interrupted remove-quarantine has no original entry name");
+            };
+            if decode_remove_quarantine_original_name(encoded_name)?.as_os_str() != original_name {
+                continue;
+            }
+            if manifest.entry_device != expected.device || manifest.entry_inode != expected.inode {
+                // Any pending quarantine for this exact selected name blocks a replacement at
+                // that name too; the caller must not authorize a second object while the first
+                // confirmed removal is unresolved.
+                return Ok(true);
+            }
+            let expected_identity = EntryIdentity::directory(expected.device, expected.inode);
+            let quarantined_entry_path = quarantine_path.join("entry");
+            match self.entry_identity(&quarantined_entry_path)? {
+                Some(identity) if identity == expected_identity => {
+                    let entry = self.bind_entry(&quarantined_entry_path, false)?;
+                    let directory = self.open_bound_directory(&entry, expected_identity)?;
+                    if directory.physical_identity()? != expected {
+                        bail!("quarantined directory birth identity changed");
+                    }
+                }
+                Some(_) => bail!("quarantined directory object identity changed"),
+                None => {}
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Lists only crash-interrupted recursive removals that require caller revalidation. This is
+    /// a read-only diagnostic path for queue UIs; it does not restore, reconcile, or delete them.
+    pub(crate) fn pending_remove_quarantine_original_names(
+        &self,
+        parent_path: &Path,
+    ) -> Result<Vec<OsString>> {
+        let parent_entry = self.bind_entry(parent_path, false)?;
+        let parent_identity = self
+            .bound_entry_identity(&parent_entry)?
+            .context("remove-quarantine parent directory is missing")?;
+        if !parent_identity.is_dir() {
+            bail!("remove-quarantine parent is not a directory");
+        }
+        self.validate_private_bound_directory(&parent_entry, parent_identity, 0o700)?;
+        let entries = self.list_bound_directory_bounded(
+            &parent_entry,
+            parent_identity,
+            0o700,
+            MAX_REMOVE_QUARANTINE_SCAN_ENTRIES,
+        )?;
+        let mut original_names = Vec::new();
+        for (name, quarantine_identity) in entries {
+            let name_bytes = name.as_encoded_bytes();
+            if !name_bytes.starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes()) {
+                continue;
+            }
+            if name_bytes.ends_with(REMOVE_QUARANTINE_TOMBSTONE_SUFFIX.as_bytes()) {
+                bail!("an interrupted remove-quarantine tombstone requires recovery");
+            }
+            if !quarantine_identity.is_dir() {
+                bail!("an interrupted remove-quarantine entry is not a directory");
+            }
+            let quarantine_path = parent_path.join(&name);
+            let quarantine_entry = self.bind_entry(&quarantine_path, false)?;
+            if self.bound_entry_identity(&quarantine_entry)? != Some(quarantine_identity) {
+                bail!("remove-quarantine directory identity changed during inspection");
+            }
+            let directory = self.open_bound_directory(&quarantine_entry, quarantine_identity)?;
+            let (owner, _group, mode) = directory.access_policy()?;
+            if owner != unsafe { libc::geteuid() } || mode & 0o777 != 0o700 {
+                bail!("remove-quarantine directory is not owner-private");
+            }
+            let manifest_path = quarantine_path.join(REMOVE_QUARANTINE_MANIFEST_NAME);
+            let manifest_file = self
+                .open_bound_file(&manifest_path)?
+                .context("interrupted remove-quarantine manifest is missing")?;
+            manifest_file.validate_private_single_link(0o600)?;
+            let manifest: RemoveQuarantineManifest = serde_json::from_slice(
+                &manifest_file.read_limited(REMOVE_QUARANTINE_MANIFEST_LIMIT)?,
+            )
+            .context("failed to parse interrupted remove-quarantine manifest")?;
+            let quarantine_name = CString::new(name.as_encoded_bytes())
+                .context("remove-quarantine name contains an invalid NUL")?;
+            validate_remove_quarantine_manifest(
+                &manifest,
+                &quarantine_name,
+                parent_identity,
+                quarantine_identity,
+                true,
+            )?;
+            if !manifest.entry_is_directory
+                || !manifest.recursive
+                || !manifest.restore_requires_revalidation
+            {
+                continue;
+            }
+            let Some(encoded_name) = manifest.original_name_hex.as_deref() else {
+                bail!("interrupted remove-quarantine has no original entry name");
+            };
+            let original_name = decode_remove_quarantine_original_name(encoded_name)?;
+            let expected_entry =
+                EntryIdentity::directory(manifest.entry_device, manifest.entry_inode);
+            match self.entry_identity(&quarantine_path.join("entry"))? {
+                Some(identity) if identity == expected_entry => {}
+                Some(_) => bail!("interrupted remove-quarantine entry identity changed"),
+                None => {}
+            }
+            original_names.push(original_name);
+        }
+        original_names.sort();
+        original_names.dedup();
+        Ok(original_names)
     }
 
     pub(crate) fn entry_identity(&self, path: &Path) -> Result<Option<EntryIdentity>> {
@@ -2284,7 +2641,7 @@ impl RootedFs {
             flags,
             RemoveQuarantinePolicy::retain(false),
             || {},
-            || Ok(()),
+            |_| Ok(()),
         )
     }
 
@@ -2305,7 +2662,7 @@ impl RootedFs {
             flags,
             RemoveQuarantinePolicy::retain(false),
             before_quarantine_move,
-            || Ok(()),
+            |_| Ok(()),
         )
     }
 
@@ -2320,7 +2677,7 @@ impl RootedFs {
     ) -> Result<()>
     where
         F: FnOnce(),
-        G: FnOnce() -> Result<()>,
+        G: FnOnce(&Path) -> Result<()>,
     {
         // Protected property: unlink only the object identity captured by the caller. Moving the
         // live name into a private directory atomically lets us validate that object before any
@@ -2410,7 +2767,8 @@ impl RootedFs {
             );
         }
 
-        if let Err(validation_error) = after_quarantine_move() {
+        let quarantined_entry_path = quarantine_path.join(quarantined_leaf);
+        if let Err(validation_error) = after_quarantine_move(&quarantined_entry_path) {
             let validation_error = validation_error.context(format!(
                 "bound path removal validation rejected {}",
                 entry.path.display()
@@ -2490,7 +2848,7 @@ impl RootedFs {
             AtFlags::empty(),
             RemoveQuarantinePolicy::retain(false),
             || {},
-            after_quarantine_move,
+            |_| after_quarantine_move(),
         )
     }
 
@@ -2727,6 +3085,48 @@ fn list_directory_entries(
             "bound directory identity changed during listing: {}",
             display_path.display()
         );
+    }
+    Ok(entries)
+}
+
+fn list_directory_entries_until(
+    directory: &OwnedFd,
+    expected: EntryIdentity,
+    display_path: &Path,
+    limit: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<(OsString, EntryIdentity)>> {
+    if identity_for_fd(directory)? != expected {
+        bail!("bound directory identity changed before bounded listing");
+    }
+    if std::time::Instant::now() >= deadline {
+        bail!("bounded directory listing exceeded its time limit");
+    }
+    let names = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to read bound directory {}", display_path.display()))?;
+    let mut visited = 0usize;
+    let mut entries = Vec::new();
+    for item in names {
+        if std::time::Instant::now() >= deadline {
+            bail!("bounded directory listing exceeded its time limit");
+        }
+        let item = item.map_err(errno_to_io)?;
+        let name = item.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if visited >= limit {
+            bail!("bounded directory listing exceeded its entry limit");
+        }
+        visited += 1;
+        // Skip ordinary vanished children; an unreadable child remains an error.
+        if let Some(entry) = listed_directory_entry(directory, name)? {
+            entries.push(entry);
+        }
+    }
+    if identity_for_fd(directory)? != expected {
+        bail!("bound directory identity changed during bounded listing");
     }
     Ok(entries)
 }
@@ -3251,9 +3651,9 @@ fn validate_remove_quarantine_manifest(
             .context("interrupted-removal manifest has no original name")?;
         decode_remove_quarantine_original_name(original_name)?;
         if manifest.restore_requires_revalidation
-            && (manifest.entry_is_directory || manifest.recursive)
+            && (manifest.entry_is_directory != manifest.recursive)
         {
-            bail!("interrupted-removal restore policy is only valid for one regular file");
+            bail!("interrupted-removal restore policy has an invalid recursive shape");
         }
     } else if manifest.original_name_hex.is_some() || manifest.restore_requires_revalidation {
         bail!("legacy interrupted-removal manifest contains unsupported recovery policy");
@@ -3893,6 +4293,44 @@ pub(crate) fn identity_for_open_file(file: &std::fs::File) -> Result<EntryIdenti
     identity_for_fd(file)
 }
 
+#[cfg(unix)]
+fn physical_identity_for_open_file(
+    file: &std::fs::File,
+    expected: EntryIdentity,
+) -> Result<PhysicalItemIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .context("failed to inspect open descriptor physical identity")?;
+    if metadata.dev() != expected.device()
+        || metadata.ino() != expected.inode()
+        || (expected.is_file() && !metadata.is_file())
+        || (expected.is_dir() && !metadata.is_dir())
+        || (!expected.is_file() && !expected.is_dir())
+    {
+        bail!("open descriptor does not match its rooted object identity");
+    }
+    let birth = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    Ok(PhysicalItemIdentity::from_parts(
+        metadata.dev(),
+        metadata.ino(),
+        birth.as_ref().map(|time| time.as_secs() as i64),
+        birth.map(|time| time.subsec_nanos() as i64),
+    ))
+}
+
+#[cfg(not(unix))]
+fn physical_identity_for_open_file(
+    _file: &std::fs::File,
+    _expected: EntryIdentity,
+) -> Result<PhysicalItemIdentity> {
+    bail!("persistent no-follow birth identity is unavailable on this platform");
+}
+
 fn identity_at(parent: &OwnedFd, name: &OsStr) -> Result<Option<EntryIdentity>> {
     match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => Ok(Some(identity_from_stat(&stat))),
@@ -4106,6 +4544,118 @@ mod tests {
             "telegram-video-downloader-safe-fs-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn staging_cleanup_bounded_listings_enforce_limits_without_rejecting_child_churn() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("media");
+        fs::create_dir(&child).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::write(child.join(name), b"ordinary media metadata").unwrap();
+        }
+        let rooted = RootedFs::new(directory.path()).unwrap();
+        let bound = rooted.bind_entry(&child, false).unwrap();
+        let identity = rooted.bound_entry_identity(&bound).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 2, deadline)
+                .is_err()
+        );
+        assert_eq!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 3, deadline)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(rooted.list_root_directory_until(0, deadline).is_err());
+        assert_eq!(
+            rooted.list_root_directory_until(1, deadline).unwrap().len(),
+            1
+        );
+        fs::write(child.join("four"), b"new sibling").unwrap();
+        assert_eq!(rooted.bound_entry_identity(&bound).unwrap(), Some(identity));
+        assert_eq!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 4, deadline)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            rooted
+                .list_root_directory_until(8, std::time::Instant::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn physical_identity_uses_descriptor_birth_and_ignores_child_churn() {
+        let root = temp_dir("physical-identity-birth");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).expect("staging root should create");
+        let payload = staging.join("video.part");
+        fs::write(&payload, b"partial payload").expect("payload should write");
+
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let root_identity = rooted
+            .root_physical_identity()
+            .expect("root physical identity should come from its open descriptor");
+        let staging_entry = rooted
+            .bind_entry(&staging, false)
+            .expect("staging directory should bind");
+        let staging_identity = rooted
+            .bound_entry_identity(&staging_entry)
+            .expect("staging identity should read")
+            .expect("staging directory should exist");
+        let staging_directory = rooted
+            .open_bound_directory(&staging_entry, staging_identity)
+            .expect("staging directory should open without following a replacement");
+        let before_directory = staging_directory
+            .physical_identity()
+            .expect("directory physical identity should read from its descriptor");
+        let payload_file = rooted
+            .open_bound_file(&payload)
+            .expect("payload should open through the rooted filesystem")
+            .expect("payload should exist");
+        let before_payload = payload_file
+            .physical_identity()
+            .expect("file physical identity should read from its descriptor");
+
+        fs::write(&payload, b"a longer partial payload")
+            .expect("payload may change without replacing its object");
+        fs::write(staging.join("another.part"), b"new sibling")
+            .expect("directory child churn should be allowed");
+
+        assert_eq!(
+            payload_file
+                .physical_identity()
+                .expect("payload identity should remain readable after mutation"),
+            before_payload,
+            "same-object content and mtime changes must not alter persistent object identity"
+        );
+        assert_eq!(
+            staging_directory
+                .physical_identity()
+                .expect("staging identity should remain readable after child churn"),
+            before_directory,
+            "directory child churn must not alter persistent object identity"
+        );
+        assert_eq!(root_identity.device, rooted.root_identity().device());
+        assert_eq!(root_identity.inode, rooted.root_identity().inode());
+        assert_eq!(before_directory.device, staging_identity.device());
+        assert_eq!(before_directory.inode, staging_identity.inode());
+        assert_eq!(
+            before_payload.has_complete_birth(),
+            before_payload.birth_seconds.is_some() && before_payload.birth_nanoseconds.is_some()
+        );
+
+        drop(payload_file);
+        drop(staging_directory);
+        drop(rooted);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
@@ -5181,6 +5731,55 @@ mod tests {
     }
 
     #[test]
+    fn validated_recursive_removal_restores_job_tree_on_inventory_rejection() {
+        let root = temp_dir("bound-tree-remove-validation-rollback");
+        fs::create_dir_all(&root).expect("root should create");
+        let owned_path = root.join("job-1");
+        fs::create_dir(&owned_path).expect("job directory should create");
+        fs::write(owned_path.join("video.part"), b"partial bytes")
+            .expect("partial file should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&owned_path, false)
+            .expect("job directory should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("job identity should read")
+            .expect("job should exist");
+
+        let error = rooted
+            .remove_bound_tree_durably_if_identity_with_validation(
+                &entry,
+                expected,
+                |quarantined| {
+                    assert!(quarantined.ends_with("entry"));
+                    fs::write(quarantined.join("unreviewed.part"), b"racing child")
+                        .expect("test race should add a child after quarantine");
+                    bail!("staging inventory changed after preview")
+                },
+            )
+            .expect_err("rejected inventory must restore its selected directory");
+
+        assert!(format!("{error:#}").contains("staging inventory changed after preview"));
+        assert_eq!(
+            fs::read(owned_path.join("video.part")).unwrap(),
+            b"partial bytes"
+        );
+        assert_eq!(
+            fs::read(owned_path.join("unreviewed.part")).unwrap(),
+            b"racing child"
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REMOVE_QUARANTINE_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn interrupted_validated_removal_requires_an_explicit_recovery_decision() {
         let root = temp_dir("validated-remove-recovery-decision");
         fs::create_dir_all(&root).expect("root should create");
@@ -5263,6 +5862,54 @@ mod tests {
             }));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn interrupted_recursive_cleanup_is_reported_and_keeps_quarantined_bytes() {
+        let root = temp_dir("cleanup-quarantine-diagnostic");
+        let staging = root.join(".telegram-video-downloader-staging");
+        let job = staging.join("job-1");
+        fs::create_dir_all(&job).expect("staging job should create");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+                .expect("staging parent should be private");
+            fs::set_permissions(&job, fs::Permissions::from_mode(0o700))
+                .expect("staging job should be private");
+        }
+        let partial = job.join("video.part");
+        fs::write(&partial, b"retained partial bytes").expect("partial bytes should write");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let entry = rooted
+            .bind_entry(&job, false)
+            .expect("staging job should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("job identity should read")
+            .expect("job should exist");
+        rooted
+            .leave_validated_tree_removal_quarantined_for_test(&entry, expected)
+            .expect("interrupted cleanup should persist a quarantine");
+
+        let pending = rooted
+            .pending_remove_quarantine_original_names(&staging)
+            .expect("pending cleanup should be diagnosable");
+
+        assert_eq!(pending, vec![std::ffi::OsString::from("job-1")]);
+        let quarantined_bytes = fs::read_dir(&staging)
+            .expect("staging root should remain readable")
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX)
+            })
+            .map(|entry| fs::read(entry.path().join("entry/video.part")))
+            .expect("quarantined partial should remain reachable")
+            .expect("quarantined partial should read");
+        assert_eq!(quarantined_bytes.as_slice(), b"retained partial bytes");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

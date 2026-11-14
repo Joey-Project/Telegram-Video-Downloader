@@ -1216,7 +1216,7 @@ fn read_capped_stream<R: Read>(mut reader: R, limit: usize) -> anyhow::Result<Ve
     Ok(retained)
 }
 
-fn archive_filename(original_name: &str, audio: &AudioBytes) -> anyhow::Result<String> {
+pub(crate) fn archive_filename(original_name: &str, audio: &AudioBytes) -> anyhow::Result<String> {
     let extension = audio
         .path
         .extension()
@@ -1230,20 +1230,25 @@ fn archive_filename(original_name: &str, audio: &AudioBytes) -> anyhow::Result<S
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("audio");
-    let mut safe = String::with_capacity(stem.len().min(96));
-    let mut separator = false;
+    // Keep the user's multilingual filename. Only remove filesystem separators and
+    // control characters; the original-content hash below prevents name collisions.
+    // Reserve room for the full hash, separator, dot and longest supported extension.
+    const MAX_STEM_BYTES: usize = 176;
+    let mut safe = String::with_capacity(stem.len().min(MAX_STEM_BYTES));
     for character in stem.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-            if safe.len() < 88 {
-                safe.push(character);
-            }
-            separator = false;
-        } else if character.is_ascii_whitespace() && !separator && safe.len() < 88 {
-            safe.push('-');
-            separator = true;
+        let character = if character.is_control() || matches!(character, '/' | '\\' | ':') {
+            '_'
+        } else {
+            character
+        };
+        if safe.len() + character.len_utf8() > MAX_STEM_BYTES {
+            break;
         }
+        safe.push(character);
     }
-    let safe = safe.trim_matches(['.', '-', '_']);
+    let safe = safe.trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '.' | '-' | '_')
+    });
     let stem = if safe.is_empty() { "audio" } else { safe };
     if !is_sha256(&audio.sha256) {
         bail!("original audio SHA-256 is invalid");
@@ -1910,7 +1915,7 @@ mod tests {
             archive_filename("../../Artist Track?.mp3", &audio("/tmp/source.mp3")).unwrap();
         assert_eq!(
             result,
-            "Artist-Track-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.mp3"
+            "Artist Track?-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.mp3"
         );
         assert!(!result.contains('/'));
     }
@@ -1918,14 +1923,14 @@ mod tests {
     #[test]
     fn lossless_archives_keep_the_original_extension_case_insensitively() {
         let result = archive_filename("Artist Track.flac", &audio("/tmp/source.FLAC")).unwrap();
-        assert!(result.starts_with("Artist-Track-"));
+        assert!(result.starts_with("Artist Track-"));
         assert!(result.ends_with(".flac"));
         assert!(is_lossless_source_path(Path::new("/tmp/source.FLAC")));
         assert!(is_lossless_source_path(Path::new("/tmp/source.WaV")));
         assert!(!is_lossless_source_path(Path::new("/tmp/source.flac.m4a")));
 
         let wav = archive_filename("Artist Track.WAV", &audio("/tmp/source.WAV")).unwrap();
-        assert!(wav.starts_with("Artist-Track-"));
+        assert!(wav.starts_with("Artist Track-"));
         assert!(wav.ends_with(".wav"));
     }
 
@@ -2058,11 +2063,50 @@ mod tests {
     fn archive_name_is_byte_bounded_for_long_unicode_source_names() {
         let original_name = format!("🎵{}🎵.mp3", "A".repeat(200));
         let result = archive_filename(&original_name, &audio("/tmp/source.mp3")).unwrap();
-        assert!(result.is_ascii());
+        assert!(result.starts_with('🎵'));
         assert!(
-            result.len() <= 157,
+            result.len() <= 255,
             "archive filename is {} bytes",
             result.len()
+        );
+        let retry = archive_filename(
+            &format!("[retry 2] {original_name}"),
+            &audio("/tmp/source.mp3"),
+        )
+        .expect("retry filename should remain byte bounded");
+        assert!(retry.starts_with("[retry 2] "));
+        assert_ne!(retry, result, "truncation must preserve retry separation");
+        assert!(retry.len() <= 255);
+    }
+
+    #[test]
+    fn music_archive_preserves_multilingual_original_filename_and_lossless_extension() {
+        for stem in [
+            "01. 愛♡スクリ～ム!",
+            "中文 歌曲",
+            "한국어 노래",
+            "Русская музыка",
+            "François - L'été",
+            "Perché ti amo",
+        ] {
+            let result = archive_filename(&format!("{stem}.FLAC"), &audio("/tmp/original.flac"))
+                .expect("multilingual original filename should be supported");
+            assert_eq!(
+                result,
+                format!("{stem}-{}.flac", "0123456789abcdef".repeat(4))
+            );
+            assert!(result.len() <= 255);
+        }
+        let result = archive_filename(
+            "../../.Artist\\Album:Track.flac",
+            &audio("/tmp/original.flac"),
+        )
+        .expect("unsafe characters should be sanitized");
+        assert!(result.starts_with("Artist_Album_Track-"));
+        assert!(
+            !result
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | ':'))
         );
     }
 

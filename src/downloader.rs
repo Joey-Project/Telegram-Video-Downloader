@@ -48,6 +48,7 @@ use crate::bilibili_core;
 use crate::bilibili_planning;
 use crate::config::AppConfig;
 use crate::episode_retry::{EpisodeFailureDisposition, classify_episode_failure};
+use crate::library::PhysicalItemIdentity;
 use crate::media_libraries::{
     StagingMigrationControlReceipt, TaskTransferControl, TaskTransferControlKind,
 };
@@ -60,10 +61,12 @@ use crate::router::{
     BilibiliSelection, JobRequest, bilibili_bvid_from_url, is_bilibili_ugc_collection_url,
 };
 use crate::safe_fs::{
-    BoundDirectory, BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file,
+    BoundDirectory, BoundDirectoryCursorEntry, BoundEntry, BoundFile, EntryIdentity, RootedFs,
+    identity_for_open_file,
 };
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static VIDEO_STAGING_CLEANUP_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_MISSING_VALIDATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // Credential migration can block on the cross-process auth lock. Keep callers waiting
 // asynchronously so inbound Bilibili links cannot consume Tokio blocking workers.
@@ -94,6 +97,8 @@ const VIDEO_STAGING_RETENTION_VERSION: u32 = 1;
 const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
+const VIDEO_STAGING_TASK_RETRY_RETENTION_REASON: &str =
+    "persistent task retry; this attempt is retained if it fails or is canceled";
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 5;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
@@ -12547,6 +12552,20 @@ fn recovery_scan_entries(
     }
 }
 
+fn recovery_scan_entries_until(
+    root: &RootedFs,
+    directory: &RecoveryScanDirectory,
+    limit: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<(std::ffi::OsString, EntryIdentity)>> {
+    match directory {
+        RecoveryScanDirectory::Root => root.list_root_directory_until(limit, deadline),
+        RecoveryScanDirectory::Bound { entry, identity } => {
+            root.list_bound_directory_until(entry, *identity, limit, deadline)
+        }
+    }
+}
+
 fn bind_recovery_scan_child(
     root: &RootedFs,
     directory: &RecoveryScanDirectory,
@@ -13798,9 +13817,7 @@ async fn run_staged_video_job(
     let staging_dir = staging.path().to_path_buf();
     staging.validate_for_path_access()?;
     staging
-        .retain_for_manual_recovery(
-            "persistent task retry; this attempt is retained if it fails or is canceled",
-        )
+        .retain_for_manual_recovery(VIDEO_STAGING_TASK_RETRY_RETENTION_REASON)
         .context("failed to mark staged download for recovery before execution")?;
     send_progress(
         progress.as_ref(),
@@ -15539,6 +15556,70 @@ pub(crate) struct VideoMigrationGuard {
     _roots: Vec<VideoOutputRootGuard>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VideoStagingCleanupSnapshot {
+    pub(crate) root_identity: PhysicalItemIdentity,
+    pub(crate) control_identity: PhysicalItemIdentity,
+    pub(crate) control_owner_identity: PhysicalItemIdentity,
+    pub(crate) output_lock_identity: PhysicalItemIdentity,
+    pub(crate) recovery_state_identity: PhysicalItemIdentity,
+    pub(crate) staging_root_identity: PhysicalItemIdentity,
+    pub(crate) staging_identity: PhysicalItemIdentity,
+    pub(crate) staging_entry_identity: EntryIdentity,
+    pub(crate) owner_identity: PhysicalItemIdentity,
+    pub(crate) inventory_sha256: String,
+    pub(crate) bytes: u64,
+    pub(crate) file_count: usize,
+    pub(crate) inventory_entry_count: usize,
+}
+
+/// Read-only recovery audit result tied to the output lease that produced it.
+/// The private identity fields keep callers from manufacturing a cleanup capability.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoStagingCleanupRecoveryStatus {
+    lease_id: u64,
+    root_identity: PhysicalItemIdentity,
+    control_identity: PhysicalItemIdentity,
+    control_owner_identity: PhysicalItemIdentity,
+    output_lock_identity: PhysicalItemIdentity,
+    recovery_state_identity: PhysicalItemIdentity,
+    recovery_state: u8,
+    deadline: std::time::Instant,
+    safe: bool,
+    reason: Option<&'static str>,
+}
+
+impl VideoStagingCleanupRecoveryStatus {
+    pub(crate) fn is_safe(&self) -> bool {
+        self.safe
+    }
+
+    pub(crate) fn was_dirty_ordinary(&self) -> bool {
+        self.safe && self.recovery_state == VIDEO_RECOVERY_STATE_DIRTY
+    }
+
+    pub(crate) fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+}
+
+/// Holds the existing process-wide output slot and the authenticated root flock without running
+/// startup recovery or creating/rebinding any control files.
+pub(crate) struct VideoStagingCleanupLease {
+    _process_guard: MutexGuard<'static, ()>,
+    lease_id: u64,
+    root: RootedFs,
+    control: VideoControlDirectory,
+    control_owner: BoundFile,
+    output_lock: BoundFile,
+    recovery_state: VideoRecoveryMarker,
+    root_identity: PhysicalItemIdentity,
+    control_identity: PhysicalItemIdentity,
+    control_owner_identity: PhysicalItemIdentity,
+    output_lock_identity: PhysicalItemIdentity,
+    recovery_state_identity: PhysicalItemIdentity,
+}
+
 impl VideoMigrationGuard {
     pub(crate) fn validate_for_root(&self, root: &RootedFs) -> Result<()> {
         root.validate_configured_root()?;
@@ -15824,6 +15905,1215 @@ pub(crate) fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
     file.validate_private_link_count(0o600, 2)?;
     root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
     Ok(file)
+}
+
+const MAX_STAGING_CLEANUP_ROOT_ENTRIES: usize = 10_000;
+const MAX_STAGING_CLEANUP_INVENTORY_ENTRIES: usize = 4_096;
+const MAX_STAGING_CLEANUP_DEPTH: usize = 32;
+const MAX_VIDEO_STAGING_RECOVERY_AUDIT_ENTRIES: usize = 100_000;
+// Keep in sync with safe_fs::REMOVE_QUARANTINE_PREFIX; matching this exact protocol prefix
+// protects durable-removal artifacts without reserving ordinary media words.
+const VIDEO_STAGING_CLEANUP_REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
+
+impl VideoStagingCleanupLease {
+    pub(crate) fn root(&self) -> &RootedFs {
+        &self.root
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.root.validate_configured_root()?;
+        if require_complete_cleanup_identity(self.root.root_physical_identity()?)?
+            != self.root_identity
+        {
+            bail!("video output root physical identity changed");
+        }
+        validate_cleanup_control_binding(
+            &self.root,
+            &self.control,
+            &self.control_owner,
+            self.control_identity,
+            self.control_owner_identity,
+            &self.output_lock,
+            self.output_lock_identity,
+            &self.recovery_state,
+            self.recovery_state_identity,
+            false,
+        )
+    }
+
+    pub(crate) fn recovery_state(&self) -> Result<u8> {
+        video_recovery_state(&self.recovery_state)
+    }
+
+    /// Classifies the durable recovery marker without running startup recovery or changing it.
+    /// CLEAN remains a constant-time path; DIRTY is accepted only after a bounded read-only audit
+    /// proves that the root contains no pending transaction, publication, or removal artifact and
+    /// every remaining staging job is an owned retained failed download.
+    pub(crate) fn staging_cleanup_recovery_status_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<VideoStagingCleanupRecoveryStatus> {
+        self.validate()?;
+        let recovery_state = self.recovery_state()?;
+        let (safe, reason) = match recovery_state {
+            VIDEO_RECOVERY_STATE_CLEAN => (true, None),
+            VIDEO_RECOVERY_STATE_DIRTY => {
+                match audit_dirty_video_staging_cleanup_root(&self.root, deadline) {
+                    Ok(()) => (true, None),
+                    Err(error) if crate::file_provider::is_file_provider_access_error(&error) => {
+                        return Err(error);
+                    }
+                    Err(_) => (
+                        false,
+                        Some(
+                            "Pending, unreadable, or over-budget video output recovery keeps staging protected.",
+                        ),
+                    ),
+                }
+            }
+            VIDEO_RECOVERY_STATE_INCOMPLETE => (
+                false,
+                Some("The video output recovery scan is incomplete; staging remains protected."),
+            ),
+            _ => bail!("video output recovery state marker has invalid contents"),
+        };
+        self.validate()?;
+        if self.recovery_state()? != recovery_state {
+            bail!("video output recovery state changed during staging cleanup audit");
+        }
+        Ok(VideoStagingCleanupRecoveryStatus {
+            lease_id: self.lease_id,
+            root_identity: self.root_identity,
+            control_identity: self.control_identity,
+            control_owner_identity: self.control_owner_identity,
+            output_lock_identity: self.output_lock_identity,
+            recovery_state_identity: self.recovery_state_identity,
+            recovery_state,
+            deadline,
+            safe,
+            reason,
+        })
+    }
+
+    fn validate_recovery_status(
+        &self,
+        status: &VideoStagingCleanupRecoveryStatus,
+        refresh_dirty_audit: bool,
+    ) -> Result<()> {
+        self.validate()?;
+        if std::time::Instant::now() >= status.deadline {
+            bail!("staging cleanup recovery audit status expired");
+        }
+        if status.root_identity != self.root_identity
+            || status.lease_id != self.lease_id
+            || status.control_identity != self.control_identity
+            || status.control_owner_identity != self.control_owner_identity
+            || status.output_lock_identity != self.output_lock_identity
+            || status.recovery_state_identity != self.recovery_state_identity
+        {
+            bail!("staging cleanup recovery status belongs to a different output lease");
+        }
+        if self.recovery_state()? != status.recovery_state {
+            bail!("video output recovery state changed after the staging cleanup audit");
+        }
+        if !status.safe {
+            bail!(
+                "{}",
+                status.reason.unwrap_or(
+                    "Video output recovery is pending; staging cleanup remains protected."
+                )
+            );
+        }
+        if refresh_dirty_audit && status.recovery_state == VIDEO_RECOVERY_STATE_DIRTY {
+            let refreshed = self.staging_cleanup_recovery_status_until(status.deadline)?;
+            if !refreshed.safe {
+                bail!(
+                    "{}",
+                    refreshed.reason.unwrap_or(
+                        "Video output recovery is pending; staging cleanup remains protected."
+                    )
+                );
+            }
+            if refreshed.recovery_state != status.recovery_state
+                || refreshed.recovery_state_identity != status.recovery_state_identity
+            {
+                bail!("video output recovery state changed during staging cleanup revalidation");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_cleanup_quarantine_relatives(&self) -> Result<Vec<PathBuf>> {
+        self.validate()?;
+        let parent = self.root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+        if self.root.entry_identity(&parent)?.is_none() {
+            return Ok(Vec::new());
+        }
+        self.root
+            .pending_remove_quarantine_original_names(&parent)
+            .map(|names| {
+                names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let name = name.to_str()?;
+                        name.starts_with("job-")
+                            .then(|| PathBuf::from(VIDEO_STAGING_DIR_NAME).join(name))
+                    })
+                    .collect()
+            })
+    }
+
+    pub(crate) fn list_job_relatives(&self) -> Result<Vec<PathBuf>> {
+        self.validate()?;
+        let parent_path = self.root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+        let Some(parent_identity) = self.root.entry_identity(&parent_path)? else {
+            return Ok(Vec::new());
+        };
+        if !parent_identity.is_dir() {
+            bail!("video staging root is not a directory");
+        }
+        let parent_entry = self.root.bind_entry(&parent_path, false)?;
+        self.root
+            .validate_private_bound_directory(&parent_entry, parent_identity, 0o700)?;
+        let parent = self
+            .root
+            .open_bound_directory(&parent_entry, parent_identity)?;
+        require_complete_cleanup_identity(parent.physical_identity()?)?;
+
+        let mut cursor =
+            self.root
+                .start_bound_directory_cursor(&parent_entry, parent_identity, 0o700)?;
+        let mut jobs = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let page = self
+                .root
+                .peek_bound_directory_cursor(&mut cursor, 128, 0o700)?;
+            match page.entry {
+                Some(BoundDirectoryCursorEntry::Present { name, .. }) => {
+                    total = total.saturating_add(1);
+                    if total > MAX_STAGING_CLEANUP_ROOT_ENTRIES {
+                        bail!("video staging root contains too many entries to inspect safely");
+                    }
+                    if let Some(name) = name.to_str()
+                        && name.starts_with("job-")
+                    {
+                        jobs.push(PathBuf::from(VIDEO_STAGING_DIR_NAME).join(name));
+                    }
+                    self.root.consume_bound_directory_cursor_entry(&mut cursor);
+                }
+                Some(BoundDirectoryCursorEntry::Unreadable { name, error }) => {
+                    bail!(
+                        "could not inspect video staging entry {}: {error}",
+                        name.to_string_lossy()
+                    );
+                }
+                None if page.exhausted => break,
+                None => continue,
+            }
+        }
+        jobs.sort();
+        Ok(jobs)
+    }
+
+    pub(crate) fn snapshot_job_for_cleanup(
+        &self,
+        relative: &Path,
+        status: &VideoStagingCleanupRecoveryStatus,
+    ) -> Result<VideoStagingCleanupSnapshot> {
+        self.validate()?;
+        self.validate_recovery_status(status, false)?;
+        let path = validate_cleanup_job_relative(&self.root, relative)?;
+        let staging_root_path = self.root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+        let staging_root_identity = self
+            .root
+            .entry_identity(&staging_root_path)?
+            .context("video staging root is missing")?;
+        if !staging_root_identity.is_dir() {
+            bail!("video staging root is not a directory");
+        }
+        let staging_root_entry = self.root.bind_entry(&staging_root_path, false)?;
+        self.root.validate_private_bound_directory(
+            &staging_root_entry,
+            staging_root_identity,
+            0o700,
+        )?;
+        let staging_root_physical = require_complete_cleanup_identity(
+            self.root
+                .open_bound_directory(&staging_root_entry, staging_root_identity)?
+                .physical_identity()?,
+        )?;
+        let snapshot = inspect_video_staging_cleanup_tree(
+            &self.root,
+            &path,
+            staging_root_physical,
+            self.root_identity,
+            self.control_identity,
+            self.control_owner_identity,
+            self.output_lock_identity,
+            self.recovery_state_identity,
+            true,
+            status.deadline,
+        )?;
+        let leaf = path
+            .file_name()
+            .context("video staging job path has no leaf")?;
+        if self.root.has_pending_remove_quarantine_for_directory(
+            &staging_root_path,
+            leaf,
+            snapshot.staging_identity,
+        )? {
+            bail!("video staging job has an interrupted confirmed removal pending recovery");
+        }
+        Ok(snapshot)
+    }
+
+    /// One confirmed batch marks recovery dirty once, revalidates each quarantined directory
+    /// immediately before unlink, and restores CLEAN only after every remove-quarantine is gone.
+    pub(crate) fn remove_jobs(
+        &mut self,
+        jobs: &[(PathBuf, VideoStagingCleanupSnapshot)],
+        status: &VideoStagingCleanupRecoveryStatus,
+    ) -> Vec<(PathBuf, Result<()>)> {
+        if jobs.is_empty() {
+            return Vec::new();
+        }
+        if let Err(error) = self.validate_recovery_status(status, true) {
+            return jobs
+                .iter()
+                .map(|(path, _)| (path.clone(), Err(anyhow!("{error:#}"))))
+                .collect();
+        }
+        if let Err(error) = self.recovery_state.write_state(VIDEO_RECOVERY_STATE_DIRTY) {
+            return jobs
+                .iter()
+                .map(|(path, _)| {
+                    (
+                        path.clone(),
+                        Err(anyhow!(
+                            "failed to persist cleanup recovery state: {error:#}"
+                        )),
+                    )
+                })
+                .collect();
+        }
+        self.recovery_state_identity = match self.recovery_state.file.physical_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                return jobs
+                    .iter()
+                    .map(|(path, _)| {
+                        (
+                            path.clone(),
+                            Err(anyhow!("failed to bind cleanup recovery state: {error:#}")),
+                        )
+                    })
+                    .collect();
+            }
+        };
+
+        let mut results = Vec::with_capacity(jobs.len());
+        for (relative, expected) in jobs {
+            let mut removal_expected = expected.clone();
+            removal_expected.recovery_state_identity = self.recovery_state_identity;
+            let result = self.remove_one_job(relative, &removal_expected, status.deadline);
+            results.push((relative.clone(), result));
+        }
+
+        let finalization = match self.staging_cleanup_recovery_status_until(status.deadline) {
+            Ok(status) if status.is_safe() => self
+                .recovery_state
+                .write_state(VIDEO_RECOVERY_STATE_CLEAN)
+                .and_then(|()| self.recovery_state.file.physical_identity()),
+            Ok(status) => Err(anyhow!(
+                "removal completed but output recovery remains unresolved: {}",
+                status
+                    .reason()
+                    .unwrap_or("video output recovery audit did not authorize a clean state")
+            )),
+            Err(error) => Err(error)
+                .context("removal completed but the output recovery audit could not be completed"),
+        };
+        match finalization {
+            Ok(identity) => self.recovery_state_identity = identity,
+            Err(error) => {
+                for (_, result) in &mut results {
+                    if result.is_ok() {
+                        *result = Err(anyhow!(
+                            "removal completed but recovery state could not be finalized: {error:#}"
+                        ));
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    fn remove_one_job(
+        &self,
+        relative: &Path,
+        expected: &VideoStagingCleanupSnapshot,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let path = validate_cleanup_job_relative(&self.root, relative)?;
+        let current = inspect_video_staging_cleanup_tree(
+            &self.root,
+            &path,
+            expected.staging_root_identity,
+            expected.root_identity,
+            expected.control_identity,
+            expected.control_owner_identity,
+            expected.output_lock_identity,
+            expected.recovery_state_identity,
+            false,
+            deadline,
+        )?;
+        if !cleanup_snapshots_match(&current, expected) {
+            bail!("video staging job changed after its cleanup preview");
+        }
+        let entry = self.root.bind_entry(&path, false)?;
+        let root = self.root.clone();
+        let validation_path = path.clone();
+        let expected = expected.clone();
+        self.root
+            .remove_bound_tree_durably_if_identity_with_validation(
+                &entry,
+                current.staging_entry_identity,
+                move |quarantined_path| {
+                    let quarantined = inspect_video_staging_cleanup_tree(
+                        &root,
+                        quarantined_path,
+                        expected.staging_root_identity,
+                        expected.root_identity,
+                        expected.control_identity,
+                        expected.control_owner_identity,
+                        expected.output_lock_identity,
+                        expected.recovery_state_identity,
+                        false,
+                        deadline,
+                    )?;
+                    if !cleanup_snapshots_match(&quarantined, &expected) {
+                        bail!(
+                            "video staging job changed while being quarantined from {}",
+                            validation_path.display()
+                        );
+                    }
+                    Ok(())
+                },
+            )
+    }
+}
+
+pub(crate) fn try_hold_video_staging_cleanup(root: &RootedFs) -> Result<VideoStagingCleanupLease> {
+    let process_guard = VIDEO_OUTPUT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .try_lock()
+        .map_err(|_| anyhow::Error::new(crate::staging_cleanup::StagingCleanupBusy))?;
+    root.validate_configured_root()?;
+    let root_identity = require_complete_cleanup_identity(root.root_physical_identity()?)?;
+    let control_path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
+    let control_entry = root.bind_entry(&control_path, false)?;
+    let control_identity = root
+        .bound_entry_identity(&control_entry)?
+        .filter(|identity| identity.is_dir())
+        .context("video control directory is missing or invalid")?;
+    root.validate_private_bound_directory(&control_entry, control_identity, 0o700)?;
+    let control = VideoControlDirectory {
+        path: control_path.clone(),
+        entry: control_entry,
+        identity: control_identity,
+    };
+    let control_physical_identity = require_complete_cleanup_identity(
+        root.open_bound_directory(&control.entry, control_identity)?
+            .physical_identity()?,
+    )?;
+
+    let owner_path = control_path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+    let owner_entry = root.bind_entry(&owner_path, false)?;
+    let (owner_entry_identity, owner_value) =
+        load_video_control_owner(root, &owner_entry, &owner_path)?;
+    if owner_value != video_control_owner(root, control_identity) {
+        bail!("video control ownership record does not match the bound output root");
+    }
+    let control_owner = root
+        .open_bound_file(&owner_path)?
+        .context("video control ownership record disappeared")?;
+    if control_owner.identity() != owner_entry_identity {
+        bail!("video control ownership record changed during cleanup lease acquisition");
+    }
+    let control_owner_identity =
+        require_complete_cleanup_identity(control_owner.physical_identity()?)?;
+
+    let anchor_path = control_path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+    let legacy_path = root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+    let anchor_entry = root.bind_entry(&anchor_path, false)?;
+    let legacy_entry = root.bind_entry(&legacy_path, false)?;
+    let anchor_identity = root
+        .bound_entry_identity(&anchor_entry)?
+        .context("video output lock anchor is missing")?;
+    if root.bound_entry_identity(&legacy_entry)? != Some(anchor_identity) {
+        bail!("video output lock aliases do not match their authenticated anchor");
+    }
+    let output_lock = root
+        .open_bound_file(&anchor_path)?
+        .context("video output lock anchor disappeared")?;
+    if output_lock.identity() != anchor_identity {
+        bail!("video output lock anchor changed during cleanup lease acquisition");
+    }
+    output_lock.validate_private_link_count(0o600, 2)?;
+    let output_lock_identity = require_complete_cleanup_identity(output_lock.physical_identity()?)?;
+    if !output_lock.try_lock_exclusive()? {
+        return Err(crate::staging_cleanup::StagingCleanupBusy.into());
+    }
+
+    let recovery_path = control_path.join(VIDEO_RECOVERY_STATE_FILE_NAME);
+    let recovery_temp_path = control_path.join(VIDEO_RECOVERY_STATE_TEMP_FILE_NAME);
+    if root.entry_identity(&recovery_temp_path)?.is_some()
+        || root
+            .entry_identity(
+                &root
+                    .logical_root_path()
+                    .join(LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME),
+            )?
+            .is_some()
+    {
+        bail!("video output recovery metadata needs recovery before staging cleanup");
+    }
+    let recovery_entry = root.bind_entry(&recovery_path, false)?;
+    let recovery_state_file = root
+        .open_bound_file(&recovery_path)?
+        .context("video output recovery state is missing")?;
+    recovery_state_file.validate_private_single_link(0o600)?;
+    if root.bound_entry_identity(&recovery_entry)? != Some(recovery_state_file.identity())
+        || !matches!(
+            recovery_state_file.read_limited(1)?.as_slice(),
+            [VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE]
+        )
+    {
+        bail!("video output recovery state marker is invalid");
+    }
+    let recovery_state_identity =
+        require_complete_cleanup_identity(recovery_state_file.physical_identity()?)?;
+    let recovery_state = VideoRecoveryMarker {
+        root: root.clone(),
+        path: recovery_path,
+        temp_path: recovery_temp_path,
+        entry: recovery_entry,
+        file: recovery_state_file,
+    };
+    let lease = VideoStagingCleanupLease {
+        _process_guard: process_guard,
+        lease_id: VIDEO_STAGING_CLEANUP_LEASE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        root: root.clone(),
+        control,
+        control_owner,
+        output_lock,
+        recovery_state,
+        root_identity,
+        control_identity: control_physical_identity,
+        control_owner_identity,
+        output_lock_identity,
+        recovery_state_identity,
+    };
+    lease.validate()?;
+    Ok(lease)
+}
+
+// Keep each held control inode explicit so lease validation compares every binding directly.
+#[allow(clippy::too_many_arguments)]
+fn validate_cleanup_control_binding(
+    root: &RootedFs,
+    control: &VideoControlDirectory,
+    control_owner: &BoundFile,
+    expected_control_identity: PhysicalItemIdentity,
+    expected_owner_identity: PhysicalItemIdentity,
+    output_lock: &BoundFile,
+    expected_output_lock_identity: PhysicalItemIdentity,
+    recovery_state: &VideoRecoveryMarker,
+    expected_recovery_identity: PhysicalItemIdentity,
+    require_clean_state: bool,
+) -> Result<()> {
+    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
+    let control_identity = require_complete_cleanup_identity(
+        root.open_bound_directory(&control.entry, control.identity)?
+            .physical_identity()?,
+    )?;
+    if control_identity != expected_control_identity {
+        bail!("video control directory physical identity changed");
+    }
+    let owner_path = control.path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+    let owner_entry = root.bind_entry(&owner_path, false)?;
+    let (owner_entry_identity, owner_value) =
+        load_video_control_owner(root, &owner_entry, &owner_path)?;
+    if owner_entry_identity != control_owner.identity()
+        || owner_value != video_control_owner(root, control.identity)
+        || require_complete_cleanup_identity(control_owner.physical_identity()?)?
+            != expected_owner_identity
+    {
+        bail!("video control ownership record changed");
+    }
+    let recovery_temp_path = control.path.join(VIDEO_RECOVERY_STATE_TEMP_FILE_NAME);
+    if root.entry_identity(&recovery_temp_path)?.is_some()
+        || root
+            .entry_identity(
+                &root
+                    .logical_root_path()
+                    .join(LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME),
+            )?
+            .is_some()
+    {
+        bail!("video output recovery metadata needs recovery before staging cleanup");
+    }
+    let anchor_path = control.path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+    let legacy_path = root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+    let anchor_entry = root.bind_entry(&anchor_path, false)?;
+    let legacy_entry = root.bind_entry(&legacy_path, false)?;
+    if root.bound_entry_identity(&anchor_entry)? != Some(output_lock.identity())
+        || root.bound_entry_identity(&legacy_entry)? != Some(output_lock.identity())
+        || require_complete_cleanup_identity(output_lock.physical_identity()?)?
+            != expected_output_lock_identity
+    {
+        bail!("video output lock aliases changed while staging cleanup was leased");
+    }
+    output_lock.validate_private_link_count(0o600, 2)?;
+    if root.bound_entry_identity(&recovery_state.entry)? != Some(recovery_state.file.identity())
+        || require_complete_cleanup_identity(recovery_state.file.physical_identity()?)?
+            != expected_recovery_identity
+    {
+        bail!("video output recovery state identity changed");
+    }
+    if !matches!(
+        recovery_state.file.read_limited(1)?.as_slice(),
+        [
+            VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE
+        ]
+    ) {
+        bail!("video output recovery state contents changed");
+    }
+    if require_clean_state && recovery_state.file.read_limited(1)? != [VIDEO_RECOVERY_STATE_CLEAN] {
+        bail!("video output recovery state is not clean; staging cleanup is unavailable");
+    }
+    Ok(())
+}
+
+fn require_complete_cleanup_identity(
+    identity: PhysicalItemIdentity,
+) -> Result<PhysicalItemIdentity> {
+    if !identity.has_complete_birth() {
+        bail!("filesystem does not provide a stable birth identity for staging cleanup");
+    }
+    Ok(identity)
+}
+
+fn validate_cleanup_job_relative(root: &RootedFs, relative: &Path) -> Result<PathBuf> {
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() != 2
+        || !matches!(components[0], std::path::Component::Normal(name) if name == VIDEO_STAGING_DIR_NAME)
+    {
+        bail!("video staging cleanup path is not an exact job directory");
+    }
+    let std::path::Component::Normal(leaf) = components[1] else {
+        bail!("video staging cleanup job path is not normalized");
+    };
+    let leaf = leaf
+        .to_str()
+        .ok_or_else(|| anyhow!("video staging cleanup job name is not UTF-8"))?;
+    if !leaf.starts_with("job-") || leaf.len() > 256 {
+        bail!("video staging cleanup job name is invalid");
+    }
+    Ok(root.logical_root_path().join(relative))
+}
+
+// Keep the immutable root/control identities explicit at each stage snapshot boundary.
+#[allow(clippy::too_many_arguments)]
+fn inspect_video_staging_cleanup_tree(
+    root: &RootedFs,
+    path: &Path,
+    expected_staging_root_identity: PhysicalItemIdentity,
+    root_identity: PhysicalItemIdentity,
+    control_identity: PhysicalItemIdentity,
+    control_owner_identity: PhysicalItemIdentity,
+    output_lock_identity: PhysicalItemIdentity,
+    recovery_state_identity: PhysicalItemIdentity,
+    check_job_name: bool,
+    inventory_deadline: std::time::Instant,
+) -> Result<VideoStagingCleanupSnapshot> {
+    validate_cleanup_context_identities(
+        root,
+        root_identity,
+        control_identity,
+        control_owner_identity,
+        output_lock_identity,
+        recovery_state_identity,
+    )?;
+    if check_job_name {
+        let relative = path
+            .strip_prefix(root.logical_root_path())
+            .context("video staging job path is outside its bound root")?;
+        validate_cleanup_job_relative(root, relative)?;
+    }
+    let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let parent_identity = root
+        .entry_identity(&parent_path)?
+        .context("video staging root is missing")?;
+    if !parent_identity.is_dir() {
+        bail!("video staging root is not a directory");
+    }
+    let parent_entry = root.bind_entry(&parent_path, false)?;
+    root.validate_private_bound_directory(&parent_entry, parent_identity, 0o700)?;
+    let staging_root_identity = require_complete_cleanup_identity(
+        root.open_bound_directory(&parent_entry, parent_identity)?
+            .physical_identity()?,
+    )?;
+    if staging_root_identity != expected_staging_root_identity {
+        bail!("video staging root physical identity changed");
+    }
+    let staging_entry_identity = root
+        .entry_identity(path)?
+        .context("video staging job directory is missing")?;
+    if !staging_entry_identity.is_dir() {
+        bail!("video staging job is not a directory");
+    }
+    validate_video_staging_directory(root, path, staging_entry_identity)?;
+    let staging_entry = root.bind_entry(path, false)?;
+    let staging_dir = root.open_bound_directory(&staging_entry, staging_entry_identity)?;
+    let staging_identity = require_complete_cleanup_identity(staging_dir.physical_identity()?)?;
+    let owner_path = path.join(VIDEO_STAGING_OWNER_FILE_NAME);
+    let owner_file = root
+        .open_bound_file(&owner_path)?
+        .context("video staging ownership record is missing")?;
+    owner_file.validate_private_single_link(0o600)?;
+    let owner_identity = require_complete_cleanup_identity(owner_file.physical_identity()?)?;
+
+    let retention = retained_video_staging_reason(root, path, staging_entry_identity)?;
+    if retention.as_deref() != Some(VIDEO_STAGING_TASK_RETRY_RETENTION_REASON) {
+        bail!("video staging retention reason is not eligible for cleanup");
+    }
+    if root
+        .entry_identity(&path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME))?
+        .is_some()
+    {
+        bail!("video staging job has a publication recovery manifest");
+    }
+    if root
+        .entry_identity(&path.join(BILIBILI_WORKER_REQUEST_FILE_NAME))?
+        .is_some()
+    {
+        bail!("video staging job still has a worker request marker");
+    }
+    if bilibili_worker_lifecycle_phase(
+        root,
+        path,
+        root.root_identity().device(),
+        root.root_identity().inode(),
+        staging_entry_identity.device(),
+        staging_entry_identity.inode(),
+    )? == Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted)
+    {
+        bail!("Bilibili core download completed; staging is protected for publication recovery");
+    }
+
+    let (inventory_sha256, bytes, file_count, inventory_entry_count) =
+        inventory_video_staging_tree_with_deadline(
+            root,
+            path,
+            staging_entry_identity,
+            inventory_deadline,
+        )?;
+    Ok(VideoStagingCleanupSnapshot {
+        root_identity,
+        control_identity,
+        control_owner_identity,
+        output_lock_identity,
+        recovery_state_identity,
+        staging_root_identity,
+        staging_identity,
+        staging_entry_identity,
+        owner_identity,
+        inventory_sha256,
+        bytes,
+        file_count,
+        inventory_entry_count,
+    })
+}
+
+fn cleanup_snapshots_match(
+    left: &VideoStagingCleanupSnapshot,
+    right: &VideoStagingCleanupSnapshot,
+) -> bool {
+    left.root_identity == right.root_identity
+        && left.control_identity == right.control_identity
+        && left.control_owner_identity == right.control_owner_identity
+        && left.output_lock_identity == right.output_lock_identity
+        && left.recovery_state_identity == right.recovery_state_identity
+        && left.staging_root_identity == right.staging_root_identity
+        && left.staging_identity == right.staging_identity
+        && left.staging_entry_identity == right.staging_entry_identity
+        && left.owner_identity == right.owner_identity
+        && left.inventory_sha256 == right.inventory_sha256
+        && left.bytes == right.bytes
+        && left.file_count == right.file_count
+        && left.inventory_entry_count == right.inventory_entry_count
+}
+
+fn validate_cleanup_context_identities(
+    root: &RootedFs,
+    expected_root: PhysicalItemIdentity,
+    expected_control: PhysicalItemIdentity,
+    expected_control_owner: PhysicalItemIdentity,
+    expected_output_lock: PhysicalItemIdentity,
+    expected_recovery_state: PhysicalItemIdentity,
+) -> Result<()> {
+    if require_complete_cleanup_identity(root.root_physical_identity()?)? != expected_root {
+        bail!("video output root physical identity changed");
+    }
+    let control_path = root.logical_root_path().join(VIDEO_CONTROL_DIR_NAME);
+    let control_entry = root.bind_entry(&control_path, false)?;
+    let control_entry_identity = root
+        .bound_entry_identity(&control_entry)?
+        .filter(|identity| identity.is_dir())
+        .context("video control directory is missing or invalid")?;
+    root.validate_private_bound_directory(&control_entry, control_entry_identity, 0o700)?;
+    let control_physical = require_complete_cleanup_identity(
+        root.open_bound_directory(&control_entry, control_entry_identity)?
+            .physical_identity()?,
+    )?;
+    if control_physical != expected_control {
+        bail!("video control directory physical identity changed");
+    }
+    let owner_path = control_path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+    let owner_entry = root.bind_entry(&owner_path, false)?;
+    let (owner_identity, owner) = load_video_control_owner(root, &owner_entry, &owner_path)?;
+    if owner != video_control_owner(root, control_entry_identity) {
+        bail!("video control ownership record does not match the bound output root");
+    }
+    let owner_file = root
+        .open_bound_file(&owner_path)?
+        .context("video control ownership record is missing")?;
+    if owner_file.identity() != owner_identity
+        || require_complete_cleanup_identity(owner_file.physical_identity()?)?
+            != expected_control_owner
+    {
+        bail!("video control ownership record physical identity changed");
+    }
+    let anchor_path = control_path.join(VIDEO_OUTPUT_LOCK_ANCHOR_FILE_NAME);
+    let legacy_path = root.logical_root_path().join(VIDEO_OUTPUT_LOCK_FILE_NAME);
+    let anchor_entry = root.bind_entry(&anchor_path, false)?;
+    let legacy_entry = root.bind_entry(&legacy_path, false)?;
+    let anchor = root
+        .bound_entry_identity(&anchor_entry)?
+        .context("video output lock anchor is missing")?;
+    if root.bound_entry_identity(&legacy_entry)? != Some(anchor) {
+        bail!("video output lock aliases do not match their authenticated anchor");
+    }
+    let output_file = root
+        .open_bound_file(&anchor_path)?
+        .context("video output lock anchor is missing")?;
+    output_file.validate_private_link_count(0o600, 2)?;
+    if output_file.identity() != anchor
+        || require_complete_cleanup_identity(output_file.physical_identity()?)?
+            != expected_output_lock
+    {
+        bail!("video output lock physical identity changed");
+    }
+    let recovery_path = control_path.join(VIDEO_RECOVERY_STATE_FILE_NAME);
+    let recovery_temp_path = control_path.join(VIDEO_RECOVERY_STATE_TEMP_FILE_NAME);
+    if root.entry_identity(&recovery_temp_path)?.is_some()
+        || root
+            .entry_identity(
+                &root
+                    .logical_root_path()
+                    .join(LEGACY_VIDEO_RECOVERY_STATE_FILE_NAME),
+            )?
+            .is_some()
+    {
+        bail!("video output recovery metadata needs recovery before staging cleanup");
+    }
+    let recovery_entry = root.bind_entry(&recovery_path, false)?;
+    let recovery_file = root
+        .open_bound_file(&recovery_path)?
+        .context("video output recovery state is missing")?;
+    recovery_file.validate_private_single_link(0o600)?;
+    if root.bound_entry_identity(&recovery_entry)? != Some(recovery_file.identity())
+        || require_complete_cleanup_identity(recovery_file.physical_identity()?)?
+            != expected_recovery_state
+        || !matches!(
+            recovery_file.read_limited(1)?.as_slice(),
+            [VIDEO_RECOVERY_STATE_CLEAN
+                | VIDEO_RECOVERY_STATE_DIRTY
+                | VIDEO_RECOVERY_STATE_INCOMPLETE]
+        )
+    {
+        bail!("video output recovery state identity or contents changed");
+    }
+    Ok(())
+}
+
+fn audit_dirty_video_staging_cleanup_root(
+    root: &RootedFs,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    audit_video_root_recovery_artifacts(root, deadline)?;
+    audit_retained_video_staging_jobs(root, deadline)?;
+    root.validate_configured_root()?;
+    Ok(())
+}
+
+fn audit_video_root_recovery_artifacts(
+    root: &RootedFs,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let mut pending = vec![(RecoveryScanDirectory::Root, 0usize)];
+    let mut inspected_entries = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if std::time::Instant::now() >= deadline {
+            bail!("video output recovery audit exceeded its time limit");
+        }
+        let remaining_entries =
+            MAX_VIDEO_STAGING_RECOVERY_AUDIT_ENTRIES.saturating_sub(inspected_entries);
+        let entries = recovery_scan_entries_until(root, &directory, remaining_entries, deadline)?;
+        inspected_entries = inspected_entries.saturating_add(entries.len());
+        for (name, identity) in entries {
+            if std::time::Instant::now() >= deadline {
+                bail!("video output recovery audit exceeded its time limit");
+            }
+            let bytes = name.as_encoded_bytes();
+            if bytes.starts_with(VIDEO_STAGING_CLEANUP_REMOVE_QUARANTINE_PREFIX.as_bytes()) {
+                bail!("a durable-removal quarantine is pending recovery");
+            }
+            if identity.is_dir()
+                && (bytes.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX.as_bytes())
+                    || bytes.starts_with(OVERWRITE_BACKUP_DIR_PREFIX.as_bytes()))
+            {
+                bail!("a video output transaction directory is pending recovery");
+            }
+            if directory.is_root() && name == std::ffi::OsStr::new(VIDEO_STAGING_DIR_NAME) {
+                if !identity.is_dir() {
+                    bail!("video staging root is not a directory");
+                }
+                continue;
+            }
+            if !identity.is_dir() {
+                continue;
+            }
+            if depth >= MAX_STAGING_CLEANUP_DEPTH {
+                bail!("video output recovery audit exceeded its directory depth limit");
+            }
+            let child = bind_recovery_scan_child(root, &directory, &name)?;
+            if root.bound_entry_identity(&child)? != Some(identity) {
+                bail!("video output directory changed during recovery audit");
+            }
+            pending.push((
+                RecoveryScanDirectory::Bound {
+                    entry: child,
+                    identity,
+                },
+                depth + 1,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_retained_video_staging_jobs(root: &RootedFs, deadline: std::time::Instant) -> Result<()> {
+    let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let Some(parent_identity) = root.entry_identity(&parent_path)? else {
+        return Ok(());
+    };
+    if !parent_identity.is_dir() {
+        bail!("video staging root is not a directory");
+    }
+    let parent_entry = root.bind_entry(&parent_path, false)?;
+    root.validate_private_bound_directory(&parent_entry, parent_identity, 0o700)?;
+    let parent_directory = root.open_bound_directory(&parent_entry, parent_identity)?;
+    let parent_physical = require_complete_cleanup_identity(parent_directory.physical_identity()?)?;
+    if parent_physical.device != root.root_identity().device() {
+        bail!("video staging root crosses a filesystem boundary");
+    }
+    let entries = root.list_bound_directory_until(
+        &parent_entry,
+        parent_identity,
+        MAX_VIDEO_STAGING_RECOVERY_AUDIT_ENTRIES,
+        deadline,
+    )?;
+    let mut inventory_entries = 0usize;
+    for (name, identity) in entries {
+        if std::time::Instant::now() >= deadline {
+            bail!("video staging recovery audit exceeded its time limit");
+        }
+        let component = name
+            .to_str()
+            .ok_or_else(|| anyhow!("video staging root contains a non-UTF-8 entry"))?;
+        if !identity.is_dir() || !component.starts_with("job-") {
+            // The staging root contract admits only owned job directories. This also blocks
+            // every durable-removal quarantine and tombstone name here.
+            bail!("video staging root contains an unknown entry");
+        }
+        let stage_path = parent_path.join(component);
+        let stage_entry =
+            root.bind_direct_child_of_bound_directory(&parent_entry, parent_identity, &name)?;
+        if root.bound_entry_identity(&stage_entry)? != Some(identity) {
+            bail!("video staging job changed during recovery audit");
+        }
+        validate_video_staging_directory(root, &stage_path, identity)?;
+        if retained_video_staging_reason(root, &stage_path, identity)?.as_deref()
+            != Some(VIDEO_STAGING_TASK_RETRY_RETENTION_REASON)
+        {
+            bail!("video staging job is not an owned retained failed download");
+        }
+        if root
+            .entry_identity(&stage_path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME))?
+            .is_some()
+            || root
+                .entry_identity(&stage_path.join(BILIBILI_WORKER_REQUEST_FILE_NAME))?
+                .is_some()
+        {
+            bail!("video staging job has pending publication or worker state");
+        }
+        if bilibili_worker_lifecycle_phase(
+            root,
+            &stage_path,
+            root.root_identity().device(),
+            root.root_identity().inode(),
+            identity.device(),
+            identity.inode(),
+        )? == Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted)
+        {
+            bail!("Bilibili staging job has completed media awaiting publication");
+        }
+        let (_, _, _, job_entries) =
+            inventory_video_staging_tree_with_deadline(root, &stage_path, identity, deadline)?;
+        inventory_entries = inventory_entries.saturating_add(job_entries);
+        if inventory_entries > MAX_VIDEO_STAGING_RECOVERY_AUDIT_ENTRIES {
+            bail!("video staging recovery audit exceeded its inventory limit");
+        }
+        if root.bound_entry_identity(&stage_entry)? != Some(identity) {
+            bail!("video staging job identity changed during recovery audit");
+        }
+    }
+    if root.bound_entry_identity(&parent_entry)? != Some(parent_identity) {
+        bail!("video staging root identity changed during recovery audit");
+    }
+    Ok(())
+}
+
+fn inventory_video_staging_tree(
+    root: &RootedFs,
+    stage_path: &Path,
+    stage_identity: EntryIdentity,
+) -> Result<(String, u64, usize, usize)> {
+    inventory_video_staging_tree_with_deadline(
+        root,
+        stage_path,
+        stage_identity,
+        std::time::Instant::now() + Duration::from_secs(15),
+    )
+}
+
+fn inventory_video_staging_tree_with_deadline(
+    root: &RootedFs,
+    stage_path: &Path,
+    stage_identity: EntryIdentity,
+    deadline: std::time::Instant,
+) -> Result<(String, u64, usize, usize)> {
+    // Keep recursion depth, inventory budgets, and the rooted object identities explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        root: &RootedFs,
+        directory_path: &Path,
+        directory_identity: EntryIdentity,
+        prefix: &str,
+        depth: usize,
+        digest: &mut Sha256,
+        count: &mut usize,
+        bytes: &mut u64,
+        files: &mut usize,
+        root_device: u64,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        if std::time::Instant::now() >= deadline {
+            bail!("video staging inventory exceeded its time limit");
+        }
+        if depth > MAX_STAGING_CLEANUP_DEPTH {
+            bail!("video staging job contains excessive directory depth");
+        }
+        let directory_entry = root.bind_entry(directory_path, false)?;
+        let directory = root.open_bound_directory(&directory_entry, directory_identity)?;
+        let (owner, group, mode) = directory.access_policy()?;
+        if owner != unsafe { libc::geteuid() } || mode & 0o022 != 0 {
+            bail!("video staging directory contains a non-private directory");
+        }
+        let directory_physical = require_complete_cleanup_identity(directory.physical_identity()?)?;
+        if directory_physical.device != root_device {
+            bail!("video staging job crosses a filesystem boundary");
+        }
+        add_cleanup_inventory_record(
+            digest,
+            prefix,
+            b'd',
+            directory_physical,
+            owner,
+            group,
+            mode,
+            0,
+            0,
+        );
+
+        root.validate_private_bound_directory(&directory_entry, directory_identity, mode as u16)?;
+        let remaining_entries = MAX_STAGING_CLEANUP_INVENTORY_ENTRIES.saturating_sub(*count);
+        let mut children = root.list_bound_directory_until(
+            &directory_entry,
+            directory_identity,
+            remaining_entries,
+            deadline,
+        )?;
+        root.validate_private_bound_directory(&directory_entry, directory_identity, mode as u16)?;
+        if children.len() + *count > MAX_STAGING_CLEANUP_INVENTORY_ENTRIES {
+            bail!("video staging job contains too many entries to inspect safely");
+        }
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, identity) in children {
+            if std::time::Instant::now() >= deadline {
+                bail!("video staging inventory exceeded its time limit");
+            }
+            *count = count.saturating_add(1);
+            if *count > MAX_STAGING_CLEANUP_INVENTORY_ENTRIES {
+                bail!("video staging job contains too many entries to inspect safely");
+            }
+            let component = name
+                .to_str()
+                .ok_or_else(|| anyhow!("video staging job contains a non-UTF-8 entry name"))?;
+            if component.is_empty()
+                || component.len() > 255
+                || is_video_staging_recovery_artifact(component, identity)
+            {
+                bail!("video staging job contains a protected recovery entry");
+            }
+            let child_path = directory_path.join(&name);
+            let relative = if prefix.is_empty() {
+                component.to_string()
+            } else {
+                format!("{prefix}/{component}")
+            };
+            if identity.is_dir() {
+                walk(
+                    root,
+                    &child_path,
+                    identity,
+                    &relative,
+                    depth + 1,
+                    digest,
+                    count,
+                    bytes,
+                    files,
+                    root_device,
+                    deadline,
+                )?;
+                continue;
+            }
+            if !identity.is_file() {
+                bail!("video staging job contains a symlink or special file");
+            }
+            let entry = root.bind_entry(&child_path, false)?;
+            let file = root
+                .open_bound_file(&child_path)?
+                .context("video staging file disappeared during inventory")?;
+            if file.identity() != identity {
+                bail!("video staging file identity changed during inventory");
+            }
+            let policy = file.access_policy()?;
+            if policy.owner != unsafe { libc::geteuid() }
+                || policy.mode & 0o022 != 0
+                || policy.link_count != 1
+            {
+                bail!("video staging file is not private or has multiple hard links");
+            }
+            let physical = require_complete_cleanup_identity(file.physical_identity()?)?;
+            if physical.device != root_device {
+                bail!("video staging job crosses a filesystem boundary");
+            }
+            let length = file.byte_len()?;
+            *bytes = bytes
+                .checked_add(length)
+                .context("video staging byte count overflowed")?;
+            *files = files.saturating_add(1);
+            add_cleanup_inventory_record(
+                digest,
+                &relative,
+                b'f',
+                physical,
+                policy.owner,
+                policy.group,
+                policy.mode,
+                policy.link_count,
+                length,
+            );
+            if root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("video staging file was replaced during inventory");
+            }
+        }
+        Ok(())
+    }
+
+    let mut digest = Sha256::new();
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    let mut files = 0usize;
+    walk(
+        root,
+        stage_path,
+        stage_identity,
+        "",
+        0,
+        &mut digest,
+        &mut count,
+        &mut bytes,
+        &mut files,
+        root.root_identity().device(),
+        deadline,
+    )?;
+    Ok((format!("{:x}", digest.finalize()), bytes, files, count))
+}
+
+fn is_video_staging_recovery_artifact(component: &str, identity: EntryIdentity) -> bool {
+    // These prefixes identify actual recovery artifacts: mux and overwrite transaction
+    // directories, plus the remove-quarantine protocol prefix. User-derived filenames may
+    // contain ordinary words such as "recovery" or "overwrite" without being recovery state.
+    component.starts_with(VIDEO_STAGING_CLEANUP_REMOVE_QUARANTINE_PREFIX)
+        || (identity.is_dir()
+            && (component.starts_with(BILIBILI_MUX_STAGING_DIR_PREFIX)
+                || component.starts_with(OVERWRITE_BACKUP_DIR_PREFIX)))
+}
+
+// Explicit access-policy and identity fields make the typed inventory auditable.
+#[allow(clippy::too_many_arguments)]
+fn add_cleanup_inventory_record(
+    digest: &mut Sha256,
+    path: &str,
+    kind: u8,
+    identity: PhysicalItemIdentity,
+    owner: u32,
+    group: u32,
+    mode: u32,
+    links: u64,
+    length: u64,
+) {
+    digest.update([kind]);
+    digest.update((path.len() as u64).to_be_bytes());
+    digest.update(path.as_bytes());
+    digest.update(identity.device.to_be_bytes());
+    digest.update(identity.inode.to_be_bytes());
+    digest.update(identity.birth_seconds.unwrap_or_default().to_be_bytes());
+    digest.update(identity.birth_nanoseconds.unwrap_or_default().to_be_bytes());
+    digest.update(owner.to_be_bytes());
+    digest.update(group.to_be_bytes());
+    digest.update(mode.to_be_bytes());
+    digest.update(links.to_be_bytes());
+    digest.update(length.to_be_bytes());
 }
 
 fn video_control_directory(root: &RootedFs) -> Result<VideoControlDirectory> {
@@ -19255,6 +20545,32 @@ pub(crate) fn create_test_retained_video_staging(root: &Path) -> Result<PathBuf>
     let staging = create_video_staging_dir(&rooted)?;
     staging.retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)?;
     Ok(staging.path().to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_incomplete_video_staging(root: &Path) -> Result<PathBuf> {
+    let rooted = RootedFs::new(root)?;
+    let _ = video_output_lock_file(&rooted)?;
+    let (mut recovery, _) = video_recovery_state_file(&rooted)?;
+    recovery.write_state(VIDEO_RECOVERY_STATE_CLEAN)?;
+
+    let staging = create_video_staging_dir(&rooted)?;
+    staging.retain_for_manual_recovery(VIDEO_STAGING_TASK_RETRY_RETENTION_REASON)?;
+    persist_bilibili_worker_lifecycle(&staging)?;
+    rooted.create_new_bound_file(
+        &staging.path().join("video.part"),
+        b"partial staged media fixture",
+        0o600,
+    )?;
+    Ok(staging.path().to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) async fn mark_test_video_output_recovery_dirty(root: &Path) -> Result<()> {
+    let guard = video_output_lock(root, "test interrupted operation", None).await?;
+    guard.begin_operation();
+    drop(guard);
+    Ok(())
 }
 
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
@@ -42855,5 +44171,100 @@ mv video.original video.m4s || exit 46
     #[test]
     fn tails_nonempty_lines() {
         assert_eq!(tail_lines("a\n\nb\nc\n", 2), "b\nc");
+    }
+
+    #[test]
+    fn staging_cleanup_dirty_audit_protects_transactions_in_nested_media_directories() {
+        for overwrite in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let stage = create_test_incomplete_video_staging(directory.path()).unwrap();
+            let root = RootedFs::new(directory.path()).unwrap();
+            let nested = directory.path().join("Category").join("Collection");
+            fs::create_dir_all(&nested).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            audit_dirty_video_staging_cleanup_root(&root, deadline)
+                .expect("ordinary retained media should pass the read-only audit");
+            let transaction = if overwrite {
+                create_overwrite_backup_dir(&root, &nested).unwrap()
+            } else {
+                create_bilibili_mux_staging_dir(&root, &nested).unwrap()
+            };
+            let error = audit_dirty_video_staging_cleanup_root(&root, deadline)
+                .expect_err("nested output transactions must block dirty-root cleanup");
+            assert!(
+                error.to_string().contains("transaction directory"),
+                "{error:#}"
+            );
+            assert!(transaction.0.exists());
+            assert!(stage.join("video.part").exists());
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_inventory_accepts_user_media_names_with_recovery_words() {
+        let directory = tempfile::tempdir().expect("isolated staging inventory root should create");
+        let stage = create_test_incomplete_video_staging(directory.path())
+            .expect("retained failed-download staging should create");
+        let ordinary_files = [
+            "Disaster Recovery [PHH1wTDF-1M].mp4.part",
+            "final OVERWRITE cut（東京）—v2!.mkv.part",
+        ];
+        for name in ordinary_files {
+            fs::write(stage.join(name), b"ordinary partial media")
+                .expect("ordinary media name should be written");
+        }
+        let ordinary_folder = stage.join("Recovery — 第2話 [合集]");
+        fs::create_dir(&ordinary_folder).expect("ordinary title directory should create");
+        fs::write(
+            ordinary_folder.join("OVERWRITE（完成版）?! 🎞.mp4.part"),
+            b"partial",
+        )
+        .expect("Unicode title file should be written");
+
+        let root = RootedFs::new(directory.path()).expect("staging root should bind");
+        let identity = root
+            .entry_identity(&stage)
+            .expect("staging identity should be read")
+            .expect("staging directory should remain present");
+        let (_, _, file_count, _) = inventory_video_staging_tree(&root, &stage, identity)
+            .expect("user-derived recovery and overwrite words should remain ordinary names");
+        assert!(
+            file_count >= 7,
+            "all user media files should be inventoried"
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_inventory_protects_actual_recovery_transaction_directories() {
+        fn assert_transaction_directory_is_protected(
+            create: impl FnOnce(&RootedFs, &std::path::Path),
+        ) {
+            let directory =
+                tempfile::tempdir().expect("isolated staging inventory root should create");
+            let root = RootedFs::new(directory.path()).expect("staging root should bind");
+            let stage = create_test_incomplete_video_staging(directory.path())
+                .expect("retained failed-download staging should create");
+            create(&root, &stage);
+            let identity = root
+                .entry_identity(&stage)
+                .expect("staging identity should be read")
+                .expect("staging directory should remain present");
+
+            let error = inventory_video_staging_tree(&root, &stage, identity)
+                .expect_err("recovery transaction directories must remain protected");
+            assert!(
+                error.to_string().contains("protected recovery entry"),
+                "unexpected inventory error: {error:#}"
+            );
+        }
+
+        assert_transaction_directory_is_protected(|root, stage| {
+            let _ = create_bilibili_mux_staging_dir(root, stage)
+                .expect("Bilibili mux transaction should use its reserved directory contract");
+        });
+        assert_transaction_directory_is_protected(|root, stage| {
+            let _ = create_overwrite_backup_dir(root, stage)
+                .expect("overwrite transaction should use its reserved directory contract");
+        });
     }
 }

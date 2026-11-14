@@ -14,7 +14,8 @@ export type RequestKind =
   | "download_submit"
   | "library_migration_preview"
   | "library_migration_confirm"
-  | "library_migration_control";
+  | "library_migration_control"
+  | "staging_cleanup";
 
 export interface InboxEnvelope {
   seq: number;
@@ -93,6 +94,12 @@ export interface LibraryMigrationPreviewPayload {
   supersedes_preview_id?: string;
   supersedes_revision?: string;
 }
+
+export type StagingCleanupPayload = BoundLibraryMutationIdentity & (
+  | { operation: "scan" }
+  | { operation: "preview"; item_ids: string[] }
+  | { operation: "confirm" | "cancel"; preview_seq: number; preview_id: string; revision: string }
+);
 
 export interface FilePreviewPayload extends BoundLibraryMutationIdentity {
   item_ids?: string[];
