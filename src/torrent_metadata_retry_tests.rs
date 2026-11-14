@@ -155,6 +155,7 @@ async fn upload_metadata_retry_waits_through_card_redraw() {
         !deferred.manual_refresh,
         "failed metadata refresh must consume the one-shot manual trigger"
     );
+    let redraw_count_before = inner.state.lock().unwrap().updated_cards.len();
 
     make_card_redraw_due(&manager, &queued.task_id);
     assert!(task_has_action_due(
@@ -167,7 +168,11 @@ async fn upload_metadata_retry_waits_through_card_redraw() {
         1,
         "redraw must not retry retrieval"
     );
-    assert_eq!(inner.state.lock().unwrap().updated_cards.len(), 1);
+    assert_eq!(
+        inner.state.lock().unwrap().updated_cards.len(),
+        redraw_count_before + 1,
+        "due card redraw must still update the card"
+    );
 
     make_retry_due(&manager, &queued.task_id);
     manager.process_task_once_for_test(&queued.task_id).await;
@@ -205,6 +210,7 @@ async fn magnet_metadata_export_waits_through_card_redraw() {
     let deferred = manager.store.task(&queued.task_id).unwrap().unwrap();
     assert!(deferred.next_action_at > unix_seconds());
     assert!(deferred.metainfo.is_none());
+    let redraw_count_before = backend.state.lock().unwrap().updated_cards.len();
 
     make_card_redraw_due(&manager, &queued.task_id);
     assert!(task_has_action_due(
@@ -214,7 +220,11 @@ async fn magnet_metadata_export_waits_through_card_redraw() {
     manager.process_task_once_for_test(&queued.task_id).await;
     assert_eq!(backend.export_count(), 1, "redraw must not retry export");
     assert_eq!(backend.magnet_submissions().len(), 1);
-    assert_eq!(backend.state.lock().unwrap().updated_cards.len(), 1);
+    assert_eq!(
+        backend.state.lock().unwrap().updated_cards.len(),
+        redraw_count_before + 1,
+        "due card redraw must still update the card"
+    );
 
     make_retry_due(&manager, &queued.task_id);
     manager.process_task_once_for_test(&queued.task_id).await;

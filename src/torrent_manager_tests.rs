@@ -10,12 +10,16 @@ use tempfile::TempDir;
 
 #[path = "torrent_admission_race_tests.rs"]
 mod admission_race;
+#[path = "torrent_batch_isolation_tests.rs"]
+mod batch_isolation;
 #[path = "torrent_card_recovery_tests.rs"]
 mod card_recovery;
 #[path = "torrent_metadata_retry_tests.rs"]
 mod metadata_retry;
 #[path = "torrent_refresh_recovery_tests.rs"]
 mod refresh_recovery;
+#[path = "torrent_worker_limit_tests.rs"]
+mod worker_limit;
 
 struct TestBackendState {
     visible_candidates: Vec<TorrentRemoteSnapshot>,

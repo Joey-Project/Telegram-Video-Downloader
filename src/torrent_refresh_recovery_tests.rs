@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 struct RecordingBackend {
     inner: Arc<TestBackend>,
     fail_lookup_once: AtomicBool,
+    lookup_call_count: AtomicUsize,
     status_call_count: AtomicUsize,
     fail_second_status_call: AtomicBool,
     complete_later_pending: AtomicBool,
@@ -20,6 +21,7 @@ impl RecordingBackend {
         Self {
             inner,
             fail_lookup_once: AtomicBool::new(false),
+            lookup_call_count: AtomicUsize::new(0),
             status_call_count: AtomicUsize::new(0),
             fail_second_status_call: AtomicBool::new(false),
             complete_later_pending: AtomicBool::new(false),
@@ -29,6 +31,10 @@ impl RecordingBackend {
 
     fn fail_one_lookup(&self) {
         self.fail_lookup_once.store(true, Ordering::SeqCst);
+    }
+
+    fn lookup_call_count(&self) -> usize {
+        self.lookup_call_count.load(Ordering::SeqCst)
     }
 
     fn fail_second_status_call(&self) {
@@ -52,6 +58,7 @@ impl TorrentBackend for RecordingBackend {
         &self,
         identity: TorrentIdentity,
     ) -> crate::torrent_types::TorrentFuture<'_, Vec<TorrentRemoteSnapshot>> {
+        self.lookup_call_count.fetch_add(1, Ordering::SeqCst);
         if self.fail_lookup_once.swap(false, Ordering::SeqCst) {
             return Box::pin(async { Err(anyhow::anyhow!("temporary lookup failure")) });
         }
@@ -205,14 +212,14 @@ async fn create_confirmed_uploaded_task(
     manager.process_task_once_for_test(&queued.task_id).await;
     let verified = manager
         .snapshot(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             &queued.task_id,
         )
         .expect("read verified uploaded task");
     let selected = manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             verified.card_message_id.expect("card delivered"),
             &queued.task_id,
@@ -225,7 +232,7 @@ async fn create_confirmed_uploaded_task(
         .expect("select file");
     let confirmed = manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             selected.card_message_id.expect("card delivered"),
             &queued.task_id,
@@ -275,7 +282,7 @@ async fn matching_remote_with_incomplete_inventory_backs_off_without_submission(
     backend.set_visible_candidate(remote);
     manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             deferred.card_message_id.expect("card delivered"),
             &queued.task_id,
@@ -303,7 +310,7 @@ async fn failed_inventory_refresh_blocks_import_until_explicit_revalidation() {
 
     manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             confirmed.card_message_id.unwrap(),
             &task_id,
@@ -354,7 +361,7 @@ async fn failed_inventory_refresh_blocks_import_until_explicit_revalidation() {
     backend.state.lock().unwrap().visible_candidates.clear();
     manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             confirmed.card_message_id.unwrap(),
             &task_id,
@@ -381,7 +388,7 @@ async fn failed_inventory_refresh_blocks_import_until_explicit_revalidation() {
     backend.set_visible_candidate(valid);
     manager
         .apply_action(
-            fixture.upload.user_id,
+            fixture.upload.chat_id,
             fixture.upload.user_id,
             confirmed.card_message_id.unwrap(),
             &task_id,
@@ -637,9 +644,90 @@ async fn detached_manual_refresh_reconciles_and_backs_off_after_lookup_failure()
     assert!(!task_has_action_due(&deferred, now));
     assert_eq!(inner.submitted_count(), 0);
 
+    manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            deferred.card_message_id.expect("card delivered"),
+            &queued.task_id,
+            deferred.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("explicitly retry after the scheduled lookup backoff");
     manager.process_task_once_for_test(&queued.task_id).await;
     let reconciled = manager.store.task(&queued.task_id).unwrap().unwrap();
     assert!(reconciled.remote.is_some());
     assert!(!reconciled.manual_refresh);
+    assert_eq!(inner.submitted_count(), 0);
+}
+
+#[tokio::test]
+async fn ambiguous_lookup_backs_off_and_explicit_refresh_recovers_without_submission() {
+    let fixture = Fixture::new();
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[0.5, 1.0], 0.7, 2);
+    let inner = fixture.backend(vec![remote.clone(), remote.clone()], None);
+    let backend = Arc::new(RecordingBackend::new(inner.clone()));
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let queued = manager
+        .enqueue(fixture.upload.clone())
+        .expect("enqueue uploaded torrent");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+
+    let now = unix_seconds();
+    let ambiguous = manager.store.task(&queued.task_id).unwrap().unwrap();
+    assert_eq!(ambiguous.phase, TorrentPhase::Ambiguous);
+    assert!(ambiguous.remote.is_none());
+    assert!(ambiguous.manual_refresh);
+    assert!(ambiguous.next_action_at > now);
+    assert!(
+        ambiguous
+            .next_refresh_at
+            .is_some_and(|retry_at| retry_at > now)
+    );
+    assert_eq!(backend.lookup_call_count(), 1);
+    assert_eq!(inner.submitted_count(), 0);
+
+    manager.process_task_once_for_test(&queued.task_id).await;
+    assert_eq!(
+        backend.lookup_call_count(),
+        1,
+        "a card redraw must not bypass the reconciliation retry deadline"
+    );
+    manager
+        .store
+        .transact(|state| {
+            let task = state.tasks.get_mut(&queued.task_id).unwrap();
+            task.card_render_pending = true;
+            task.next_card_update_at = unix_seconds().saturating_sub(1);
+            Ok(((), true))
+        })
+        .expect("force a due card redraw");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    assert_eq!(
+        backend.lookup_call_count(),
+        1,
+        "a due card redraw must not bypass the reconciliation retry deadline"
+    );
+
+    inner.state.lock().unwrap().visible_candidates = vec![remote];
+    manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            ambiguous.card_message_id.expect("card delivered"),
+            &queued.task_id,
+            ambiguous.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("explicitly request a fresh reconciliation");
+    manager.process_task_once_for_test(&queued.task_id).await;
+
+    let recovered = manager.store.task(&queued.task_id).unwrap().unwrap();
+    assert!(recovered.remote.is_some());
+    assert_ne!(recovered.phase, TorrentPhase::Ambiguous);
+    assert!(!recovered.manual_refresh);
+    assert_eq!(backend.lookup_call_count(), 2);
     assert_eq!(inner.submitted_count(), 0);
 }

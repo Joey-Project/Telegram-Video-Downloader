@@ -154,6 +154,11 @@ superseded_by: ""
   is consumed or rescheduled; retained unverified inventory blocks new Music
   admission until revalidation. Additional deadline and attachment regressions
   run in the existing macOS CI suite.
+- Ambiguous uploaded-task matches use bounded reconciliation retries. Music
+  batches that fail admission retry one source at a time, allowing healthy
+  tracks to proceed independently. The worker limit applies to the total active
+  set through completion, including imports no longer in the due list; blocked
+  import regressions verify the bound and slot release.
 - A broader local run passed 1,597 bot tests with 17 existing ignores and two
   timeouts in file-library E2Es. The 101-item bulk test passed from the same
   artifact in isolation; the migration mid-copy restart test still timed out

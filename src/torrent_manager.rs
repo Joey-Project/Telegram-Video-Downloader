@@ -731,8 +731,11 @@ impl TorrentManager {
                 Err(_) => return,
                 Ok(Err(_)) => return,
             };
-        for task_id in due.into_iter().take(MAX_ACTIVE_WORKERS) {
+        for task_id in due {
             let mut active = self.active_workers.lock().await;
+            if active.len() >= MAX_ACTIVE_WORKERS {
+                break;
+            }
             if !active.insert(task_id.clone()) {
                 continue;
             }
@@ -1464,6 +1467,11 @@ impl TorrentManager {
                     .get_mut(&task_id)
                     .ok_or_else(|| anyhow!("torrent task disappeared"))?;
                 current.phase = TorrentPhase::Ambiguous;
+                current.manual_refresh = true;
+                current.attempts = current.attempts.saturating_add(1);
+                let retry_at = unix_seconds().saturating_add(backoff(current.attempts));
+                current.next_action_at = retry_at;
+                current.next_refresh_at = Some(retry_at);
                 current.error = Some(
                     "More than one qBittorrent task matches this torrent identity.".to_string(),
                 );
@@ -1815,7 +1823,13 @@ impl TorrentManager {
             })
             .collect::<Vec<_>>();
         eligible.sort_by_key(|(index, _, _)| *index);
-        eligible.truncate(MAX_MUSIC_BATCH_FILES);
+        let retrying_after_batch_failure =
+            eligible.iter().any(|(_, request, _)| request.attempts > 0);
+        eligible.truncate(if retrying_after_batch_failure {
+            1
+        } else {
+            MAX_MUSIC_BATCH_FILES
+        });
         if eligible.is_empty() {
             return;
         }
