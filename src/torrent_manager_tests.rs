@@ -12,6 +12,8 @@ use tempfile::TempDir;
 mod admission_race;
 #[path = "torrent_card_recovery_tests.rs"]
 mod card_recovery;
+#[path = "torrent_metadata_retry_tests.rs"]
+mod metadata_retry;
 #[path = "torrent_refresh_recovery_tests.rs"]
 mod refresh_recovery;
 

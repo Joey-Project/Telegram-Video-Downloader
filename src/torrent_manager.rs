@@ -324,6 +324,50 @@ impl TorrentManager {
         );
     }
 
+    fn defer_remote_attachment(&self, task_id: &str, message: &str) {
+        let _ = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(task_id)
+                .context("torrent task disappeared")?;
+            current.manual_refresh = true;
+            current.attempts = current.attempts.saturating_add(1);
+            let retry_at = unix_seconds().saturating_add(backoff(current.attempts));
+            current.next_action_at = retry_at;
+            current.next_refresh_at = Some(retry_at);
+            current.error = Some(message.to_owned());
+            touch(current);
+            Ok(((), true))
+        });
+    }
+
+    fn attach_remote_or_defer(
+        &self,
+        task_id: &str,
+        remote: TorrentRemoteSnapshot,
+        message: &str,
+    ) -> bool {
+        if let Ok(Some(task)) = self.store.task(task_id)
+            && task
+                .metainfo
+                .as_ref()
+                .is_some_and(|metainfo| !remote.matches_identity(&metainfo.identity))
+        {
+            self.mark_invalid(
+                task_id,
+                "qBittorrent returned a different torrent identity.",
+            );
+            return false;
+        }
+        match self.attach_remote(task_id, remote) {
+            Ok(()) => true,
+            Err(_) => {
+                self.defer_remote_attachment(task_id, message);
+                false
+            }
+        }
+    }
+
     fn enqueue_source(
         &self,
         origin_key: String,
@@ -730,6 +774,16 @@ impl TorrentManager {
         {
             return;
         }
+        let now = unix_seconds();
+        if task.next_action_at > now
+            && !task.manual_refresh
+            && !task.next_refresh_at.is_some_and(|at| at <= now)
+            && (task.metainfo.is_none() || task.remote.is_none())
+        {
+            // Card redraws above remain independent from prerequisite work. Retry deadlines
+            // cover metadata retrieval and remote attachment as well as scheduler eligibility.
+            return;
+        }
         if task.existing.is_some() && task.metainfo.is_none() {
             self.process_existing(task).await;
             return;
@@ -992,7 +1046,11 @@ impl TorrentManager {
                 Ok(((), true))
             });
             if saved.is_ok() {
-                let _ = self.attach_remote(&task.task_id, remote);
+                self.attach_remote_or_defer(
+                    &task.task_id,
+                    remote,
+                    "qBittorrent has not reported a verifiable file inventory yet; retry is scheduled.",
+                );
             }
             return;
         }
@@ -1101,6 +1159,8 @@ impl TorrentManager {
             }
             if self.attach_remote(&task_id, remote).is_ok() {
                 self.resume_existing_imports(&task_id);
+            } else {
+                self.defer_existing_revalidation(&task_id);
             }
             return;
         }
@@ -1170,8 +1230,12 @@ impl TorrentManager {
             touch(current);
             Ok(((), true))
         });
-        if saved.is_ok() && self.attach_remote(&task_id, remote).is_ok() {
-            self.resume_existing_imports(&task_id);
+        if saved.is_ok() {
+            if self.attach_remote(&task_id, remote).is_ok() {
+                self.resume_existing_imports(&task_id);
+            } else {
+                self.defer_existing_revalidation(&task_id);
+            }
         }
     }
 
@@ -1269,6 +1333,8 @@ impl TorrentManager {
                         .tasks
                         .get_mut(&task_id)
                         .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+                    current.manual_refresh = false;
+                    current.next_refresh_at = None;
                     current.attempts = current.attempts.saturating_add(1);
                     current.next_action_at =
                         unix_seconds().saturating_add(backoff(current.attempts));
@@ -1331,6 +1397,8 @@ impl TorrentManager {
                     .tasks
                     .get_mut(&task_id)
                     .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+                current.manual_refresh = false;
+                current.next_refresh_at = None;
                 current.attempts = current.attempts.saturating_add(1);
                 current.next_action_at = unix_seconds().saturating_add(backoff(current.attempts));
                 current.error = Some(
@@ -1405,7 +1473,11 @@ impl TorrentManager {
             return;
         }
         if let Some(remote) = matches.into_iter().next() {
-            let _ = self.attach_remote(&task_id, remote);
+            self.attach_remote_or_defer(
+                &task_id,
+                remote,
+                "qBittorrent has not reported a verifiable file inventory yet; retry is scheduled.",
+            );
             return;
         }
 
@@ -1498,25 +1570,18 @@ impl TorrentManager {
         let remote = match result {
             Ok(remote) => remote,
             Err(_) => {
-                let _ = self.store.transact(|state| {
-                    let current = state
-                        .tasks
-                        .get_mut(&task_id)
-                        .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-                    current.manual_refresh = false;
-                    current.attempts = current.attempts.saturating_add(1);
-                    current.next_refresh_at =
-                        Some(unix_seconds().saturating_add(backoff(current.attempts)));
-                    current.error = Some(
-                        "Could not refresh qBittorrent progress; retry is available.".to_string(),
-                    );
-                    touch(current);
-                    Ok(((), true))
-                });
+                self.defer_remote_attachment(
+                    &task_id,
+                    "Could not refresh qBittorrent progress; retry is scheduled.",
+                );
                 return;
             }
         };
-        let _ = self.attach_remote(&task_id, remote);
+        self.attach_remote_or_defer(
+            &task_id,
+            remote,
+            "qBittorrent has not reported a verifiable file inventory yet; retry is scheduled.",
+        );
     }
 
     fn attach_remote(&self, task_id: &str, remote: TorrentRemoteSnapshot) -> Result<()> {

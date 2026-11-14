@@ -129,7 +129,8 @@ superseded_by: ""
 - Existing-source records validate and reopen after restart, then use the common
   Music admission/status worker after metadata verification. Opening an unchanged
   task preserves confirmations; changed source inventory invalidates them.
-- The final torrent-focused suite passed 73 tests, including all three mocked
+- Local torrent-focused validation passed 73 tests before the final retry
+  refinements, including all three mocked
   Telegram/qBittorrent/Music E2Es. The separate qBittorrent HTTP/parser suite passed
   13 tests. Formatting passed. Strict workspace/all-targets Clippy is enforced
   by the existing macOS CI job.
@@ -148,6 +149,11 @@ superseded_by: ""
   follows submission reconciliation and respects transient-error backoff.
 - Hybrid metainfo compares payload layouts separately from v1 padding while
   preserving the original v1 file indexes used by qBittorrent.
+- Metadata retries and remote-inventory validation failures respect their
+  operation deadlines independently of card redraws. A failed explicit refresh
+  is consumed or rescheduled; retained unverified inventory blocks new Music
+  admission until revalidation. Additional deadline and attachment regressions
+  run in the existing macOS CI suite.
 - A broader local run passed 1,597 bot tests with 17 existing ignores and two
   timeouts in file-library E2Es. The 101-item bulk test passed from the same
   artifact in isolation; the migration mid-copy restart test still timed out

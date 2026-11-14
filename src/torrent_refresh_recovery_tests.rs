@@ -186,6 +186,214 @@ async fn create_confirmed_existing_task(
     (backend, manager, queued.task_id, confirmed)
 }
 
+async fn create_confirmed_uploaded_task(
+    fixture: &Fixture,
+) -> (
+    Arc<TestBackend>,
+    Arc<TorrentManager>,
+    String,
+    TorrentSnapshot,
+) {
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    let backend = fixture.backend(vec![remote], None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let queued = manager
+        .enqueue(fixture.upload.clone())
+        .expect("enqueue uploaded torrent");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    let verified = manager
+        .snapshot(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            &queued.task_id,
+        )
+        .expect("read verified uploaded task");
+    let selected = manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            verified.card_message_id.expect("card delivered"),
+            &queued.task_id,
+            verified.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: true,
+            },
+        )
+        .expect("select file");
+    let confirmed = manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            selected.card_message_id.expect("card delivered"),
+            &queued.task_id,
+            selected.selection_revision,
+            TorrentAction::ImportSelected,
+        )
+        .expect("confirm selection");
+    (backend, manager, queued.task_id, confirmed)
+}
+
+#[tokio::test]
+async fn matching_remote_with_incomplete_inventory_backs_off_without_submission() {
+    let fixture = Fixture::new();
+    let mut incomplete =
+        remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    incomplete.files.clear();
+    let backend = fixture.backend(vec![incomplete], None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let queued = manager
+        .enqueue(fixture.upload.clone())
+        .expect("enqueue uploaded torrent");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+
+    let now = unix_seconds();
+    let deferred = manager.store.task(&queued.task_id).unwrap().unwrap();
+    assert!(deferred.metainfo.is_some());
+    assert!(deferred.remote.is_none());
+    assert!(deferred.manual_refresh);
+    assert!(deferred.next_action_at > now);
+    assert!(
+        deferred
+            .next_refresh_at
+            .is_some_and(|retry_at| retry_at > now)
+    );
+    assert!(
+        deferred
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("verifiable file inventory"))
+    );
+    assert!(!task_has_action_due(&deferred, now));
+    assert_eq!(backend.submitted_count(), 0);
+
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    backend.set_visible_candidate(remote);
+    manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            deferred.card_message_id.expect("card delivered"),
+            &queued.task_id,
+            deferred.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("explicitly retry attachment");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    let retried = manager.store.task(&queued.task_id).unwrap().unwrap();
+    assert!(retried.remote.is_some());
+    assert!(!retried.manual_refresh);
+    assert_eq!(backend.submitted_count(), 0);
+}
+
+#[tokio::test]
+async fn failed_inventory_refresh_blocks_import_until_explicit_revalidation() {
+    let fixture = Fixture::new();
+    let (backend, manager, task_id, confirmed) = create_confirmed_uploaded_task(&fixture).await;
+    let original = manager.store.task(&task_id).unwrap().unwrap();
+    let original_import = original.imports.get(&0).unwrap().clone();
+    let mut incomplete =
+        remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    incomplete.files.clear();
+    backend.set_visible_candidate(incomplete);
+
+    manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            confirmed.card_message_id.unwrap(),
+            &task_id,
+            confirmed.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("request a read-only refresh");
+    manager.process_task_once_for_test(&task_id).await;
+
+    let now = unix_seconds();
+    let deferred = manager.store.task(&task_id).unwrap().unwrap();
+    assert!(deferred.manual_refresh);
+    assert!(deferred.next_action_at > now);
+    assert!(
+        deferred
+            .next_refresh_at
+            .is_some_and(|retry_at| retry_at > now)
+    );
+    assert_eq!(deferred.inventory_revision, original.inventory_revision);
+    assert_eq!(deferred.selection_revision, original.selection_revision);
+    assert_eq!(
+        deferred.remote, original.remote,
+        "unverified inventory must not replace the last verified snapshot"
+    );
+    assert_eq!(
+        deferred
+            .imports
+            .get(&0)
+            .unwrap()
+            .confirmed_inventory_revision,
+        original_import.confirmed_inventory_revision
+    );
+    assert_eq!(
+        deferred
+            .imports
+            .get(&0)
+            .unwrap()
+            .confirmed_selection_revision,
+        original_import.confirmed_selection_revision
+    );
+    assert!(!task_has_action_due(&deferred, now));
+    manager.process_task_once_for_test(&task_id).await;
+    assert!(
+        backend.music_batches().is_empty(),
+        "stale inventory cannot admit the confirmed import"
+    );
+
+    backend.state.lock().unwrap().visible_candidates.clear();
+    manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            confirmed.card_message_id.unwrap(),
+            &task_id,
+            confirmed.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("request another read-only refresh");
+    manager.process_task_once_for_test(&task_id).await;
+    let unavailable = manager.store.task(&task_id).unwrap().unwrap();
+    assert!(unavailable.manual_refresh);
+    assert!(unavailable.next_action_at > unix_seconds());
+    assert_eq!(unavailable.remote, original.remote);
+    assert_eq!(
+        unavailable
+            .imports
+            .get(&0)
+            .unwrap()
+            .confirmed_inventory_revision,
+        original_import.confirmed_inventory_revision
+    );
+    assert!(backend.music_batches().is_empty());
+
+    let valid = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    backend.set_visible_candidate(valid);
+    manager
+        .apply_action(
+            fixture.upload.user_id,
+            fixture.upload.user_id,
+            confirmed.card_message_id.unwrap(),
+            &task_id,
+            confirmed.inventory_revision,
+            TorrentAction::Refresh,
+        )
+        .expect("explicitly retry the read-only refresh");
+    manager.process_task_once_for_test(&task_id).await;
+    manager.process_task_once_for_test(&task_id).await;
+    assert_eq!(backend.music_batches().len(), 1);
+}
+
 #[tokio::test]
 async fn transient_refresh_failure_preserves_confirmation_and_explicit_retry_resumes() {
     let fixture = Fixture::new();
