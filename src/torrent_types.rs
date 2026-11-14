@@ -24,6 +24,7 @@ pub struct TorrentSettings {
     #[serde(skip_serializing)]
     pub password: Option<String>,
     pub state_dir: PathBuf,
+    pub metainfo_dir: Option<PathBuf>,
     pub max_torrent_bytes: usize,
     pub max_files: usize,
     pub poll_seconds: u64,
@@ -39,6 +40,7 @@ impl Default for TorrentSettings {
             username: None,
             password: None,
             state_dir: PathBuf::new(),
+            metainfo_dir: None,
             max_torrent_bytes: DEFAULT_MAX_TORRENT_BYTES,
             max_files: DEFAULT_MAX_FILES,
             poll_seconds: 10,
@@ -95,6 +97,30 @@ pub struct TorrentUpload {
     pub file_unique_id: String,
     pub file_name: String,
     pub file_size: u64,
+}
+
+/// Telegram message containing a magnet link. The URI can contain private tracker passkeys,
+/// so its Debug representation is intentionally redacted.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TorrentMagnet {
+    pub update_id: i64,
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub user_id: i64,
+    pub uri: String,
+}
+
+impl fmt::Debug for TorrentMagnet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TorrentMagnet")
+            .field("update_id", &self.update_id)
+            .field("chat_id", &self.chat_id)
+            .field("message_id", &self.message_id)
+            .field("user_id", &self.user_id)
+            .field("uri", &"[redacted]")
+            .finish()
+    }
 }
 
 /// The protocol identifiers encoded by a metainfo `info` dictionary.
@@ -353,6 +379,7 @@ pub struct TorrentSnapshot {
     pub progress: f64,
     pub cursor_folder_id: u32,
     pub cursor_page: u32,
+    pub review_selection: bool,
     pub folders: Vec<TorrentFolder>,
     pub files: Vec<TorrentFileSnapshot>,
     pub selected_count: usize,
@@ -365,6 +392,7 @@ pub struct TorrentSnapshot {
 pub enum TorrentAction {
     Refresh,
     Browse { folder_id: u32, page: u32 },
+    ReviewSelection { page: u32 },
     SetFile { index: u32, selected: bool },
     SetFolder { folder_id: u32, selected: bool },
     ClearSelection,
@@ -388,6 +416,18 @@ pub trait TorrentBackend: Send + Sync + 'static {
     fn lookup(&self, identity: TorrentIdentity) -> TorrentFuture<'_, Vec<TorrentRemoteSnapshot>>;
 
     fn submit(&self, raw_torrent: Vec<u8>, file_name: String) -> TorrentFuture<'_, SubmitResult>;
+
+    fn default_save_path(&self) -> TorrentFuture<'_, PathBuf> {
+        Box::pin(async { anyhow::bail!("qBittorrent default save path is not configured") })
+    }
+
+    fn submit_magnet(&self, _uri: String, _save_path: PathBuf) -> TorrentFuture<'_, SubmitResult> {
+        Box::pin(async { anyhow::bail!("qBittorrent magnet submission is not configured") })
+    }
+
+    fn export_metainfo(&self, _hash: String) -> TorrentFuture<'_, Vec<u8>> {
+        Box::pin(async { anyhow::bail!("qBittorrent metainfo export is not configured") })
+    }
 
     fn refresh(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot>;
 

@@ -39,8 +39,9 @@ conversion_timeout_seconds = 1800
 archive_dir = "~/Library/Mobile Documents/com~apple~CloudDocs/Collection/Music"
 
 # Optional .torrent uploads use an existing local qBittorrent WebUI API.
-# Download every file; choose audio for Music separately in the task's Widget.
-# qBittorrent keeps its existing save path, categories and seeding files.
+# Download every file; choose audio for Music separately with the task's buttons.
+# Existing qBittorrent tasks keep their paths, categories and seeding files.
+# New magnets use a task folder below qBittorrent's default download directory.
 [torrent]
 enabled = false
 base_url = "http://127.0.0.1:8080"
@@ -49,6 +50,8 @@ base_url = "http://127.0.0.1:8080"
 # username = ""
 # password = ""
 # state_dir defaults to <video root>/.telegram-video-downloader-torrents.
+# Optional read-only fallback for magnets with qBittorrent older than 4.5:
+# metainfo_dir = "~/Library/Application Support/qBittorrent/BT_backup"
 max_torrent_bytes = 4194304 # 4 MiB of metainfo, not the payload size
 max_files = 5000
 poll_seconds = 10

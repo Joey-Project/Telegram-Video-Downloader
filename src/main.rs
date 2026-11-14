@@ -49,7 +49,10 @@ mod staging_cleanup_bot;
 #[cfg(test)]
 mod staging_cleanup_tests;
 mod telegram;
+mod torrent_backup;
 mod torrent_bot;
+mod torrent_inline;
+mod torrent_magnet;
 mod torrent_manager;
 mod torrent_metainfo;
 mod torrent_runtime;
@@ -7127,6 +7130,19 @@ async fn handle_message(
         return Ok(());
     }
 
+    if torrent_bot::admit_magnet_text(
+        &context,
+        update_id,
+        message_id,
+        submitter_user_id,
+        chat_id,
+        is_private_chat,
+        text,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     if torrent_bot::handle_command(
         &context,
         update_id,
@@ -7314,6 +7330,10 @@ fn default_bot_commands() -> Vec<BotCommand> {
             description: "View torrent downloads and choose Music imports.".to_string(),
         },
         BotCommand {
+            command: "magnet".to_string(),
+            description: "Download a magnet link using local qBittorrent.".to_string(),
+        },
+        BotCommand {
             command: "bbdown".to_string(),
             description: "Manage BBDown Bilibili login state.".to_string(),
         },
@@ -7444,6 +7464,7 @@ fn help_message() -> String {
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
         "Send .m4a, .mp3, .aac, .flac or .wav files in the allowed private chat to import music automatically.",
         "Send .torrent files to download all contents in local qBittorrent, then choose music to import in the task card.",
+        "Paste one magnet link directly, or use /magnet LINK, to create the same kind of download task.",
         "",
         "Commands:",
         "/help - Show this help.",
@@ -7453,6 +7474,7 @@ fn help_message() -> String {
         "/queue - View active tasks; use /queue history [page] for history.",
         "/music - View music imports; /music retry TASK_ID or /music cancel TASK_ID.",
         "/torrents - View torrent downloads and reopen their music selection cards.",
+        "/magnet LINK - Download a magnet link and wait for its file list.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
         "/bbdown logout - Clear the local BBDown credential state.",
@@ -17772,7 +17794,7 @@ mod tests {
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "help", "pdf", "queue", "file", "settings", "music", "torrents", "bbdown"
+                "help", "pdf", "queue", "file", "settings", "music", "torrents", "magnet", "bbdown"
             ]
         );
         assert_eq!(

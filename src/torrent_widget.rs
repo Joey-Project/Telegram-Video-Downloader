@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 use std::fmt;
 
+#[cfg(test)]
 pub const TORRENT_WIDGET_HTML: &str = include_str!("../assets/torrent-widget.html");
 pub const TORRENT_WIDGET_MAX_ENTRIES: usize = 4;
 pub const TORRENT_WIDGET_MAX_CHAT_DATA_BYTES: usize = 1_024;
@@ -74,8 +75,8 @@ pub struct TorrentWidgetPresentation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TorrentWidgetActionRequest {
     pub task_id: String,
-    /// The revision encoded in the request frame. Import requests use the selection revision;
-    /// all other actions use the inventory revision.
+    /// The revision encoded in the request frame. Review and import requests use the selection
+    /// revision; other actions use the inventory revision.
     pub expected_revision: u64,
     pub action: TorrentWidgetAction,
 }
@@ -87,6 +88,7 @@ pub enum TorrentWidgetAction {
     SetFile { index: u32, selected: bool },
     SetFolder { folder_id: u32, selected: bool },
     ClearSelection,
+    ReviewSelection { page: u32 },
     ImportSelected,
     RetryImports,
 }
@@ -144,8 +146,9 @@ impl std::error::Error for WidgetRenderError {}
 /// Parses the compact, idempotent request protocol sent by the static widget.
 ///
 /// Format: `t1:<32-lowerhex-task>:<16-lowerhex-expected-revision>:<op>[:args]`.
-/// Import requests use the selection revision; all other actions use the inventory revision.
-/// Folder, page, and file indexes are capped at the repository's 5000-entry bound.
+/// Review and import requests use the selection revision; all other actions use the inventory
+/// revision.
+/// Folder, browser-page, review-page, and file indexes use the repository's 5000-entry bound.
 pub fn parse_widget_request(data: &str) -> Result<TorrentWidgetActionRequest, WidgetProtocolError> {
     if data.is_empty() || data.len() > 64 || !data.is_ascii() {
         return Err(WidgetProtocolError::ByteLength);
@@ -176,6 +179,9 @@ pub fn parse_widget_request(data: &str) -> Result<TorrentWidgetActionRequest, Wi
     let action = match (fields[3], fields.len()) {
         ("r", 4) => TorrentWidgetAction::Refresh,
         ("c", 4) => TorrentWidgetAction::ClearSelection,
+        ("v", 5) => TorrentWidgetAction::ReviewSelection {
+            page: parse_bounded_u32(fields[4])?,
+        },
         ("i", 4) => TorrentWidgetAction::ImportSelected,
         ("y", 4) => TorrentWidgetAction::RetryImports,
         ("b", 6) => TorrentWidgetAction::Browse {
@@ -374,6 +380,14 @@ mod tests {
     fn compact_request_parser_accepts_each_supported_idempotent_action() {
         let parse = |suffix: &str| parse_widget_request(&format!("t1:{TASK}:{REVISION}:{suffix}"));
         assert_eq!(parse("i").unwrap().expected_revision, 0x12);
+        assert_eq!(
+            parse("v:0").unwrap().action,
+            TorrentWidgetAction::ReviewSelection { page: 0 }
+        );
+        assert_eq!(
+            parse("v:5000").unwrap().action,
+            TorrentWidgetAction::ReviewSelection { page: 5000 }
+        );
         assert_eq!(parse("r").unwrap().action, TorrentWidgetAction::Refresh);
         assert_eq!(
             parse("b:5:2").unwrap().action,
@@ -413,7 +427,9 @@ mod tests {
     #[test]
     fn compact_request_parser_rejects_malformed_bytes_and_out_of_range_values() {
         let prefix = format!("t1:{TASK}:{REVISION}:");
-        for input in ["", "r:extra", "b:1", "b:5001:0", "f:0:2", "d:+1:1", "i:1"] {
+        for input in [
+            "", "r:extra", "b:1", "b:5001:0", "f:0:2", "d:+1:1", "v:+1", "i:1",
+        ] {
             assert!(
                 parse_widget_request(&format!("{prefix}{input}")).is_err(),
                 "{input}"

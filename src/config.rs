@@ -331,6 +331,10 @@ impl AppConfig {
             expand_home_path(&self.torrent.state_dir)
         };
         self.torrent.state_dir = self.resolve_project_path(&torrent_state);
+        if let Some(directory) = self.torrent.metainfo_dir.take() {
+            self.torrent.metainfo_dir =
+                Some(self.resolve_project_path(&expand_home_path(&directory)));
+        }
     }
 
     fn expand_music_paths(&mut self) {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::torrent_types::{TorrentIdentity, TorrentMusicJobStatus};
+use crate::torrent_types::{TorrentIdentity, TorrentMagnet, TorrentMusicJobStatus};
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -11,6 +11,11 @@ struct TestBackendState {
     accepted_on_submit: Option<TorrentRemoteSnapshot>,
     submitted_count: usize,
     submitted_bytes: Vec<Vec<u8>>,
+    magnet_submissions: Vec<(String, PathBuf)>,
+    default_save_path: PathBuf,
+    exported_metainfo: Option<Vec<u8>>,
+    export_failures: usize,
+    export_count: usize,
     sent_cards: usize,
     updated_cards: Vec<TorrentSnapshot>,
     music_batches: Vec<(String, Vec<CompletedTorrentFile>)>,
@@ -35,6 +40,11 @@ impl TestBackend {
                 accepted_on_submit,
                 submitted_count: 0,
                 submitted_bytes: Vec::new(),
+                magnet_submissions: Vec::new(),
+                default_save_path: std::env::temp_dir().join("mock-qbittorrent-default"),
+                exported_metainfo: None,
+                export_failures: 0,
+                export_count: 0,
                 sent_cards: 0,
                 updated_cards: Vec::new(),
                 music_batches: Vec::new(),
@@ -49,6 +59,26 @@ impl TestBackend {
 
     fn music_batches(&self) -> Vec<(String, Vec<CompletedTorrentFile>)> {
         self.state.lock().unwrap().music_batches.clone()
+    }
+
+    fn configure_magnet(
+        &self,
+        default_save_path: PathBuf,
+        exported_metainfo: Option<Vec<u8>>,
+        export_failures: usize,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        state.default_save_path = default_save_path;
+        state.exported_metainfo = exported_metainfo;
+        state.export_failures = export_failures;
+    }
+
+    fn magnet_submissions(&self) -> Vec<(String, PathBuf)> {
+        self.state.lock().unwrap().magnet_submissions.clone()
+    }
+
+    fn export_count(&self) -> usize {
+        self.state.lock().unwrap().export_count
     }
 }
 
@@ -83,6 +113,35 @@ impl TorrentBackend for TestBackend {
         // Model an API timeout after qBittorrent accepted the add request. The manager must
         // persist intent and reconcile by identity after restart instead of posting again.
         Box::pin(async { anyhow::bail!("mocked response lost after acceptance") })
+    }
+
+    fn default_save_path(&self) -> crate::torrent_types::TorrentFuture<'_, PathBuf> {
+        let path = self.state.lock().unwrap().default_save_path.clone();
+        Box::pin(async move { Ok(path) })
+    }
+
+    fn submit_magnet(
+        &self,
+        uri: String,
+        save_path: PathBuf,
+    ) -> crate::torrent_types::TorrentFuture<'_, SubmitResult> {
+        let mut state = self.state.lock().unwrap();
+        state.magnet_submissions.push((uri, save_path));
+        if let Some(remote) = state.accepted_on_submit.take() {
+            state.visible_candidates = vec![remote];
+        }
+        Box::pin(async { anyhow::bail!("mocked magnet response lost after acceptance") })
+    }
+
+    fn export_metainfo(&self, _hash: String) -> crate::torrent_types::TorrentFuture<'_, Vec<u8>> {
+        let mut state = self.state.lock().unwrap();
+        state.export_count += 1;
+        if state.export_failures > 0 {
+            state.export_failures -= 1;
+            return Box::pin(async { anyhow::bail!("mocked metadata is not ready") });
+        }
+        let bytes = state.exported_metainfo.clone();
+        Box::pin(async move { bytes.ok_or_else(|| anyhow!("mock metadata is unavailable")) })
     }
 
     fn refresh(
@@ -313,6 +372,32 @@ async fn parse_task(manager: &TorrentManager, upload: TorrentUpload) -> String {
     queued.task_id
 }
 
+fn magnet_upload(fixture: &Fixture, update_id: i64, message_id: i64) -> TorrentMagnet {
+    let v1 = fixture
+        .metainfo
+        .identity
+        .v1
+        .as_deref()
+        .expect("fixture v1 identity");
+    TorrentMagnet {
+        update_id,
+        chat_id: fixture.upload.chat_id,
+        message_id,
+        user_id: fixture.upload.chat_id,
+        uri: format!("magnet:?xt=urn:btih:{v1}&dn=release&so=0"),
+    }
+}
+
+fn alternate_single_file_torrent() -> Vec<u8> {
+    let info = dict(vec![
+        (b"length".to_vec(), integer(3)),
+        (b"name".to_vec(), text("other.mp3")),
+        (b"piece length".to_vec(), integer(16_384)),
+        (b"pieces".to_vec(), bencode_bytes(&[8; 20])),
+    ]);
+    dict(vec![(b"info".to_vec(), info)])
+}
+
 #[tokio::test]
 async fn existing_or_ambiguous_qbittorrent_candidates_are_never_submitted() {
     let fixture = Fixture::new();
@@ -375,6 +460,178 @@ async fn restart_reconciles_unknown_add_outcome_without_a_second_post() {
         1,
         "recovery must only perform a read-only lookup"
     );
+}
+
+#[tokio::test]
+async fn magnet_unknown_submit_reconciles_after_restart_without_a_second_post() {
+    let fixture = Fixture::new();
+    let accepted = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    let backend = fixture.backend(Vec::new(), Some(accepted));
+    backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        0,
+    );
+    let settings = fixture.settings();
+    let manager = TorrentManager::open(settings.clone(), backend.clone()).expect("open manager");
+    let queued = manager
+        .enqueue_magnet(magnet_upload(&fixture, 301, 401))
+        .expect("admit valid magnet source");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    let submissions = backend.magnet_submissions();
+    assert_eq!(submissions.len(), 1);
+    assert!(
+        !submissions[0].0.contains("so="),
+        "partial selection is removed"
+    );
+    assert_eq!(
+        submissions[0].1,
+        fixture
+            .source_root
+            .join("Telegram Downloads")
+            .join(&queued.task_id)
+    );
+    let pending = manager
+        .snapshot(
+            fixture.upload.chat_id,
+            fixture.upload.chat_id,
+            &queued.task_id,
+        )
+        .expect("read pending submission state");
+    assert_eq!(pending.phase, TorrentPhase::ReconciliationPending);
+    drop(manager);
+
+    let restarted = TorrentManager::open(settings, backend.clone()).expect("reopen manager");
+    restarted.process_task_once_for_test(&queued.task_id).await;
+    let reconciled = restarted
+        .snapshot(
+            fixture.upload.chat_id,
+            fixture.upload.chat_id,
+            &queued.task_id,
+        )
+        .expect("read reconciled magnet task");
+    assert_eq!(reconciled.phase, TorrentPhase::Completed);
+    assert_eq!(reconciled.files.len(), 2);
+    assert_eq!(backend.magnet_submissions().len(), 1);
+}
+
+#[tokio::test]
+async fn magnet_metadata_wait_and_mismatched_export_never_expose_selectable_files() {
+    let fixture = Fixture::new();
+    let existing = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[0.0, 0.0], 0.0, 9);
+    let backend = fixture.backend(vec![existing.clone()], None);
+    backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        1,
+    );
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let queued = manager
+        .enqueue_magnet(magnet_upload(&fixture, 302, 402))
+        .expect("admit existing magnet");
+    manager.process_task_once_for_test(&queued.task_id).await;
+    manager.process_task_once_for_test(&queued.task_id).await;
+    let waiting = manager
+        .snapshot(
+            fixture.upload.chat_id,
+            fixture.upload.chat_id,
+            &queued.task_id,
+        )
+        .expect("read metadata waiting state");
+    assert_eq!(waiting.phase, TorrentPhase::DownloadingMetainfo);
+    assert_eq!(backend.export_count(), 1);
+    assert!(
+        waiting.files.is_empty(),
+        "unverified metadata has no file inventory"
+    );
+    assert!(
+        manager
+            .apply_action(
+                fixture.upload.chat_id,
+                fixture.upload.chat_id,
+                waiting.card_message_id.unwrap(),
+                &queued.task_id,
+                waiting.inventory_revision,
+                TorrentAction::SetFile {
+                    index: 0,
+                    selected: true
+                },
+            )
+            .is_err()
+    );
+    assert!(backend.magnet_submissions().is_empty());
+
+    let mismatch_backend = fixture.backend(vec![existing], None);
+    mismatch_backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(alternate_single_file_torrent()),
+        0,
+    );
+    let mismatch_manager = TorrentManager::open(
+        TorrentSettings {
+            state_dir: fixture.state_dir.join("mismatched-export"),
+            ..fixture.settings()
+        },
+        mismatch_backend.clone(),
+    )
+    .expect("open mismatch manager");
+    let mismatch = mismatch_manager
+        .enqueue_magnet(magnet_upload(&fixture, 303, 403))
+        .expect("admit another magnet task");
+    mismatch_manager
+        .process_task_once_for_test(&mismatch.task_id)
+        .await;
+    mismatch_manager
+        .process_task_once_for_test(&mismatch.task_id)
+        .await;
+    let rejected = mismatch_manager
+        .snapshot(
+            fixture.upload.chat_id,
+            fixture.upload.chat_id,
+            &mismatch.task_id,
+        )
+        .expect("read rejected mismatch task");
+    assert_eq!(rejected.phase, TorrentPhase::Invalid);
+    assert_eq!(mismatch_backend.export_count(), 1);
+    assert!(rejected.files.is_empty());
+    assert!(mismatch_backend.magnet_submissions().is_empty());
+}
+
+#[tokio::test]
+async fn same_magnet_hash_from_different_messages_is_associated_as_two_origins() {
+    let fixture = Fixture::new();
+    let existing = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    let backend = fixture.backend(vec![existing], None);
+    backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        0,
+    );
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let first = manager
+        .enqueue_magnet(magnet_upload(&fixture, 304, 404))
+        .expect("admit first origin");
+    let second = manager
+        .enqueue_magnet(magnet_upload(&fixture, 305, 405))
+        .expect("admit second message origin");
+    assert_ne!(first.task_id, second.task_id);
+    assert!(first.created && second.created);
+
+    for task_id in [&first.task_id, &second.task_id] {
+        manager.process_task_once_for_test(task_id).await;
+        manager.process_task_once_for_test(task_id).await;
+    }
+    let listed = manager
+        .list(fixture.upload.chat_id)
+        .expect("list both origins");
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed
+            .iter()
+            .all(|task| task.phase == TorrentPhase::Completed)
+    );
+    assert!(backend.magnet_submissions().is_empty());
 }
 
 #[tokio::test]
@@ -485,6 +742,161 @@ async fn owner_and_selection_revisions_protect_import_confirmation() {
             .is_ok(),
         "Refresh can recover a card with a stale inventory revision"
     );
+}
+
+#[tokio::test]
+async fn review_selection_paginates_and_resets_on_selection_or_browse_changes() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend).expect("open manager");
+    let task_id = parse_task(&manager, fixture.upload.clone()).await;
+    let metainfo = TorrentMetainfo {
+        identity: fixture.metainfo.identity.clone(),
+        raw_sha256: fixture.metainfo.raw_sha256.clone(),
+        name: fixture.metainfo.name.clone(),
+        files: (0..9)
+            .map(|index| MetainfoFile {
+                index,
+                relative_path: PathBuf::from("album").join(format!("track-{index:02}.mp3")),
+                size: 1,
+                is_padding: false,
+            })
+            .collect(),
+        total_size: 9,
+        private: false,
+    };
+    manager
+        .store
+        .transact(|state| {
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| anyhow!("torrent test task disappeared"))?;
+            task.metainfo = Some(metainfo.clone());
+            Ok(((), true))
+        })
+        .expect("seed the review inventory");
+    manager
+        .attach_remote(
+            &task_id,
+            remote_snapshot(&metainfo, &fixture.source_root, &[1.0; 9], 1.0, 0),
+        )
+        .expect("attach the completed review inventory");
+
+    let mut snapshot = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, &task_id)
+        .unwrap();
+    for index in 0..9 {
+        snapshot = manager
+            .apply_action(
+                fixture.upload.chat_id,
+                fixture.upload.user_id,
+                snapshot.card_message_id.unwrap(),
+                &task_id,
+                snapshot.inventory_revision,
+                TorrentAction::SetFile {
+                    index,
+                    selected: true,
+                },
+            )
+            .expect("select a reviewable audio file");
+    }
+    snapshot = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.unwrap(),
+            &task_id,
+            snapshot.selection_revision,
+            TorrentAction::ReviewSelection { page: 2 },
+        )
+        .expect("open the third review page");
+    assert!(snapshot.review_selection);
+    assert_eq!(snapshot.cursor_page, 2);
+    assert!(
+        manager
+            .apply_action(
+                fixture.upload.chat_id,
+                fixture.upload.user_id,
+                snapshot.card_message_id.unwrap(),
+                &task_id,
+                snapshot.selection_revision,
+                TorrentAction::ReviewSelection { page: 3 },
+            )
+            .is_err(),
+        "pages beyond the selected-file inventory are rejected"
+    );
+
+    let selection_revision = snapshot.selection_revision;
+    manager
+        .attach_remote(
+            &task_id,
+            remote_snapshot(&metainfo, &fixture.source_root, &[0.9; 9], 0.9, 1),
+        )
+        .expect("progress-only refresh preserves the inventory");
+    snapshot = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, &task_id)
+        .unwrap();
+    assert!(snapshot.review_selection);
+    assert_eq!(snapshot.cursor_page, 2);
+    assert_eq!(snapshot.selection_revision, selection_revision);
+
+    snapshot = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.unwrap(),
+            &task_id,
+            snapshot.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: false,
+            },
+        )
+        .expect("changing the selected set returns to its first page");
+    assert!(!snapshot.review_selection);
+    assert_eq!(snapshot.cursor_page, 0);
+    assert_eq!(snapshot.selected_count, 8);
+
+    snapshot = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.unwrap(),
+            &task_id,
+            snapshot.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: true,
+            },
+        )
+        .expect("restore the original selection");
+    snapshot = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.unwrap(),
+            &task_id,
+            snapshot.selection_revision,
+            TorrentAction::ReviewSelection { page: 2 },
+        )
+        .expect("reopen the third review page");
+    snapshot = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.unwrap(),
+            &task_id,
+            snapshot.inventory_revision,
+            TorrentAction::Browse {
+                folder_id: 0,
+                page: 0,
+            },
+        )
+        .expect("return to normal file browsing");
+    assert!(!snapshot.review_selection);
+    assert_eq!(snapshot.cursor_folder_id, 0);
+    assert_eq!(snapshot.cursor_page, 0);
 }
 
 #[tokio::test]

@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
 use flate2::Compression;
+#[cfg(test)]
 use flate2::write::ZlibEncoder;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::io::Write;
 use tracing::info;
 
@@ -20,7 +23,9 @@ pub struct TelegramClient {
     token: String,
 }
 
+#[cfg(test)]
 pub const MAX_WIDGET_HTML_BYTES: usize = 32_768;
+#[cfg(test)]
 pub const MAX_WIDGET_COMPRESSED_HTML_BYTES: usize = 4_096;
 pub const MAX_WIDGET_DATA_BYTES: usize = 1_024;
 pub const MAX_SMALL_TELEGRAM_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -180,6 +185,7 @@ struct AnswerCallbackQueryRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct SendWidgetRequest<'a> {
     chat_id: i64,
     html: &'a str,
@@ -189,6 +195,7 @@ struct SendWidgetRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct EditMessageWidgetDataRequest<'a> {
     chat_id: i64,
     message_id: i64,
@@ -196,6 +203,7 @@ struct EditMessageWidgetDataRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 struct EditMessageCaptionRequest<'a> {
     chat_id: i64,
     message_id: i64,
@@ -305,6 +313,7 @@ impl TelegramClient {
     ///
     /// Telegram fixes widget HTML when the message is created, so both documented
     /// UTF-8 and zlib level-9 limits are checked before any request is sent.
+    #[cfg(test)]
     pub async fn send_widget(
         &self,
         chat_id: i64,
@@ -349,6 +358,7 @@ impl TelegramClient {
     }
 
     /// Replaces the chat-local state of an existing static widget message.
+    #[cfg(test)]
     pub async fn edit_widget_data(
         &self,
         chat_id: i64,
@@ -381,6 +391,7 @@ impl TelegramClient {
     }
 
     /// Keeps unsupported-client and transcript captions current alongside widget state.
+    #[cfg(test)]
     pub async fn edit_widget_caption(
         &self,
         chat_id: i64,
@@ -788,6 +799,7 @@ fn telegram_edit_result_for_method<T>(
     telegram_optional_result(response, method)
 }
 
+#[cfg(test)]
 fn validate_widget_html(html: &str) -> Result<()> {
     let byte_len = html.len();
     if byte_len == 0 || byte_len > MAX_WIDGET_HTML_BYTES {

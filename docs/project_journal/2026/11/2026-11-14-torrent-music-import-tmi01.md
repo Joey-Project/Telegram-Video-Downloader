@@ -14,13 +14,12 @@ superseded_by: ""
 
 ## Agreed scope
 
-- Accept uploaded `.torrent` documents and submit them to the existing local
+- Accept uploaded `.torrent` documents and magnet links and submit them to the existing local
   qBittorrent service. Download every file; Music import is a separate explicit
   selection, not a download-priority selector.
 - Let the user browse supported audio by folder and select individual files or
-  an album/folder for Music import. Prefer Telegram's new message-embedded HTML
-  Widgets after checking current official capabilities; a separate Mini App is
-  not a prerequisite.
+  an album/folder for Music import. Use native Telegram inline buttons with
+  pagination and explicit review/confirmation; a separate Mini App is not required.
 - Keep the qBittorrent payload unchanged and available for seeding. Snapshot
   selected completed files into private Music staging before using the existing
   lossless conversion, original-audio archive, Music-copy verification, cloud
@@ -33,14 +32,14 @@ superseded_by: ""
 ## Implementation boundaries
 
 - Mac owns qBittorrent access and file bytes. Cloud ingress carries only Telegram
-  metadata and authorized widget queries, using the existing durable inbox.
+  metadata and authorized callback queries, using the existing durable inbox.
 - Use only supported audio formats already admitted by Music. Never import
   incomplete files, follow an untrusted path outside the selected torrent root,
   or remove/move qBittorrent payloads as Music cache cleanup.
-- Widget controls must validate the actual Telegram user/chat/message, bind
-  selections to a fresh file inventory, answer within the Bot API deadline and
-  enforce documented HTML/state/query byte budgets with pagination.
-- Keep idle Cloud traffic low; widget interactions wake the Mac through the
+- Card controls must validate the actual Telegram user/chat/message, bind
+  selections to a fresh file inventory, answer callbacks promptly and enforce
+  Telegram text/callback byte limits with pagination.
+- Keep idle Cloud traffic low; button interactions wake the Mac through the
   existing ingress path, and status edits go directly to the Telegram Bot API.
 - Ordinary validation uses mock Telegram/qBittorrent/Music and synthetic files.
   Production deployment and real Music imports remain separate controlled steps.
@@ -55,17 +54,22 @@ superseded_by: ""
   remains in place. Local Music jobs use the existing archive, conversion,
   deduplication, import verification and cleanup pipeline without per-track
   Telegram messages.
-- Added the private Telegram Widget card and query handling, including authorized
-  Cloud Worker ingress, bounded state and queries, stale-card rejection and
-  direct card edits from the Mac.
+- Added the private native Telegram card with paginated file/folder selection,
+  review pages, stale-card rejection and direct edits from the Mac. Telegram's
+  ordinary-bot Widget restriction was confirmed by a minimal live API probe, so
+  no production UI depends on Widget availability.
+- Magnet submission persists a single add intent and a scoped save path before
+  the mutating request. Reconciliation/export validates metadata before selection;
+  old local qBittorrent installations can explicitly enable a read-only BT_backup
+  fallback. Matching existing tasks stay in place and retain their priorities.
 - Bounded filesystem work outside the message receiver, paginated before card
   aggregation, and covered 5,000-file selection without rebuilding full snapshots
   per file. Replayed confirmations and cleared pending selections derive their
   phase from the persisted import ledger.
-- Documented setup, webhook/Worker release ordering, fixed signed Mac release,
+- Documented setup, existing message/callback ingress, fixed signed Mac release,
   source preservation and recovery limits in `docs/torrent-music-import.md`.
 
-## Validation evidence
+## Initial implementation validation
 
 - The full mocked Telegram-to-qBittorrent-to-Music E2E passed, covering selected
   completed files, private snapshots, original payload retention, status message
@@ -79,6 +83,32 @@ superseded_by: ""
   added and no system Music library was changed.
 - A read-only qBittorrent 4.3.9 / Web API 2.8.2 schema check confirmed the required
   torrent and file fields. It did not change a task or service setting.
+
+## Native buttons and magnet acceptance
+
+- The final torrent-focused suite passed 45 tests, including both mocked
+  Telegram-to-qBittorrent-to-Music E2Es. qBittorrent's 10 parser/HTTP regressions
+  passed, including unknown metadata sizes and absent/null/empty optional paths.
+  Strict workspace/all-targets Clippy and formatting passed.
+- A broader bot run passed 1,568 tests with 17 existing ignores. Its four failures
+  were resolved: the test converter artifact was built and both FLAC/WAV tests
+  passed; corrected native-card mock IDs and optional-path parsing made both
+  torrent E2Es pass on focused reruns. A single final full-suite rerun was not
+  performed.
+- Real acceptance used the independent Telegram bot/user and existing local
+  qBittorrent 4.3.9. The private sample completed all nine files and remained
+  available for seeding. Its original metainfo bytes were preserved exactly.
+- The public magnet was submitted without importing its matching `.torrent`.
+  qBittorrent first exposed no metadata, then discovered all 48 files and began
+  downloading. All file names/sizes matched the supplied torrent; no file was
+  skipped. Both actual tasks and their payloads were retained without pausing or
+  deleting them.
+- Sixteen real callback operations exercised cross-page selection, folder
+  selection, paginated review and clearing. Restart preserved the selection and
+  original card generation. Test selections were cleared without sending a Music
+  import confirmation; real Music import was not repeated during this acceptance.
+- Only the fixed signed test executable was updated. Production deployment was
+  left unchanged; normal build and validation commands do not deploy the bot.
 
 ## Official interface references
 

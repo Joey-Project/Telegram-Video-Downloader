@@ -10,7 +10,7 @@ use crate::telegram::{
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WidgetQuery,
 };
 use crate::torrent_runtime::{card_presentation, phase_label};
-use crate::torrent_types::{TorrentAction, TorrentUpload};
+use crate::torrent_types::{TorrentAction, TorrentMagnet, TorrentUpload};
 use crate::torrent_widget::{TorrentWidgetAction, parse_widget_request};
 use crate::{BotContext, answer_callback_or_log, human_bytes, send_or_log};
 
@@ -146,6 +146,66 @@ pub(crate) async fn admit_document(
     Ok(true)
 }
 
+fn magnet_input(text: &str) -> Option<&str> {
+    let text = text.trim();
+    if text
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+    {
+        return Some(text);
+    }
+    let command = text.split_whitespace().next()?;
+    if command.split('@').next() == Some("/magnet") {
+        return Some(text[command.len()..].trim());
+    }
+    None
+}
+
+pub(crate) async fn admit_magnet_text(
+    context: &BotContext,
+    update_id: i64,
+    message_id: i64,
+    user_id: Option<i64>,
+    chat_id: i64,
+    private: bool,
+    text: &str,
+) -> Result<bool> {
+    let Some(uri) = magnet_input(text) else {
+        return Ok(false);
+    };
+    if !is_owner(context, chat_id, user_id, private) {
+        return Ok(true);
+    }
+    let parsed = match crate::torrent_magnet::parse_magnet_uri(uri) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            send_or_log(&context.telegram, chat_id,
+                "Invalid magnet link. Send one magnet URI with a valid BTIH or BTMH hash, or use /magnet LINK.".into()).await;
+            return Ok(true);
+        }
+    };
+    let Some(service) = &context.torrent else {
+        send_or_log(
+            &context.telegram,
+            chat_id,
+            "Torrent downloads are disabled on this bot.".into(),
+        )
+        .await;
+        return Ok(true);
+    };
+    service
+        .enqueue_magnet(TorrentMagnet {
+            update_id,
+            chat_id,
+            message_id,
+            user_id: chat_id,
+            uri: parsed.normalized_uri,
+        })
+        .await
+        .context(TorrentAdmissionFailure)?;
+    Ok(true)
+}
+
 pub(crate) async fn handle_widget(context: BotContext, query: WidgetQuery) {
     let result = handle_widget_inner(&context, &query).await;
     let answer = match result {
@@ -202,6 +262,7 @@ async fn handle_widget_inner(context: &BotContext, query: &WidgetQuery) -> Resul
             selected,
         },
         TorrentWidgetAction::ClearSelection => TorrentAction::ClearSelection,
+        TorrentWidgetAction::ReviewSelection { page } => TorrentAction::ReviewSelection { page },
         TorrentWidgetAction::ImportSelected => TorrentAction::ImportSelected,
         TorrentWidgetAction::RetryImports => TorrentAction::RetryImports,
     };
@@ -288,6 +349,20 @@ pub(crate) async fn handle_command(
 }
 
 pub(crate) async fn handle_callback(context: &BotContext, query: &CallbackQuery) -> bool {
+    if query
+        .data
+        .as_deref()
+        .is_some_and(|data| data.starts_with("t1:"))
+    {
+        let result = handle_selection_callback(context, query).await;
+        let response = if result.is_ok() {
+            "Selection updated."
+        } else {
+            "This choice could not be confirmed. Refresh the current card or open /torrents."
+        };
+        answer_callback_or_log(&context.telegram, query.id.clone(), response.into()).await;
+        return true;
+    }
     let Some(task_id) = query
         .data
         .as_deref()
@@ -322,6 +397,62 @@ pub(crate) async fn handle_callback(context: &BotContext, query: &CallbackQuery)
     true
 }
 
+async fn handle_selection_callback(context: &BotContext, query: &CallbackQuery) -> Result<()> {
+    let message = query
+        .message
+        .as_ref()
+        .context("torrent card message is missing")?;
+    let user = query.from.as_ref().context("torrent sender is missing")?;
+    if !is_owner(
+        context,
+        message.chat.id,
+        Some(user.id),
+        message.chat.is_private(),
+    ) {
+        bail!("torrent callback owner is invalid");
+    }
+    let request = parse_widget_request(query.data.as_deref().unwrap_or_default())?;
+    let action = match request.action {
+        TorrentWidgetAction::Refresh => TorrentAction::Refresh,
+        TorrentWidgetAction::Browse { folder_id, page } => {
+            TorrentAction::Browse { folder_id, page }
+        }
+        TorrentWidgetAction::SetFile { index, selected } => {
+            TorrentAction::SetFile { index, selected }
+        }
+        TorrentWidgetAction::SetFolder {
+            folder_id,
+            selected,
+        } => TorrentAction::SetFolder {
+            folder_id,
+            selected,
+        },
+        TorrentWidgetAction::ClearSelection => TorrentAction::ClearSelection,
+        TorrentWidgetAction::ReviewSelection { page } => TorrentAction::ReviewSelection { page },
+        TorrentWidgetAction::ImportSelected => TorrentAction::ImportSelected,
+        TorrentWidgetAction::RetryImports => TorrentAction::RetryImports,
+    };
+    let service = context
+        .torrent
+        .as_ref()
+        .context("torrent downloads are disabled")?;
+    // The durable action owns its bounded filesystem permit even if this UI answer expires.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.apply_action(
+            message.chat.id,
+            user.id,
+            message.message_id,
+            request.task_id,
+            request.expected_revision,
+            action,
+        ),
+    )
+    .await
+    .context("torrent action is still being saved")??;
+    Ok(())
+}
+
 fn valid_task_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -332,6 +463,17 @@ fn valid_task_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnet_text_entry_accepts_direct_or_command_without_stealing_other_messages() {
+        let uri = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(magnet_input(uri), Some(uri));
+        assert_eq!(magnet_input(&format!(" /magnet {uri} ")), Some(uri));
+        assert_eq!(magnet_input(&format!("/magnet@test_bot {uri}")), Some(uri));
+        assert_eq!(magnet_input("/magnet"), Some(""));
+        assert_eq!(magnet_input("https://example.com/video"), None);
+        assert_eq!(magnet_input("/torrents"), None);
+    }
 
     fn document(name: Option<&str>, mime: Option<&str>, size: Option<u64>) -> Message {
         serde_json::from_value(serde_json::json!({

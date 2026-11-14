@@ -1,11 +1,20 @@
 # Torrent downloads and selected Music imports
 
-Send a `.torrent` document to the bot in its authorized private chat. qBittorrent
+Send a `.torrent` document or a magnet URI (also `/magnet LINK`) to the bot in its authorized private chat. qBittorrent
 downloads the entire torrent using its existing save location and category
 settings. Music selection is a separate, optional action: the task card shows
 download progress and supports folder navigation, file selection and explicit
 Music import. A torrent without supported audio remains an ordinary qBittorrent
 download.
+
+New magnet tasks use `<qBittorrent default save path>/Telegram Downloads/<task ID>`
+until their metadata can be validated. The bot removes magnet `so` download-selection
+parameters so every file downloads. Metadata is exported from qBittorrent and checked
+against the magnet identity before any Music selection becomes available. A matching
+existing task is associated in place without changing its path or file priorities.
+After an uncertain add response, the bot reconciles by identity instead of posting
+another add. Private torrents should be supplied as their original `.torrent` files;
+the bot does not convert them to public-discovery magnets.
 
 Use folder selection for an album, or select individual tracks across pages.
 Selections can be confirmed while downloading; each chosen file waits until it
@@ -57,12 +66,19 @@ service settings. The API client supports the documented 4.x/5.x add protocol an
 checks the actual task afterward instead of treating HTTP success as admission.
 Actual v2/hybrid download support depends on the installed qBittorrent/libtorrent
 version; the bot does not upgrade or reconfigure the client.
+Magnet selection uses the metainfo export API available in qBittorrent 4.5 and
+newer. For an older local installation, explicitly configure `torrent.metainfo_dir`
+to its `BT_backup` directory (on macOS usually
+`~/Library/Application Support/qBittorrent/BT_backup`). This fallback reads only the
+hash-named `.torrent`, rejects symbolic links, enforces the metainfo size limit and
+verifies its parsed identity before showing selectable files. It never writes to
+the backup directory or uses an unrelated uploaded torrent to seed metadata.
 Selected-audio imports additionally require the existing `[music]` integration
 to be enabled and authorized; qBittorrent downloads work independently of Music.
 
 Private task records and metainfo default to
 `<video root>/.telegram-video-downloader-torrents`. Metainfo may include private
-tracker credentials and is kept as private control data, not exposed in Widget
+tracker credentials and is kept as private control data, not exposed in Telegram card
 state. This is separate from the qBittorrent payload save path.
 
 The default metainfo limit is 4 MiB and the file inventory limit is 5,000. These
@@ -74,11 +90,15 @@ up to 16 MiB for inventories with unusually long paths.
 
 ## Telegram card and recovery
 
-The native card uses [Telegram Widgets](https://core.telegram.org/bots/widgets),
-available in private bot chats on supported Telegram clients. It needs no separate
-Mini App URL or network access from its HTML. The bot retains the full selection;
-the Widget carries a bounded page and short identifiers, not local filesystem paths.
-Its caption also exposes task status and the `/torrents` recovery command.
+The card uses ordinary Telegram messages and inline keyboard buttons. Four rows per
+page support individual track selection, folder selection, navigation, clearing,
+and a separate paginated review with explicit import confirmation. The Mac retains
+the selection across pages. Buttons carry short task identifiers and revisions;
+neither absolute paths nor tracker URLs are sent. No Mini App is needed.
+
+Telegram currently restricts Widgets for ordinary bots, including private chats.
+The live API returned `INPUT_MEDIA_WIDGET_NOT_ALLOWED`; the restriction is also
+[confirmed by Telegram's maintainer](https://github.com/tdlib/telegram-bot-api/issues/947).
 
 `/torrents` lists retained tasks. Choose a task or use `/torrents TASK_ID` to open a
 new card generation while keeping its download/import state. Ordinary retries and
@@ -95,16 +115,13 @@ no-blind-reimport protection.
 
 ## Cloud ingress and release
 
-Cloud mode requires the matching Worker owner-filter update and a webhook
-subscription that includes `widget_query`. Deploy the matching Worker owner
-filter that accepts authorized widget queries, then add `widget_query` to the
-existing webhook's `allowed_updates` while preserving every other enabled update,
-the webhook URL, secret token and pending updates. Never register a second
+Cloud mode uses the existing authorized `message` and `callback_query` ingress.
+Preserve the existing webhook URL, secret token and pending updates. Never register a second
 polling consumer to test a production webhook. The Worker durably stores the
 original authorized update and the Mac processes it through its local inbox.
 
-Widget queries are answered promptly; qBittorrent requests, source hashing,
-conversion and Music operations run on background workers. Widget refresh is
+Callback queries are answered promptly; qBittorrent requests, source hashing,
+conversion and Music operations run on background workers. Card refresh is
 explicit, and active progress edits go directly from the Mac to the Telegram Bot
 API. This feature adds no idle Mini App polling or repeated D1 state snapshots.
 

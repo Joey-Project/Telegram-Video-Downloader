@@ -47,13 +47,19 @@ struct MockHttpState {
     torrent_bytes: Vec<u8>,
     torrent_hash: String,
     save_path: PathBuf,
+    default_save_path: PathBuf,
     files: Vec<TorrentFileFixture>,
     submitted: AtomicBool,
+    magnet_submission: AtomicBool,
+    metadata_available: AtomicBool,
     complete: AtomicBool,
     qbit_adds: AtomicUsize,
-    send_widgets: AtomicUsize,
-    widget_data_edits: AtomicUsize,
-    caption_edits: AtomicUsize,
+    export_attempts: AtomicUsize,
+    submitted_save_path: Mutex<Option<PathBuf>>,
+    submitted_magnet_uri: Mutex<Option<String>>,
+    card_sends: AtomicUsize,
+    card_edits: AtomicUsize,
+    last_keyboard_callbacks: Mutex<Vec<String>>,
     send_messages: AtomicUsize,
     text_edits: AtomicUsize,
 }
@@ -80,14 +86,20 @@ impl MockHttpServer {
         let state = Arc::new(MockHttpState {
             torrent_bytes,
             torrent_hash,
+            default_save_path: save_path.clone(),
             save_path,
             files,
             submitted: AtomicBool::new(false),
+            magnet_submission: AtomicBool::new(false),
+            metadata_available: AtomicBool::new(true),
             complete: AtomicBool::new(false),
             qbit_adds: AtomicUsize::new(0),
-            send_widgets: AtomicUsize::new(0),
-            widget_data_edits: AtomicUsize::new(0),
-            caption_edits: AtomicUsize::new(0),
+            export_attempts: AtomicUsize::new(0),
+            submitted_save_path: Mutex::new(None),
+            submitted_magnet_uri: Mutex::new(None),
+            card_sends: AtomicUsize::new(0),
+            card_edits: AtomicUsize::new(0),
+            last_keyboard_callbacks: Mutex::new(Vec::new()),
             send_messages: AtomicUsize::new(0),
             text_edits: AtomicUsize::new(0),
         });
@@ -108,6 +120,20 @@ impl MockHttpServer {
             state,
             task,
         }
+    }
+
+    async fn start_magnet(
+        torrent_bytes: Vec<u8>,
+        torrent_hash: String,
+        default_save_path: PathBuf,
+        files: Vec<TorrentFileFixture>,
+    ) -> Self {
+        let server = Self::start(torrent_bytes, torrent_hash, default_save_path, files).await;
+        server
+            .state
+            .metadata_available
+            .store(false, Ordering::Release);
+        server
     }
 
     fn telegram(&self) -> TelegramClient {
@@ -139,9 +165,38 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
     if request.path.starts_with("/api/v2/app/version") {
         return respond(&mut stream, 200, "text/plain", b"v5.0.0").await;
     }
+    if request.path.starts_with("/api/v2/app/defaultSavePath") {
+        let path = state.default_save_path.to_string_lossy().into_owned();
+        return respond(&mut stream, 200, "text/plain", path.as_bytes()).await;
+    }
+    if request.path.starts_with("/api/v2/torrents/export") {
+        state.export_attempts.fetch_add(1, Ordering::Relaxed);
+        if state.metadata_available.load(Ordering::Acquire) {
+            return respond(
+                &mut stream,
+                200,
+                "application/x-bittorrent",
+                &state.torrent_bytes,
+            )
+            .await;
+        }
+        return respond(&mut stream, 404, "text/plain", b"metadata pending").await;
+    }
     if request.path.starts_with("/api/v2/torrents/info") {
         let body = if state.submitted.load(Ordering::Acquire) {
             let complete = state.complete.load(Ordering::Acquire);
+            let magnet = state.magnet_submission.load(Ordering::Acquire);
+            let metadata_available = state.metadata_available.load(Ordering::Acquire);
+            let save_path = if magnet {
+                state
+                    .submitted_save_path
+                    .lock()
+                    .expect("submitted save path should not be poisoned")
+                    .clone()
+                    .unwrap_or_else(|| state.default_save_path.clone())
+            } else {
+                state.save_path.clone()
+            };
             let total_size = state
                 .files
                 .iter()
@@ -149,13 +204,20 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
                 .sum::<u64>();
             serde_json::to_vec(&vec![serde_json::json!({
                 "hash": state.torrent_hash,
+                "info_hash_v1": state.torrent_hash,
                 "name": "Album",
-                "state": if complete { "uploading" } else { "downloading" },
-                "progress": if complete { 1.0 } else { 0.6 },
-                "save_path": state.save_path,
-                "content_path": state.save_path.join("Album"),
-                "total_size": total_size,
-                "amount_left": if complete { 0 } else { 1 },
+                "state": if magnet && !metadata_available {
+                    "metaDL"
+                } else if complete {
+                    "uploading"
+                } else {
+                    "downloading"
+                },
+                "progress": if complete { 1.0 } else if metadata_available { 0.6 } else { 0.0 },
+                "save_path": save_path,
+                "content_path": if metadata_available { Some(save_path.join("Album")) } else { None::<PathBuf> },
+                "total_size": if metadata_available { total_size } else { 0 },
+                "amount_left": if complete { 0 } else if metadata_available { 1 } else { 0 },
             })])
             .expect("qBittorrent response should serialize")
         } else {
@@ -164,6 +226,11 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         return respond(&mut stream, 200, "application/json", &body).await;
     }
     if request.path.starts_with("/api/v2/torrents/files") {
+        if state.magnet_submission.load(Ordering::Acquire)
+            && !state.metadata_available.load(Ordering::Acquire)
+        {
+            return respond(&mut stream, 200, "application/json", b"[]").await;
+        }
         let complete = state.complete.load(Ordering::Acquire);
         let body = serde_json::to_vec(
             &state
@@ -186,16 +253,49 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         return respond(&mut stream, 200, "application/json", &body).await;
     }
     if request.method == "POST" && request.path.starts_with("/api/v2/torrents/add") {
-        assert!(
-            request
-                .headers
-                .to_ascii_lowercase()
-                .contains("content-type: multipart/form-data")
-        );
-        assert!(
-            !request.body.is_empty(),
-            "qBittorrent add should carry torrent bytes"
-        );
+        if request
+            .headers
+            .to_ascii_lowercase()
+            .contains("content-type: multipart/form-data")
+        {
+            assert!(
+                !request.body.is_empty(),
+                "qBittorrent add should carry torrent bytes"
+            );
+        } else {
+            assert!(
+                request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/x-www-form-urlencoded")
+            );
+            let form = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            let uri = form
+                .get("urls")
+                .expect("magnet form should include urls")
+                .clone();
+            let save_path = form
+                .get("savepath")
+                .expect("magnet form should include savepath");
+            assert_eq!(form.get("autoTMM").map(String::as_str), Some("false"));
+            assert_eq!(form.get("stopped").map(String::as_str), Some("false"));
+            let save_path = PathBuf::from(save_path);
+            assert!(
+                save_path.starts_with(&state.default_save_path),
+                "magnet must use the configured qBittorrent default save path"
+            );
+            *state
+                .submitted_magnet_uri
+                .lock()
+                .expect("submitted magnet URI should not be poisoned") = Some(uri);
+            *state
+                .submitted_save_path
+                .lock()
+                .expect("submitted save path should not be poisoned") = Some(save_path);
+            state.magnet_submission.store(true, Ordering::Release);
+        }
         state.qbit_adds.fetch_add(1, Ordering::Relaxed);
         state.submitted.store(true, Ordering::Release);
         return respond(&mut stream, 200, "text/plain", b"Ok.").await;
@@ -224,59 +324,59 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         )
         .await;
     }
-    if request.path.ends_with("/sendWidget") {
-        let generation = state.send_widgets.fetch_add(1, Ordering::Relaxed);
+    if request.path.ends_with("/sendMessage") {
+        let payload: serde_json::Value = serde_json::from_slice(&request.body)
+            .expect("Telegram sendMessage payload should be JSON");
+        let callbacks = keyboard_callbacks(&payload);
+        let generation = if callbacks.is_empty() {
+            state.send_messages.fetch_add(1, Ordering::Relaxed);
+            1
+        } else {
+            state
+                .last_keyboard_callbacks
+                .lock()
+                .expect("last keyboard callbacks should not be poisoned")
+                .clone_from(&callbacks);
+            state.card_sends.fetch_add(1, Ordering::Relaxed)
+        };
+        let message_id = if callbacks.is_empty() {
+            900 + generation as i64
+        } else {
+            mock_card_message_id(generation)
+        };
         let body = serde_json::to_vec(&serde_json::json!({
             "ok": true,
             "result": {
-                "message_id": CARD_MESSAGE_ID + generation as i64,
+                "message_id": message_id,
                 "chat": {"id": CHAT_ID, "type": "private"},
             }
         }))
-        .expect("Telegram widget response should serialize");
+        .expect("Telegram message response should serialize");
         return respond(&mut stream, 200, "application/json", &body).await;
     }
-    if request.path.ends_with("/editMessageWidgetData") {
-        state.widget_data_edits.fetch_add(1, Ordering::Relaxed);
-        return respond(
-            &mut stream,
-            200,
-            "application/json",
-            br#"{"ok":true,"result":true}"#,
-        )
-        .await;
-    }
-    if request.path.ends_with("/editMessageCaption") {
-        state.caption_edits.fetch_add(1, Ordering::Relaxed);
-        return respond(
-            &mut stream,
-            200,
-            "application/json",
-            br#"{"ok":true,"result":true}"#,
-        )
-        .await;
-    }
-    if request.path.ends_with("/answerWidgetQuery") {
-        return respond(
-            &mut stream,
-            200,
-            "application/json",
-            br#"{"ok":true,"result":true}"#,
-        )
-        .await;
-    }
-    if request.path.ends_with("/sendMessage") {
-        state.send_messages.fetch_add(1, Ordering::Relaxed);
-        return respond(
-            &mut stream,
-            200,
-            "application/json",
-            br#"{"ok":true,"result":{"message_id":702,"chat":{"id":123456789,"type":"private"}}}"#,
-        )
-        .await;
-    }
     if request.path.ends_with("/editMessageText") {
-        state.text_edits.fetch_add(1, Ordering::Relaxed);
+        let payload: serde_json::Value = serde_json::from_slice(&request.body)
+            .expect("Telegram editMessageText payload should be JSON");
+        let callbacks = keyboard_callbacks(&payload);
+        if callbacks.is_empty() {
+            state.text_edits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            state
+                .last_keyboard_callbacks
+                .lock()
+                .expect("last keyboard callbacks should not be poisoned")
+                .clone_from(&callbacks);
+            state.card_edits.fetch_add(1, Ordering::Relaxed);
+        }
+        return respond(
+            &mut stream,
+            200,
+            "application/json",
+            br#"{"ok":true,"result":true}"#,
+        )
+        .await;
+    }
+    if request.path.ends_with("/answerCallbackQuery") {
         return respond(
             &mut stream,
             200,
@@ -605,6 +705,7 @@ fn torrent_settings(base_url: String, state_dir: PathBuf) -> TorrentSettings {
         username: None,
         password: None,
         state_dir,
+        metainfo_dir: None,
         max_torrent_bytes: DEFAULT_MAX_TORRENT_BYTES,
         max_files: DEFAULT_MAX_FILES,
         poll_seconds: 1,
@@ -659,7 +760,7 @@ async fn process_update(context: &BotContext, update: serde_json::Value, offset:
         .expect("Telegram update should be processed");
 }
 
-struct WidgetUpdateFixture<'a> {
+struct CallbackUpdateFixture<'a> {
     update_id: i64,
     query_id: &'a str,
     sender_id: i64,
@@ -669,22 +770,23 @@ struct WidgetUpdateFixture<'a> {
     action: &'a str,
 }
 
-async fn process_widget(
+async fn process_callback(
     context: &BotContext,
     offset: &mut Option<i64>,
-    fixture: WidgetUpdateFixture<'_>,
+    fixture: CallbackUpdateFixture<'_>,
 ) {
     process_update(
         context,
         serde_json::json!({
             "update_id": fixture.update_id,
-            "widget_query": {
+            "callback_query": {
                 "id": fixture.query_id,
                 "from": {"id": fixture.sender_id},
-                "chat": {"id": CHAT_ID, "type": "private"},
-                "chat_instance": "private-test",
-                "message_id": fixture.message_id,
-                "type": {"type": "data"},
+                "message": {
+                    "message_id": fixture.message_id,
+                    "chat": {"id": CHAT_ID, "type": "private"},
+                    "text": "torrent selection",
+                },
                 "data": format!(
                     "t1:{}:{:016x}:{}",
                     fixture.task_id, fixture.revision, fixture.action
@@ -694,6 +796,66 @@ async fn process_widget(
         offset,
     )
     .await;
+}
+
+fn keyboard_callbacks(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get("reply_markup")
+        .and_then(|markup| markup.get("inline_keyboard"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(|button| button.get("callback_data"))
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn expected_callback(task_id: &str, revision: u64, action: &str) -> String {
+    format!("t1:{task_id}:{revision:016x}:{action}")
+}
+
+fn mock_card_message_id(generation: usize) -> i64 {
+    CARD_MESSAGE_ID + i64::try_from(generation).expect("mock card generation should fit i64")
+}
+
+#[test]
+fn mock_card_generations_use_distinct_message_ids_starting_at_expected_id() {
+    assert_eq!(mock_card_message_id(0), CARD_MESSAGE_ID);
+    assert_eq!(mock_card_message_id(1), CARD_MESSAGE_ID + 1);
+}
+
+fn folder_id(snapshot: &crate::torrent_types::TorrentSnapshot, relative_path: &str) -> u32 {
+    snapshot
+        .folders
+        .iter()
+        .find(|folder| folder.relative_path == Path::new(relative_path))
+        .map(|folder| folder.id)
+        .unwrap_or_else(|| panic!("torrent folder {relative_path:?} should be present"))
+}
+
+fn keyboard_has_callback(mock: &MockHttpServer, callback: &str) -> bool {
+    mock.state
+        .last_keyboard_callbacks
+        .lock()
+        .expect("last keyboard callbacks should not be poisoned")
+        .iter()
+        .any(|item| item == callback)
+}
+
+async fn wait_for_keyboard_callback(mock: &MockHttpServer, callback: &str, expected: &str) {
+    tokio::time::timeout(MAX_TEST_WAIT, async {
+        loop {
+            if keyboard_has_callback(mock, callback) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("torrent inline keyboard should expose {expected}"));
 }
 
 async fn wait_for_snapshot(
@@ -742,16 +904,27 @@ async fn wait_for_music_cleanup(backend: &FakeMusicBackend) -> String {
 async fn wait_for_card_edits(mock: &MockHttpServer) {
     tokio::time::timeout(MAX_TEST_WAIT, async {
         loop {
-            if mock.state.widget_data_edits.load(Ordering::Acquire) > 0
-                && mock.state.caption_edits.load(Ordering::Acquire) > 0
-            {
+            if mock.state.card_edits.load(Ordering::Acquire) > 0 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("torrent card should edit both compact data and caption after delivery");
+    .expect("torrent inline card should edit its text and keyboard after delivery");
+}
+
+async fn wait_for_export_attempts(mock: &MockHttpServer, expected: usize) {
+    tokio::time::timeout(MAX_TEST_WAIT, async {
+        loop {
+            if mock.state.export_attempts.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("magnet metainfo export should reach {expected} attempts"));
 }
 
 async fn wait_until_reopenable_music(
@@ -989,19 +1162,18 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
     assert!(initial.files[1].supported_music);
     assert!(!initial.files[2].supported_music);
     assert_eq!(mock.state.qbit_adds.load(Ordering::Relaxed), 1);
-    assert_eq!(mock.state.send_widgets.load(Ordering::Relaxed), 1);
-    assert!(mock.state.widget_data_edits.load(Ordering::Relaxed) > 0);
-    assert!(mock.state.caption_edits.load(Ordering::Relaxed) > 0);
+    assert_eq!(mock.state.card_sends.load(Ordering::Relaxed), 1);
+    assert!(mock.state.card_edits.load(Ordering::Relaxed) > 0);
 
     let task_id = initial.task_id.clone();
     let inventory_revision = initial.inventory_revision;
     let selection_revision = initial.selection_revision;
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
+        CallbackUpdateFixture {
             update_id: 5002,
-            query_id: "foreign-widget-query",
+            query_id: "foreign-selection-callback",
             sender_id: CHAT_ID + 1,
             message_id: CARD_MESSAGE_ID,
             task_id: &task_id,
@@ -1010,10 +1182,10 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         },
     )
     .await;
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
+        CallbackUpdateFixture {
             update_id: 5003,
             query_id: "stale-card-query",
             sender_id: CHAT_ID,
@@ -1025,27 +1197,63 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
     )
     .await;
 
-    process_widget(
+    let album_folder_id = folder_id(&initial, "Album");
+    let browse_action = format!("b:{album_folder_id}:0");
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, inventory_revision, &browse_action),
+        "the Album folder button",
+    )
+    .await;
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
+        CallbackUpdateFixture {
             update_id: 5004,
-            query_id: "select-one-supported-file",
+            query_id: "open-album-folder",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
             task_id: &task_id,
             revision: inventory_revision,
-            action: "f:0:1",
+            action: &browse_action,
         },
     )
     .await;
-    let selected = torrent
-        .list(CHAT_ID)
-        .await
-        .expect("task should remain readable")
-        .into_iter()
-        .find(|snapshot| snapshot.task_id == task_id)
-        .expect("selected torrent task should remain present");
+    let browsed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.cursor_folder_id == album_folder_id,
+        "opened Album folder in the native card",
+    )
+    .await;
+    let select_action = "f:0:1";
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, browsed.inventory_revision, select_action),
+        "the supported file selection button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 5005,
+            query_id: "select-one-supported-file",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: browsed.inventory_revision,
+            action: select_action,
+        },
+    )
+    .await;
+    let selected = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.files[0].selected,
+        "selected torrent file",
+    )
+    .await;
     assert_eq!(
         selected
             .files
@@ -1056,12 +1264,18 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         vec![0]
     );
     assert!(selected.selection_revision > selection_revision);
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, selected.selection_revision, "v:0"),
+        "the Review selection button",
+    )
+    .await;
 
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
-            update_id: 5005,
+        CallbackUpdateFixture {
+            update_id: 5006,
             query_id: "stale-selection-revision",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
@@ -1071,11 +1285,11 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         },
     )
     .await;
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
-            update_id: 5006,
+        CallbackUpdateFixture {
+            update_id: 5007,
             query_id: "unsupported-file-selection",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
@@ -1085,16 +1299,43 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         },
     )
     .await;
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
-            update_id: 5007,
-            query_id: "confirm-selected-incomplete-file",
+        CallbackUpdateFixture {
+            update_id: 5008,
+            query_id: "review-selected-files",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
             task_id: &task_id,
             revision: selected.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let reviewed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "selection review page",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, reviewed.selection_revision, "i"),
+        "the review confirmation button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 5009,
+            query_id: "confirm-selected-incomplete-file",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: reviewed.selection_revision,
             action: "i",
         },
     )
@@ -1131,17 +1372,48 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
     );
     drop(manager);
 
-    mock.state.complete.store(true, Ordering::Release);
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
-            update_id: 5008,
+        CallbackUpdateFixture {
+            update_id: 5010,
+            query_id: "back-to-torrent-files",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: waiting.inventory_revision,
+            action: "b:0:0",
+        },
+    )
+    .await;
+    let browser = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && !snapshot.review_selection
+                && snapshot.cursor_folder_id == 0
+        },
+        "returned to the torrent file browser",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, browser.inventory_revision, "r"),
+        "the torrent refresh button",
+    )
+    .await;
+    mock.state.complete.store(true, Ordering::Release);
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 5011,
             query_id: "refresh-completed-selected-file",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
             task_id: &task_id,
-            revision: selected.inventory_revision,
+            revision: browser.inventory_revision,
             action: "r",
         },
     )
@@ -1222,16 +1494,43 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
     );
 
     process_update(&context, upload_update, &mut offset).await;
-    process_widget(
+    process_callback(
         &context,
         &mut offset,
-        WidgetUpdateFixture {
-            update_id: 5009,
+        CallbackUpdateFixture {
+            update_id: 5013,
             query_id: "replay-import-confirmation",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
             task_id: &task_id,
             revision: imported.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let replay_review = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "reopened import review before replay confirmation",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, replay_review.selection_revision, "i"),
+        "the replay confirmation button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 5014,
+            query_id: "replay-import-confirmation-final",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: replay_review.selection_revision,
             action: "i",
         },
     )
@@ -1368,11 +1667,11 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         "reopened card generation after restart",
     )
     .await;
-    process_widget(
+    process_callback(
         &restarted_context,
         &mut restarted_offset,
-        WidgetUpdateFixture {
-            update_id: 5012,
+        CallbackUpdateFixture {
+            update_id: 5015,
             query_id: "callback-from-old-card-generation",
             sender_id: CHAT_ID,
             message_id: CARD_MESSAGE_ID,
@@ -1382,18 +1681,47 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         },
     )
     .await;
-    process_widget(
+    process_callback(
         &restarted_context,
         &mut restarted_offset,
-        WidgetUpdateFixture {
-            update_id: 5013,
-            query_id: "restart-import-confirmation",
+        CallbackUpdateFixture {
+            update_id: 5016,
+            query_id: "restart-import-review",
             sender_id: CHAT_ID,
             message_id: reopened_card
                 .card_message_id
                 .expect("reopened card should have a message ID"),
             task_id: &task_id,
             revision: reopened_card.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let restarted_review = wait_for_snapshot(
+        &restarted_torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "restarted import review page",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, restarted_review.selection_revision, "i"),
+        "the restarted review confirmation button",
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 5017,
+            query_id: "restart-import-confirmation",
+            sender_id: CHAT_ID,
+            message_id: reopened_card
+                .card_message_id
+                .expect("reopened card should have a message ID"),
+            task_id: &task_id,
+            revision: restarted_review.selection_revision,
             action: "i",
         },
     )
@@ -1414,6 +1742,643 @@ async fn telegram_torrent_selection_snapshots_and_imports_only_the_confirmed_com
         assert_eq!((metadata.dev(), metadata.ino()), (*device, *inode));
         assert_eq!(
             fs::read(source).expect("source bytes should survive restart"),
+            *original_bytes
+        );
+    }
+
+    let _ = torrent_shutdown_tx.send(true);
+    let _ = music_shutdown_tx.send(true);
+    drop(restarted_context);
+    drop(restarted_torrent);
+    drop(restarted_music);
+    wait_until_reopenable_music(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+    )
+    .await;
+    wait_until_reopenable_torrent(torrent_settings).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn telegram_magnet_waits_for_metadata_then_imports_selected_file_once_across_restart() {
+    let root = unique_test_root();
+    fs::create_dir_all(&root).expect("test root should be created");
+    let default_save_path = root.join("qbit-default");
+    fs::create_dir_all(&default_save_path).expect("qBittorrent default path should exist");
+
+    let fixtures = vec![
+        TorrentFileFixture {
+            path: "Album/selected.m4a".into(),
+            bytes: b"synthetic magnet selected M4A bytes".to_vec(),
+        },
+        TorrentFileFixture {
+            path: "Album/not-selected.mp3".into(),
+            bytes: b"synthetic magnet non-selected MP3 bytes".to_vec(),
+        },
+        TorrentFileFixture {
+            path: "Album/unsupported.mp4".into(),
+            bytes: b"synthetic magnet video bytes".to_vec(),
+        },
+    ];
+    let (torrent_bytes, torrent_hash) = make_torrent(&fixtures);
+    let magnet_uri = format!("magnet:?xt=urn:btih:{torrent_hash}&dn=Album");
+    let mock = MockHttpServer::start_magnet(
+        torrent_bytes,
+        torrent_hash.clone(),
+        default_save_path.clone(),
+        fixtures.clone(),
+    )
+    .await;
+    let telegram = mock.telegram();
+    let music_settings = private_music_settings(&root);
+    let sentinel = music_settings
+        .staging_dir
+        .join("keep-existing-staging-data");
+    fs::write(&sentinel, b"unrelated Music staging data").expect("staging sentinel should exist");
+    let backend = FakeMusicBackend::new(
+        music_settings.archive_dir.clone(),
+        music_settings.staging_dir.clone(),
+        root.join("fake-music-library"),
+    );
+    let backend_dyn: Arc<dyn MusicBackend> = Arc::new(backend.clone());
+
+    let (music_shutdown_tx, music_shutdown_rx) = watch::channel(false);
+    let music = MusicService::with_backend(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+        music_shutdown_rx,
+    );
+    music.start();
+
+    let torrent_settings = torrent_settings(mock.base_url.clone(), root.join("qbit-state"));
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = watch::channel(false);
+    let torrent = TorrentService::new(
+        torrent_settings.clone(),
+        telegram.clone(),
+        Some(Arc::clone(&music)),
+        music_settings.max_file_bytes,
+        torrent_shutdown_rx,
+    )
+    .expect("torrent service should use the loopback qBittorrent client");
+    torrent.start();
+
+    let mut config = AppConfig::for_test();
+    config.telegram.allowed_chat_ids = vec![CHAT_ID];
+    config.downloads.video_dir = root.join("video-queue");
+    config.downloads.pdf_dir = root.join("pdf-queue");
+    fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should exist");
+    fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should exist");
+    let context = build_context(telegram.clone(), config, Arc::clone(&torrent));
+    let mut offset = None;
+    let magnet_update = serde_json::json!({
+        "update_id": 7001,
+        "message": {
+            "message_id": 810,
+            "chat": {"id": CHAT_ID, "type": "private"},
+            "from": {"id": CHAT_ID},
+            "text": magnet_uri,
+        }
+    });
+    process_update(&context, magnet_update.clone(), &mut offset).await;
+
+    let pending = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.card_message_id == Some(CARD_MESSAGE_ID)
+                && snapshot.phase == TorrentPhase::DownloadingMetainfo
+        },
+        "magnet task waiting for exported metainfo",
+    )
+    .await;
+    wait_for_export_attempts(&mock, 2).await;
+    assert!(pending.files.is_empty());
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.card_sends.load(Ordering::Acquire), 1);
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 0);
+    assert!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should not be poisoned")
+            .is_empty(),
+        "a magnet with pending metadata must not reach Music preparation"
+    );
+
+    let task_id = pending.task_id.clone();
+    let submitted_save_path = mock
+        .state
+        .submitted_save_path
+        .lock()
+        .expect("submitted save path should not be poisoned")
+        .clone()
+        .expect("magnet request should include a scoped save path");
+    assert_eq!(
+        submitted_save_path,
+        default_save_path.join("Telegram Downloads").join(&task_id),
+        "untrusted magnet content must be isolated below the task-specific download directory"
+    );
+    let posted_uri = mock
+        .state
+        .submitted_magnet_uri
+        .lock()
+        .expect("submitted magnet URI should not be poisoned")
+        .clone()
+        .expect("qBittorrent should receive the normalized magnet URI");
+    assert!(posted_uri.contains(&torrent_hash));
+    assert!(!posted_uri.to_ascii_lowercase().contains("so="));
+
+    process_update(&context, magnet_update.clone(), &mut offset).await;
+    assert_eq!(
+        mock.state.qbit_adds.load(Ordering::Acquire),
+        1,
+        "replaying the same Telegram update must not repeat the qBittorrent add"
+    );
+    assert!(
+        mock.state.export_attempts.load(Ordering::Acquire) >= 2,
+        "pending metadata should retry export without submitting the magnet again"
+    );
+
+    let source_root = submitted_save_path.join("Album");
+    fs::create_dir_all(&source_root).expect("magnet content root should exist");
+    let mut source_identities = Vec::new();
+    for file in &fixtures {
+        let source = submitted_save_path.join(&file.path);
+        fs::create_dir_all(source.parent().expect("fixture should have a parent"))
+            .expect("torrent fixture parent should exist");
+        fs::write(&source, &file.bytes).expect("qBittorrent magnet fixture should be written");
+        let metadata = fs::metadata(&source).expect("source identity should be readable");
+        source_identities.push((metadata.dev(), metadata.ino(), file.bytes.clone()));
+    }
+    mock.state.metadata_available.store(true, Ordering::Release);
+
+    let initial = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && snapshot.card_message_id == Some(CARD_MESSAGE_ID)
+                && snapshot.phase == TorrentPhase::Downloading
+                && snapshot.state.is_some()
+                && snapshot.files.len() == fixtures.len()
+        },
+        "exported magnet metainfo and selected file inventory",
+    )
+    .await;
+    wait_for_card_edits(&mock).await;
+    assert!(initial.files[0].supported_music);
+    assert!(initial.files[1].supported_music);
+    assert!(!initial.files[2].supported_music);
+    assert!(!initial.files[0].complete);
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.card_sends.load(Ordering::Acquire), 1);
+
+    let album_folder_id = folder_id(&initial, "Album");
+    let browse_action = format!("b:{album_folder_id}:0");
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, initial.inventory_revision, &browse_action),
+        "the magnet Album folder button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7002,
+            query_id: "open-magnet-album-folder",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: initial.inventory_revision,
+            action: &browse_action,
+        },
+    )
+    .await;
+    let browsed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.cursor_folder_id == album_folder_id,
+        "opened magnet Album folder in the native card",
+    )
+    .await;
+    let select_action = "f:0:1";
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, browsed.inventory_revision, select_action),
+        "the supported magnet file selection button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7003,
+            query_id: "select-only-one-magnet-file",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: browsed.inventory_revision,
+            action: select_action,
+        },
+    )
+    .await;
+    let selected = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.files[0].selected,
+        "selected supported magnet file",
+    )
+    .await;
+    assert_eq!(
+        selected
+            .files
+            .iter()
+            .filter(|file| file.selected)
+            .map(|file| file.index)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, selected.selection_revision, "v:0"),
+        "the magnet Review selection button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7004,
+            query_id: "review-selected-magnet-file",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: selected.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let reviewed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "magnet file review page",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, reviewed.selection_revision, "i"),
+        "the magnet review confirmation button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7005,
+            query_id: "confirm-incomplete-magnet-file",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: reviewed.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    let manager = torrent
+        .manager()
+        .await
+        .expect("torrent manager should remain open while magnet data is incomplete");
+    manager.process_task_once_for_test(&task_id).await;
+    let waiting = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && snapshot.files[0].music_stage
+                    == Some(crate::torrent_types::TorrentMusicStage::Pending)
+        },
+        "confirmed magnet import waiting for qBittorrent completion",
+    )
+    .await;
+    assert!(!waiting.files[0].complete);
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 0);
+    assert!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should not be poisoned")
+            .is_empty(),
+        "an incomplete selected source must not reach Music preparation"
+    );
+    drop(manager);
+
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7006,
+            query_id: "back-to-magnet-files",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: waiting.inventory_revision,
+            action: "b:0:0",
+        },
+    )
+    .await;
+    let browser = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && !snapshot.review_selection
+                && snapshot.cursor_folder_id == 0
+        },
+        "returned to magnet file browser",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, browser.inventory_revision, "r"),
+        "the magnet file refresh button",
+    )
+    .await;
+    mock.state.complete.store(true, Ordering::Release);
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7007,
+            query_id: "refresh-complete-magnet-files",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: browser.inventory_revision,
+            action: "r",
+        },
+    )
+    .await;
+    let completed = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && snapshot.files.len() == fixtures.len()
+                && snapshot.files.iter().all(|file| file.complete)
+        },
+        "completed qBittorrent magnet files",
+    )
+    .await;
+    let job_id = wait_for_music_cleanup(&backend).await;
+    assert!(completed.files.iter().all(|file| file.complete));
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should not be poisoned")
+            .as_slice(),
+        &[fixtures[0].bytes.clone()],
+        "only the explicitly selected supported magnet file should reach Music"
+    );
+    assert!(sentinel.is_file());
+    assert!(!music_settings.staging_dir.join(&job_id).exists());
+    assert_eq!(
+        fs::read(music_settings.archive_dir.join("verified-source.archive"))
+            .expect("fake archive should contain verified magnet source bytes"),
+        fixtures[0].bytes
+    );
+    for (file, (device, inode, original_bytes)) in fixtures.iter().zip(&source_identities) {
+        let source = submitted_save_path.join(&file.path);
+        let metadata = fs::metadata(&source).expect("qBittorrent source must remain present");
+        assert_eq!((metadata.dev(), metadata.ino()), (*device, *inode));
+        assert_eq!(
+            fs::read(source).expect("qBittorrent source bytes should remain readable"),
+            *original_bytes
+        );
+    }
+
+    let status = music
+        .local_job_status(CHAT_ID, std::slice::from_ref(&job_id))
+        .await
+        .expect("local Music status should be readable without Telegram messages");
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].stage, JobStage::Complete);
+    let manager = torrent
+        .manager()
+        .await
+        .expect("torrent manager should remain open");
+    manager.refresh_music_status_for_test(&task_id).await;
+    let imported = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.phase == TorrentPhase::Imported,
+        "aggregate magnet Music completion",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7008,
+            query_id: "reopen-magnet-import-review",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: imported.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let replay_review = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "magnet import review before replay confirmation",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, replay_review.selection_revision, "i"),
+        "the magnet replay confirmation button",
+    )
+    .await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7009,
+            query_id: "replay-magnet-import-confirmation",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: replay_review.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.send_messages.load(Ordering::Acquire), 0);
+    assert_eq!(mock.state.text_edits.load(Ordering::Acquire), 0);
+
+    drop(manager);
+    let _ = torrent_shutdown_tx.send(true);
+    let _ = music_shutdown_tx.send(true);
+    drop(context);
+    drop(torrent);
+    drop(music);
+    wait_until_reopenable_music(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+    )
+    .await;
+    wait_until_reopenable_torrent(torrent_settings.clone()).await;
+    let reopened_torrent =
+        TorrentManager::open(torrent_settings.clone(), Arc::new(ReopenProbeBackend))
+            .expect("magnet state should reopen after service shutdown");
+    let persisted = reopened_torrent
+        .list(CHAT_ID)
+        .expect("reopened magnet state should list its task");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].task_id, task_id);
+    assert_eq!(persisted[0].phase, TorrentPhase::Imported);
+    drop(reopened_torrent);
+
+    let (music_shutdown_tx, music_shutdown_rx) = watch::channel(false);
+    let restarted_music = MusicService::with_backend(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+        music_shutdown_rx,
+    );
+    restarted_music.start();
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = watch::channel(false);
+    let restarted_torrent = TorrentService::new(
+        torrent_settings.clone(),
+        telegram.clone(),
+        Some(Arc::clone(&restarted_music)),
+        music_settings.max_file_bytes,
+        torrent_shutdown_rx,
+    )
+    .expect("torrent service should restart with saved magnet state");
+    restarted_torrent.start();
+    let mut restarted_config = AppConfig::for_test();
+    restarted_config.telegram.allowed_chat_ids = vec![CHAT_ID];
+    restarted_config.downloads.video_dir = root.join("video-queue");
+    restarted_config.downloads.pdf_dir = root.join("pdf-queue");
+    let restarted_context = build_context(
+        telegram.clone(),
+        restarted_config,
+        Arc::clone(&restarted_torrent),
+    );
+    let restarted_status = restarted_music
+        .local_job_status(CHAT_ID, std::slice::from_ref(&job_id))
+        .await
+        .expect("restarted Music service should retain the completed local job");
+    assert_eq!(restarted_status.len(), 1);
+    assert_eq!(restarted_status[0].stage, JobStage::Complete);
+    let mut restarted_offset = None;
+    process_update(&restarted_context, magnet_update, &mut restarted_offset).await;
+    process_update(
+        &restarted_context,
+        serde_json::json!({
+            "update_id": 7011,
+            "message": {
+                "message_id": 811,
+                "chat": {"id": CHAT_ID, "type": "private"},
+                "from": {"id": CHAT_ID},
+                "text": format!("/torrents {task_id}"),
+            }
+        }),
+        &mut restarted_offset,
+    )
+    .await;
+    let reopened_card = wait_for_snapshot(
+        &restarted_torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == task_id
+                && snapshot
+                    .card_message_id
+                    .is_some_and(|message_id| message_id > CARD_MESSAGE_ID)
+        },
+        "new card generation for the restarted magnet task",
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 7012,
+            query_id: "stale-magnet-card-confirmation",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &task_id,
+            revision: reopened_card.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 7013,
+            query_id: "restart-magnet-import-review",
+            sender_id: CHAT_ID,
+            message_id: reopened_card
+                .card_message_id
+                .expect("reopened card should have a message ID"),
+            task_id: &task_id,
+            revision: reopened_card.selection_revision,
+            action: "v:0",
+        },
+    )
+    .await;
+    let restarted_review = wait_for_snapshot(
+        &restarted_torrent,
+        CHAT_ID,
+        |snapshot| snapshot.task_id == task_id && snapshot.review_selection,
+        "restarted magnet review page",
+    )
+    .await;
+    wait_for_keyboard_callback(
+        &mock,
+        &expected_callback(&task_id, restarted_review.selection_revision, "i"),
+        "the restarted magnet confirmation button",
+    )
+    .await;
+    process_callback(
+        &restarted_context,
+        &mut restarted_offset,
+        CallbackUpdateFixture {
+            update_id: 7014,
+            query_id: "restart-magnet-import-confirmation",
+            sender_id: CHAT_ID,
+            message_id: reopened_card
+                .card_message_id
+                .expect("reopened card should have a message ID"),
+            task_id: &task_id,
+            revision: restarted_review.selection_revision,
+            action: "i",
+        },
+    )
+    .await;
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    for (file, (device, inode, original_bytes)) in fixtures.iter().zip(&source_identities) {
+        let source = submitted_save_path.join(&file.path);
+        let metadata = fs::metadata(&source).expect("qBittorrent source must survive restart");
+        assert_eq!((metadata.dev(), metadata.ino()), (*device, *inode));
+        assert_eq!(
+            fs::read(source).expect("magnet source bytes should survive restart"),
             *original_bytes
         );
     }

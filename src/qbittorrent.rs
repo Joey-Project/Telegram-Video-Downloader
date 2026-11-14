@@ -1,7 +1,7 @@
 //! Bounded, local-only qBittorrent WebUI API client.
 
 use std::fmt;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -184,6 +184,101 @@ impl QbittorrentClient {
             http_status: status.as_u16(),
             disposition,
         })
+    }
+
+    /// Read qBittorrent's configured download root as a bounded, absolute local path.
+    pub async fn default_save_path(&self) -> Result<PathBuf> {
+        let response = self
+            .request_with_auth(
+                |sid| {
+                    self.request(Method::GET, "app/defaultSavePath")
+                        .maybe_cookie(sid)
+                },
+                true,
+            )
+            .await?;
+        ensure!(
+            response.status().is_success(),
+            "qBittorrent default save path request failed with HTTP {}",
+            response.status().as_u16()
+        );
+        let body = read_limited(response, MAX_API_STRING_BYTES).await?;
+        let path =
+            String::from_utf8(body).context("qBittorrent default save path response is invalid")?;
+        let path = path
+            .strip_suffix("\r\n")
+            .or_else(|| path.strip_suffix('\n'))
+            .unwrap_or(&path);
+        validate_absolute_path_text(path)
+            .context("qBittorrent default save path response is invalid")
+    }
+
+    /// Submit a normalized magnet exactly once. The manager persists submission intent first
+    /// and reconciles it through `lookup`; this method does not retry an uncertain add request.
+    pub async fn submit_magnet(&self, uri: String, save_path: PathBuf) -> Result<SubmitResult> {
+        let normalized_uri = crate::torrent_magnet::parse_magnet_uri(&uri)?.normalized_uri;
+        let save_path_text = validate_absolute_path_input(&save_path)?;
+        let major = self.version_major().await?;
+        let mut fields = vec![
+            ("urls", normalized_uri.as_str()),
+            ("savepath", save_path_text),
+            ("autoTMM", "false"),
+        ];
+        if major >= 5 {
+            fields.push(("stopped", "false"));
+        } else {
+            fields.push(("paused", "false"));
+        }
+        let response = self
+            .request_with_auth(
+                |sid| {
+                    self.request(Method::POST, "torrents/add")
+                        .maybe_cookie(sid)
+                        .form(&fields)
+                },
+                false,
+            )
+            .await?;
+        let status = response.status();
+        let body = read_limited(response, MAX_AUTH_RESPONSE_BYTES).await?;
+        let body_text = String::from_utf8_lossy(&body);
+        let disposition = match status {
+            StatusCode::OK if body_text.trim().eq_ignore_ascii_case("ok.") => {
+                SubmitDisposition::Accepted
+            }
+            StatusCode::OK | StatusCode::ACCEPTED => SubmitDisposition::Unknown,
+            StatusCode::CONFLICT => SubmitDisposition::Conflict,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => SubmitDisposition::InvalidMetainfo,
+            _ => SubmitDisposition::Unknown,
+        };
+        Ok(SubmitResult {
+            http_status: status.as_u16(),
+            disposition,
+        })
+    }
+
+    /// Export the server-side metainfo bytes for a hash. A pending export is surfaced as an
+    /// error so the durable manager can retry this read without repeating the magnet add.
+    pub async fn export_metainfo(&self, hash: &str) -> Result<Vec<u8>> {
+        validate_hash_parameter(hash)?;
+        let response = self
+            .request_with_auth(
+                |sid| {
+                    self.request(Method::GET, "torrents/export")
+                        .maybe_cookie(sid)
+                        .query(&[("hash", hash)])
+                },
+                true,
+            )
+            .await?;
+        ensure!(
+            response.status().is_success(),
+            "qBittorrent metainfo export failed with HTTP {}",
+            response.status().as_u16()
+        );
+        let bytes = read_limited(response, self.max_torrent_bytes).await?;
+        ensure!(!bytes.is_empty(), "qBittorrent metainfo export is empty");
+        Ok(bytes)
     }
 
     pub async fn refresh(&self, hash: &str) -> Result<TorrentRemoteSnapshot> {
@@ -520,15 +615,24 @@ fn parse_torrent_info(value: &Value) -> Result<TorrentRemoteSnapshot> {
     );
     let save_path = required_path(object, &["save_path", "savePath"])?;
     let content_path = optional_path(object, &["content_path", "contentPath"])?;
-    let total_size = optional_u64(object, &["total_size", "totalSize", "size"])?
-        .ok_or_else(|| anyhow!("qBittorrent total size is missing"))?;
-    let amount_left = optional_u64(object, &["amount_left", "amountLeft"])?.unwrap_or_else(|| {
-        total_size.saturating_sub(
-            (progress * total_size as f64)
-                .round()
-                .clamp(0.0, u64::MAX as f64) as u64,
-        )
-    });
+    let unknown_size_allowed = matches!(
+        state.to_ascii_lowercase().as_str(),
+        "metadl" | "forcedmetadl" | "checkingresumedata"
+    );
+    let total_size = optional_size(
+        object,
+        &["total_size", "totalSize", "size"],
+        unknown_size_allowed,
+    )?
+    .ok_or_else(|| anyhow!("qBittorrent total size is missing"))?;
+    let amount_left = optional_size(object, &["amount_left", "amountLeft"], unknown_size_allowed)?
+        .unwrap_or_else(|| {
+            total_size.saturating_sub(
+                (progress * total_size as f64)
+                    .round()
+                    .clamp(0.0, u64::MAX as f64) as u64,
+            )
+        });
     let mut info_hash_v1 = optional_hash(object, &["infohash_v1", "info_hash_v1", "infoHashV1"])?;
     let mut info_hash_v2 = optional_hash(object, &["infohash_v2", "info_hash_v2", "infoHashV2"])?;
     if info_hash_v1.is_none() && hash.len() == 40 {
@@ -643,6 +747,31 @@ fn optional_u64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Resul
     Ok(None)
 }
 
+fn optional_size(
+    object: &serde_json::Map<String, Value>,
+    keys: &[&str],
+    allow_unknown_sentinel: bool,
+) -> Result<Option<u64>> {
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            let number = if let Some(number) = value.as_u64() {
+                number
+            } else if let Some(number) = value.as_i64() {
+                if number == -1 && allow_unknown_sentinel {
+                    0
+                } else {
+                    u64::try_from(number)
+                        .map_err(|_| anyhow!("qBittorrent response size is invalid"))?
+                }
+            } else {
+                bail!("qBittorrent response size is invalid");
+            };
+            return Ok(Some(number));
+        }
+    }
+    Ok(None)
+}
+
 fn optional_i64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Result<Option<i64>> {
     for key in keys {
         if let Some(value) = object.get(*key) {
@@ -679,9 +808,30 @@ fn optional_path(
     object: &serde_json::Map<String, Value>,
     keys: &[&str],
 ) -> Result<Option<PathBuf>> {
-    optional_string(object, keys, MAX_API_STRING_BYTES)?
-        .map(validated_absolute_path)
-        .transpose()
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| anyhow!("qBittorrent response field is invalid"))?;
+        if value.is_empty() {
+            return Ok(None);
+        }
+        ensure!(
+            value.len() <= MAX_API_STRING_BYTES,
+            "qBittorrent response field is too long"
+        );
+        ensure!(
+            !value.chars().any(char::is_control),
+            "qBittorrent response field is invalid"
+        );
+        return validated_absolute_path(value.to_string()).map(Some);
+    }
+    Ok(None)
 }
 
 fn validated_absolute_path(value: String) -> Result<PathBuf> {
@@ -698,6 +848,24 @@ fn validated_absolute_path(value: String) -> Result<PathBuf> {
         "qBittorrent returned an unsafe path"
     );
     Ok(path)
+}
+
+fn validate_absolute_path_text(value: &str) -> Result<PathBuf> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= MAX_API_STRING_BYTES
+            && !value.chars().any(char::is_control),
+        "qBittorrent path is invalid"
+    );
+    validated_absolute_path(value.to_string())
+}
+
+fn validate_absolute_path_input(path: &Path) -> Result<&str> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| anyhow!("magnet save path is invalid"))?;
+    validate_absolute_path_text(value).context("magnet save path is invalid")?;
+    Ok(value)
 }
 
 fn safe_relative_path(value: &str) -> Result<PathBuf> {
@@ -796,6 +964,7 @@ impl HeaderRequestBuilderExt for reqwest::RequestBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -905,12 +1074,225 @@ mod tests {
             username: None,
             password: None,
             state_dir: PathBuf::from("/tmp/torrent-test-state"),
+            metainfo_dir: None,
             max_torrent_bytes: DEFAULT_MAX_TORRENT_BYTES,
             max_files: DEFAULT_MAX_FILES,
             poll_seconds: 10,
             request_timeout_seconds: 3,
             max_api_response_bytes: 64 * 1024,
         }
+    }
+
+    #[tokio::test]
+    async fn magnet_uses_scoped_form_submission_and_exports_bounded_metainfo() {
+        // synthetic-token-fixtures: joey-private-v3 / access-a and api-key-a, active.
+        const SYNTHETIC_SESSION: &str = "codex_synth_v1_access_a";
+        const SYNTHETIC_PASSWORD: &str = "codex_synth_v1_api_key_a";
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let input_uri = format!("magnet:?xt=urn:btih:{HASH}&dn=Album&so=0");
+        let normalized_uri = crate::torrent_magnet::parse_magnet_uri(&input_uri)
+            .unwrap()
+            .normalized_uri;
+        let default_path = PathBuf::from("/tmp/qBittorrent Downloads");
+        let submitted_path = default_path
+            .join("Telegram Downloads")
+            .join("0123456789abcdef0123456789abcdef");
+        let submitted_path_text = submitted_path.to_string_lossy().into_owned();
+        let normalized_uri_for_server = normalized_uri.clone();
+        let adds = Arc::new(AtomicUsize::new(0));
+        let adds_for_server = Arc::clone(&adds);
+        let exports = Arc::new(AtomicUsize::new(0));
+        let exports_for_server = Arc::clone(&exports);
+        let default_path_text = default_path.to_string_lossy().into_owned();
+        let metainfo = b"bounded synthetic bencoded bytes".to_vec();
+        let metainfo_for_server = metainfo.clone();
+        let (base_url, server) = serve(move |request| {
+            assert!(request.headers.to_ascii_lowercase().contains("referer: "));
+            assert!(request.headers.to_ascii_lowercase().contains("origin: "));
+            if request.line.starts_with("POST /api/v2/auth/login") {
+                (
+                    200,
+                    vec![(
+                        "Set-Cookie".to_string(),
+                        format!("SID={SYNTHETIC_SESSION}; path=/"),
+                    )],
+                    b"Ok.".to_vec(),
+                )
+            } else if request.line.starts_with("GET /api/v2/app/defaultSavePath") {
+                if request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("cookie: sid={SYNTHETIC_SESSION}"))
+                {
+                    (200, vec![], format!("{default_path_text}\r\n").into_bytes())
+                } else {
+                    (403, vec![], b"Forbidden".to_vec())
+                }
+            } else if request.line.starts_with("GET /api/v2/app/version") {
+                if request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains(&format!("cookie: sid={SYNTHETIC_SESSION}"))
+                {
+                    (200, vec![], b"v5.0.0".to_vec())
+                } else {
+                    (403, vec![], b"Forbidden".to_vec())
+                }
+            } else if request.line.starts_with("POST /api/v2/torrents/add") {
+                assert!(
+                    request
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("cookie: sid={SYNTHETIC_SESSION}"))
+                );
+                assert!(
+                    request
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains("content-type: application/x-www-form-urlencoded")
+                );
+                let fields = url::form_urlencoded::parse(&request.body)
+                    .into_owned()
+                    .collect::<HashMap<_, _>>();
+                assert_eq!(fields.get("urls"), Some(&normalized_uri_for_server));
+                assert!(
+                    !fields
+                        .get("urls")
+                        .is_some_and(|uri| uri.to_ascii_lowercase().contains("so="))
+                );
+                assert_eq!(fields.get("savepath"), Some(&submitted_path_text));
+                assert_eq!(fields.get("autoTMM").map(String::as_str), Some("false"));
+                assert_eq!(fields.get("stopped").map(String::as_str), Some("false"));
+                assert!(!fields.contains_key("paused"));
+                assert!(!fields.contains_key("category"));
+                adds_for_server.fetch_add(1, Ordering::Relaxed);
+                (200, vec![], b"Ok.".to_vec())
+            } else if request
+                .line
+                .starts_with(&format!("GET /api/v2/torrents/export?hash={HASH}"))
+            {
+                assert!(
+                    request
+                        .headers
+                        .to_ascii_lowercase()
+                        .contains(&format!("cookie: sid={SYNTHETIC_SESSION}"))
+                );
+                exports_for_server.fetch_add(1, Ordering::Relaxed);
+                (200, vec![], metainfo_for_server.clone())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let mut config = settings(base_url);
+        config.username = Some("test-user".to_string());
+        config.password = Some(SYNTHETIC_PASSWORD.to_string());
+        let client = QbittorrentClient::new(&config).unwrap();
+
+        assert_eq!(client.default_save_path().await.unwrap(), default_path);
+        let result = client
+            .submit_magnet(input_uri, submitted_path)
+            .await
+            .unwrap();
+        assert_eq!(result.disposition, SubmitDisposition::Accepted);
+        assert_eq!(client.export_metainfo(HASH).await.unwrap(), metainfo);
+        assert_eq!(adds.load(Ordering::Relaxed), 1);
+        assert_eq!(exports.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn magnet_v4_uses_paused_false_and_export_pending_is_retryable_error() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let uri = format!("magnet:?xt=urn:btih:{HASH}");
+        let adds = Arc::new(AtomicUsize::new(0));
+        let adds_for_server = Arc::clone(&adds);
+        let (base_url, server) = serve(move |request| {
+            if request.line.starts_with("GET /api/v2/app/version") {
+                (200, vec![], b"v4.3.9".to_vec())
+            } else if request.line.starts_with("POST /api/v2/torrents/add") {
+                let fields = url::form_urlencoded::parse(&request.body)
+                    .into_owned()
+                    .collect::<HashMap<_, _>>();
+                assert_eq!(fields.get("paused").map(String::as_str), Some("false"));
+                assert!(!fields.contains_key("stopped"));
+                assert_eq!(fields.get("autoTMM").map(String::as_str), Some("false"));
+                adds_for_server.fetch_add(1, Ordering::Relaxed);
+                (409, vec![], b"conflict".to_vec())
+            } else if request.line.starts_with("GET /api/v2/torrents/export") {
+                (404, vec![], b"metainfo is not ready".to_vec())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        let result = client
+            .submit_magnet(uri, PathBuf::from("/tmp/Telegram Downloads/task"))
+            .await
+            .unwrap();
+        assert_eq!(result.disposition, SubmitDisposition::Conflict);
+        assert!(client.export_metainfo(HASH).await.is_err());
+        assert_eq!(adds.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn default_save_path_and_export_responses_reject_bad_or_oversized_data() {
+        let (base_url, server) = serve(|request| {
+            if request.line.starts_with("GET /api/v2/app/defaultSavePath") {
+                (200, vec![], b"relative/downloads".to_vec())
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        assert!(client.default_save_path().await.is_err());
+        server.abort();
+
+        let (base_url, server) = serve(|request| {
+            if request.line.starts_with("GET /api/v2/app/defaultSavePath") {
+                (
+                    200,
+                    vec![(
+                        "Content-Length".to_string(),
+                        (MAX_API_STRING_BYTES + 1).to_string(),
+                    )],
+                    Vec::new(),
+                )
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        assert!(client.default_save_path().await.is_err());
+        server.abort();
+
+        let (base_url, server) = serve(|request| {
+            if request.line.starts_with("GET /api/v2/torrents/export") {
+                (
+                    200,
+                    vec![(
+                        "Content-Length".to_string(),
+                        (DEFAULT_MAX_TORRENT_BYTES + 1).to_string(),
+                    )],
+                    Vec::new(),
+                )
+            } else {
+                (404, vec![], Vec::new())
+            }
+        })
+        .await;
+        let client = QbittorrentClient::new(&settings(base_url)).unwrap();
+        assert!(
+            client
+                .export_metainfo("0123456789abcdef0123456789abcdef01234567")
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1100,6 +1482,76 @@ mod tests {
             PathBuf::from("folder/track.mp3")
         );
         server.abort();
+    }
+
+    #[test]
+    fn optional_content_path_accepts_absent_metadata_but_required_save_path_stays_strict() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({ "content_path": null }),
+            serde_json::json!({ "content_path": "" }),
+        ] {
+            assert_eq!(
+                optional_path(
+                    response.as_object().unwrap(),
+                    &["content_path", "contentPath"]
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let invalid_optional = serde_json::json!({ "content_path": "relative/path" });
+        assert!(
+            optional_path(
+                invalid_optional.as_object().unwrap(),
+                &["content_path", "contentPath"]
+            )
+            .is_err()
+        );
+
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({ "save_path": null }),
+            serde_json::json!({ "save_path": "" }),
+            serde_json::json!({ "save_path": "relative/path" }),
+        ] {
+            assert!(required_path(response.as_object().unwrap(), &["save_path"]).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_states_accept_only_qbittorrent_unknown_size_sentinels() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let record = |state: &str, total_size: i64, amount_left: i64| {
+            serde_json::json!({
+                "hash": HASH,
+                "name": "magnet metadata pending",
+                "state": state,
+                "progress": 0.0,
+                "save_path": "/tmp/downloads",
+                "content_path": null,
+                "total_size": total_size,
+                "amount_left": amount_left,
+            })
+        };
+
+        for state in ["metaDL", "forcedMetaDL", "checkingResumeData"] {
+            let snapshot = parse_torrent_info(&record(state, -1, -1))
+                .expect("metadata state should accept qBittorrent's unknown-size sentinel");
+            assert_eq!(snapshot.state, state);
+            assert_eq!(snapshot.total_size, 0);
+            assert_eq!(snapshot.amount_left, 0);
+        }
+
+        let real_download = parse_torrent_info(&record("downloading", 100, 50))
+            .expect("nonnegative sizes should remain valid during download");
+        assert_eq!(real_download.total_size, 100);
+        assert_eq!(real_download.amount_left, 50);
+
+        assert!(parse_torrent_info(&record("downloading", -1, -1)).is_err());
+        assert!(parse_torrent_info(&record("checkingResumeData", -2, -1)).is_err());
+        assert!(parse_torrent_info(&record("metaDL", -1, -2)).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Application adapters for the durable torrent worker and its private Telegram card.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -17,12 +17,13 @@ use crate::telegram::TelegramClient;
 use crate::torrent_manager::TorrentManager;
 use crate::torrent_types::{
     CompletedTorrentFile, SubmitResult, TorrentAction, TorrentBackend, TorrentEnqueueResult,
-    TorrentFuture, TorrentIdentity, TorrentMusicJobRef, TorrentMusicJobStatus, TorrentMusicStage,
-    TorrentPhase, TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot, TorrentUpload,
+    TorrentFuture, TorrentIdentity, TorrentMagnet, TorrentMusicJobRef, TorrentMusicJobStatus,
+    TorrentMusicStage, TorrentPhase, TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot,
+    TorrentUpload,
 };
 use crate::torrent_widget::{
-    TORRENT_WIDGET_HTML, TorrentWidgetPresentation, TorrentWidgetView, WidgetEntry,
-    WidgetMusicStage, render_torrent_widget,
+    TorrentWidgetPresentation, TorrentWidgetView, WidgetEntry, WidgetMusicStage,
+    render_torrent_widget,
 };
 
 /// Torrent metadata startup and local state writes never hold the Telegram receiver thread.
@@ -50,6 +51,8 @@ impl TorrentService {
             music,
             music_max_bytes,
             max_torrent_bytes: settings.max_torrent_bytes,
+            metainfo_dir: settings.metainfo_dir.clone(),
+            metainfo_readers: Arc::new(Semaphore::new(1)),
             shutdown: shutdown.clone(),
         });
         Ok(Self::with_backend(settings, backend, shutdown))
@@ -144,6 +147,17 @@ impl TorrentService {
         .context("torrent admission worker stopped")?
     }
 
+    pub async fn enqueue_magnet(&self, magnet: TorrentMagnet) -> Result<TorrentEnqueueResult> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager.enqueue_magnet(magnet)
+        })
+        .await
+        .context("magnet admission worker stopped")?
+    }
+
     pub async fn apply_action(
         &self,
         chat_id: i64,
@@ -213,6 +227,8 @@ struct RuntimeTorrentBackend {
     music: Option<Arc<MusicService>>,
     music_max_bytes: u64,
     max_torrent_bytes: usize,
+    metainfo_dir: Option<PathBuf>,
+    metainfo_readers: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -233,20 +249,46 @@ impl TorrentBackend for RuntimeTorrentBackend {
         Box::pin(async move { self.qbit.submit(bytes, name).await })
     }
 
+    fn default_save_path(&self) -> TorrentFuture<'_, PathBuf> {
+        Box::pin(async move { self.qbit.default_save_path().await })
+    }
+
+    fn submit_magnet(&self, uri: String, save_path: PathBuf) -> TorrentFuture<'_, SubmitResult> {
+        Box::pin(async move { self.qbit.submit_magnet(uri, save_path).await })
+    }
+
+    fn export_metainfo(&self, hash: String) -> TorrentFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            match self.qbit.export_metainfo(&hash).await {
+                Ok(bytes) => Ok(bytes),
+                Err(error) => {
+                    let Some(directory) = self.metainfo_dir.clone() else {
+                        return Err(error);
+                    };
+                    let permit = Arc::clone(&self.metainfo_readers)
+                        .try_acquire_owned()
+                        .context("local metainfo reader is busy")?;
+                    let max_bytes = self.max_torrent_bytes;
+                    tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        crate::torrent_backup::read_metainfo(&directory, &hash, max_bytes)
+                    })
+                    .await
+                    .context("local metainfo reader stopped")?
+                }
+            }
+        })
+    }
+
     fn refresh(&self, hash: String) -> TorrentFuture<'_, TorrentRemoteSnapshot> {
         Box::pin(async move { self.qbit.refresh(&hash).await })
     }
 
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64> {
         Box::pin(async move {
-            let card = card_presentation(&snapshot)?;
+            let card = crate::torrent_inline::render_torrent_inline(&snapshot)?;
             self.telegram
-                .send_widget(
-                    snapshot.chat_id,
-                    TORRENT_WIDGET_HTML,
-                    &card.chat_data,
-                    &card.caption,
-                )
+                .send_message_with_inline_keyboard(snapshot.chat_id, card.text, card.reply_markup)
                 .await
         })
     }
@@ -256,12 +298,14 @@ impl TorrentBackend for RuntimeTorrentBackend {
             let message_id = snapshot
                 .card_message_id
                 .context("torrent card is not registered")?;
-            let card = card_presentation(&snapshot)?;
+            let card = crate::torrent_inline::render_torrent_inline(&snapshot)?;
             self.telegram
-                .edit_widget_data(snapshot.chat_id, message_id, &card.chat_data)
-                .await?;
-            self.telegram
-                .edit_widget_caption(snapshot.chat_id, message_id, &card.caption)
+                .edit_message_text_with_inline_keyboard(
+                    snapshot.chat_id,
+                    message_id,
+                    card.text,
+                    card.reply_markup,
+                )
                 .await
         })
     }
@@ -564,6 +608,7 @@ mod tests {
             progress: 1.0,
             cursor_folder_id: 0,
             cursor_page: 0,
+            review_selection: false,
             folders: vec![TorrentFolder {
                 id: 0,
                 relative_path: PathBuf::new(),
