@@ -282,6 +282,7 @@ pub(crate) struct MockBackend {
     pub(crate) original_sha: Mutex<String>,
     pub(crate) import_sha: Mutex<String>,
     pub(crate) downloads: AtomicUsize,
+    pub(crate) preparations: AtomicUsize,
     pub(crate) archives: AtomicUsize,
     pub(crate) adds: AtomicUsize,
     pub(crate) queries: AtomicUsize,
@@ -296,6 +297,11 @@ pub(crate) struct MockBackend {
     pub(crate) archive_default: Mutex<ArchiveState>,
     pub(crate) download_gate: Mutex<Option<Arc<DownloadGate>>>,
     pub(crate) download_failure: Mutex<Option<MusicDownloadFailure>>,
+    pub(crate) cleanup_calls: Mutex<Vec<(String, PreparedAudio, ArchiveState, MusicTrack)>>,
+    pub(crate) cleanup_failure_remaining: AtomicUsize,
+    pub(crate) cleanup_state_path: Mutex<Option<PathBuf>>,
+    pub(crate) cleanup_staging_root: Mutex<Option<PathBuf>>,
+    pub(crate) cleanup_saw_durable_complete: AtomicBool,
 }
 
 impl MockBackend {
@@ -313,6 +319,7 @@ impl MockBackend {
             original_sha: Mutex::new("a".repeat(64)),
             import_sha: Mutex::new("b".repeat(64)),
             downloads: AtomicUsize::new(0),
+            preparations: AtomicUsize::new(0),
             archives: AtomicUsize::new(0),
             adds: AtomicUsize::new(0),
             queries: AtomicUsize::new(0),
@@ -326,6 +333,11 @@ impl MockBackend {
             archive_states: Mutex::new(VecDeque::new()),
             download_gate: Mutex::new(None),
             download_failure: Mutex::new(None),
+            cleanup_calls: Mutex::new(Vec::new()),
+            cleanup_failure_remaining: AtomicUsize::new(0),
+            cleanup_state_path: Mutex::new(None),
+            cleanup_staging_root: Mutex::new(None),
+            cleanup_saw_durable_complete: AtomicBool::new(false),
         })
     }
 
@@ -417,6 +429,7 @@ impl MusicBackend for MockBackend {
         working_dir: &Path,
         cancel: &MusicCancellation,
     ) -> Result<PreparedAudio> {
+        self.preparations.fetch_add(1, Ordering::Relaxed);
         if cancel.is_cancelled() {
             bail!("synthetic cancellation before audio preparation");
         }
@@ -517,6 +530,70 @@ impl MusicBackend for MockBackend {
             local_bytes: self.defer_eviction.load(Ordering::Acquire),
             ..archive.clone()
         })
+    }
+
+    fn cleanup_staging(
+        &self,
+        job_id: &str,
+        audio: &PreparedAudio,
+        archive: &ArchiveState,
+        track: &MusicTrack,
+    ) -> Result<()> {
+        if let Some(state_path) = self
+            .cleanup_state_path
+            .lock()
+            .expect("cleanup state path should not be poisoned")
+            .as_ref()
+        {
+            let state: serde_json::Value = serde_json::from_slice(&fs::read(state_path)?)?;
+            if state["jobs"][job_id]["stage"] != "complete"
+                || state["jobs"][job_id]["staging_cleanup_completed"] != false
+            {
+                bail!("cleanup ran before durable completion was recorded");
+            }
+            self.cleanup_saw_durable_complete
+                .store(true, Ordering::Release);
+        }
+        self.cleanup_calls
+            .lock()
+            .expect("cleanup calls should not be poisoned")
+            .push((
+                job_id.to_string(),
+                audio.clone(),
+                archive.clone(),
+                track.clone(),
+            ));
+        let mut remaining = self.cleanup_failure_remaining.load(Ordering::Acquire);
+        let should_fail = loop {
+            if remaining == 0 {
+                break false;
+            }
+            match self.cleanup_failure_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(current) => remaining = current,
+            }
+        };
+        if should_fail {
+            bail!("synthetic staging cleanup failure");
+        }
+        if let Some(staging_root) = self
+            .cleanup_staging_root
+            .lock()
+            .expect("cleanup staging root should not be poisoned")
+            .as_ref()
+        {
+            match fs::remove_dir_all(staging_root.join(job_id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -705,6 +782,16 @@ impl MusicBackend for NativeFlacConversionBackend {
             ..archive.clone()
         })
     }
+
+    fn cleanup_staging(
+        &self,
+        _: &str,
+        _: &PreparedAudio,
+        _: &ArchiveState,
+        _: &MusicTrack,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -808,6 +895,7 @@ pub(crate) fn upload(message_id: i64, file_unique_id: &str) -> MusicUpload {
 
 fn stored_job(upload: MusicUpload, stage: JobStage, created_at: u64) -> StoredJob {
     let (job_id, origin_key) = job_identity(&upload);
+    let staging_cleanup_completed = stage == JobStage::Complete;
     StoredJob {
         job_id,
         origin_key,
@@ -835,7 +923,84 @@ fn stored_job(upload: MusicUpload, stage: JobStage, created_at: u64) -> StoredJo
         status_pending_text: None,
         status_edit_attempts: 0,
         status_next_attempt_at: None,
+        staging_cleanup_completed,
+        staging_cleanup_attempts: 0,
+        staging_cleanup_next_attempt_at: None,
     }
+}
+
+fn insert_completed_cleanup_job(
+    store: &MusicStore,
+    settings: &MusicSettings,
+    upload: MusicUpload,
+) -> (String, PreparedAudio, ArchiveState, MusicTrack) {
+    let (job_id, origin_key) = job_identity(&upload);
+    let prepared = PreparedAudio {
+        conversion: None,
+        original: AudioBytes {
+            path: settings
+                .staging_dir
+                .join(format!("already-cleaned-{job_id}"))
+                .join("original.m4a"),
+            sha256: "a".repeat(64),
+            size: 24,
+        },
+        import: AudioBytes {
+            path: settings
+                .staging_dir
+                .join(format!("already-cleaned-{job_id}"))
+                .join("prepared.m4a"),
+            sha256: "b".repeat(64),
+            size: 22,
+        },
+    };
+    let archive = ArchiveState {
+        path: settings.archive_dir.join(format!("cleanup-{job_id}.m4a")),
+        uploaded: true,
+        uploading: false,
+        downloading: false,
+        conflicts: false,
+        local_bytes: false,
+    };
+    let track = MusicTrack {
+        persistent_id: format!("cleanup-pid-{}", upload.message_id),
+        location: Some(PathBuf::from(format!(
+            "/Music/Cleanup-{}.m4a",
+            upload.message_id
+        ))),
+        cloud_status: "uploaded".to_string(),
+    };
+    store
+        .transact(|state| {
+            let now = unix_seconds();
+            let mut job = stored_job(upload, JobStage::Complete, now);
+            job.origin_key = origin_key;
+            job.download_complete = true;
+            job.download_path = Some(prepared.original.path.clone());
+            job.prepared = Some(prepared.clone());
+            job.archive = Some(archive.clone());
+            job.persistent_id = Some(track.persistent_id.clone());
+            job.track = Some(track.clone());
+            job.local_copy_verified = true;
+            job.add_intent = true;
+            job.status_message_id = Some(900 + job.upload.message_id);
+            job.status_send_attempted = true;
+            job.status_text = Some(render_status(&job));
+            job.staging_cleanup_completed = false;
+            state.jobs.insert(job_id.clone(), job);
+            state.content_catalog.insert(
+                prepared.original.sha256.clone(),
+                CatalogEntry {
+                    add_intent: true,
+                    persistent_id: Some(track.persistent_id.clone()),
+                    prepared: prepared.clone(),
+                    archive: archive.clone(),
+                },
+            );
+            Ok(())
+        })
+        .expect("completed cleanup fixture should persist");
+    (job_id, prepared, archive, track)
 }
 
 /// Seed a full valid active queue in one atomic state write for Telegram intake tests.
@@ -972,7 +1137,15 @@ async fn wait_for_stage(manager: &MusicManager, job_id: &str, stage: JobStage) -
 }
 
 async fn wait_for_complete(manager: &MusicManager, job_id: &str) -> StoredJob {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    wait_for_complete_with_timeout(manager, job_id, Duration::from_secs(10)).await
+}
+
+async fn wait_for_complete_with_timeout(
+    manager: &MusicManager,
+    job_id: &str,
+    timeout: Duration,
+) -> StoredJob {
+    match tokio::time::timeout(timeout, async {
         loop {
             if let Some(job) = manager.store.job(job_id).expect("job should read")
                 && job.stage == JobStage::Complete
@@ -983,7 +1156,427 @@ async fn wait_for_complete(manager: &MusicManager, job_id: &str) -> StoredJob {
         }
     })
     .await
-    .expect("job did not complete")
+    {
+        Ok(job) => job,
+        Err(_) => {
+            let latest = manager.store.job(job_id).expect("job should read");
+            let diagnostic = latest.map_or_else(
+                || "job missing".to_string(),
+                |job| {
+                    format!(
+                        "stage={:?}, cleanup_completed={}, cleanup_attempts={}, cleanup_next={:?}, error={:?}",
+                        job.stage,
+                        job.staging_cleanup_completed,
+                        job.staging_cleanup_attempts,
+                        job.staging_cleanup_next_attempt_at,
+                        job.error,
+                    )
+                },
+            );
+            panic!("job {job_id} did not complete within {timeout:?}; latest state: {diagnostic}");
+        }
+    }
+}
+
+async fn wait_for_cleanup_attempts(backend: &MockBackend, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if backend
+                .cleanup_calls
+                .lock()
+                .expect("cleanup calls should not be poisoned")
+                .len()
+                >= expected
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("staging cleanup attempt did not occur");
+}
+
+async fn wait_for_cleanup_retry(manager: &MusicManager, job_id: &str, attempts: u8) -> StoredJob {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(job) = manager.store.job(job_id).expect("job should read")
+                && job.staging_cleanup_attempts >= attempts
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("staging cleanup retry metadata was not saved")
+}
+
+async fn wait_for_cleanup_complete(manager: &MusicManager, job_id: &str) -> StoredJob {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(job) = manager.store.job(job_id).expect("job should read")
+                && job.stage == JobStage::Complete
+                && job.staging_cleanup_completed
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("staging cleanup did not complete")
+}
+
+#[tokio::test]
+async fn completed_import_cleanup_follows_durable_completion_and_replay_does_not_reimport() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    *backend
+        .cleanup_state_path
+        .lock()
+        .expect("cleanup state path should not be poisoned") =
+        Some(settings.state_dir.join(STATE_FILE));
+    *backend
+        .cleanup_staging_root
+        .lock()
+        .expect("cleanup staging root should not be poisoned") = Some(settings.staging_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let original_upload = upload(700, "cleanup-complete-700");
+    let admission = manager
+        .enqueue(original_upload.clone())
+        .await
+        .expect("music upload should enqueue");
+    let staging_dir = settings.staging_dir.join(&admission.job_id);
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+
+    let completed = wait_for_cleanup_complete(&manager, &admission.job_id).await;
+    assert_eq!(completed.stage, JobStage::Complete);
+    assert!(completed.staging_cleanup_completed);
+    assert!(
+        !staging_dir.exists(),
+        "only this job's staging directory is removed"
+    );
+    assert_eq!(backend.cleanup_calls.lock().unwrap().len(), 1);
+    assert!(backend.cleanup_saw_durable_complete.load(Ordering::Acquire));
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+
+    let sends = server.count_method("sendMessage");
+    let edits = server.count_method("editMessageText");
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    drop(manager);
+
+    let reopened = open_manager(settings, &server, backend.clone() as Arc<dyn MusicBackend>).await;
+    let replay = reopened
+        .enqueue(original_upload)
+        .await
+        .expect("same-origin replay should remain idempotent");
+    assert!(!replay.created);
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = reopened.start(receiver);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.cleanup_calls.lock().unwrap().len(), 1);
+    assert_eq!(server.count_method("sendMessage"), sends);
+    assert_eq!(server.count_method("editMessageText"), edits);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("reopened worker should stop")
+        .expect("reopened worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn completed_cleanup_retries_after_restart_without_status_or_import_work() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    backend
+        .cleanup_failure_remaining
+        .store(1, Ordering::Release);
+    *backend
+        .cleanup_state_path
+        .lock()
+        .expect("cleanup state path should not be poisoned") =
+        Some(settings.state_dir.join(STATE_FILE));
+    *backend
+        .cleanup_staging_root
+        .lock()
+        .expect("cleanup staging root should not be poisoned") = Some(settings.staging_dir.clone());
+
+    let initial = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let (job_id, _prepared, _archive, _track) = insert_completed_cleanup_job(
+        &initial.store,
+        &settings,
+        upload(701, "cleanup-restart-701"),
+    );
+    assert!(!safe_to_evict_completed_job(
+        &initial.store.snapshot().unwrap(),
+        &initial.store.job(&job_id).unwrap().unwrap()
+    ));
+    drop(initial);
+
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let failed_attempt = wait_for_cleanup_retry(&manager, &job_id, 1).await;
+    wait_for_cleanup_attempts(&backend, 1).await;
+    assert_eq!(failed_attempt.stage, JobStage::Complete);
+    assert!(!failed_attempt.staging_cleanup_completed);
+    assert!(failed_attempt.staging_cleanup_next_attempt_at.is_some());
+    assert_eq!(backend.cleanup_calls.lock().unwrap().len(), 1);
+    assert!(backend.cleanup_saw_durable_complete.load(Ordering::Acquire));
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.archive_status_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(server.count_method("sendMessage"), 0);
+    assert_eq!(server.count_method("editMessageText"), 0);
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("first worker should stop before the scheduled retry")
+        .expect("first worker should join");
+    drop(manager);
+
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    manager
+        .store
+        .set_job(&job_id, |job| {
+            job.staging_cleanup_next_attempt_at = Some(unix_seconds())
+        })
+        .expect("retry should be made due in the test");
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let completed = wait_for_cleanup_complete(&manager, &job_id).await;
+    assert_eq!(completed.stage, JobStage::Complete);
+    assert!(completed.staging_cleanup_completed);
+    assert_eq!(backend.cleanup_calls.lock().unwrap().len(), 2);
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.archive_status_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(server.count_method("sendMessage"), 0);
+    assert_eq!(server.count_method("editMessageText"), 0);
+    assert!(
+        manager
+            .store
+            .snapshot()
+            .unwrap()
+            .content_catalog
+            .contains_key(&"a".repeat(64))
+    );
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn content_dedup_works_when_catalog_source_is_absent_and_cleans_only_new_job() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    *backend
+        .original_sha
+        .lock()
+        .expect("original hash should not be poisoned") = "c".repeat(64);
+    *backend
+        .import_sha
+        .lock()
+        .expect("import hash should not be poisoned") = "d".repeat(64);
+    *backend
+        .cleanup_staging_root
+        .lock()
+        .expect("cleanup staging root should not be poisoned") = Some(settings.staging_dir.clone());
+    let archive = ArchiveState {
+        path: settings.archive_dir.join("dedup-accepted.m4a"),
+        uploaded: true,
+        uploading: false,
+        downloading: false,
+        conflicts: false,
+        local_bytes: false,
+    };
+    backend.set_archive_default(archive.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let old_audio = PreparedAudio {
+        conversion: None,
+        original: AudioBytes {
+            path: settings.staging_dir.join("previous-job/original.m4a"),
+            sha256: "c".repeat(64),
+            size: 24,
+        },
+        import: AudioBytes {
+            path: settings.staging_dir.join("previous-job/prepared.m4a"),
+            sha256: "d".repeat(64),
+            size: 22,
+        },
+    };
+    let track = MusicTrack {
+        persistent_id: "persistent-id-dedup-cleanup".to_string(),
+        location: Some(PathBuf::from("/Music/Dedup.m4a")),
+        cloud_status: "matched".to_string(),
+    };
+    manager
+        .seed_completed(&old_audio, &archive, &track)
+        .await
+        .expect("verified prior import should seed the catalog");
+    assert!(!old_audio.original.path.exists());
+    assert!(!old_audio.import.path.exists());
+    let admission = manager
+        .enqueue(upload(702, "new-upload-same-content-702"))
+        .await
+        .expect("new upload with prior content should enqueue");
+    let new_job_staging = settings.staging_dir.join(&admission.job_id);
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let completed = wait_for_cleanup_complete(&manager, &admission.job_id).await;
+
+    assert_eq!(completed.stage, JobStage::Complete);
+    assert_eq!(
+        completed.persistent_id.as_deref(),
+        Some(track.persistent_id.as_str())
+    );
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.cleanup_calls.lock().unwrap().len(), 1);
+    assert_eq!(backend.cleanup_calls.lock().unwrap()[0].0, admission.job_id);
+    assert_eq!(
+        backend.cleanup_calls.lock().unwrap()[0].1.original.path,
+        old_audio.original.path
+    );
+    assert!(
+        !new_job_staging.exists(),
+        "cleanup must target the new upload's staging directory"
+    );
+    let catalog = manager.store.snapshot().unwrap().content_catalog;
+    let retained = catalog
+        .get(&"c".repeat(64))
+        .expect("catalog metadata should remain");
+    assert_eq!(retained.prepared.original.path, old_audio.original.path);
+    assert!(!retained.prepared.original.path.exists());
+    assert!(!retained.prepared.import.path.exists());
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn failed_cancelled_and_incomplete_jobs_keep_their_staging_files() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let fixtures = [
+        (JobStage::Failed, upload(703, "cleanup-retain-failed")),
+        (JobStage::Cancelled, upload(704, "cleanup-retain-cancelled")),
+        (
+            JobStage::Downloading,
+            upload(705, "cleanup-retain-incomplete"),
+        ),
+    ];
+    let mut retained_paths = Vec::new();
+    manager
+        .store
+        .transact(|state| {
+            for (stage, upload) in fixtures {
+                let mut job = stored_job(upload, stage, unix_seconds());
+                let job_dir = settings.staging_dir.join(&job.job_id);
+                fs::create_dir_all(&job_dir)?;
+                let partial = job_dir.join("original.m4a");
+                fs::write(&partial, b"retained source")?;
+                job.download_path = Some(partial.clone());
+                job.attempt = 1;
+                job.staging_cleanup_completed = false;
+                retained_paths.push((job.job_id.clone(), partial));
+                state.jobs.insert(job.job_id.clone(), job);
+            }
+            Ok(())
+        })
+        .expect("non-completed source records should persist");
+
+    for (job_id, _) in &retained_paths {
+        assert!(manager.cleanup_completed_staging(job_id).await);
+    }
+    assert!(backend.cleanup_calls.lock().unwrap().is_empty());
+    for (_, path) in retained_paths {
+        assert_eq!(fs::read(path).unwrap(), b"retained source");
+    }
+    server.stop();
+}
+
+#[test]
+fn legacy_complete_json_defaults_cleanup_metadata_to_uncompleted() {
+    let upload = upload(706, "legacy-cleanup-state");
+    let mut job = stored_job(upload, JobStage::Complete, 1);
+    let mut value = serde_json::to_value(&job).expect("job should serialize");
+    let object = value
+        .as_object_mut()
+        .expect("stored job should serialize to an object");
+    object.remove("staging_cleanup_completed");
+    object.remove("staging_cleanup_attempts");
+    object.remove("staging_cleanup_next_attempt_at");
+    job = serde_json::from_value(value).expect("legacy job should deserialize");
+    assert_eq!(job.stage, JobStage::Complete);
+    assert!(!job.staging_cleanup_completed);
+    assert_eq!(job.staging_cleanup_attempts, 0);
+    assert_eq!(job.staging_cleanup_next_attempt_at, None);
 }
 
 fn shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
@@ -1165,7 +1758,7 @@ async fn completed_history_eviction_preserves_catalog_and_failed_partials() {
         .await
         .expect("a safely evictable completed record should make room");
     assert!(admission.created);
-    wait_for_complete(&manager, &admission.job_id).await;
+    wait_for_complete_with_timeout(&manager, &admission.job_id, Duration::from_secs(30)).await;
 
     let state = manager.store.snapshot().expect("state should read");
     assert_eq!(state.jobs.len(), MAX_JOBS);

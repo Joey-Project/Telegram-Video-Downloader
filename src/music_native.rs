@@ -389,16 +389,29 @@ impl NativeMusicBackend {
         if !is_persistent_id(&track.persistent_id) {
             bail!("Music persistent ID is invalid");
         }
+        let current = self.query_track(&track.persistent_id)?;
+        if current.location != track.location {
+            bail!("Music track location changed since its persistent ID was queried");
+        }
+        self.verify_copy_current(audio, &current).map(|_| ())
+    }
+
+    /// Verify bytes at a track record fetched immediately beforehand and retain the exact copy
+    /// identity. Callers that need a fresh location first query by persistent ID, then use this
+    /// helper so a Music-managed relocation is followed instead of pinned to an older snapshot.
+    fn verify_copy_current(
+        &self,
+        audio: &PreparedAudio,
+        current: &MusicTrack,
+    ) -> anyhow::Result<VerifiedCopy> {
+        if !is_persistent_id(&current.persistent_id) {
+            bail!("Music persistent ID is invalid");
+        }
         if audio.import.size == 0
             || audio.import.size > MAX_IMPORT_BYTES
             || !is_sha256(&audio.import.sha256)
         {
             bail!("saved import content identity is invalid");
-        }
-
-        let current = self.query_track(&track.persistent_id)?;
-        if current.location != track.location {
-            bail!("Music track location changed since its persistent ID was queried");
         }
         let music_path = current
             .location
@@ -439,7 +452,7 @@ impl NativeMusicBackend {
         require_not_ubiquitous(music_path)?;
 
         let record = VerifiedCopy {
-            persistent_id: current.persistent_id,
+            persistent_id: current.persistent_id.clone(),
             path: music_path.to_path_buf(),
             identity: after,
             expires_at: Instant::now() + VERIFIED_COPY_TTL,
@@ -447,8 +460,76 @@ impl NativeMusicBackend {
         *self
             .verified_copy
             .lock()
-            .map_err(|_| anyhow::anyhow!("verified-copy receipt lock is poisoned"))? = Some(record);
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("verified-copy receipt lock is poisoned"))? =
+            Some(record.clone());
+        Ok(record)
+    }
+
+    /// Remove the selected completed job's private Music staging subtree after a fresh
+    /// uploaded-archive check and verification of the Music copy currently named by its PID.
+    pub fn cleanup_staging(
+        &self,
+        job_id: &str,
+        audio: &PreparedAudio,
+        archive: &ArchiveState,
+        track: &MusicTrack,
+    ) -> anyhow::Result<()> {
+        use crate::music_staging_cleanup::{
+            VerifiedFileIdentity, cleanup_staging_tree_with_refresh, identify_regular_file,
+        };
+
+        if paths_overlap(&self.settings.staging_dir, &self.settings.state_dir)
+            || paths_overlap(&self.settings.staging_dir, &self.settings.archive_dir)
+        {
+            bail!("Music staging overlaps its durable state or archive directory");
+        }
+        if !is_persistent_id(&track.persistent_id) {
+            bail!("Music persistent ID is invalid");
+        }
+        let persistent_id = track.persistent_id.clone();
+        cleanup_staging_tree_with_refresh(&self.settings.staging_dir, job_id, || {
+            let current = self.query_track(&persistent_id)?;
+            if current.persistent_id != persistent_id || !current.cloud_complete() {
+                bail!("current Music track is not in an uploaded or matched cloud state");
+            }
+            let music_path = current
+                .location
+                .as_deref()
+                .context("current Music track has no readable file location")?;
+            if music_path.starts_with(&self.settings.staging_dir) {
+                bail!("current Music copy resolves inside Music staging");
+            }
+            let current_copy = self.verify_copy_current(audio, &current)?;
+
+            let current_archive = self.archive_status(&archive.path)?;
+            if current_archive.path != archive.path
+                || !current_archive.uploaded
+                || current_archive.uploading
+                || current_archive.downloading
+                || current_archive.conflicts
+            {
+                bail!("iCloud archive is not in a stable uploaded state");
+            }
+            let archive_identity = identify_regular_file(&archive.path)
+                .context("capture uploaded archive identity without opening its contents")?;
+            if archive_identity.size != audio.original.size {
+                bail!("uploaded archive size changed from the completed job record");
+            }
+            Ok((
+                VerifiedFileIdentity {
+                    path: current_copy.path,
+                    device: current_copy.identity.device,
+                    inode: current_copy.identity.inode,
+                    size: current_copy.identity.size,
+                },
+                VerifiedFileIdentity {
+                    path: archive_identity.path,
+                    device: archive_identity.device,
+                    inode: archive_identity.inode,
+                    size: archive_identity.size,
+                },
+            ))
+        })
     }
 
     pub fn archive_status(&self, path: &Path) -> anyhow::Result<ArchiveState> {
@@ -605,6 +686,10 @@ fn check_cancelled(cancel: &MusicCancellation) -> anyhow::Result<()> {
         bail!("Music audio preparation was cancelled");
     }
     Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn is_lossless_source_path(path: &Path) -> bool {

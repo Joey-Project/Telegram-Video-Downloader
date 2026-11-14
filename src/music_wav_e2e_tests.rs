@@ -109,6 +109,16 @@ impl MusicBackend for WavBackend {
             ..archive.clone()
         })
     }
+
+    fn cleanup_staging(
+        &self,
+        _: &str,
+        _: &PreparedAudio,
+        _: &ArchiveState,
+        _: &MusicTrack,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn test_tool(name: &str) -> PathBuf {

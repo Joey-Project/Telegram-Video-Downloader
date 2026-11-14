@@ -209,6 +209,11 @@ Music imports use its isolated worker for FLAC and PCM WAV uploads, retaining th
 iCloud Drive and importing the verified local ALAC. Workspace checks on macOS require
 `flac` and `pkg-config` (`brew install flac pkg-config`).
 
+Completed Music imports clean their private download and conversion staging after
+checking the uploaded original and independent Music copy. Cleanup retries survive
+restart; incomplete, failed and cancelled tasks retain their files. See the
+[Music automation guide](docs/macos-music-automation.md) for the safety boundaries.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings

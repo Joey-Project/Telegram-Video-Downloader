@@ -176,4 +176,12 @@ pub trait MusicBackend: Send + Sync + 'static {
     fn verify_copy(&self, audio: &PreparedAudio, track: &MusicTrack) -> Result<()>;
     fn archive_status(&self, path: &Path) -> Result<ArchiveState>;
     fn evict_archive(&self, archive: &ArchiveState, track: &MusicTrack) -> Result<ArchiveState>;
+    /// Remove only this job's private staging files after completed-copy proofs pass.
+    fn cleanup_staging(
+        &self,
+        job_id: &str,
+        audio: &PreparedAudio,
+        archive: &ArchiveState,
+        track: &MusicTrack,
+    ) -> Result<()>;
 }

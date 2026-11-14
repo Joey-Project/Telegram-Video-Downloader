@@ -28,11 +28,14 @@ mod metadata_recovery_bot;
 #[cfg(test)]
 mod metadata_recovery_e2e_tests;
 mod music_automation;
+#[cfg(test)]
+mod music_cleanup_e2e_tests;
 mod music_conversion;
 mod music_import;
 mod music_manager;
 mod music_native;
 mod music_runtime;
+mod music_staging_cleanup;
 mod music_transfer;
 mod music_types;
 mod pgc_metadata_backfill;
