@@ -1552,6 +1552,42 @@ fn metadata_recovery_receipt_identity(record: &InboxRecord) -> Option<Value> {
     }))
 }
 
+fn staging_cleanup_request_identity(record: &InboxRecord) -> Option<Map<String, Value>> {
+    let operation = record.request.staging_cleanup_operation()?;
+    if !matches!(operation, "scan" | "preview" | "confirm" | "cancel") {
+        return None;
+    }
+    let payload = &record.request.payload;
+    let library_id = payload.get("library_id")?.as_str()?;
+    let root_binding = payload.get("root_binding")?.as_str()?;
+    if !valid_library_id(library_id) || !valid_root_binding_token(root_binding) {
+        return None;
+    }
+    let mut identity = Map::new();
+    identity.insert("operation".into(), json!(operation));
+    identity.insert("library_id".into(), json!(library_id));
+    identity.insert("root_binding".into(), json!(root_binding));
+    if matches!(operation, "confirm" | "cancel") {
+        let preview_seq = payload.get("preview_seq")?.as_u64()?;
+        if preview_seq == 0 || preview_seq > MAX_MIGRATION_SUMMARY_SAFE_INTEGER {
+            return None;
+        }
+        identity.insert("preview_seq".into(), json!(preview_seq));
+        for (field, max_bytes) in [("preview_id", 128), ("revision", 256)] {
+            let value = payload.get(field)?.as_str()?;
+            if value.is_empty()
+                || value.len() > max_bytes
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
+                return None;
+            }
+            identity.insert(field.into(), json!(value));
+        }
+    }
+    Some(identity)
+}
+
 fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value {
     let result = record.result.as_ref().map(|result| {
         if record.request.kind == "library_scan" {
@@ -1602,10 +1638,10 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         "result": result,
         "error": error,
     });
-    if let Some(operation_kind) = record.request.staging_cleanup_operation()
+    if let Some(identity) = staging_cleanup_request_identity(record)
         && let Some(fields) = operation.as_object_mut()
     {
-        fields.insert("operation".to_string(), json!(operation_kind));
+        fields.extend(identity);
     }
     if record.request.kind == "file_preview"
         && let Some(fields) = operation.as_object_mut()
@@ -3020,6 +3056,51 @@ mod tests {
             "preview-cancelled-history"
         );
         assert!(previews.is_empty());
+    }
+
+    #[test]
+    fn staging_cleanup_pending_identity_survives_replay_without_publishing_payload() {
+        for operation_kind in ["confirm", "cancel"] {
+            for status in [
+                InboxStatus::Pending,
+                InboxStatus::Processing,
+                InboxStatus::Retryable,
+            ] {
+                let mut receipt = record(53, "staging_cleanup", status, None, None);
+                receipt.request.payload = json!({
+                    "operation": operation_kind,
+                    "library_id": "ml-test-root",
+                    "root_binding": TEST_ROOT_BINDING,
+                    "preview_seq": 52,
+                    "preview_id": "staging-preview-52",
+                    "revision": "staging-revision-52",
+                });
+                let replayed: InboxRecord = serde_json::from_slice(
+                    &serde_json::to_vec(&receipt).expect("pending receipt should persist"),
+                )
+                .expect("pending receipt should replay");
+                for full in [false, true] {
+                    let published = operation_snapshot(&replayed, full);
+                    for field in [
+                        "operation",
+                        "library_id",
+                        "root_binding",
+                        "preview_seq",
+                        "preview_id",
+                        "revision",
+                    ] {
+                        assert_eq!(published[field], receipt.request.payload[field]);
+                    }
+                    assert_eq!(published["status"], status_name(status));
+                    assert!(published.get("payload").is_none());
+                    assert!(serde_json::to_vec(&published).unwrap().len() < 1024);
+                }
+                receipt.request.payload["preview_id"] = json!("x".repeat(129));
+                let malformed = operation_snapshot(&receipt, false);
+                assert!(malformed.get("preview_id").is_none());
+                assert!(malformed.get("operation").is_none());
+            }
+        }
     }
 
     #[test]

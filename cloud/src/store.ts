@@ -72,6 +72,40 @@ export interface PendingSummary {
   kind: RequestKind;
   created_at: number;
   status: "waiting_for_local";
+  operation?: "scan" | "preview" | "confirm" | "cancel";
+  library_id?: string;
+  root_binding?: string;
+  preview_seq?: number;
+  preview_id?: string;
+  revision?: string;
+}
+
+type PendingSummaryRow = Pick<PendingSummary, "seq" | "kind" | "created_at"> & {
+  operation: unknown;
+  library_id: unknown;
+  root_binding: unknown;
+  preview_seq: unknown;
+  preview_id: unknown;
+  revision: unknown;
+};
+
+type StagingPendingIdentity = Pick<PendingSummary,
+  "operation" | "library_id" | "root_binding" | "preview_seq" | "preview_id" | "revision">;
+
+function stagingPendingIdentity(row: PendingSummaryRow): StagingPendingIdentity {
+  if (row.kind !== "staging_cleanup") return {};
+  const operation = row.operation;
+  if (operation !== "scan" && operation !== "preview" && operation !== "confirm" && operation !== "cancel") return {};
+  const bounded = (value: unknown, limit: number): value is string => typeof value === "string"
+    && value.length > 0 && value.trim() === value && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    && new TextEncoder().encode(value).byteLength <= limit;
+  if (!bounded(row.library_id, 128) || typeof row.root_binding !== "string"
+      || !/^v1:[0-9a-f]{64}$/u.test(row.root_binding)) return {};
+  const identity: StagingPendingIdentity = { operation, library_id: row.library_id, root_binding: row.root_binding };
+  if (operation === "scan" || operation === "preview") return identity;
+  if (!Number.isSafeInteger(row.preview_seq) || (row.preview_seq as number) <= 0
+      || !bounded(row.preview_id, 128) || !bounded(row.revision, 256)) return {};
+  return { ...identity, preview_seq: row.preview_seq as number, preview_id: row.preview_id, revision: row.revision };
 }
 
 export interface PendingPage {
@@ -272,10 +306,18 @@ export async function getPendingPage(db: D1Database, limit: number): Promise<Pen
 
 export async function getPendingSummary(db: D1Database, limit: number): Promise<PendingSummary[]> {
   const result = await db.prepare(
-    "SELECT seq, kind, created_at FROM inbox WHERE acked_at IS NULL ORDER BY seq ASC LIMIT ?",
-  ).bind(limit).all<Omit<PendingSummary, "status">>();
+    `SELECT seq, kind, created_at,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.operation') END AS operation,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.library_id') END AS library_id,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.root_binding') END AS root_binding,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.preview_seq') END AS preview_seq,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.preview_id') END AS preview_id,
+       CASE WHEN kind = 'staging_cleanup' THEN json_extract(payload_json, '$.revision') END AS revision
+     FROM inbox WHERE acked_at IS NULL ORDER BY seq ASC LIMIT ?`,
+  ).bind(limit).all<PendingSummaryRow>();
   if (!result.success) throw new Error("D1 inbox summary read failed");
-  return result.results.map((row) => ({ ...row, status: "waiting_for_local" }));
+  return result.results.map((row) => ({ seq: row.seq, kind: row.kind, created_at: row.created_at,
+    status: "waiting_for_local", ...stagingPendingIdentity(row) }));
 }
 
 export async function getPendingBySeq(db: D1Database, seq: number): Promise<InboxEnvelope | null> {

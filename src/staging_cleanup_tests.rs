@@ -432,3 +432,164 @@ fn staging_cleanup_multiple_attempts_of_one_task_are_cleaned_together_and_replay
         TaskStatus::Failed
     );
 }
+
+#[test]
+fn staging_cleanup_bounded_inventory_keeps_earlier_displayed_rows_previewable() {
+    let fixture = Fixture::new();
+    for index in 0..12 {
+        fixture.partial(&format!("bounded-inventory-{index:02}"), TaskStatus::Failed);
+    }
+
+    let scan = with_idle_output(|| {
+        fixture
+            .queue
+            .scan_staging_cleanup_with_inventory_limit_for_test(
+                &fixture.library_id,
+                &fixture.binding,
+                &[CHAT_ID],
+                32,
+            )
+    })
+    .expect("a bounded inventory should return its completed ownership rows");
+    assert!(
+        scan.truncated,
+        "the synthetic inventory limit should be reached"
+    );
+    let selected = scan
+        .items
+        .iter()
+        .find(|item| item.task_id == "bounded-inventory-00")
+        .expect("the first eligible row should be displayed before truncation");
+    assert!(selected.eligible, "{:?}", selected.reason);
+
+    let preview = with_idle_output(|| {
+        fixture
+            .queue
+            .preview_staging_cleanup_with_inventory_limit_for_test(
+                &fixture.library_id,
+                &fixture.binding,
+                &[CHAT_ID],
+                std::slice::from_ref(&selected.id),
+                32,
+            )
+    })
+    .expect("an earlier displayed row should preview after unrelated inventory truncation");
+    assert_eq!(preview.items.len(), 1);
+    assert_eq!(preview.items[0].task_id, "bounded-inventory-00");
+}
+
+#[test]
+fn staging_cleanup_still_blocks_preview_when_global_queue_ownership_is_incomplete() {
+    let fixture = Fixture::new();
+    let stage = fixture.partial("a-eligible-before-missing", TaskStatus::Failed);
+    fixture.partial("z-missing-queue-record", TaskStatus::Failed);
+    let missing_record = fixture
+        .root
+        .join(".telegram-video-downloader-queue")
+        .join("task-z-missing-queue-record.json");
+    fs::remove_file(missing_record).expect("remove a synthetic indexed task record");
+
+    let scan = fixture.scan();
+    assert!(
+        scan.warnings
+            .iter()
+            .any(|warning| warning.contains("Queue ownership is incomplete"))
+    );
+    let row = scan
+        .items
+        .iter()
+        .find(|item| item.task_id == "a-eligible-before-missing")
+        .expect("the earlier row remains visible for diagnosis");
+    assert!(!row.eligible, "{:?}", row.reason);
+    assert!(
+        row.reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("Queue ownership is incomplete"))
+    );
+    assert!(
+        with_idle_output(|| fixture.queue.preview_staging_cleanup(
+            &fixture.library_id,
+            &fixture.binding,
+            &[CHAT_ID],
+            std::slice::from_ref(&row.id),
+        ))
+        .is_err(),
+        "a selected partial row must not bypass incomplete global ownership"
+    );
+    assert_eq!(
+        fs::read(stage.join("video.part")).unwrap(),
+        b"partial source bytes"
+    );
+}
+
+#[tokio::test]
+async fn staging_cleanup_allows_ordinary_failed_download_with_dirty_marker_without_restart() {
+    let fixture = Fixture::new();
+    let stage = fixture.partial("dirty-ordinary-failure", TaskStatus::Failed);
+    crate::downloader::mark_test_video_output_recovery_dirty(&fixture.root)
+        .await
+        .expect("model the dirty marker left by an ordinary failed download");
+
+    let scan = fixture.scan();
+    assert!(scan.warnings.iter().any(|warning| {
+        warning.contains("dirty marker reflects ordinary retained downloads only")
+    }));
+    let row = scan
+        .items
+        .iter()
+        .find(|item| item.task_id == "dirty-ordinary-failure")
+        .expect("find failed staging row without reopening the queue");
+    assert!(row.eligible, "{:?}", row.reason);
+    let preview = with_idle_output(|| {
+        fixture.queue.preview_staging_cleanup(
+            &fixture.library_id,
+            &fixture.binding,
+            &[CHAT_ID],
+            std::slice::from_ref(&row.id),
+        )
+    })
+    .expect("ordinary retained-download state should allow a bounded preview");
+    let result = with_idle_output(|| fixture.queue.confirm_staging_cleanup(&preview, &[CHAT_ID]))
+        .expect("ordinary retained-download state should allow explicit cleanup");
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.removed, vec![row.id.clone()]);
+    assert!(!stage.exists());
+}
+
+#[tokio::test]
+async fn staging_cleanup_keeps_actual_interrupted_removal_quarantine_protected() {
+    let fixture = Fixture::new();
+    let stage = fixture.partial("interrupted-removal", TaskStatus::Failed);
+    let rooted = crate::safe_fs::RootedFs::new(&fixture.root).unwrap();
+    let entry = rooted.bind_entry(&stage, false).unwrap();
+    let identity = rooted.entry_identity(&stage).unwrap().unwrap();
+    rooted
+        .leave_validated_tree_removal_quarantined_for_test(&entry, identity)
+        .expect("leave an actual synthetic removal transaction pending");
+    crate::downloader::mark_test_video_output_recovery_dirty(&fixture.root)
+        .await
+        .expect("mark the interrupted removal as dirty without resolving it");
+
+    let scan = fixture.scan();
+    let row = scan
+        .items
+        .iter()
+        .find(|item| item.task_id == "interrupted-removal")
+        .expect("the retained queue association should remain visible");
+    assert!(!row.eligible);
+    assert!(
+        row.reason
+            .as_ref()
+            .is_some_and(|reason| { reason.contains("confirmed removal is pending recovery") })
+    );
+    assert!(
+        with_idle_output(|| fixture.queue.preview_staging_cleanup(
+            &fixture.library_id,
+            &fixture.binding,
+            &[CHAT_ID],
+            std::slice::from_ref(&row.id),
+        ))
+        .is_err(),
+        "actual removal recovery must remain closed to preview"
+    );
+}

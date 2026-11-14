@@ -787,6 +787,23 @@ impl RootedFs {
         Ok(entries)
     }
 
+    pub(crate) fn list_root_directory_until(
+        &self,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        self.validate_root()?;
+        let entries = list_directory_entries_until(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            limit,
+            deadline,
+        )?;
+        self.validate_root()?;
+        Ok(entries)
+    }
+
     #[cfg(test)]
     pub(crate) fn reconcile_remove_quarantines(&self) -> Result<Vec<String>> {
         Ok(self.reconcile_remove_quarantines_with_status()?.messages)
@@ -1801,6 +1818,28 @@ impl RootedFs {
                 "bound directory identity changed during listing: {}",
                 entry.path.display()
             );
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        Ok(entries)
+    }
+
+    pub(crate) fn list_bound_directory_until(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<(OsString, EntryIdentity)>> {
+        let directory = self.open_bound_directory(entry, expected)?;
+        let entries = list_directory_entries_until(
+            directory.fd.as_ref(),
+            expected,
+            &entry.path,
+            limit,
+            deadline,
+        )?;
+        if self.bound_entry_identity(entry)? != Some(expected) {
+            bail!("bound directory identity changed during bounded listing");
         }
         self.validate_bound_parent(&entry.parent)?;
         Ok(entries)
@@ -3046,6 +3085,48 @@ fn list_directory_entries(
             "bound directory identity changed during listing: {}",
             display_path.display()
         );
+    }
+    Ok(entries)
+}
+
+fn list_directory_entries_until(
+    directory: &OwnedFd,
+    expected: EntryIdentity,
+    display_path: &Path,
+    limit: usize,
+    deadline: std::time::Instant,
+) -> Result<Vec<(OsString, EntryIdentity)>> {
+    if identity_for_fd(directory)? != expected {
+        bail!("bound directory identity changed before bounded listing");
+    }
+    if std::time::Instant::now() >= deadline {
+        bail!("bounded directory listing exceeded its time limit");
+    }
+    let names = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| format!("failed to read bound directory {}", display_path.display()))?;
+    let mut visited = 0usize;
+    let mut entries = Vec::new();
+    for item in names {
+        if std::time::Instant::now() >= deadline {
+            bail!("bounded directory listing exceeded its time limit");
+        }
+        let item = item.map_err(errno_to_io)?;
+        let name = item.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if visited >= limit {
+            bail!("bounded directory listing exceeded its entry limit");
+        }
+        visited += 1;
+        // Skip ordinary vanished children; an unreadable child remains an error.
+        if let Some(entry) = listed_directory_entry(directory, name)? {
+            entries.push(entry);
+        }
+    }
+    if identity_for_fd(directory)? != expected {
+        bail!("bound directory identity changed during bounded listing");
     }
     Ok(entries)
 }
@@ -4463,6 +4544,51 @@ mod tests {
             "telegram-video-downloader-safe-fs-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn staging_cleanup_bounded_listings_enforce_limits_without_rejecting_child_churn() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("media");
+        fs::create_dir(&child).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::write(child.join(name), b"ordinary media metadata").unwrap();
+        }
+        let rooted = RootedFs::new(directory.path()).unwrap();
+        let bound = rooted.bind_entry(&child, false).unwrap();
+        let identity = rooted.bound_entry_identity(&bound).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 2, deadline)
+                .is_err()
+        );
+        assert_eq!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 3, deadline)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(rooted.list_root_directory_until(0, deadline).is_err());
+        assert_eq!(
+            rooted.list_root_directory_until(1, deadline).unwrap().len(),
+            1
+        );
+        fs::write(child.join("four"), b"new sibling").unwrap();
+        assert_eq!(rooted.bound_entry_identity(&bound).unwrap(), Some(identity));
+        assert_eq!(
+            rooted
+                .list_bound_directory_until(&bound, identity, 4, deadline)
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            rooted
+                .list_root_directory_until(8, std::time::Instant::now())
+                .is_err()
+        );
     }
 
     #[test]

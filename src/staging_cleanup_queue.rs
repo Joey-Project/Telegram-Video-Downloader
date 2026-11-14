@@ -1,7 +1,8 @@
 use super::*;
 
 use crate::downloader::{
-    VideoStagingCleanupLease, VideoStagingCleanupSnapshot, try_hold_video_staging_cleanup,
+    VideoStagingCleanupLease, VideoStagingCleanupRecoveryStatus, VideoStagingCleanupSnapshot,
+    try_hold_video_staging_cleanup,
 };
 use crate::staging_cleanup::{
     CleanupFailure, CleanupPreview, CleanupProof, CleanupResult, MAX_STAGING_CLEANUP_ITEMS,
@@ -36,6 +37,7 @@ struct StagingCandidateSet {
     items: Vec<StagingCandidate>,
     warnings: Vec<String>,
     truncated: bool,
+    // Queue-to-staging ownership only; directory inventory limits are tracked by `truncated`.
     ownership_complete: bool,
 }
 
@@ -46,6 +48,37 @@ impl QueueManager {
         root_binding: &str,
         allowed_chat_ids: &[i64],
     ) -> Result<StagingScan> {
+        self.scan_staging_cleanup_with_inventory_limit(
+            library_id,
+            root_binding,
+            allowed_chat_ids,
+            MAX_STAGING_CLEANUP_INVENTORY_ENTRIES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_staging_cleanup_with_inventory_limit_for_test(
+        &self,
+        library_id: &str,
+        root_binding: &str,
+        allowed_chat_ids: &[i64],
+        inventory_entry_limit: usize,
+    ) -> Result<StagingScan> {
+        self.scan_staging_cleanup_with_inventory_limit(
+            library_id,
+            root_binding,
+            allowed_chat_ids,
+            inventory_entry_limit,
+        )
+    }
+
+    fn scan_staging_cleanup_with_inventory_limit(
+        &self,
+        library_id: &str,
+        root_binding: &str,
+        allowed_chat_ids: &[i64],
+        inventory_entry_limit: usize,
+    ) -> Result<StagingScan> {
         let initial_store = self.staging_cleanup_store(library_id, root_binding)?;
         let lease = try_hold_video_staging_cleanup(&initial_store.root)?;
         let _operation = self.operation_lock.lock().map_err(poisoned_lock)?;
@@ -54,9 +87,18 @@ impl QueueManager {
         require_same_cleanup_root(&initial_store, &store, &lease)?;
         let _queue_operations = store.lock_queue_operations()?;
         lease.validate()?;
+        let deadline = Instant::now() + Duration::from_millis(MAX_STAGING_CLEANUP_SCAN_MILLIS);
+        let recovery_status = lease.staging_cleanup_recovery_status_until(deadline)?;
 
-        let candidate_set =
-            self.collect_staging_candidates(&library, &store, allowed_chat_ids, &lease)?;
+        let candidate_set = self.collect_staging_candidates(
+            &library,
+            &store,
+            allowed_chat_ids,
+            &lease,
+            &recovery_status,
+            deadline,
+            inventory_entry_limit,
+        )?;
         let mut items = candidate_set
             .items
             .into_iter()
@@ -95,6 +137,41 @@ impl QueueManager {
         allowed_chat_ids: &[i64],
         item_ids: &[String],
     ) -> Result<CleanupPreview> {
+        self.preview_staging_cleanup_with_inventory_limit(
+            library_id,
+            root_binding,
+            allowed_chat_ids,
+            item_ids,
+            MAX_STAGING_CLEANUP_INVENTORY_ENTRIES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_staging_cleanup_with_inventory_limit_for_test(
+        &self,
+        library_id: &str,
+        root_binding: &str,
+        allowed_chat_ids: &[i64],
+        item_ids: &[String],
+        inventory_entry_limit: usize,
+    ) -> Result<CleanupPreview> {
+        self.preview_staging_cleanup_with_inventory_limit(
+            library_id,
+            root_binding,
+            allowed_chat_ids,
+            item_ids,
+            inventory_entry_limit,
+        )
+    }
+
+    fn preview_staging_cleanup_with_inventory_limit(
+        &self,
+        library_id: &str,
+        root_binding: &str,
+        allowed_chat_ids: &[i64],
+        item_ids: &[String],
+        inventory_entry_limit: usize,
+    ) -> Result<CleanupPreview> {
         validate_staging_cleanup_selection(item_ids)?;
         let initial_store = self.staging_cleanup_store(library_id, root_binding)?;
         let lease = try_hold_video_staging_cleanup(&initial_store.root)?;
@@ -104,12 +181,26 @@ impl QueueManager {
         require_same_cleanup_root(&initial_store, &store, &lease)?;
         let _queue_operations = store.lock_queue_operations()?;
         lease.validate()?;
-        if !lease.is_recovery_clean()? {
-            bail!("video output recovery is pending; staging cleanup preview is unavailable");
+        let deadline = Instant::now() + Duration::from_millis(MAX_STAGING_CLEANUP_SCAN_MILLIS);
+        let recovery_status = lease.staging_cleanup_recovery_status_until(deadline)?;
+        if !recovery_status.is_safe() {
+            bail!(
+                "{} Staging cleanup preview is unavailable.",
+                recovery_status
+                    .reason()
+                    .unwrap_or("Video output recovery is unresolved.")
+            );
         }
 
-        let candidate_set =
-            self.collect_staging_candidates(&library, &store, allowed_chat_ids, &lease)?;
+        let candidate_set = self.collect_staging_candidates(
+            &library,
+            &store,
+            allowed_chat_ids,
+            &lease,
+            &recovery_status,
+            deadline,
+            inventory_entry_limit,
+        )?;
         if !candidate_set.ownership_complete {
             bail!(
                 "could not verify every authorized queue record; refresh the staging scan before previewing"
@@ -126,7 +217,10 @@ impl QueueManager {
         let mut total_bytes = 0_u64;
         for id in item_ids {
             let candidate = by_id.remove(id).ok_or_else(|| {
-                anyhow!("selected staging directory is no longer available; refresh the scan")
+                anyhow!(
+                    "selected staging directory is unavailable or outside the bounded inventory; \
+                     refresh and select a displayed row"
+                )
             })?;
             let Some(proof) = candidate.proof else {
                 bail!(
@@ -191,11 +285,17 @@ impl QueueManager {
         require_same_cleanup_root(&initial_store, &store, &lease)?;
         let _queue_operations = store.lock_queue_operations()?;
         lease.validate()?;
-        if !lease.is_recovery_clean()? {
-            bail!("video output recovery is pending; staging cleanup confirmation is unavailable");
+        let deadline = Instant::now() + Duration::from_millis(MAX_STAGING_CLEANUP_SCAN_MILLIS);
+        let recovery_status = lease.staging_cleanup_recovery_status_until(deadline)?;
+        if !recovery_status.is_safe() {
+            bail!(
+                "{} Staging cleanup confirmation is unavailable.",
+                recovery_status
+                    .reason()
+                    .unwrap_or("Video output recovery is unresolved.")
+            );
         }
 
-        let deadline = Instant::now() + Duration::from_millis(MAX_STAGING_CLEANUP_SCAN_MILLIS);
         let (records, warnings, truncated, ownership_complete) = read_indexed_staging_records(
             self,
             &store,
@@ -285,7 +385,8 @@ impl QueueManager {
                 continue;
             }
 
-            let snapshot = lease.snapshot_job(Path::new(&proof.relative_path))?;
+            let snapshot = lease
+                .snapshot_job_for_cleanup(Path::new(&proof.relative_path), &recovery_status)?;
             let fresh_item = staging_item_for(record, &proof.relative_path, Some(&snapshot), None)?;
             let fresh_proof = cleanup_proof_for(record, &proof.relative_path, &snapshot);
             if &fresh_item != item || &fresh_proof != proof {
@@ -309,7 +410,7 @@ impl QueueManager {
         }
         lease.validate()?;
 
-        let removals = lease.remove_jobs(&removal_jobs);
+        let removals = lease.remove_jobs(&removal_jobs, &recovery_status);
         let mut result = CleanupResult {
             removed: already_removed,
             ..CleanupResult::default()
@@ -405,14 +506,18 @@ impl QueueManager {
         Ok((library, store))
     }
 
+    // Keep the ownership scope, authenticated lease and independent inventory budget explicit.
+    #[allow(clippy::too_many_arguments)]
     fn collect_staging_candidates(
         &self,
         library: &MediaLibrary,
         store: &DownloadStore,
         allowed_chat_ids: &[i64],
         lease: &VideoStagingCleanupLease,
+        recovery_status: &VideoStagingCleanupRecoveryStatus,
+        deadline: Instant,
+        inventory_entry_limit: usize,
     ) -> Result<StagingCandidateSet> {
-        let deadline = Instant::now() + Duration::from_millis(MAX_STAGING_CLEANUP_SCAN_MILLIS);
         let (records, mut warnings, mut truncated, mut ownership_complete) =
             read_indexed_staging_records(
                 self,
@@ -472,12 +577,19 @@ impl QueueManager {
         all_jobs.extend(pending_jobs);
         let mut relatives = all_jobs.into_iter().collect::<Vec<_>>();
         relatives.sort();
-        let recovery_clean = lease.is_recovery_clean()?;
-        if !recovery_clean {
+        if !recovery_status.is_safe() {
             truncated = true;
             push_cleanup_warning(
                 &mut warnings,
-                "Video output recovery is pending; every retained staging directory is protected.",
+                recovery_status.reason().unwrap_or(
+                    "Unresolved video output recovery protects every retained staging directory.",
+                ),
+            );
+        } else if recovery_status.was_dirty_ordinary() {
+            push_cleanup_warning(
+                &mut warnings,
+                "A bounded audit verified that the dirty marker reflects ordinary retained \
+                 downloads only.",
             );
         }
 
@@ -487,10 +599,9 @@ impl QueueManager {
         for relative in relatives {
             if Instant::now() >= deadline {
                 truncated = true;
-                ownership_complete = false;
                 push_cleanup_warning(
                     &mut warnings,
-                    "The staging inventory reached its time limit; some directories were omitted.",
+                    "The staging inventory reached its time limit; later directories were omitted.",
                 );
                 break;
             }
@@ -533,15 +644,15 @@ impl QueueManager {
             let is_pending_quarantine = pending.contains(&relative);
             if is_pending_quarantine {
                 protected_reason = Some("A previous confirmed removal is pending recovery.");
-            } else if !recovery_clean {
+            } else if !recovery_status.is_safe() {
                 protected_reason =
-                    Some("Video output recovery is pending; this directory is protected.");
+                    Some("Video output recovery is unresolved; this directory is protected.");
             }
 
-            let snapshot = if is_pending_quarantine || !recovery_clean {
+            let snapshot = if is_pending_quarantine || !recovery_status.is_safe() {
                 None
             } else {
-                match lease.snapshot_job(&relative) {
+                match lease.snapshot_job_for_cleanup(&relative, recovery_status) {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) if crate::file_provider::is_file_provider_access_error(&error) => {
                         return Err(error);
@@ -559,15 +670,14 @@ impl QueueManager {
             if let Some(snapshot) = snapshot.as_ref() {
                 inventory_entry_count =
                     inventory_entry_count.saturating_add(snapshot.inventory_entry_count);
-                if inventory_entry_count > MAX_STAGING_CLEANUP_INVENTORY_ENTRIES {
+                if inventory_entry_count > inventory_entry_limit {
                     truncated = true;
-                    ownership_complete = false;
                     protected_reason = Some(
-                        "The global staging inventory limit was reached; rescan a smaller selection.",
+                        "The inventory limit was reached; only earlier displayed rows are selectable.",
                     );
                     push_cleanup_warning(
                         &mut warnings,
-                        "The global staging inventory limit was reached; later directories remain protected.",
+                        "The staging inventory limit was reached; later rows remain protected.",
                     );
                 }
             }
@@ -585,14 +695,34 @@ impl QueueManager {
                 None
             };
             candidates.push(StagingCandidate { item, proof });
-            if inventory_entry_count > MAX_STAGING_CLEANUP_INVENTORY_ENTRIES {
+            if inventory_entry_count > inventory_entry_limit {
                 break;
             }
         }
-        if truncated {
+        if !ownership_complete {
+            for candidate in &mut candidates {
+                candidate.item.eligible = false;
+                candidate.proof = None;
+                let reason = candidate
+                    .item
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!("Queue ownership is incomplete; {reason}"))
+                    .unwrap_or_else(|| {
+                        "Queue ownership is incomplete; refresh before selecting this row."
+                            .to_string()
+                    });
+                candidate.item.reason =
+                    Some(bounded_text(&reason, MAX_STAGING_CLEANUP_TITLE_BYTES));
+            }
             push_cleanup_warning(
                 &mut warnings,
-                "The scan is incomplete. Only displayed eligible rows can be previewed.",
+                "Queue ownership is incomplete; preview is blocked until a complete scan succeeds.",
+            );
+        } else if truncated {
+            push_cleanup_warning(
+                &mut warnings,
+                "The bounded inventory is incomplete; preview only displayed eligible rows.",
             );
         }
         if has_unassociated_jobs {

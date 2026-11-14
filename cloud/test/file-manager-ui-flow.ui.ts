@@ -512,6 +512,47 @@ function stagingPreviewOperation(seq: number) {
   return { operation, activePreview, preview };
 }
 
+function stagingCleanupPendingRequest(seq: number, previewSeq: number, operation: "confirm" | "cancel") {
+  return {
+    seq,
+    kind: "staging_cleanup",
+    operation,
+    status: "waiting_for_local",
+    created_at: Math.floor(Date.now() / 1_000),
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    preview_seq: previewSeq,
+    preview_id: STAGING_PREVIEW_ID,
+    revision: STAGING_PREVIEW_REVISION,
+  };
+}
+
+function stagingCleanupPendingOperation(
+  seq: number,
+  previewSeq: number,
+  operation: "confirm" | "cancel",
+  status: "retryable" | "failed",
+) {
+  const updatedAt = Math.floor(Date.now() / 1_000);
+  return {
+    seq,
+    kind: "staging_cleanup",
+    operation,
+    status,
+    created_at: updatedAt,
+    updated_at: updatedAt,
+    attempts: 1,
+    next_attempt_at: 0,
+    result: null,
+    error: status === "failed" ? "The cleanup action could not be applied." : null,
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    preview_seq: previewSeq,
+    preview_id: STAGING_PREVIEW_ID,
+    revision: STAGING_PREVIEW_REVISION,
+  };
+}
+
 function migrationPreviewSnapshot() {
   const sourceLibrary = {
     id: LIBRARY_ID,
@@ -4112,6 +4153,119 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#operation-list").textContent).toContain("Cleanup preview cancelled. No staging data was removed.");
     expect(reloadedPage.actions).toHaveLength(1);
   });
+
+  it.each(["confirm", "cancel"] as const)(
+    "keeps an accepted video cleanup %s disabled through Worker and desktop pending snapshots",
+    async (operation) => {
+      vi.stubGlobal("crypto", webcrypto);
+      const storage = makeMemoryStorage();
+      const preview = stagingPreviewOperation(740);
+      let currentSnapshot: Record<string, any> = {
+        ...ownerSnapshot,
+        state_version: 1,
+        operations: [preview.operation],
+        pending_requests: [],
+        previews: [preview.activePreview],
+      };
+      let workerPendingSnapshot: Record<string, any> = currentSnapshot;
+      const firstPage = await mountFileManagerFixture(currentSnapshot, storage, async (action, seq, publishSnapshot) => {
+        expect(action.kind).toBe("staging_cleanup");
+        expect(action.payload.operation).toBe(operation);
+        const pending = stagingCleanupPendingRequest(seq, preview.operation.seq, operation);
+        expect(pending).not.toHaveProperty("payload");
+        workerPendingSnapshot = {
+          ...currentSnapshot,
+          state_version: currentSnapshot.state_version + 1,
+          pending_requests: [pending],
+        };
+        currentSnapshot = workerPendingSnapshot;
+        await publishSnapshot(workerPendingSnapshot);
+        return { status: 202, body: { seq, request_id: action.request_id } };
+      }, 930);
+
+      element<HTMLButtonElement>('[data-view="waiting"]').click();
+      const confirmButton = () => element<HTMLButtonElement>(`[data-staging-cleanup-confirm="${STAGING_PREVIEW_ID}"]`);
+      const cancelButton = () => element<HTMLButtonElement>(`[data-staging-cleanup-cancel="${STAGING_PREVIEW_ID}"]`);
+      expect(confirmButton().disabled).toBe(false);
+      expect(cancelButton().disabled).toBe(false);
+      element<HTMLButtonElement>(`[data-staging-cleanup-${operation}="${STAGING_PREVIEW_ID}"]`).click();
+      await vi.waitFor(() => {
+        expect(firstPage.actions).toHaveLength(1);
+        expect(storage.getItem("file-manager.actions.v1")).toBe("[]");
+        expect(confirmButton().disabled).toBe(true);
+        expect(cancelButton().disabled).toBe(true);
+      });
+      expect(workerPendingSnapshot.pending_requests[0]).toMatchObject({
+        operation,
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        preview_seq: preview.operation.seq,
+        preview_id: STAGING_PREVIEW_ID,
+        revision: STAGING_PREVIEW_REVISION,
+      });
+      expect(workerPendingSnapshot.pending_requests[0]).not.toHaveProperty("payload");
+      element<HTMLButtonElement>(`[data-staging-cleanup-${operation}="${STAGING_PREVIEW_ID}"]`).click();
+      expect(firstPage.actions).toHaveLength(1);
+
+      const reloadedPage = await mountFileManagerFixture(
+        workerPendingSnapshot,
+        storage,
+        () => { throw new Error("A Worker-pending action must not be submitted again after reload."); },
+        940,
+      );
+      element<HTMLButtonElement>('[data-view="waiting"]').click();
+      await vi.waitFor(() => {
+        expect(confirmButton().disabled).toBe(true);
+        expect(cancelButton().disabled).toBe(true);
+      });
+      expect(reloadedPage.actions).toHaveLength(0);
+
+      Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+      window.dispatchEvent(new Event("offline"));
+      await vi.waitFor(() => expect(latestOpenSocket(reloadedPage.sockets)).toBeUndefined());
+      expect(confirmButton().disabled).toBe(true);
+      expect(cancelButton().disabled).toBe(true);
+      expect(reloadedPage.actions).toHaveLength(0);
+
+      Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+      window.dispatchEvent(new Event("online"));
+      await vi.waitFor(() => expect(latestOpenSocket(reloadedPage.sockets)?.watch).toBe(true));
+      const rustPending = stagingCleanupPendingOperation(930, preview.operation.seq, operation, "retryable");
+      expect(rustPending).not.toHaveProperty("payload");
+      const rustPendingSnapshot = {
+        ...workerPendingSnapshot,
+        state_version: 3,
+        operations: [preview.operation, rustPending],
+        pending_requests: [],
+      };
+      const socket = latestOpenSocket(reloadedPage.sockets);
+      if (!socket) throw new Error("Expected a live update socket while the cleanup operation is retrying.");
+      const beforeRetry = reloadedPage.stateRequests;
+      await reloadedPage.publishSnapshot(rustPendingSnapshot);
+      socket.publishSnapshot(rustPendingSnapshot.state_version);
+      await vi.waitFor(() => expect(reloadedPage.stateRequests).toBe(beforeRetry + 1));
+      await vi.waitFor(() => {
+        expect(confirmButton().disabled).toBe(true);
+        expect(cancelButton().disabled).toBe(true);
+      });
+
+      const terminalOperation = { ...rustPending, status: "failed", updated_at: rustPending.updated_at + 1 };
+      const terminalSnapshot = {
+        ...rustPendingSnapshot,
+        state_version: 4,
+        operations: [preview.operation, terminalOperation],
+      };
+      const beforeTerminal = reloadedPage.stateRequests;
+      await reloadedPage.publishSnapshot(terminalSnapshot);
+      socket.publishSnapshot(terminalSnapshot.state_version);
+      await vi.waitFor(() => expect(reloadedPage.stateRequests).toBe(beforeTerminal + 1));
+      await vi.waitFor(() => {
+        expect(confirmButton().disabled).toBe(false);
+        expect(cancelButton().disabled).toBe(false);
+      });
+      expect(reloadedPage.actions).toHaveLength(0);
+    },
+  );
 
   it("confirms only the saved staging preview, records a compact summary, and invalidates the old scan", async () => {
     vi.stubGlobal("crypto", webcrypto);

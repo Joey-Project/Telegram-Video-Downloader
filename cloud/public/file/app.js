@@ -1159,11 +1159,23 @@ function restoreAwaitingOperationResults() {
         || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
         || actionReplayStatus(action).status !== "valid"
         || state.awaitingOperationResults.has(action.request_id)) continue;
-    state.awaitingOperationResults.set(action.request_id, {
-      kind: action.kind,
-      seq: null,
-    });
+    state.awaitingOperationResults.set(action.request_id, awaitingOperationResultTracker(action));
   }
+}
+
+function awaitingOperationResultTracker(action, seq = null) {
+  const tracker = { kind: action?.kind, seq };
+  if (action?.kind !== "staging_cleanup") return tracker;
+  const payload = action.payload && typeof action.payload === "object" ? action.payload : {};
+  tracker.operation = payload.operation;
+  tracker.library_id = payload.library_id;
+  tracker.root_binding = payload.root_binding;
+  if (["confirm", "cancel"].includes(payload.operation)) {
+    tracker.preview_seq = payload.preview_seq;
+    tracker.preview_id = payload.preview_id;
+    tracker.revision = payload.revision;
+  }
+  return tracker;
 }
 
 function activeSnapshotOperationAwaitingResult() {
@@ -2196,10 +2208,10 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     onQueued: (queuedAction) => {
       onQueued?.(queuedAction);
       if (["library_scan", "legacy_import"].includes(kind)) {
-        state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
+        state.awaitingOperationResults.set(queuedAction.request_id, awaitingOperationResultTracker(queuedAction));
       }
       if (kind === "staging_cleanup") {
-        state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
+        state.awaitingOperationResults.set(queuedAction.request_id, awaitingOperationResultTracker(queuedAction));
       }
       if ((["file_preview", "library_migration_preview"].includes(kind)
           || kind === "staging_cleanup" && payload?.operation === "preview") && state.view !== "waiting") {
@@ -2763,13 +2775,25 @@ function updateStagingSelection(candidateIds, selected) {
 function stagingCleanupActionPending(operation, libraryId = null, preview = null) {
   const matches = (entry) => {
     if (entry?.kind !== "staging_cleanup" || stagingCleanupOperationName(entry) !== operation) return false;
-    if (libraryId && String(entry?.payload?.library_id ?? entry.library_id ?? "") !== libraryId) return false;
-    if (preview && (Number(entry?.payload?.preview_seq ?? entry.preview_seq ?? 0) !== preview.seq
-        || String(entry?.payload?.preview_id ?? entry.preview_id ?? "") !== preview.id
-        || String(entry?.payload?.revision ?? entry.revision ?? "") !== preview.revision)) return false;
+    const entryLibraryId = String(entry?.payload?.library_id ?? entry.library_id ?? "");
+    const entryRootBinding = String(entry?.payload?.root_binding ?? entry.root_binding ?? "");
+    const expectedLibraryId = preview?.library_id ?? libraryId;
+    if (expectedLibraryId && entryLibraryId && entryLibraryId !== expectedLibraryId) return false;
+    if (preview && entryRootBinding && entryRootBinding !== preview.root_binding) return false;
+    if (preview) {
+      const previewSeq = entry?.payload?.preview_seq ?? entry.preview_seq;
+      const previewId = entry?.payload?.preview_id ?? entry.preview_id;
+      const revision = entry?.payload?.revision ?? entry.revision;
+      const hasExactPreviewIdentity = Number.isSafeInteger(previewSeq)
+        && typeof previewId === "string" && typeof revision === "string";
+      if (hasExactPreviewIdentity && (previewSeq !== preview.seq || previewId !== preview.id || revision !== preview.revision)) {
+        return false;
+      }
+    }
     return !SETTLED_OPERATION_STATUSES.has(String(entry.status ?? "pending").toLowerCase());
   };
-  return readActionQueue().some(matches)
+  return [...state.awaitingOperationResults.values()].some(matches)
+    || readActionQueue().some(matches)
     || (Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : []).some(matches)
     || (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).some(matches);
 }

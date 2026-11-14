@@ -67,22 +67,42 @@ superseded_by: ""
   confirmation or cancellation. Leaving Requests therefore releases its operation
   subscription. Confirmation receipts publish the library/root identity used to
   invalidate the previous scan without exposing the private request payload.
+- Accepted confirmations and cancellations keep their exact preview identity
+  visible in bounded pending receipts, including while the desktop is offline or
+  retrying. Those controls stay disabled across Mini App sessions until a result
+  arrives. Pending summaries expose only allowlisted scalar bindings and omit
+  selections and local filesystem proofs.
+- Ordinary retained failures with a DIRTY recovery marker can proceed after a
+  bounded read-only audit of nested output transactions and every staging owner,
+  retention/lifecycle marker and inventory. It runs no startup recovery. Cleanup
+  revalidates the lease and requires a fresh full audit before declaring recovery
+  CLEAN after deletion. Unreadable, unknown or over-budget recovery stays blocked.
+- Global queue ownership failures protect every displayed row. Directory
+  inventory truncation alone leaves earlier verified rows previewable. Ordinary
+  media titles containing recovery or overwrite remain valid; only actual
+  reserved recovery artifacts are protected. Directory listings enforce their
+  entry and time budgets while reading, with object identity revalidation.
 
 ## Validation
 
-- Sixteen staging-specific tests pass, including real temporary files and mocked
+- Twenty-five staging-specific tests pass, including real temporary files and mocked
   Telegram/cloud requests for offline cancellation, restart confirmation,
   resumed tasks, cross-chat aliases, multiple attempts, replay and proof privacy.
 - Filesystem tests preserve new/replaced entries, symlink/hard-link targets and
   completed unpublished downloads. A benign timestamp test explicitly preserves
   birth identity: on this host a pre-birth mtime also changes creation time, so
   the fixture uses a future mtime and verifies unchanged creation identity.
-- Full workspace: 1,470 main tests, 27 native converter unit tests and eight real
-  codec E2Es pass; 17 existing tests remain ignored. Nine converter client tests
-  also pass without native features. Strict workspace Clippy and formatting pass.
-- Worker/D1: 405 tests pass; mounted Mini App: 92 tests pass. Type checking,
+- Required Rust CI covers the complete workspace, native converter unit tests,
+  eight real codec E2Es, nine converter client tests without native features,
+  service helpers and fixed Music runtime checks. Strict workspace Clippy and
+  formatting pass.
+- Worker/D1: 406 tests pass; mounted Mini App: 94 tests pass. Type checking,
   migration preservation checks and deployment dry-run pass. Existing CI
   automatically discovers the new Rust and Mini App tests.
 - Mounted UI regressions cover releasing preview-result interest on navigation,
   retaining review controls and invalidating scans using the real public receipt
   shape. The restart-confirmation E2E verifies that shape from the Rust snapshot.
+- Additional regressions cover accepted confirm/cancel across reload/offline/retry
+  and terminal release, DIRTY ordinary failures, interrupted removal quarantines,
+  nested transaction directories, ordinary recovery-word media names, bounded
+  listings and truncated inventory with complete or incomplete queue ownership.
