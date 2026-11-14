@@ -37,13 +37,13 @@ const CACHE_KEY = "file-manager.snapshot.v1";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const MAX_LEGACY_BYTES = 256 * 1024;
 const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
-const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import"]);
+const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import", "staging_cleanup"]);
 const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "retryable"]);
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoverySelectionQueue: null, metadataRecoverySelectionRequestId: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), stagingSelected: new Set(), stagingQuery: "", stagingPage: 0, stagingScanKey: "", groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoverySelectionQueue: null, metadataRecoverySelectionRequestId: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let snapshotRefreshPending = false;
@@ -1110,7 +1110,7 @@ function updateSnapshotInterest() {
   restoreAwaitingOperationResults();
   const pendingQueuedAction = readActionQueue().some((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE)
     && action.delivery_outcome !== "outcome_unknown");
-  const visibleResultView = state.view === "waiting" || state.view === "organizing";
+  const visibleResultView = state.view === "waiting" || state.view === "organizing" || state.view === "temporary";
   const downloadHistory = state.downloadSubmission
     ? inspectDownloadSubmissionHistory(state.downloadSubmission, state.snapshot)
     : { kind: "unaccepted" };
@@ -1154,7 +1154,7 @@ function restoreAwaitingOperationResults() {
     }
   }
   for (const action of queue) {
-    if (!["library_scan", "legacy_import"].includes(action.kind)
+    if (!["library_scan", "legacy_import", "staging_cleanup"].includes(action.kind)
         || state.quarantinedActionIds.has(action.request_id)
         || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
         || actionReplayStatus(action).status !== "valid"
@@ -1213,6 +1213,7 @@ function showPrivateAccessGate(message, { preserveRecoveryPreviewRequest = false
   state.detailId = null;
   clearSelectedItems();
   clearMetadataRecoveryState({ preservePreviewRequest: preserveRecoveryPreviewRequest });
+  state.stagingSelected.clear();
   state.historyQuery = "";
   if (!preserveRecoveryPreviewRequest) {
     state.previewCancellations.clear();
@@ -1222,11 +1223,11 @@ function showPrivateAccessGate(message, { preserveRecoveryPreviewRequest = false
   state.legacyOperationKey = null;
   state.legacySelection.clear();
   document.querySelector(".detail-panel")?.remove();
-  document.querySelectorAll("#app-content .stack-list, #app-content .library-list, #metadata-recovery-results")
+  document.querySelectorAll("#app-content .stack-list, #app-content .library-list, #app-content .staging-list, #metadata-recovery-results")
     .forEach((list) => { list.innerHTML = ""; });
   byId("history-summary").textContent = "";
   byId("history-search").value = "";
-  for (const id of ["waiting-count", "organizing-count", "history-count", "library-count", "needs-count"]) {
+  for (const id of ["waiting-count", "organizing-count", "history-count", "library-count", "needs-count", "staging-count"]) {
     byId(id).textContent = "0";
   }
   byId("app-content").classList.add("hidden");
@@ -2110,11 +2111,40 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     showToast("This preview is no longer awaiting review. Refresh the Requests view before cancelling it.");
     return false;
   }
+  if (kind === "staging_cleanup") {
+    const libraryId = String(payload?.library_id ?? "");
+    const library = registeredMediaLibrary(state.snapshot, libraryId);
+    if (!isValidLibraryRootBinding(payload?.root_binding)
+        || payload?.operation !== "cancel" && (!library || library.root_binding !== payload.root_binding)) {
+      showToast("This cleanup request no longer matches a registered media library. Refresh and scan again.");
+      return false;
+    }
+    if (payload?.operation === "preview") {
+      const scan = latestStagingScan(libraryId);
+      const eligibleIds = new Set((Array.isArray(scan?.items) ? scan.items : [])
+        .filter((item) => item?.eligible === true && typeof item.id === "string").map((item) => item.id));
+      if (!scan || scan.root_binding !== payload.root_binding
+          || !Array.isArray(payload.item_ids) || payload.item_ids.length === 0
+          || payload.item_ids.some((id) => !eligibleIds.has(id))) {
+        showToast("The selected staging entries no longer match the latest saved scan. Scan again and select current eligible entries.");
+        return false;
+      }
+    }
+    if (["confirm", "cancel"].includes(payload?.operation)
+        && !stagingCleanupPreviewEntries().some((entry) => entry.seq === payload.preview_seq
+          && entry.id === payload.preview_id && entry.revision === payload.revision
+          && entry.library_id === libraryId && entry.root_binding === payload.root_binding
+          && isReviewablePreviewStatus(entry.status))) {
+      showToast("This cleanup preview is no longer awaiting review. Refresh the Requests view before continuing.");
+      return false;
+    }
+  }
   const unavailableLibraryAction = (() => {
     if (["file_preview", "legacy_import", "metadata_recover"].includes(kind)) {
       return !libraryCanOperate(String(payload?.library_id ?? ""));
     }
     if (kind === "download_submit") return !libraryCanOperate(String(payload?.library_id ?? ""));
+    if (kind === "staging_cleanup") return payload?.operation !== "cancel" && !libraryCanOperate(String(payload?.library_id ?? ""));
     if (kind === "library_migration_preview") {
       return !libraryCanOperate(String(payload?.source_library_id ?? ""))
         || !libraryCanOperate(String(payload?.target_library_id ?? ""));
@@ -2146,7 +2176,7 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     showToast("This library is offline or showing a saved scan. Reconnect it and refresh before changing files.");
     return false;
   }
-  if (kind === "file_preview") {
+  if (kind === "file_preview" || kind === "staging_cleanup" && payload?.operation === "preview") {
     for (const field of ["item_ids", "metadata_patches"]) {
       if (Array.isArray(payload?.[field]) && payload[field].length > MAX_SELECTED_ITEMS) {
         showToast(`Choose at most ${MAX_SELECTED_ITEMS} ${field === "item_ids" ? "videos" : "metadata matches"} per request.`);
@@ -2164,7 +2194,11 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
       if (["library_scan", "legacy_import"].includes(kind)) {
         state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
       }
-      if (["file_preview", "library_migration_preview"].includes(kind) && state.view !== "waiting") {
+      if (kind === "staging_cleanup") {
+        state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
+      }
+      if ((["file_preview", "library_migration_preview"].includes(kind)
+          || kind === "staging_cleanup" && payload?.operation === "preview") && state.view !== "waiting") {
         state.view = "waiting";
         render();
       }
@@ -2591,6 +2625,14 @@ function renderMetadataRecovery() {
 }
 
 function operationTitle(operation) {
+  if (operation?.kind === "staging_cleanup") {
+    return {
+      scan: "Video staging scan",
+      preview: "Video staging cleanup preview",
+      confirm: "Video staging cleanup",
+      cancel: "Video staging preview cancellation",
+    }[stagingCleanupOperationName(operation)] ?? "Video staging cleanup";
+  }
   const kind = String(operation.kind ?? "operation").replaceAll("_", " ");
   return kind.replace(/^\w/u, (letter) => letter.toLocaleUpperCase());
 }
@@ -2626,7 +2668,221 @@ function allReviewEntries() {
       entry,
       libraryId: String(entry.result?.source_library_id ?? entry.source_library_id ?? ""),
     })),
+    ...stagingCleanupPreviewEntries().filter((entry) => isReviewablePreviewStatus(entry.status))
+      .map((entry) => ({ kind: "staging_cleanup", entry, libraryId: entry.library_id ?? "" })),
   ];
+}
+
+function stagingCleanupOperationName(entry) {
+  return entry?.operation ?? entry?.result?.operation ?? entry?.payload?.operation ?? null;
+}
+
+function stagingCleanupPreviewEntries() {
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  const previews = Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : [];
+  const entries = new Map();
+  for (const entry of [...operations, ...previews]) {
+    if (entry?.kind !== "staging_cleanup") continue;
+    const result = entry.result && typeof entry.result === "object" ? entry.result : {};
+    const preview = entry.preview && typeof entry.preview === "object"
+      ? entry.preview
+      : result.preview && typeof result.preview === "object" ? result.preview : null;
+    if (!preview || stagingCleanupOperationName(entry) !== null && stagingCleanupOperationName(entry) !== "preview") continue;
+    const id = entry.preview_id ?? entry.id ?? result.preview_id ?? preview.id;
+    const revision = entry.revision ?? result.revision ?? preview.revision;
+    if (typeof id !== "string" || !id || typeof revision !== "string" || !revision) continue;
+    const normalized = {
+      ...entry,
+      kind: "staging_cleanup",
+      id,
+      preview_id: id,
+      revision,
+      library_id: entry.library_id ?? result.library_id ?? preview.library_id ?? "",
+      root_binding: entry.root_binding ?? result.root_binding ?? preview.root_binding ?? "",
+      preview,
+    };
+    const key = Number.isSafeInteger(entry.seq) && entry.seq > 0 ? `seq:${entry.seq}` : `preview:${id}:${revision}`;
+    const previous = entries.get(key);
+    const incomingIsTerminal = !isReviewablePreviewStatus(normalized.status);
+    const previousIsTerminal = previous && !isReviewablePreviewStatus(previous.status);
+    if (!previous || incomingIsTerminal && !previousIsTerminal
+        || !incomingIsTerminal && !previousIsTerminal
+          && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items)) {
+      entries.set(key, normalized);
+    }
+  }
+  return [...entries.values()];
+}
+
+function latestStagingScan(libraryId = activeLibraryId()) {
+  const library = registeredMediaLibrary(state.snapshot, libraryId);
+  const rootBinding = library?.root_binding;
+  if (!isValidLibraryRootBinding(rootBinding)) return null;
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  const candidates = operations
+    .filter((entry) => entry?.kind === "staging_cleanup"
+      && stagingCleanupOperationName(entry) === "scan"
+      && ["completed", "complete", "succeeded"].includes(String(entry.status ?? "").toLowerCase()))
+    .map((entry) => ({ entry, scan: entry?.result?.scan }))
+    .filter(({ scan }) => scan && scan.library_id === libraryId && scan.root_binding === rootBinding
+      && typeof scan.revision === "string" && Array.isArray(scan.items));
+  candidates.sort((left, right) => Number(right.scan.scanned_at ?? 0) - Number(left.scan.scanned_at ?? 0)
+    || Number(right.entry.seq ?? 0) - Number(left.entry.seq ?? 0));
+  const latest = candidates[0];
+  if (!latest) return null;
+  const invalidatedByCleanup = operations.some((entry) => entry?.kind === "staging_cleanup"
+    && stagingCleanupOperationName(entry) === "confirm"
+    && Number.isSafeInteger(entry.seq) && Number.isSafeInteger(latest.entry.seq) && entry.seq > latest.entry.seq
+    && String(entry.payload?.library_id ?? "") === libraryId
+    && String(entry.payload?.root_binding ?? "") === rootBinding
+    && entry.result?.cleanup && typeof entry.result.cleanup === "object"
+    && SETTLED_OPERATION_STATUSES.has(String(entry.status ?? "").toLowerCase()));
+  return invalidatedByCleanup ? null : latest.scan;
+}
+
+function activeStagingLibraryIdentity() {
+  const libraryId = activeLibraryId();
+  const library = registeredMediaLibrary(state.snapshot, libraryId);
+  if (!library || !isValidLibraryRootBinding(library.root_binding)) return null;
+  return { library_id: libraryId, root_binding: library.root_binding };
+}
+
+function updateStagingSelection(candidateIds, selected) {
+  const result = updateSelectionWithinLimit(state.stagingSelected, candidateIds, selected);
+  state.stagingSelected = new Set(result.ids);
+  if (result.omittedCount > 0) {
+    showToast(`${result.omittedCount.toLocaleString()} additional entries skipped by the ${MAX_SELECTED_ITEMS.toLocaleString()}-item selection limit.`);
+  }
+  renderStaging();
+}
+
+function stagingCleanupActionPending(operation, libraryId = null, preview = null) {
+  const matches = (entry) => {
+    if (entry?.kind !== "staging_cleanup" || stagingCleanupOperationName(entry) !== operation) return false;
+    if (libraryId && String(entry?.payload?.library_id ?? entry.library_id ?? "") !== libraryId) return false;
+    if (preview && (Number(entry?.payload?.preview_seq ?? entry.preview_seq ?? 0) !== preview.seq
+        || String(entry?.payload?.preview_id ?? entry.preview_id ?? "") !== preview.id
+        || String(entry?.payload?.revision ?? entry.revision ?? "") !== preview.revision)) return false;
+    return !SETTLED_OPERATION_STATUSES.has(String(entry.status ?? "pending").toLowerCase());
+  };
+  return readActionQueue().some(matches)
+    || (Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : []).some(matches)
+    || (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).some(matches);
+}
+
+function filteredStagingItems(scan) {
+  const items = Array.isArray(scan?.items) ? scan.items : [];
+  const query = String(state.stagingQuery ?? "").trim().toLocaleLowerCase();
+  if (!query) return items;
+  return items.filter((item) => [item.title, item.relative_path, item.task_id, item.task_status, item.reason]
+    .some((value) => String(value ?? "").toLocaleLowerCase().includes(query)));
+}
+
+function stagingItemIdentifier(item) {
+  const id = typeof item?.id === "string" ? item.id : "";
+  return id && id.trim() === id && id.length <= 128 && !/[\u0000-\u001f\u007f]/u.test(id) ? id : null;
+}
+
+function stagingItemRow(item, canSelect) {
+  const id = stagingItemIdentifier(item) ?? "";
+  const eligible = item?.eligible === true && Boolean(id);
+  const disabled = !eligible || !canSelect;
+  const title = String(item?.title ?? "Untitled video");
+  const path = String(item?.relative_path ?? "Path unavailable");
+  const task = [item?.task_status, item?.task_id].filter((value) => typeof value === "string" && value.length > 0).join(" · ");
+  const reason = eligible ? "Recorded video staging entry" : String(item?.reason
+    ?? (item?.eligible === true ? "Protected: this staging row has no complete entry ID." : "Protected: this entry is not eligible for cleanup."));
+  const size = Number.isSafeInteger(item?.bytes) && item.bytes >= 0 ? formatBytes(item.bytes) : "Size unavailable";
+  const files = Number.isSafeInteger(item?.file_count) && item.file_count >= 0 ? `${item.file_count} file${item.file_count === 1 ? "" : "s"}` : "File count unavailable";
+  return `<article class="staging-row"><label class="staging-check"><input type="checkbox" data-staging-select="${escapeHtml(id)}" aria-label="Select ${escapeHtml(title)}" ${state.stagingSelected.has(id) ? "checked" : ""} ${disabled ? "disabled" : ""}></label><div class="staging-item-main"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(path)}</span><small>${escapeHtml(task || "Download task status unavailable")}</small>${!eligible ? `<p class="media-selection-reason readonly">${escapeHtml(reason)}</p>` : ""}</div><div class="staging-item-meta"><span>${escapeHtml(files)}</span><span>${escapeHtml(size)}</span></div></article>`;
+}
+
+function renderStaging() {
+  const libraryId = activeLibraryId();
+  const library = registeredMediaLibrary(state.snapshot, libraryId);
+  const rootBinding = library?.root_binding;
+  const scan = latestStagingScan(libraryId);
+  const scanKey = scan ? `${scan.library_id}\0${scan.root_binding}\0${scan.revision}` : `${libraryId}\0${rootBinding ?? ""}\0`;
+  if (state.stagingScanKey !== scanKey) {
+    state.stagingSelected.clear();
+    state.stagingPage = 0;
+    state.stagingScanKey = scanKey;
+  }
+  const canOperate = Boolean(library && isValidLibraryRootBinding(rootBinding) && libraryCanOperate(libraryId));
+  const scanPending = stagingCleanupActionPending("scan", libraryId);
+  byId("staging-library-label").textContent = library ? library.name : "Media library unavailable";
+  byId("staging-scan").disabled = !canOperate || scanPending;
+  byId("staging-scan").textContent = scanPending ? "Scan request sent" : "Scan staging";
+  byId("staging-scan-age").textContent = scan ? `Saved scan ${timeAgo(scan.scanned_at)}` : "No saved staging scan";
+  if (!scan) {
+    byId("staging-status").textContent = scanPending
+      ? "Your computer is checking recorded video staging entries. This request does not remove files."
+      : canOperate
+        ? "Scan when you want to review recorded video staging entries. Cleanup is always a separate selection, preview, and confirmation."
+        : "Reconnect this media library and refresh the snapshot before scanning its recorded video staging entries.";
+    byId("staging-list").innerHTML = `<div class="empty-state"><div class="empty-art" aria-hidden="true">▱</div><h2>No saved video staging scan</h2><p>Only recorded video download staging is listed here. PDF downloads, Music originals and playback dependencies, and unknown or unowned directories are outside this view.</p></div>`;
+    byId("staging-warnings").innerHTML = "";
+    byId("staging-pagination").classList.add("hidden");
+    byId("staging-selection-actions").classList.add("hidden");
+    byId("staging-count").textContent = "0";
+    return;
+  }
+
+  const items = filteredStagingItems(scan);
+  const pageCount = Math.max(1, Math.ceil(items.length / LIBRARY_PAGE_SIZE));
+  state.stagingPage = Math.min(state.stagingPage, pageCount - 1);
+  const start = state.stagingPage * LIBRARY_PAGE_SIZE;
+  const pageItems = items.slice(start, start + LIBRARY_PAGE_SIZE);
+  const eligibleCount = Array.isArray(scan.items)
+    ? scan.items.filter((item) => item?.eligible === true && stagingItemIdentifier(item) !== null).length
+    : 0;
+  const warnings = [
+    ...(Array.isArray(scan.warnings) ? scan.warnings.filter((warning) => typeof warning === "string") : []),
+    ...(scan.truncated === true ? ["This scan is incomplete. Only listed entries can be selected; scan again before reviewing the full staging inventory."] : []),
+  ];
+  byId("staging-status").textContent = `${scan.items.length.toLocaleString()} recorded video staging entr${scan.items.length === 1 ? "y" : "ies"} · ${eligibleCount.toLocaleString()} eligible for preview. Protected and unknown entries remain visible with a reason.`;
+  byId("staging-warnings").innerHTML = warnings.map((warning) => `<p class="warning-text">${escapeHtml(warning)}</p>`).join("");
+  byId("staging-list").innerHTML = pageItems.length
+    ? pageItems.map((item) => stagingItemRow(item, canOperate)).join("")
+    : `<div class="empty-state"><h2>No matching staging entries</h2><p>Change the search or scan again later.</p></div>`;
+  byId("staging-count").textContent = String(scan.items.length);
+  byId("staging-pagination").classList.toggle("hidden", pageCount <= 1);
+  byId("staging-previous").disabled = state.stagingPage <= 0;
+  byId("staging-next").disabled = state.stagingPage + 1 >= pageCount;
+  byId("staging-page-label").textContent = `Page ${state.stagingPage + 1} of ${pageCount} · entries ${items.length ? start + 1 : 0}–${Math.min(start + LIBRARY_PAGE_SIZE, items.length)} of ${items.length.toLocaleString()}`;
+  byId("staging-selection-actions").classList.toggle("hidden", state.stagingSelected.size === 0);
+  byId("staging-selection-count").textContent = `${state.stagingSelected.size.toLocaleString()} selected · up to ${MAX_SELECTED_ITEMS.toLocaleString()} explicit entries per preview`;
+  byId("staging-preview").disabled = !canOperate || state.stagingSelected.size === 0 || state.stagingSelected.size > MAX_SELECTED_ITEMS;
+}
+
+function stagingCleanupPreviewCard(entry) {
+  const preview = entry.preview && typeof entry.preview === "object" ? entry.preview : {};
+  const items = Array.isArray(preview.sample_items) ? preview.sample_items : Array.isArray(preview.items) ? preview.items : [];
+  const count = Number.isSafeInteger(preview.item_count) && preview.item_count >= 0 ? preview.item_count : items.length;
+  const omitted = Number.isSafeInteger(preview.omitted_item_count) && preview.omitted_item_count >= 0
+    ? preview.omitted_item_count
+    : Math.max(0, count - items.length);
+  const sample = items.slice(0, 4).map((item) => {
+    const title = String(item?.title ?? "Untitled video");
+    const path = String(item?.relative_path ?? "Path unavailable");
+    const reason = item?.eligible === true ? "Ready for cleanup" : String(item?.reason ?? "No longer eligible");
+    return `<div class="preview-line"><span>${escapeHtml(title)}<br><span class="field-hint">${escapeHtml(path)}</span></span><strong class="${item?.eligible === true ? "move" : "skip"}">${escapeHtml(reason)}</strong></div>`;
+  }).join("");
+  const totalBytes = Number.isSafeInteger(preview.total_bytes) && preview.total_bytes >= 0 ? formatBytes(preview.total_bytes) : "Size unavailable";
+  const library = registeredMediaLibrary(state.snapshot, entry.library_id);
+  const bindingMatches = Boolean(library && library.root_binding === entry.root_binding && isValidLibraryRootBinding(entry.root_binding));
+  const canConfirm = bindingMatches && libraryCanOperate(entry.library_id) && count > 0;
+  const busy = stagingCleanupActionPending("confirm", null, entry) || stagingCleanupActionPending("cancel", null, entry);
+  const disabled = busy;
+  const warning = "Confirming permanently removes the selected video staging data from disk. This cannot be undone. Finished media, active writers, PDF downloads, Music originals or playback dependencies, and unknown or unowned directories are outside this cleanup.";
+  return `<article class="stack-card staging-cleanup-preview" id="staging-cleanup-preview-${escapeHtml(entry.seq ?? entry.id)}"><div class="stack-card-head"><div><h3>${count.toLocaleString()} video staging entries selected</h3><p>${escapeHtml(library?.name ?? libraryLabel(entry.library_id))} · preview requested ${escapeHtml(timeAgo(entry.created_at, "seconds"))}</p></div><span class="state-pill pending">Review needed</span></div><p class="warning-text">${warning}</p><p class="field-hint">Estimated staging bytes: ${escapeHtml(totalBytes)}. The local confirmation rechecks the exact selected entries and active-writer state.</p><div class="preview-table">${sample}${items.length === 0 ? `<p class="field-hint">No item examples were retained in the public preview.</p>` : ""}${omitted ? `<p class="field-hint">${omitted.toLocaleString()} selected entries are omitted from this bounded preview summary.</p>` : ""}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-staging-cleanup-confirm="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${!canConfirm || disabled ? "disabled" : ""}>Permanently clean ${count.toLocaleString()} selected entries</button><button class="quiet-button" type="button" data-staging-cleanup-cancel="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${disabled ? "disabled" : ""}>Cancel preview</button>${!bindingMatches ? `<p class="field-hint">The original library registration is unavailable. Cleanup cannot be confirmed from this snapshot.</p>` : ""}${busy ? `<p class="field-hint" role="status">A confirmation or cancellation request is already waiting for your computer.</p>` : ""}</div></article>`;
+}
+
+function renderStagingCleanupPreviews() {
+  const entries = stagingCleanupPreviewEntries().filter((entry) => isReviewablePreviewStatus(entry.status));
+  byId("staging-cleanup-preview-list").innerHTML = entries.length
+    ? entries.map(stagingCleanupPreviewCard).join("")
+    : `<div class="empty-state"><h3>No video cleanup previews need review</h3><p>Choose eligible staging entries in Video staging and preview them first.</p></div>`;
 }
 
 function queuedCancellationMatches(action, review) {
@@ -3335,10 +3591,11 @@ function renderReviewNavigation() {
       : cancelState?.status === "submitted" ? `Cancellation request #${cancelState.seq} is waiting for your computer.`
         : cancelState?.status === "failed" ? `Cancellation failed: ${cancelState.error || "The computer could not cancel this preview."}`
           : "";
-    const title = kind === "file_preview" ? "File changes need review" : "Library migration needs review";
+    const title = kind === "file_preview" ? "File changes need review"
+      : kind === "library_migration_preview" ? "Library migration needs review" : "Video staging cleanup needs review";
     const reviewButton = canReview
       ? `<button class="secondary-button" type="button" data-review-library="${escapeHtml(libraryId)}" data-review-preview-kind="${escapeHtml(kind)}" data-review-preview-seq="${escapeHtml(sequence)}" data-review-preview-id="${escapeHtml(id)}" data-review-preview-revision="${escapeHtml(revision)}">Review</button>`
-      : `<p class="field-hint">This library is no longer registered. You can still cancel this saved preview by its exact identity.</p>`;
+      : `<p class="field-hint">${kind === "staging_cleanup" ? "The original library registration is unavailable. Cleanup confirmation is disabled; the saved preview remains available below." : "This library is no longer registered. You can still cancel this saved preview by its exact identity."}</p>`;
     cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(libraryLabel(libraryId))} · request ${sequence ? `#${sequence}` : "details unavailable"}</p>${cancelMessage ? `<p class="field-hint">${escapeHtml(cancelMessage)}</p>` : ""}</div><span class="state-pill pending">Review needed</span></div><div class="stack-actions">${reviewButton}${previewCancellationMarkup(kind, entry)}</div></article>`);
   }
   for (const [key, tracker] of state.previewCancellations) {
@@ -3596,11 +3853,53 @@ function manualTargetPickerMarkup(key, selection, hintIndex) {
   return `<div class="manual-target-picker"><label class="field-label" for="manual-target-search-${hintIndex}">Search present videos</label><input id="manual-target-search-${hintIndex}" class="text-control" type="search" autocomplete="off" data-manual-picker-search="${escapeHtml(key)}" value="${escapeHtml(state.manualPickerQuery)}" placeholder="Title, path, or ID"><p class="field-hint" data-manual-picker-status="${escapeHtml(key)}">${escapeHtml(contents.status)}</p><select id="manual-target-${hintIndex}" class="select-control manual-target" data-manual-target="${escapeHtml(key)}">${contents.options}</select></div>`;
 }
 
+function stagingCleanupHistorySummary(entry) {
+  const result = entry?.result && typeof entry.result === "object" ? entry.result : {};
+  const operation = stagingCleanupOperationName(entry);
+  if (operation === "scan") {
+    const scan = result.scan && typeof result.scan === "object" ? result.scan : {};
+    const items = Array.isArray(scan.items) ? scan.items : [];
+    const eligible = items.filter((item) => item?.eligible === true).length;
+    return `Scanned ${items.length.toLocaleString()} recorded video staging entr${items.length === 1 ? "y" : "ies"}; ${eligible.toLocaleString()} eligible for review${scan.truncated === true ? " · inventory incomplete" : ""}.`;
+  }
+  if (operation === "preview") {
+    const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
+    const count = Number.isSafeInteger(preview.item_count) ? preview.item_count : Array.isArray(preview.sample_items) ? preview.sample_items.length : 0;
+    return `Cleanup preview for ${count.toLocaleString()} video staging entr${count === 1 ? "y" : "ies"}.`;
+  }
+  if (operation === "confirm") {
+    const cleanup = result.cleanup && typeof result.cleanup === "object" ? result.cleanup : {};
+    const removed = Array.isArray(cleanup.removed) ? cleanup.removed.length : 0;
+    const failed = Array.isArray(cleanup.failed) ? cleanup.failed.length : 0;
+    const bytes = Number.isSafeInteger(cleanup.bytes) && cleanup.bytes >= 0 ? formatBytes(cleanup.bytes) : "size unavailable";
+    return `${removed.toLocaleString()} video staging entr${removed === 1 ? "y" : "ies"} removed · ${failed.toLocaleString()} failed · ${bytes} removed from staging.`;
+  }
+  if (operation === "cancel") return result.cancelled === true ? "Cleanup preview cancelled. No staging data was removed." : "Cleanup cancellation completed.";
+  return "Video staging cleanup request recorded.";
+}
+
+function stagingCleanupHistoryDetails(entry) {
+  const result = entry?.result && typeof entry.result === "object" ? entry.result : {};
+  const operation = stagingCleanupOperationName(entry);
+  if (operation === "preview") {
+    const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
+    const items = Array.isArray(preview.sample_items) ? preview.sample_items : [];
+    return items.length ? `<div class="preview-table">${items.map((item) => `<div class="preview-line"><span>${escapeHtml(item?.title ?? "Untitled video")}<br><span class="field-hint">${escapeHtml(item?.relative_path ?? "Path unavailable")}</span></span><strong class="${item?.eligible === true ? "move" : "skip"}">${escapeHtml(item?.eligible === true ? "Ready for review" : item?.reason ?? "No longer eligible")}</strong></div>`).join("")}</div>` : "";
+  }
+  if (operation !== "confirm") return "";
+  const cleanup = result.cleanup && typeof result.cleanup === "object" ? result.cleanup : {};
+  const failures = Array.isArray(cleanup.failed) ? cleanup.failed : [];
+  return failures.length
+    ? `<div class="operation-warnings">${failures.slice(0, 8).map((item) => `<p>${escapeHtml(item?.error ?? "A staging entry could not be removed.")}</p>`).join("")}${failures.length > 8 ? `<p>${(failures.length - 8).toLocaleString()} additional failures are in the saved local report.</p>` : ""}</div>`
+    : "";
+}
+
 function renderOperations() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
   const history = operationHistoryEntries(operations).filter((entry) =>
     SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()) && historySearchMatches(entry));
   const active = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
+    && !(entry?.kind === "staging_cleanup" && stagingCleanupOperationName(entry) === "preview")
     && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
   const renderEntries = (entries) => entries.slice().reverse().map((entry) => {
     const result = entry.result && typeof entry.result === "object" ? entry.result : {};
@@ -3612,14 +3911,17 @@ function renderOperations() {
     const cancelTarget = entry.kind === "preview_cancel" && result.cancelled === true
       ? `${statusText(result.preview_kind)} #${Number.isSafeInteger(result.preview_seq) ? result.preview_seq : "?"} · ${String(result.preview_id ?? "preview identity unavailable")} · revision ${String(result.revision ?? "unavailable")}`
       : "";
-    const items = Array.isArray(outcome.items) ? outcome.items : Array.isArray(result.items) ? result.items : [];
+    const items = entry.kind === "staging_cleanup" ? []
+      : Array.isArray(outcome.items) ? outcome.items : Array.isArray(result.items) ? result.items : [];
     const hintCount = Array.isArray(result.hints) ? result.hints.length : 0;
     const candidateCount = Array.isArray(result.candidates) ? result.candidates.length : 0;
     const detailsWarning = operationDetailsWarning(entry);
     const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
     const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
     const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
-    const summary = fileConfirmSummary?.detailsAvailable
+    const summary = entry.kind === "staging_cleanup"
+      ? stagingCleanupHistorySummary(entry)
+      : fileConfirmSummary?.detailsAvailable
       ? `${statusText(fileConfirmSummary.status)} · ${fileConfirmSummary.selectedCount.toLocaleString()} item results · ${fileConfirmSummary.movedFileCount.toLocaleString()}/${fileConfirmSummary.fileCount.toLocaleString()} related files moved`
       : fileConfirmSummary
         ? "The batch result details are unavailable in this snapshot."
@@ -3638,6 +3940,7 @@ function renderOperations() {
       ...(Array.isArray(entry.warnings) ? entry.warnings : []),
       ...(Array.isArray(result.warnings) ? result.warnings : []),
       ...(Array.isArray(outcome.warnings) ? outcome.warnings : []),
+      ...(entry.kind === "staging_cleanup" && Array.isArray(result.scan?.warnings) ? result.scan.warnings : []),
     ];
     const telegramWarning = result.telegram_progress_warning ?? outcome.telegram_progress_warning;
     const itemResults = items.map((item) => {
@@ -3655,7 +3958,9 @@ function renderOperations() {
       ? `${libraryLabel(sourceLibraryId)} → ${libraryLabel(targetLibraryId)}`
       : operationLibraryId(entry) ? libraryLabel(operationLibraryId(entry)) : "";
     const contextLabel = libraryContext ? `<p class="field-hint">${escapeHtml(libraryContext)}</p>` : "";
-    const previewDetails = preview ? `<div class="preview-table">${describePreview(preview)}</div>` : "";
+    const previewDetails = entry.kind === "staging_cleanup"
+      ? stagingCleanupHistoryDetails(entry)
+      : preview ? `<div class="preview-table">${describePreview(preview)}</div>` : "";
     const fileConfirmDetails = fileConfirmSummary ? renderFileConfirmSummary(fileConfirmSummary) : "";
     const title = entry.kind === "preview_cancel" ? "Preview cancellation" : operationTitle(entry);
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(entry.error ?? summary)}</p>${contextLabel}</div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${previewDetails}${fileConfirmDetails}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
@@ -3703,6 +4008,7 @@ function renderTabCounts() {
   byId("waiting-count").textContent = omittedPreviews ? `${requestKeys.size}+` : String(requestKeys.size);
 
   const activeOperations = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
+    && !(entry?.kind === "staging_cleanup" && stagingCleanupOperationName(entry) === "preview")
     && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
   const retained = retainedMigrationState();
   const activeMigrations = retained.migrations.filter((migration) =>
@@ -3812,11 +4118,13 @@ function render() {
   reconcilePreviewCancellations(state.snapshot);
   renderSync();
   renderLibrary();
+  renderStaging();
   settleDownloadSubmission();
   renderDownloadStatus();
   renderWaiting();
   renderMigrations();
   renderPreviews();
+  renderStagingCleanupPreviews();
   renderReviewNavigation();
   renderLegacyMappings();
   renderOperations();
@@ -3943,6 +4251,57 @@ function openMovedTarget(button) {
 function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
   byId("scan-button").addEventListener("click", () => submitAction("library_scan", { library_id: activeLibraryId() }));
+  byId("staging-scan").addEventListener("click", () => {
+    const identity = activeStagingLibraryIdentity();
+    if (!identity || !libraryCanOperate(identity.library_id)) return showToast("Reconnect this registered library and refresh before scanning its video staging entries.");
+    void submitAction("staging_cleanup", { operation: "scan", ...identity }).then(() => renderStaging());
+  });
+  byId("staging-select-visible").addEventListener("click", () => {
+    const scan = latestStagingScan();
+    if (!scan) return;
+    const pageItems = filteredStagingItems(scan).slice(state.stagingPage * LIBRARY_PAGE_SIZE, (state.stagingPage + 1) * LIBRARY_PAGE_SIZE);
+    updateStagingSelection(pageItems
+      .filter((item) => item?.eligible === true && stagingItemIdentifier(item) !== null)
+      .map((item) => stagingItemIdentifier(item)), true);
+  });
+  byId("staging-clear-selection").addEventListener("click", () => {
+    state.stagingSelected.clear();
+    renderStaging();
+  });
+  byId("staging-previous").addEventListener("click", () => {
+    state.stagingPage = Math.max(0, state.stagingPage - 1);
+    renderStaging();
+  });
+  byId("staging-next").addEventListener("click", () => {
+    state.stagingPage += 1;
+    renderStaging();
+  });
+  byId("staging-preview").addEventListener("click", () => {
+    const scan = latestStagingScan();
+    const identity = activeStagingLibraryIdentity();
+    const eligibleIds = new Set((Array.isArray(scan?.items) ? scan.items : [])
+      .filter((item) => item?.eligible === true && stagingItemIdentifier(item) !== null)
+      .map((item) => stagingItemIdentifier(item)));
+    const itemIds = [...state.stagingSelected].filter((id) => eligibleIds.has(id));
+    if (!scan || !identity || !libraryCanOperate(identity.library_id)) {
+      showToast("Refresh the registered library and scan its video staging before preparing a cleanup preview.");
+      return;
+    }
+    if (itemIds.length === 0) {
+      showToast("Select at least one eligible video staging entry.");
+      return;
+    }
+    if (itemIds.length > MAX_SELECTED_ITEMS) {
+      showToast(`Choose at most ${MAX_SELECTED_ITEMS.toLocaleString()} entries per cleanup preview.`);
+      return;
+    }
+    submitAction("staging_cleanup", { operation: "preview", ...identity, item_ids: itemIds });
+  });
+  byId("staging-search").addEventListener("input", (event) => {
+    state.stagingQuery = event.target.value;
+    state.stagingPage = 0;
+    renderStaging();
+  });
   document.querySelectorAll("[data-scan]").forEach((button) => button.addEventListener("click", () => submitAction("library_scan", { library_id: activeLibraryId() })));
   byId("library-select").addEventListener("change", () => {
     state.libraryId = byId("library-select").value;
@@ -4128,6 +4487,18 @@ function bindEvents() {
     if (status) status.textContent = contents.status;
   });
   document.body.addEventListener("change", (event) => {
+    const stagingSelection = event.target.closest("[data-staging-select]");
+    if (stagingSelection) {
+      const id = stagingSelection.dataset.stagingSelect ?? "";
+      const item = (Array.isArray(latestStagingScan()?.items) ? latestStagingScan().items : [])
+        .find((entry) => stagingItemIdentifier(entry) === id);
+      if (stagingSelection.checked && (!item || item.eligible !== true || !libraryCanOperate())) {
+        renderStaging();
+        return;
+      }
+      updateStagingSelection([id], stagingSelection.checked);
+      return;
+    }
     const recoveryCandidate = event.target.closest("[data-recovery-candidate]");
     if (recoveryCandidate) {
       const recovery = currentMetadataRecovery();
@@ -4245,6 +4616,39 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const stagingConfirm = event.target.closest("[data-staging-cleanup-confirm]");
+    const stagingCancel = event.target.closest("[data-staging-cleanup-cancel]");
+    const stagingAction = stagingConfirm ?? stagingCancel;
+    if (stagingAction) {
+      const operation = stagingConfirm ? "confirm" : "cancel";
+      const preview = stagingCleanupPreviewEntries().find((entry) => entry.seq === Number(stagingAction.dataset.stagingCleanupSeq)
+        && entry.id === stagingAction.dataset[stagingConfirm ? "stagingCleanupConfirm" : "stagingCleanupCancel"]
+        && entry.revision === stagingAction.dataset.stagingCleanupRevision
+        && entry.library_id === stagingAction.dataset.stagingCleanupLibrary
+        && entry.root_binding === stagingAction.dataset.stagingCleanupBinding);
+      if (!preview || !isReviewablePreviewStatus(preview.status) || stagingCleanupActionPending("confirm", null, preview)
+          || stagingCleanupActionPending("cancel", null, preview)) {
+        showToast("This cleanup preview is no longer awaiting review, or an action is already pending.");
+        renderStagingCleanupPreviews();
+        return;
+      }
+      if (operation === "confirm" && (!libraryCanOperate(preview.library_id)
+          || registeredMediaLibrary(state.snapshot, preview.library_id)?.root_binding !== preview.root_binding)) {
+        showToast("Reconnect the original registered library and refresh before confirming permanent cleanup.");
+        renderStagingCleanupPreviews();
+        return;
+      }
+      stagingAction.disabled = true;
+      void submitAction("staging_cleanup", {
+        operation,
+        library_id: preview.library_id,
+        root_binding: preview.root_binding,
+        preview_seq: preview.seq,
+        preview_id: preview.id,
+        revision: preview.revision,
+      }).then(() => renderStagingCleanupPreviews());
+      return;
+    }
     const reviewLibrary = event.target.closest("[data-review-library]");
     if (reviewLibrary) {
       const libraryId = reviewLibrary.dataset.reviewLibrary;

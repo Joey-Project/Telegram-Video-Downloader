@@ -13,6 +13,7 @@ import type {
   SnapshotChunkManifest,
   PreparedSnapshotContent,
   RequestKind,
+  StagingCleanupPayload,
 } from "./types";
 
 export const MAX_WEBHOOK_BODY_BYTES = 1_000_000;
@@ -824,6 +825,41 @@ function validateLibraryDescriptors(library: Record<string, unknown>): void {
   validateMigrationDiscoveryWarnings(library);
 }
 
+function parseStagingCleanupPayload(value: Record<string, unknown>): StagingCleanupPayload {
+  const operation = value.operation;
+  if (operation !== "scan" && operation !== "preview" && operation !== "confirm" && operation !== "cancel") {
+    throw new HttpError(400, "staging_cleanup operation is not supported");
+  }
+  const commonKeys = ["operation", "library_id", "root_binding"];
+  const allowedKeys = operation === "preview"
+    ? [...commonKeys, "item_ids"]
+    : operation === "confirm" || operation === "cancel"
+      ? [...commonKeys, "preview_seq", "preview_id", "revision"]
+      : commonKeys;
+  if (!onlyKeys(value, allowedKeys)) throw new HttpError(400, "staging_cleanup payload has an invalid shape");
+
+  const identity = parseBoundLibraryMutationIdentity(value);
+  if (operation === "scan") return { operation, ...identity };
+  if (operation === "preview") {
+    return {
+      operation,
+      ...identity,
+      item_ids: stringList(value.item_ids, "item_ids", MAX_SELECTED_ITEMS, 128),
+    };
+  }
+
+  if (!Number.isSafeInteger(value.preview_seq) || (value.preview_seq as number) <= 0) {
+    throw new HttpError(400, "preview_seq must be a positive safe integer");
+  }
+  const previewId = boundedUtf8String(value.preview_id, "preview_id", 128);
+  const revision = boundedUtf8String(value.revision, "revision", 256);
+  if (previewId !== value.preview_id || revision !== value.revision
+      || /[\u0080-\u009f]/u.test(previewId) || /[\u0080-\u009f]/u.test(revision)) {
+    throw new HttpError(400, "Staging cleanup preview identity is invalid");
+  }
+  return { operation, ...identity, preview_seq: value.preview_seq as number, preview_id: previewId, revision };
+}
+
 export function validateActionRequest(value: unknown): ActionRequest {
   if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload", "queued_at_ms", "replay_expires_at_ms"])) {
     throw new HttpError(400, "Action request has an invalid shape");
@@ -836,7 +872,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
   const supportedKinds = [
     "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
     "metadata_recover", "file_preview", "file_confirm", "preview_cancel", "legacy_import", "download_submit", "library_migration_preview",
-    "library_migration_confirm", "library_migration_control",
+    "library_migration_confirm", "library_migration_control", "staging_cleanup",
   ];
   if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
     throw new HttpError(400, "kind is not supported");
@@ -911,6 +947,9 @@ export function validateActionRequest(value: unknown): ActionRequest {
       break;
     case "library_migration_preview":
       payload = parseMigrationPreview(value.payload);
+      break;
+    case "staging_cleanup":
+      payload = parseStagingCleanupPayload(value.payload) as unknown as Record<string, unknown>;
       break;
     case "library_migration_confirm":
       if (!onlyKeys(value.payload, ["preview_id", "revision"])) {

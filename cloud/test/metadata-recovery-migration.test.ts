@@ -37,10 +37,14 @@ async function createOldInboxProbe() {
 describe.each([
   { migrationName: "0005_metadata_recovery_kind", temporaryTable: "inbox_with_metadata_recovery_kind", newKind: "metadata_recover" },
   { migrationName: "0006_preview_cancel_kind", temporaryTable: "inbox_with_preview_cancel_kind", newKind: "preview_cancel" },
+  { migrationName: "0007_staging_cleanup_kind", temporaryTable: "inbox_with_staging_cleanup_kind", newKind: "staging_cleanup" },
 ])("$migrationName inbox migration", ({ migrationName, temporaryTable, newKind }) => {
   const migration = (queries: string[]) => inboxProbeMigration(migrationName, temporaryTable, queries);
   it("preserves populated inbox fields and rolls back the failed migration atomically", async () => {
     await createOldInboxProbe();
+    const epochBefore = await testEnv.DB.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1")
+      .first<{ epoch: string }>();
+    expect(epochBefore?.epoch).toMatch(/^[0-9a-f]{32}$/u);
     const originalRows = [
       {
         seq: 7,
@@ -80,6 +84,9 @@ describe.each([
     expect(probeTable).toBeNull();
 
     await applyD1Migrations(testEnv.DB, [migration([])], probeMigrationsTable);
+    const epochAfter = await testEnv.DB.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1")
+      .first<{ epoch: string }>();
+    expect(epochAfter?.epoch).toBe(epochBefore?.epoch);
     const preservedRows = await testEnv.DB.prepare(`SELECT seq, dedup_key, payload_hash, kind, payload_json, created_at, acked_at
       FROM inbox_probe ORDER BY seq`).all<Record<string, unknown>>();
     expect(preservedRows.results).toEqual(originalRows);

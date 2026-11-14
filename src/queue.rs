@@ -59,6 +59,9 @@ const QUEUE_PAGE_SIZE: usize = 10;
 const MAX_PGC_BACKFILL_INDEX_CANDIDATES: usize = 64;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[path = "staging_cleanup_queue.rs"]
+mod staging_cleanup_queue;
+
 fn validate_library_root_binding_token(binding: &str) -> Result<()> {
     if binding.len() != 67
         || !binding.starts_with("v1:")

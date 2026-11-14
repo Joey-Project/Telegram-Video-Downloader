@@ -153,6 +153,15 @@ original. Completed download staging is retained in this first implementation;
 archive eviction does not remove those separate staging files. A later explicit
 staging-cleanup feature must protect active tasks and Music playback dependencies.
 
+New original archives retain the filename received from Telegram, including
+multilingual titles, spaces and safe punctuation. Filesystem separators and
+control characters are sanitized, and long names are bounded by UTF-8 bytes.
+The full original-content SHA-256 remains a suffix to distinguish same-title
+files. Archive retries add a short retry prefix, preserving any previous partial
+copy rather than overwriting it. FLAC/WAV originals keep their original format even when the Music import
+is ALAC. Existing catalog archive paths remain valid and are not renamed by this
+change.
+
 Music must make a separate local media-library copy. If its file-copy setting is
 disabled, enable it and consolidate the requested tracks in Music before retrying
 the saved task. Verification refuses a playback file that still references the

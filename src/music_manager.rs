@@ -1189,8 +1189,18 @@ impl MusicManager {
             return;
         }
         let _ = self.update_status(job_id).await;
-        let extension = supported_extension(&job.upload.file_name).unwrap_or("m4a");
-        let archive_name = format!("music-{job_id}-attempt-{archive_attempt}.{extension}");
+        // Keep retries distinct from a preserved partial archive left by an earlier
+        // interrupted copy. Put the discriminator first so long-name truncation cannot
+        // remove it; the native backend retains the original-content hash as well.
+        let archive_name = if archive_attempt == 1 {
+            job.upload.file_name.clone()
+        } else {
+            let basename = Path::new(&job.upload.file_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&job.upload.file_name);
+            format!("[retry {archive_attempt}] {basename}")
+        };
         let backend = Arc::clone(&self.backend);
         let archive = run_blocking(move || backend.archive(&prepared, &archive_name)).await;
         match archive {

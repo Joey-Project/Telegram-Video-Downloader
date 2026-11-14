@@ -2,7 +2,11 @@ import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { Event as HappyDOMEvent } from "happy-dom";
-import type { HTMLButtonElement as HappyDOMButtonElement, HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
+import type {
+  HTMLButtonElement as HappyDOMButtonElement,
+  HTMLInputElement as HappyDOMInputElement,
+  HTMLSelectElement as HappyDOMSelectElement,
+} from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
@@ -397,6 +401,117 @@ const ownerSnapshot = {
   previews: [],
 };
 
+const STAGING_SCAN_REVISION = "video-staging-r1";
+const STAGING_PREVIEW_ID = "video-staging-preview-1";
+const STAGING_PREVIEW_REVISION = "video-staging-preview-r1";
+
+function stagingItemFixture(id: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    title: id === "video-stage-eligible" ? "Interrupted Alpha" : "Protected Beta",
+    task_id: id === "video-stage-eligible" ? "task-alpha" : "task-beta",
+    task_status: id === "video-stage-eligible" ? "failed" : "running",
+    relative_path: `.telegram-video-downloader/staging/${id}`,
+    bytes: id === "video-stage-eligible" ? 4_096 : 8_192,
+    file_count: id === "video-stage-eligible" ? 2 : 3,
+    eligible: id === "video-stage-eligible",
+    ...(id === "video-stage-eligible" ? {} : { reason: "Protected because this download still has an active writer." }),
+    ...overrides,
+  };
+}
+
+function stagingScanFixture() {
+  const warnings: string[] = [];
+  return {
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    revision: STAGING_SCAN_REVISION,
+    scanned_at: Math.floor(Date.now() / 1_000),
+    items: [
+      stagingItemFixture("video-stage-eligible"),
+      stagingItemFixture("video-stage-active"),
+      stagingItemFixture("video-stage-unowned", {
+        task_status: "unknown",
+        eligible: false,
+        reason: "Protected because this directory has no verified task owner.",
+      }),
+      stagingItemFixture("video-stage-incomplete-id", {
+        id: "",
+        eligible: true,
+        reason: "Protected because this staging row has no complete entry ID.",
+      }),
+    ],
+    warnings,
+    truncated: false,
+  };
+}
+
+function stagingScanOperation(seq: number, scan = stagingScanFixture()) {
+  return {
+    seq,
+    request_id: `staging-scan-${seq}`,
+    kind: "staging_cleanup",
+    operation: "scan",
+    status: "completed",
+    created_at: scan.scanned_at,
+    payload: { operation: "scan", library_id: LIBRARY_ID, root_binding: ROOT_BINDING },
+    result: { operation: "scan", library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scan },
+  };
+}
+
+function stagingPreviewOperation(seq: number) {
+  const sampleItem = stagingItemFixture("video-stage-eligible");
+  const preview = {
+    id: STAGING_PREVIEW_ID,
+    revision: STAGING_PREVIEW_REVISION,
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    created_at: Date.now(),
+    item_count: 1,
+    omitted_item_count: 0,
+    total_bytes: 4_096,
+    sample_items: [sampleItem],
+  };
+  const operation = {
+    seq,
+    request_id: `staging-preview-${seq}`,
+    kind: "staging_cleanup",
+    operation: "preview",
+    status: "awaiting_confirmation",
+    created_at: Math.floor(Date.now() / 1_000),
+    preview_id: STAGING_PREVIEW_ID,
+    revision: STAGING_PREVIEW_REVISION,
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    payload: {
+      operation: "preview",
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      item_ids: [sampleItem.id],
+    },
+    result: {
+      operation: "preview",
+      preview_id: STAGING_PREVIEW_ID,
+      revision: STAGING_PREVIEW_REVISION,
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      preview,
+      cleanup_preview: { private_proof: "must not appear in public UI" },
+    },
+  };
+  const activePreview = {
+    seq,
+    kind: "staging_cleanup",
+    preview_id: STAGING_PREVIEW_ID,
+    revision: STAGING_PREVIEW_REVISION,
+    status: "awaiting_confirmation",
+    library_id: LIBRARY_ID,
+    root_binding: ROOT_BINDING,
+    preview,
+  };
+  return { operation, activePreview, preview };
+}
+
 function migrationPreviewSnapshot() {
   const sourceLibrary = {
     id: LIBRARY_ID,
@@ -757,6 +872,7 @@ async function mountFileManagerFixture(
     seq: number,
     publishSnapshot: (snapshot: Record<string, any>, databaseEpoch?: string) => Promise<void>,
   ) => Promise<MockActionResponse | void> | MockActionResponse | void,
+  initialNextActionSeq = 901,
 ) {
   await releaseMountedFixture();
   installFixtureWindowTimerTracking();
@@ -772,7 +888,7 @@ async function mountFileManagerFixture(
   let nextStateResponseGate: ReturnType<typeof deferredSignal> | null = null;
   const stateRequestVersions: number[] = [];
   const stateRequestEpochs: string[] = [];
-  let nextActionSeq = 901;
+  let nextActionSeq = initialNextActionSeq;
   const actions: Array<Record<string, any>> = [];
   let pendingActionResponseCount = 0;
   let currentSnapshot = initialSnapshot;
@@ -3836,5 +3952,243 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#operation-list").textContent).toContain("Completed");
     expect(element<HTMLElement>("#operation-list").textContent).toContain("File preview");
     expect(element<HTMLElement>("#operation-list").textContent).toContain("Cancelled");
+  });
+
+  it("scans staging only on request and keeps a saved cleanup preview reviewable after reload until cancelled", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const clock = controlledSnapshotClock();
+    const storage = makeMemoryStorage();
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      operations: [],
+      pending_requests: [],
+      previews: [],
+    };
+    let currentSnapshot: Record<string, any> = initialSnapshot;
+    const firstPage = await mountFileManagerFixture(initialSnapshot, storage, async (action, seq, publishSnapshot) => {
+      if (action.kind !== "staging_cleanup") throw new Error(`Unexpected action ${action.kind}`);
+      const operation = action.payload.operation;
+      let nextOperation: Record<string, any>;
+      let nextPreviews = currentSnapshot.previews;
+      if (operation === "scan") {
+        expect(action.payload).toEqual({ operation: "scan", library_id: LIBRARY_ID, root_binding: ROOT_BINDING });
+        const scan = stagingScanFixture();
+        scan.truncated = true;
+        scan.warnings.push("Some rows were omitted at the staging scan budget.");
+        nextOperation = { ...stagingScanOperation(seq, scan), request_id: action.request_id };
+      } else if (operation === "preview") {
+        expect(action.payload).toEqual({
+          operation: "preview",
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
+          item_ids: ["video-stage-eligible"],
+        });
+        const stagingPreview = stagingPreviewOperation(seq);
+        nextOperation = { ...stagingPreview.operation, request_id: action.request_id };
+        nextPreviews = [stagingPreview.activePreview];
+      } else {
+        throw new Error(`Unexpected staging operation ${operation}`);
+      }
+      currentSnapshot = {
+        ...currentSnapshot,
+        state_version: currentSnapshot.state_version + 1,
+        operations: [...currentSnapshot.operations, nextOperation],
+        pending_requests: [],
+        previews: nextPreviews,
+      };
+      await publishSnapshot(currentSnapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLButtonElement>('[data-view="temporary"]').click();
+    expect(firstPage.actions).toHaveLength(0);
+    expect(firstPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(element<HTMLButtonElement>("#staging-scan").disabled).toBe(false);
+
+    clock.advanceRefreshBudget();
+    element<HTMLButtonElement>("#staging-scan").click();
+    await vi.waitFor(() => {
+      expect(firstPage.actions).toHaveLength(1);
+      expect(element<HTMLElement>("#staging-list").textContent).toContain("Interrupted Alpha");
+      expect(element<HTMLElement>("#staging-list").textContent).toContain("Protected because this download still has an active writer.");
+      expect(element<HTMLElement>("#staging-list").textContent).toContain("Protected because this directory has no verified task owner.");
+      expect(element<HTMLElement>("#staging-warnings").textContent).toContain("This scan is incomplete.");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(firstPage.actions[0]?.payload).toEqual({ operation: "scan", library_id: LIBRARY_ID, root_binding: ROOT_BINDING });
+    expect(element<HappyDOMInputElement>('[data-staging-select="video-stage-active"]').disabled).toBe(true);
+    expect(element<HappyDOMInputElement>('[data-staging-select="video-stage-unowned"]').disabled).toBe(true);
+    expect(element<HappyDOMInputElement>('[data-staging-select=""]').disabled).toBe(true);
+
+    const eligible = element<HappyDOMInputElement>('[data-staging-select="video-stage-eligible"]');
+    eligible.checked = true;
+    eligible.dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    expect(element<HTMLElement>("#staging-selection-count").textContent).toContain("1 selected");
+    expect(element<HTMLButtonElement>("#staging-preview").disabled).toBe(false);
+
+    clock.advanceRefreshBudget();
+    element<HTMLButtonElement>("#staging-preview").click();
+    await vi.waitFor(() => {
+      expect(firstPage.actions).toHaveLength(2);
+      expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("Interrupted Alpha");
+      expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("permanently removes the selected video staging data");
+      expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("cannot be undone");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(firstPage.actions[1]?.payload).toEqual({
+      operation: "preview",
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      item_ids: ["video-stage-eligible"],
+    });
+    expect(document.body.textContent).not.toContain("must not appear in public UI");
+    await vi.waitFor(() => expect(storage.getItem("file-manager.actions.v1")).toBe("[]"));
+
+    const previewSnapshot = firstPage.currentSnapshot;
+    let cancellationSnapshot = previewSnapshot;
+    const previewOperation = previewSnapshot.operations.find((entry: Record<string, any>) => entry.operation === "preview");
+    if (!previewOperation) throw new Error("Expected the accepted cleanup preview in the saved snapshot.");
+    const reloadedPage = await mountFileManagerFixture(previewSnapshot, storage, async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("staging_cleanup");
+      expect(action.payload).toEqual({
+        operation: "cancel",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        preview_seq: previewOperation.seq,
+        preview_id: STAGING_PREVIEW_ID,
+        revision: STAGING_PREVIEW_REVISION,
+      });
+      const cancelOperation = {
+        seq,
+        request_id: action.request_id,
+        kind: "staging_cleanup",
+        operation: "cancel",
+        status: "completed",
+        created_at: Math.floor(Date.now() / 1_000),
+        payload: action.payload,
+        result: {
+          operation: "cancel",
+          cancelled: true,
+          preview_seq: previewOperation.seq,
+          preview_id: STAGING_PREVIEW_ID,
+          revision: STAGING_PREVIEW_REVISION,
+        },
+      };
+      cancellationSnapshot = {
+        ...cancellationSnapshot,
+        state_version: cancellationSnapshot.state_version + 1,
+        operations: [...cancellationSnapshot.operations, cancelOperation],
+        previews: cancellationSnapshot.previews.map((entry: Record<string, any>) => ({ ...entry, status: "cancelled" })),
+      };
+      await publishSnapshot(cancellationSnapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    }, 903);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("Interrupted Alpha");
+    expect(element<HTMLButtonElement>(`[data-staging-cleanup-cancel="${STAGING_PREVIEW_ID}"]`).disabled).toBe(false);
+    clock.advanceRefreshBudget();
+    element<HTMLButtonElement>(`[data-staging-cleanup-cancel="${STAGING_PREVIEW_ID}"]`).click();
+    await vi.waitFor(() => {
+      expect(reloadedPage.actions).toHaveLength(1);
+      expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("No video cleanup previews need review");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(reloadedPage.actions[0]?.payload.operation).toBe("cancel");
+    expect(element<HTMLElement>("#history-summary").textContent).toContain("recent record");
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Cleanup preview cancelled. No staging data was removed.");
+    expect(reloadedPage.actions).toHaveLength(1);
+  });
+
+  it("confirms only the saved staging preview, records a compact summary, and invalidates the old scan", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const clock = controlledSnapshotClock();
+    const scan = {
+      ...stagingScanFixture(),
+      items: Array.from({ length: 5_000 }, (_, index) => ({
+        id: `stage-${index}`,
+        title: `Staged video ${index}`,
+        task_id: `task-${index}`,
+        task_status: "failed",
+        relative_path: `.staging/${index}`,
+        bytes: 1,
+        file_count: 1,
+        eligible: true,
+      })),
+    };
+    const scanOperation = stagingScanOperation(700, scan);
+    const stagingPreview = stagingPreviewOperation(701);
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      operations: [scanOperation, stagingPreview.operation],
+      pending_requests: [],
+      previews: [stagingPreview.activePreview],
+    };
+    let currentSnapshot: Record<string, any> = initialSnapshot;
+    const fixture = await mountFileManagerFixture(initialSnapshot, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("staging_cleanup");
+      expect(action.payload).toEqual({
+        operation: "confirm",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        preview_seq: 701,
+        preview_id: STAGING_PREVIEW_ID,
+        revision: STAGING_PREVIEW_REVISION,
+      });
+      const confirmOperation = {
+        seq,
+        request_id: action.request_id,
+        kind: "staging_cleanup",
+        operation: "confirm",
+        status: "completed",
+        created_at: Math.floor(Date.now() / 1_000),
+        payload: action.payload,
+        result: {
+          operation: "confirm",
+          preview_id: STAGING_PREVIEW_ID,
+          revision: STAGING_PREVIEW_REVISION,
+          cleanup: { removed: ["video-stage-eligible"], failed: [], bytes: 4_096 },
+        },
+      };
+      currentSnapshot = {
+        ...currentSnapshot,
+        state_version: currentSnapshot.state_version + 1,
+        operations: [...currentSnapshot.operations, confirmOperation],
+        previews: currentSnapshot.previews.map((entry: Record<string, any>) => ({ ...entry, status: "completed" })),
+      };
+      await publishSnapshot(currentSnapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    expect(element<HTMLElement>("#history-summary").textContent).toContain("1 recent record retained");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Scanned 5,000 recorded video staging entries; 5,000 eligible for review.");
+    expect(element<HTMLElement>("#operation-list").textContent).not.toContain("Staged video 0");
+    expect(element<HTMLElement>("#operation-list").querySelectorAll("article")).toHaveLength(1);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("Interrupted Alpha");
+    clock.advanceRefreshBudget();
+    element<HTMLButtonElement>(`[data-staging-cleanup-confirm="${STAGING_PREVIEW_ID}"]`).click();
+    await vi.waitFor(() => {
+      expect(fixture.actions).toHaveLength(1);
+      expect(element<HTMLElement>("#staging-cleanup-preview-list").textContent).toContain("No video cleanup previews need review");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(fixture.actions[0]?.payload.operation).toBe("confirm");
+
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("1 video staging entry removed · 0 failed · 4.0 KB removed from staging.");
+    expect(element<HTMLElement>("#operation-list").textContent).not.toContain("Staged video 0");
+    expect(element<HTMLElement>("#history-count").textContent).toBe("2");
+
+    element<HTMLButtonElement>('[data-view="temporary"]').click();
+    expect(element<HTMLElement>("#staging-list").textContent).toContain("No saved video staging scan");
+    expect(element<HTMLButtonElement>("#staging-scan").disabled).toBe(false);
+    expect(fixture.actions).toHaveLength(1);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
   });
 });

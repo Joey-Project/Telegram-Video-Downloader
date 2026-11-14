@@ -189,6 +189,20 @@ pub struct CloudRequest {
 }
 
 impl CloudRequest {
+    pub(crate) fn staging_cleanup_operation(&self) -> Option<&str> {
+        (self.kind == "staging_cleanup")
+            .then(|| self.payload.get("operation").and_then(Value::as_str))
+            .flatten()
+    }
+
+    pub(crate) fn is_staging_cleanup_preview(&self) -> bool {
+        self.staging_cleanup_operation() == Some("preview")
+    }
+
+    pub(crate) fn is_staging_cleanup_confirmation(&self) -> bool {
+        self.staging_cleanup_operation() == Some("confirm")
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.seq == 0 || self.seq > MAX_JS_SAFE_INTEGER {
             bail!("cloud request sequence is outside JavaScript's safe integer range");
@@ -1445,10 +1459,7 @@ impl InboxStateIndex {
                 }
             }
         }
-        if matches!(
-            record.request.kind.as_str(),
-            "file_preview" | "library_migration_preview"
-        ) {
+        if is_preview_request(&record.request) {
             if record.status == InboxStatus::AwaitingConfirmation {
                 self.awaiting_previews.insert(record.request.seq);
                 if let Some(preview_id) =
@@ -1468,25 +1479,28 @@ impl InboxStateIndex {
                 self.awaiting_previews.remove(&record.request.seq);
             }
         }
-        if matches!(
-            record.request.kind.as_str(),
-            "file_confirm" | "library_migration_confirm"
-        ) && matches!(
-            record.status,
-            InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
-        ) && let Some(preview_id) = record
-            .request
-            .payload
-            .get("preview_id")
-            .and_then(Value::as_str)
-            .filter(|id| preview_identifier_is_indexable(id))
+        if preview_kind_for_confirmation(&record.request).is_some()
+            && matches!(
+                record.status,
+                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+            )
+            && let Some(preview_id) = record
+                .request
+                .payload
+                .get("preview_id")
+                .and_then(Value::as_str)
+                .filter(|id| preview_identifier_is_indexable(id))
+            && (record.request.staging_cleanup_operation() != Some("confirm")
+                || record
+                    .request
+                    .payload
+                    .get("preview_seq")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|seq| seq > 0 && seq <= MAX_JS_SAFE_INTEGER))
         {
             let received_at_seconds = record.received_at;
-            let preview_kind = match record.request.kind.as_str() {
-                "file_confirm" => "file_preview",
-                "library_migration_confirm" => "library_migration_preview",
-                _ => unreachable!("confirmation kind was checked above"),
-            };
+            let preview_kind = preview_kind_for_confirmation(&record.request)
+                .expect("confirmation kind was checked above");
             let preview_key = preview_index_key(preview_kind, preview_id);
             let revision = record
                 .request
@@ -1769,8 +1783,33 @@ fn inbox_preview_id(record: &InboxRecord) -> Option<&str> {
                 .get("id")
                 .and_then(Value::as_str)
                 .or_else(|| result.get("preview_id").and_then(Value::as_str)),
+            "staging_cleanup" if record.request.is_staging_cleanup_preview() => result
+                .get("preview_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    result
+                        .get("preview")
+                        .and_then(|preview| preview.get("id"))
+                        .and_then(Value::as_str)
+                }),
             _ => None,
         })
+}
+
+fn is_preview_request(request: &CloudRequest) -> bool {
+    matches!(
+        request.kind.as_str(),
+        "file_preview" | "library_migration_preview"
+    ) || request.is_staging_cleanup_preview()
+}
+
+fn preview_kind_for_confirmation(request: &CloudRequest) -> Option<&'static str> {
+    match request.kind.as_str() {
+        "file_confirm" => Some("file_preview"),
+        "library_migration_confirm" => Some("library_migration_preview"),
+        "staging_cleanup" if request.is_staging_cleanup_confirmation() => Some("staging_cleanup"),
+        _ => None,
+    }
 }
 
 fn inbox_preview_revision(record: &InboxRecord) -> Option<&str> {
@@ -1791,10 +1830,7 @@ fn inbox_record_for_disk(record: &InboxRecord) -> Result<InboxRecord> {
     if record.status != InboxStatus::Cancelled {
         return Ok(record.clone());
     }
-    if !matches!(
-        record.request.kind.as_str(),
-        "file_preview" | "library_migration_preview"
-    ) {
+    if !is_preview_request(&record.request) {
         bail!("only a preview record can be persisted as cancelled");
     }
 
@@ -1830,12 +1866,7 @@ fn inbox_record_for_disk(record: &InboxRecord) -> Result<InboxRecord> {
 /// Promote only the exact marker emitted by `inbox_record_for_disk`; unrelated stale previews
 /// and malformed or mismatched markers remain stale and cannot be presented as cancelled.
 fn inbox_record_from_disk(mut record: InboxRecord) -> InboxRecord {
-    if record.status != InboxStatus::Stale
-        || !matches!(
-            record.request.kind.as_str(),
-            "file_preview" | "library_migration_preview"
-        )
-    {
+    if record.status != InboxStatus::Stale || !is_preview_request(&record.request) {
         return record;
     }
 
@@ -1879,11 +1910,7 @@ fn inbox_record_from_disk(mut record: InboxRecord) -> InboxRecord {
 }
 
 fn terminal_confirmation_index_key(record: &InboxRecord) -> Option<String> {
-    let preview_kind = match record.request.kind.as_str() {
-        "file_confirm" => "file_preview",
-        "library_migration_confirm" => "library_migration_preview",
-        _ => return None,
-    };
+    let preview_kind = preview_kind_for_confirmation(&record.request)?;
     if !matches!(
         record.status,
         InboxStatus::Completed | InboxStatus::Failed | InboxStatus::Uncertain
@@ -1943,10 +1970,8 @@ fn preview_index_key(preview_kind: &str, preview_id: &str) -> String {
 }
 
 fn inbox_abandoned_preview_expired(record: &InboxRecord, now: u64) -> bool {
-    matches!(
-        record.request.kind.as_str(),
-        "file_preview" | "library_migration_preview"
-    ) && record.status == InboxStatus::AwaitingConfirmation
+    is_preview_request(&record.request)
+        && record.status == InboxStatus::AwaitingConfirmation
         && record.updated_at <= now
         && now.saturating_sub(record.updated_at)
             >= CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs()
@@ -2242,6 +2267,27 @@ pub struct CloudInbox {
 }
 
 impl CloudInbox {
+    pub(crate) fn dispatch_result_fits(
+        request: &CloudRequest,
+        status: InboxStatus,
+        result: &Value,
+    ) -> Result<bool> {
+        let now = now_seconds();
+        let candidate = InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: request.clone(),
+            status,
+            attempts: 1,
+            received_at: Some(now),
+            updated_at: now,
+            next_attempt_at: 0,
+            error: None,
+            result: Some(result.clone()),
+        };
+        let limit = MAX_REQUEST_BYTES + 64 * 1024;
+        Ok(serde_json::to_vec(&candidate)?.len().saturating_add(512) <= limit)
+    }
+
     pub(crate) fn download_root(&self) -> &Path {
         self.root.logical_root_path()
     }
@@ -2516,15 +2562,10 @@ impl CloudInbox {
         let Some(confirmation) = self.read_record_path(&self.record_path(confirmation_seq))? else {
             return Ok(None);
         };
-        let (preview_kind, confirmation_kind) = match confirmation.request.kind.as_str() {
-            "file_confirm" => ("file_preview", "file_confirm"),
-            "library_migration_confirm" => {
-                ("library_migration_preview", "library_migration_confirm")
-            }
-            _ => return Ok(None),
+        let Some(preview_kind) = preview_kind_for_confirmation(&confirmation.request) else {
+            return Ok(None);
         };
         if confirmation.request.seq != confirmation_seq
-            || confirmation.request.kind != confirmation_kind
             || !matches!(
                 confirmation.status,
                 InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
@@ -2538,18 +2579,77 @@ impl CloudInbox {
         {
             return Ok(None);
         }
-        let sequence = self
-            .state_index
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-            .awaiting_preview_sequence_for_kind(preview_id, preview_kind);
+        let requested_sequence = if confirmation.request.is_staging_cleanup_confirmation() {
+            let Some(sequence) = confirmation
+                .request
+                .payload
+                .get("preview_seq")
+                .and_then(Value::as_u64)
+                .filter(|sequence| *sequence > 0 && *sequence <= MAX_JS_SAFE_INTEGER)
+            else {
+                return Ok(None);
+            };
+            Some(sequence)
+        } else {
+            None
+        };
+        let sequence = match requested_sequence {
+            Some(sequence) => Some(sequence),
+            None => self
+                .state_index
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+                .awaiting_preview_sequence_for_kind(preview_id, preview_kind),
+        };
         let Some(sequence) = sequence else {
             return Ok(None);
         };
         let Some(record) = self.read_record_path(&self.record_path(sequence))? else {
+            if requested_sequence.is_some() {
+                return Ok(None);
+            }
             bail!("indexed cloud preview request {sequence} is missing");
         };
-        if record.request.seq != sequence
+        if confirmation.request.is_staging_cleanup_confirmation() {
+            let confirmation_payload = &confirmation.request.payload;
+            let preview_result = record.result.as_ref();
+            let expected_library_id = confirmation_payload
+                .get("library_id")
+                .and_then(Value::as_str);
+            let expected_root_binding = confirmation_payload
+                .get("root_binding")
+                .and_then(Value::as_str);
+            if record.request.seq != requested_sequence.unwrap_or_default()
+                || record.request.kind != preview_kind
+                || !record.request.is_staging_cleanup_preview()
+                || record.status != InboxStatus::AwaitingConfirmation
+                || inbox_preview_id(&record) != Some(preview_id)
+                || inbox_preview_revision(&record)
+                    != confirmation_payload.get("revision").and_then(Value::as_str)
+                || record
+                    .request
+                    .payload
+                    .get("library_id")
+                    .and_then(Value::as_str)
+                    != expected_library_id
+                || record
+                    .request
+                    .payload
+                    .get("root_binding")
+                    .and_then(Value::as_str)
+                    != expected_root_binding
+                || preview_result
+                    .and_then(|result| result.get("library_id"))
+                    .and_then(Value::as_str)
+                    != expected_library_id
+                || preview_result
+                    .and_then(|result| result.get("root_binding"))
+                    .and_then(Value::as_str)
+                    != expected_root_binding
+            {
+                return Ok(None);
+            }
+        } else if record.request.seq != sequence
             || record.request.kind != preview_kind
             || record.status != InboxStatus::AwaitingConfirmation
             || inbox_preview_id(&record) != Some(preview_id)
@@ -2574,8 +2674,10 @@ impl CloudInbox {
         preview_id: &str,
         revision: &str,
     ) -> Result<Option<InboxRecord>> {
-        if !matches!(preview_kind, "file_preview" | "library_migration_preview")
-            || preview_seq == 0
+        if !matches!(
+            preview_kind,
+            "file_preview" | "library_migration_preview" | "staging_cleanup"
+        ) || preview_seq == 0
             || preview_seq > MAX_JS_SAFE_INTEGER
             || !valid_preview_cancel_scalar(preview_id, MAX_PREVIEW_CANCEL_ID_BYTES)
             || !valid_preview_cancel_scalar(revision, MAX_PREVIEW_CANCEL_REVISION_BYTES)
@@ -2746,13 +2848,11 @@ impl CloudInbox {
         let mut record = self
             .read_record_path(&path)?
             .ok_or_else(|| anyhow!("cloud inbox request {seq} is missing"))?;
-        let was_active_confirmation = matches!(
-            record.request.kind.as_str(),
-            "file_confirm" | "library_migration_confirm"
-        ) && matches!(
-            record.status,
-            InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
-        );
+        let was_active_confirmation = preview_kind_for_confirmation(&record.request).is_some()
+            && matches!(
+                record.status,
+                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+            );
         update(&mut record)?;
         let released_active_confirmation = was_active_confirmation
             && !matches!(
@@ -5875,6 +5975,241 @@ mod tests {
             .expect("file confirmation should resolve its persisted preview");
         assert_eq!(file.request.seq, 1);
         assert_eq!(file.request.kind, "file_preview");
+
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_cleanup_indexes_only_awaiting_preview_operations() {
+        let root = temp_root("staging-cleanup-preview-index");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        for (seq, operation, status) in [
+            (1, "scan", InboxStatus::Completed),
+            (2, "preview", InboxStatus::AwaitingConfirmation),
+            (3, "confirm", InboxStatus::Processing),
+            (4, "cancel", InboxStatus::Completed),
+        ] {
+            let mut staging_request = request(seq, operation);
+            staging_request.kind = "staging_cleanup".to_string();
+            staging_request.payload = if operation == "confirm" {
+                json!({
+                    "operation": operation,
+                    "library_id": "library-one",
+                    "root_binding": "root-one",
+                    "preview_seq": 2,
+                    "preview_id": "confirm-id",
+                    "revision": "confirm-revision",
+                })
+            } else if operation == "cancel" {
+                json!({
+                    "operation": operation,
+                    "library_id": "library-one",
+                    "root_binding": "root-one",
+                    "preview_seq": 2,
+                    "preview_id": "staging-preview",
+                    "revision": "staging-revision",
+                })
+            } else {
+                json!({
+                    "operation": operation,
+                    "library_id": "library-one",
+                    "root_binding": "root-one",
+                })
+            };
+            inbox
+                .persist(staging_request)
+                .expect("staging request should persist");
+            inbox
+                .update(seq, |record| {
+                    record.status = status;
+                    record.result = if operation == "preview" {
+                        Some(json!({
+                            "operation": "preview",
+                            "preview_id": "staging-preview",
+                            "revision": "staging-revision",
+                            "library_id": "library-one",
+                            "root_binding": "root-one",
+                            "preview": {
+                                "id": "staging-preview",
+                                "revision": "staging-revision",
+                                "library_id": "library-one",
+                                "root_binding": "root-one",
+                            },
+                            "cleanup_preview": {"proofs": [{"inventory_sha256": "private"}]},
+                        }))
+                    } else {
+                        Some(json!({"operation": operation}))
+                    };
+                })
+                .expect("staging result should persist");
+        }
+
+        let index = inbox.state_index.lock().expect("state index should lock");
+        assert_eq!(
+            index.awaiting_preview_sequence_for_kind("staging-preview", "staging_cleanup"),
+            Some(2),
+            "only the awaiting preview operation should enter the active preview index"
+        );
+        assert_eq!(
+            index.awaiting_preview_sequence_for_kind("scan-id", "staging_cleanup"),
+            None
+        );
+        assert_eq!(
+            index.awaiting_preview_sequence_for_kind("confirm-id", "staging_cleanup"),
+            None
+        );
+        assert_eq!(
+            index.awaiting_preview_sequence_for_kind("cancel-id", "staging_cleanup"),
+            None
+        );
+        drop(index);
+
+        let cancelled = inbox
+            .cancel_awaiting_preview("staging_cleanup", 2, "staging-preview", "staging-revision")
+            .expect("preview cancellation should be checked")
+            .expect("exact staging preview should cancel");
+        assert_eq!(cancelled.status, InboxStatus::Cancelled);
+        assert_eq!(
+            inbox
+                .state_index
+                .lock()
+                .expect("state index should lock")
+                .awaiting_preview_sequence_for_kind("staging-preview", "staging_cleanup"),
+            None,
+            "a cancelled staging preview must leave the active preview index"
+        );
+
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_cleanup_confirmation_requires_exact_saved_preview_identity() {
+        let root = temp_root("staging-cleanup-confirm-identity");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let mut preview_request = request(1, "staging preview");
+        preview_request.kind = "staging_cleanup".to_string();
+        preview_request.payload = json!({
+            "operation": "preview",
+            "library_id": "library-one",
+            "root_binding": "root-one",
+        });
+        inbox
+            .persist(preview_request)
+            .expect("staging preview should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "operation": "preview",
+                    "preview_id": "staging-preview",
+                    "revision": "staging-revision",
+                    "library_id": "library-one",
+                    "root_binding": "root-one",
+                    "preview": {
+                        "id": "staging-preview",
+                        "revision": "staging-revision",
+                        "library_id": "library-one",
+                        "root_binding": "root-one",
+                    },
+                    "cleanup_preview": {"proofs": []},
+                }));
+            })
+            .expect("staging preview should become confirmable");
+
+        for (seq, operation, preview_seq, preview_id, revision, library_id, root_binding) in [
+            (
+                2,
+                "confirm",
+                1,
+                "staging-preview",
+                "staging-revision",
+                "library-one",
+                "root-one",
+            ),
+            (
+                3,
+                "confirm",
+                99,
+                "staging-preview",
+                "staging-revision",
+                "library-one",
+                "root-one",
+            ),
+            (
+                4,
+                "confirm",
+                1,
+                "other-preview",
+                "staging-revision",
+                "library-one",
+                "root-one",
+            ),
+            (
+                5,
+                "confirm",
+                1,
+                "staging-preview",
+                "staging-revision",
+                "library-one",
+                "root-replaced",
+            ),
+            (
+                6,
+                "scan",
+                1,
+                "staging-preview",
+                "staging-revision",
+                "library-one",
+                "root-one",
+            ),
+        ] {
+            let mut confirmation = request(seq, "staging confirmation");
+            confirmation.kind = "staging_cleanup".to_string();
+            confirmation.payload = json!({
+                "operation": operation,
+                "preview_seq": preview_seq,
+                "preview_id": preview_id,
+                "revision": revision,
+                "library_id": library_id,
+                "root_binding": root_binding,
+            });
+            inbox
+                .persist(confirmation)
+                .expect("confirmation request should persist");
+            inbox
+                .update(seq, |record| record.status = InboxStatus::Processing)
+                .expect("confirmation should enter processing");
+        }
+
+        assert_eq!(
+            inbox
+                .awaiting_confirmation_record("staging-preview", 2)
+                .expect("exact confirmation lookup should succeed")
+                .map(|record| record.request.seq),
+            Some(1)
+        );
+        for (seq, expected_preview_id) in [
+            (3, "staging-preview"),
+            (4, "other-preview"),
+            (5, "staging-preview"),
+            (6, "staging-preview"),
+        ] {
+            assert!(
+                inbox
+                    .awaiting_confirmation_record(expected_preview_id, seq)
+                    .expect("mismatched confirmation should be rejected without filesystem access")
+                    .is_none(),
+                "confirmation sequence {seq} must match the saved preview identity"
+            );
+        }
 
         drop(inbox);
         let _ = fs::remove_dir_all(root);

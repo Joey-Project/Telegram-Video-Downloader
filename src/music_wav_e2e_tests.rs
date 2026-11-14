@@ -34,7 +34,10 @@ impl MusicBackend for WavBackend {
 
     fn archive(&self, audio: &PreparedAudio, original_name: &str) -> Result<ArchiveState> {
         ensure!(
-            original_name.ends_with(".wav"),
+            Path::new(original_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("wav")),
             "archive must retain the original WAV extension"
         );
         let path = self.archive.join(original_name);

@@ -609,11 +609,16 @@ impl MusicBackend for NativeFlacConversionBackend {
     }
 
     fn archive(&self, audio: &PreparedAudio, original_name: &str) -> Result<ArchiveState> {
-        if !original_name.ends_with(".flac") {
+        if !Path::new(original_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("flac"))
+        {
             bail!("the original FLAC extension was not retained for the archive");
         }
         fs::create_dir_all(&self.archive_root)?;
-        let path = self.archive_root.join(original_name);
+        let filename = crate::music_native::archive_filename(original_name, &audio.original)?;
+        let path = self.archive_root.join(filename);
         fs::copy(&audio.original.path, &path)?;
         Ok(ArchiveState {
             path,
@@ -983,6 +988,86 @@ async fn wait_for_complete(manager: &MusicManager, job_id: &str) -> StoredJob {
 
 fn shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>) {
     watch::channel(false)
+}
+
+#[tokio::test]
+async fn music_manager_archives_using_telegram_original_filename() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let settings = fixture.settings();
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let mut original = upload(901, "original-filename-901");
+    original.file_name = "01. 愛♡スクリ～ム! 中文 한국어 Русский Français Italiano.M4A".to_string();
+    let expected_name = original.file_name.clone();
+    let admission = manager
+        .enqueue(original)
+        .await
+        .expect("multilingual music upload should enqueue");
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let complete = wait_for_complete(&manager, &admission.job_id).await;
+    assert_eq!(
+        complete.archive.as_ref().unwrap().path,
+        settings.archive_dir.join(expected_name)
+    );
+    assert_eq!(backend.archives.load(Ordering::Relaxed), 1);
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn music_archive_retry_preserves_the_previous_partial_and_original_title() {
+    let fixture = TestDirectory::new();
+    let server = TestHttpServer::start().await;
+    let settings = fixture.settings();
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let mut original = upload(902, "original-filename-902");
+    original.file_name = "01. 愛♡スクリ～ム!.m4a".to_string();
+    let original_name = original.file_name.clone();
+    let admission = manager
+        .enqueue(original)
+        .await
+        .expect("music upload should enqueue");
+    manager
+        .store
+        .set_job(&admission.job_id, |job| {
+            job.archive_attempt = 1;
+        })
+        .expect("previous interrupted archive attempt should persist");
+    let old_partial = settings.archive_dir.join(&original_name);
+    fs::write(&old_partial, b"previous partial archive").expect("previous partial should exist");
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let complete = wait_for_complete(&manager, &admission.job_id).await;
+    assert_eq!(
+        complete.archive.as_ref().unwrap().path,
+        settings
+            .archive_dir
+            .join(format!("[retry 2] {original_name}"))
+    );
+    assert_eq!(fs::read(old_partial).unwrap(), b"previous partial archive");
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("worker should stop")
+        .expect("worker should join");
+    server.stop();
 }
 
 #[tokio::test]
@@ -2277,7 +2362,8 @@ async fn real_flac_conversion_survives_manager_restart_and_keeps_original_archiv
     let manager = open_manager(settings.clone(), &server, backend_trait).await;
 
     let mut flac_upload = upload(111, "flac-manager-e2e");
-    flac_upload.file_name = "lossless upload.FLAC".to_string();
+    flac_upload.file_name =
+        "01. 愛♡スクリ～ム! 中文 한국어 Русский Français Italiano.FLAC".to_string();
     flac_upload.file_size = source_bytes.len() as u64;
     flac_upload.mime_type = Some("audio/flac".to_string());
     let admission = manager.enqueue(flac_upload).await.unwrap();
@@ -2339,6 +2425,14 @@ async fn real_flac_conversion_survives_manager_restart_and_keeps_original_archiv
             .unwrap()
             .to_string_lossy()
             .ends_with(".flac")
+    );
+    assert!(
+        archive
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("01. 愛♡スクリ～ム! 中文 한국어 Русский Français Italiano-")
     );
     assert_eq!(fs::read(&archive.path).unwrap(), source_bytes);
     assert_eq!(fs::read(&prepared.original.path).unwrap(), source_bytes);

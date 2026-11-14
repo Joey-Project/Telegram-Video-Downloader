@@ -51,6 +51,13 @@ acknowledgments, and sequence history. Install and verify the matching desktop R
 service before deploying the new Worker and Mini App assets. Existing action kinds
 remain supported throughout this order; rolling back code does not roll back D1 data.
 
+For staging-cleanup upgrades, back up the intended D1 database and apply only
+`0007_staging_cleanup_kind.sql` before serving the new `staging_cleanup` action kind.
+The migration expands the durable inbox constraint while preserving pending requests,
+acknowledged history, payload hashes, and sequence history. Install and verify the
+matching desktop staging-cleanup support before deploying the Worker and Mini App
+assets; rolling back code does not roll back D1 data.
+
 ## On-demand time snapshots
 
 The Mac stores authoritative local state. Cloudflare stores a snapshot from a particular

@@ -827,10 +827,11 @@ pub(crate) fn preview_snapshots(
         .iter()
         .copied()
         .filter(|record| {
-            matches!(
+            (matches!(
                 record.request.kind.as_str(),
                 "file_preview" | "library_migration_preview"
-            ) && record.status == InboxStatus::AwaitingConfirmation
+            ) || record.request.is_staging_cleanup_preview())
+                && record.status == InboxStatus::AwaitingConfirmation
         })
         .collect::<Vec<_>>();
     active.sort_by_key(|record| record.request.seq);
@@ -844,8 +845,17 @@ pub(crate) fn preview_snapshots(
             record.request.kind == "file_preview" && !file_preview_has_valid_root_binding(record)
         })
         .count();
+    let invalid_staging_cleanup_preview_count = active
+        .iter()
+        .filter(|record| {
+            record.request.is_staging_cleanup_preview()
+                && staging_cleanup_preview_snapshot(record).is_none()
+        })
+        .count();
     active.retain(|record| {
-        record.request.kind != "file_preview" || file_preview_has_valid_root_binding(record)
+        (record.request.kind != "file_preview" || file_preview_has_valid_root_binding(record))
+            && (!record.request.is_staging_cleanup_preview()
+                || staging_cleanup_preview_snapshot(record).is_some())
     });
 
     let locally_omitted = active.len().saturating_sub(MAX_PREVIEW_SNAPSHOT_RECORDS);
@@ -854,6 +864,7 @@ pub(crate) fn preview_snapshots(
     }
     let omitted_count = omitted_preview_count
         .saturating_add(invalid_file_preview_binding_count)
+        .saturating_add(invalid_staging_cleanup_preview_count)
         .saturating_add(locally_omitted);
 
     // Reserve one bounded, actionable fallback for each valid migration preview before any full
@@ -863,6 +874,11 @@ pub(crate) fn preview_snapshots(
         .iter()
         .map(|record| {
             let result = record.result.as_ref();
+            if record.request.is_staging_cleanup_preview()
+                && let Some(snapshot) = staging_cleanup_preview_snapshot(record)
+            {
+                return snapshot;
+            }
             if record.request.kind == "file_preview"
                 && let Some(result) = result
                 && let Some(summary) = validated_file_preview_summary(record, result)
@@ -959,6 +975,9 @@ pub(crate) fn preview_snapshots(
         .expect("preview placeholders should fit the bounded snapshot budget");
 
     for (index, record) in active.iter().enumerate().rev() {
+        if record.request.is_staging_cleanup_preview() {
+            continue;
+        }
         let result = record.result.as_ref();
         if record.request.kind == "file_preview"
             && result.is_some_and(|result| {
@@ -1537,6 +1556,13 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
     let result = record.result.as_ref().map(|result| {
         if record.request.kind == "library_scan" {
             library_scan_receipt(result)
+        } else if record.request.kind == "staging_cleanup" {
+            let public_result = staging_cleanup_public_result(result);
+            if include_full_result {
+                public_result
+            } else {
+                compact_result_summary(&public_result)
+            }
         } else if include_full_result {
             result.clone()
         } else {
@@ -1576,6 +1602,11 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         "result": result,
         "error": error,
     });
+    if let Some(operation_kind) = record.request.staging_cleanup_operation()
+        && let Some(fields) = operation.as_object_mut()
+    {
+        fields.insert("operation".to_string(), json!(operation_kind));
+    }
     if record.request.kind == "file_preview"
         && let Some(fields) = operation.as_object_mut()
     {
@@ -1606,6 +1637,81 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         }
     }
     operation
+}
+
+fn staging_cleanup_public_result(result: &Value) -> Value {
+    let mut public_result = result.clone();
+    strip_staging_cleanup_proofs(&mut public_result);
+    public_result
+}
+
+fn strip_staging_cleanup_proofs(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                strip_staging_cleanup_proofs(value);
+            }
+        }
+        Value::Object(fields) => {
+            fields.remove("proofs");
+            fields.remove("cleanup_preview");
+            for value in fields.values_mut() {
+                strip_staging_cleanup_proofs(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn staging_cleanup_preview_snapshot(record: &InboxRecord) -> Option<Value> {
+    if !record.request.is_staging_cleanup_preview()
+        || record.status != InboxStatus::AwaitingConfirmation
+    {
+        return None;
+    }
+    let result = record.result.as_ref()?;
+    if result.get("operation").and_then(Value::as_str) != Some("preview") {
+        return None;
+    }
+    let preview = result.get("preview")?;
+    let preview_id = result.get("preview_id")?.as_str()?;
+    let revision = result.get("revision")?.as_str()?;
+    let library_id = result.get("library_id")?.as_str()?;
+    let root_binding = result.get("root_binding")?.as_str()?;
+    if !valid_library_id(library_id)
+        || !valid_root_binding_token(root_binding)
+        || record
+            .request
+            .payload
+            .get("library_id")
+            .and_then(Value::as_str)
+            != Some(library_id)
+        || record
+            .request
+            .payload
+            .get("root_binding")
+            .and_then(Value::as_str)
+            != Some(root_binding)
+        || preview.get("id").and_then(Value::as_str) != Some(preview_id)
+        || preview.get("revision").and_then(Value::as_str) != Some(revision)
+        || preview.get("library_id").and_then(Value::as_str) != Some(library_id)
+        || preview.get("root_binding").and_then(Value::as_str) != Some(root_binding)
+    {
+        return None;
+    }
+    let mut public_preview = preview.clone();
+    strip_staging_cleanup_proofs(&mut public_preview);
+    json_size_within(&public_preview, MAX_PREVIEW_SNAPSHOT_BYTES)?;
+    Some(json!({
+        "seq": record.request.seq,
+        "kind": "staging_cleanup",
+        "preview_id": preview_id,
+        "revision": revision,
+        "status": "awaiting_confirmation",
+        "library_id": library_id,
+        "root_binding": root_binding,
+        "preview": public_preview,
+    }))
 }
 
 fn library_scan_receipt(result: &Value) -> Value {
@@ -2914,6 +3020,71 @@ mod tests {
             "preview-cancelled-history"
         );
         assert!(previews.is_empty());
+    }
+
+    #[test]
+    fn staging_cleanup_snapshots_never_publish_local_identity_proofs() {
+        let mut receipt = record(
+            52,
+            "staging_cleanup",
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "operation": "preview",
+                "preview_id": "staging-preview-52",
+                "revision": "staging-revision-52",
+                "library_id": "ml-test-root",
+                "root_binding": TEST_ROOT_BINDING,
+                "preview": {
+                    "id": "staging-preview-52",
+                    "revision": "staging-revision-52",
+                    "library_id": "ml-test-root",
+                    "root_binding": TEST_ROOT_BINDING,
+                    "created_at": 520,
+                    "item_count": 1,
+                    "omitted_item_count": 0,
+                    "total_bytes": 2048,
+                    "sample_items": [{"id": "stage-1", "relative_path": "video-1.mp4"}],
+                },
+                "cleanup_preview": {
+                    "proofs": [{
+                        "owner_identity": "private-owner-identity",
+                        "control_identity": "private-control-identity",
+                        "inventory_sha256": "private-inventory-digest",
+                    }],
+                },
+            })),
+            None,
+        );
+        receipt.request.payload = json!({
+            "operation": "preview",
+            "library_id": "ml-test-root",
+            "root_binding": TEST_ROOT_BINDING,
+        });
+
+        let operations = operation_snapshots(&[&receipt]).expect("operation should fit");
+        let previews = preview_snapshots(&[&receipt], 0);
+        assert_eq!(operations[0]["operation"], "preview");
+        assert_eq!(operations[0]["result"]["preview"]["item_count"], 1);
+        assert!(previews[0]["preview"]["sample_items"].is_array());
+
+        for published in [&operations[0], &previews[0]] {
+            let serialized = serde_json::to_string(published).expect("snapshot should serialize");
+            for private_field in [
+                "proofs",
+                "cleanup_preview",
+                "owner_identity",
+                "control_identity",
+                "inventory_sha256",
+                "private-owner-identity",
+                "private-control-identity",
+                "private-inventory-digest",
+            ] {
+                assert!(
+                    !serialized.contains(private_field),
+                    "published staging snapshot included {private_field}"
+                );
+            }
+        }
     }
 
     #[test]
