@@ -157,6 +157,8 @@ It preserves the iCloud original, Music library files and content catalog.
 Cleanup completion is durable. If cleanup is interrupted or a file is temporarily
 inaccessible, the completed import remains complete and cleanup retries with
 backoff, including after restart; it does not download or add the track again.
+Retries recover validated interrupted removal transactions inside the selected
+job, including when Music staging is configured outside the video download root.
 Incomplete, failed and cancelled tasks retain their files for recovery. Cleanup
 rejects links, unsafe paths and replaced filesystem objects rather than following
 them outside the selected job directory. Earlier ad-hoc test source directories

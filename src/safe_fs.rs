@@ -13,6 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rustix::fd::{AsFd, OwnedFd};
@@ -267,6 +268,53 @@ struct RemoveQuarantineScanState {
     unresolved: bool,
     incomplete: bool,
     restored: bool,
+}
+
+struct BoundedRemoveQuarantineScan {
+    report: RemoveQuarantineRecoveryReport,
+    visited_entries: usize,
+    max_entries: usize,
+    max_depth: usize,
+    deadline: std::time::Instant,
+    recursive: bool,
+    stop: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedRemoveParent<'a> {
+    fd: &'a OwnedFd,
+    identity: EntryIdentity,
+    logical_path: &'a Path,
+}
+
+impl BoundedRemoveQuarantineScan {
+    fn new(
+        max_entries: usize,
+        max_depth: usize,
+        deadline: std::time::Instant,
+        recursive: bool,
+    ) -> Self {
+        Self {
+            report: RemoveQuarantineRecoveryReport {
+                messages: Vec::new(),
+                unresolved: false,
+                incomplete: false,
+                restored: false,
+            },
+            visited_entries: 0,
+            max_entries,
+            max_depth,
+            deadline,
+            recursive,
+            stop: false,
+        }
+    }
+
+    fn stop_incomplete(&mut self, message: impl Into<String>) {
+        self.report.incomplete = true;
+        self.report.messages.push(message.into());
+        self.stop = true;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -952,6 +1000,88 @@ impl RootedFs {
             incomplete: state.incomplete,
             restored: state.restored,
         })
+    }
+
+    /// Recovers only selected transactions beneath one identity-bound directory. The bounded
+    /// traversal never follows symlinks and the selector sees the manifest's original parent,
+    /// name, entry identity, and removal shape before any transaction is changed.
+    pub(crate) fn reconcile_remove_quarantines_in_bound_directory_tree_with_status_and_selector<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        max_entries: usize,
+        max_depth: usize,
+        deadline: std::time::Instant,
+        mut select: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(&Path, &OsStr, EntryIdentity, bool, bool) -> Result<bool>,
+    {
+        self.validate_private_bound_directory(entry, expected, 0o700)?;
+        let directory = openat_directory(entry.parent.fd.as_ref(), &entry.leaf)
+            .with_context(|| format!("failed to open bound directory {}", entry.path.display()))?;
+        if identity_for_fd(&directory)? != expected {
+            bail!("bound directory identity changed: {}", entry.path.display());
+        }
+
+        let mut scan = BoundedRemoveQuarantineScan::new(max_entries, max_depth, deadline, true);
+        reconcile_selected_remove_quarantines_in_directory(
+            &directory,
+            expected,
+            &entry.path,
+            0,
+            &mut scan,
+            &mut select,
+        )?;
+
+        self.validate_private_bound_directory(entry, expected, 0o700)?;
+        if identity_for_fd(&directory)? != expected {
+            bail!(
+                "bound directory identity changed during recovery: {}",
+                entry.path.display()
+            );
+        }
+        Ok(scan.report)
+    }
+
+    /// Recovers selected transactions immediately inside this rooted directory. This is for
+    /// recovering one missing direct child; callers must match the exact original name and
+    /// identity in `select`, leaving every other valid sibling transaction untouched.
+    pub(crate) fn reconcile_remove_quarantines_in_current_directory_with_status_and_selector<F>(
+        &self,
+        max_entries: usize,
+        deadline: std::time::Instant,
+        mut select: F,
+    ) -> Result<RemoveQuarantineRecoveryReport>
+    where
+        F: FnMut(&Path, &OsStr, EntryIdentity, bool, bool) -> Result<bool>,
+    {
+        self.validate_root()?;
+        validate_private_recovery_directory(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            0o700,
+        )?;
+
+        let mut scan = BoundedRemoveQuarantineScan::new(max_entries, 0, deadline, false);
+        reconcile_selected_remove_quarantines_in_directory(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            0,
+            &mut scan,
+            &mut select,
+        )?;
+
+        self.validate_root()?;
+        validate_private_recovery_directory(
+            self.root_fd.as_ref(),
+            self.root_identity,
+            &self.logical_root,
+            0o700,
+        )?;
+        Ok(scan.report)
     }
 
     fn reconcile_remove_quarantines_with_status_and_restore_decider_at_depth<F>(
@@ -2253,6 +2383,36 @@ impl RootedFs {
     }
 
     #[cfg(test)]
+    pub(crate) fn leave_bound_dir_removal_quarantined_for_test(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        if self.bound_entry_identity(entry)? != Some(expected) || !expected.is_dir() {
+            bail!("test bound-directory removal target identity changed");
+        }
+        let quarantine = create_private_remove_quarantine(
+            &entry.parent,
+            &entry.leaf,
+            expected,
+            RemoveQuarantinePolicy::retain(false),
+        )?;
+        renameat_noreplace(
+            entry.parent.fd.as_ref(),
+            &entry.leaf,
+            &quarantine.directory,
+            OsStr::new("entry"),
+        )?;
+        sync_directory(entry.parent.fd.as_ref())?;
+        sync_directory(&quarantine.directory)?;
+        if identity_at(&quarantine.directory, OsStr::new("entry"))? != Some(expected) {
+            bail!("test bound-directory quarantine identity changed");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn leave_validated_tree_removal_quarantined_for_test(
         &self,
         entry: &BoundEntry,
@@ -3501,6 +3661,503 @@ where
     Ok(())
 }
 
+fn validate_private_recovery_directory(
+    directory: &OwnedFd,
+    expected: EntryIdentity,
+    display_path: &Path,
+    expected_mode: u16,
+) -> Result<()> {
+    let stat = rustix::fs::fstat(directory)
+        .map_err(errno_to_io)
+        .with_context(|| {
+            format!(
+                "failed to inspect recovery directory {}",
+                display_path.display()
+            )
+        })?;
+    if identity_from_stat(&stat) != expected
+        || !expected.is_dir()
+        || stat.st_mode & 0o777 != expected_mode
+        || stat.st_uid != unsafe { libc::geteuid() }
+    {
+        bail!(
+            "recovery directory ownership, permissions, or identity changed: {}",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_selected_remove_quarantines_in_directory<F>(
+    directory: &OwnedFd,
+    expected_directory: EntryIdentity,
+    display_path: &Path,
+    depth: usize,
+    scan: &mut BoundedRemoveQuarantineScan,
+    select: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path, &OsStr, EntryIdentity, bool, bool) -> Result<bool>,
+{
+    if scan.stop {
+        return Ok(());
+    }
+    if Instant::now() >= scan.deadline {
+        scan.stop_incomplete(format!(
+            "Stopped interrupted-removal recovery after its time limit in {}",
+            display_path.display()
+        ));
+        return Ok(());
+    }
+    if identity_for_fd(directory)? != expected_directory {
+        bail!(
+            "remove-quarantine scan directory identity changed: {}",
+            display_path.display()
+        );
+    }
+
+    let mut names = Vec::new();
+    let reader = rustix::fs::Dir::read_from(directory)
+        .map_err(errno_to_io)
+        .with_context(|| {
+            format!(
+                "failed to scan selected interrupted-removal scope in {}",
+                display_path.display()
+            )
+        })?;
+    for item in reader {
+        if Instant::now() >= scan.deadline {
+            scan.stop_incomplete(format!(
+                "Stopped interrupted-removal recovery after its time limit in {}",
+                display_path.display()
+            ));
+            break;
+        }
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                scan.report.incomplete = true;
+                scan.report.messages.push(format!(
+                    "Could not read selected interrupted-removal scope {}: {error}",
+                    display_path.display()
+                ));
+                continue;
+            }
+        };
+        let name = item.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if scan.visited_entries >= scan.max_entries {
+            scan.stop_incomplete(format!(
+                "Stopped interrupted-removal recovery after {} entries in {}",
+                scan.max_entries,
+                display_path.display()
+            ));
+            break;
+        }
+        scan.visited_entries += 1;
+        names.push(name.to_owned());
+    }
+    names.sort_by_key(|name| !is_remove_quarantine_tombstone_name(name));
+
+    let mut child_directories = Vec::new();
+    for name in names {
+        if Instant::now() >= scan.deadline {
+            scan.stop_incomplete(format!(
+                "Stopped interrupted-removal recovery after its time limit in {}",
+                display_path.display()
+            ));
+            break;
+        }
+        let path = display_path.join(os_string_from_directory_name(&name));
+        let is_tombstone = is_remove_quarantine_tombstone_name(&name);
+        let is_managed = name
+            .as_bytes()
+            .starts_with(REMOVE_QUARANTINE_PREFIX.as_bytes());
+        let identity = match identity_at_cstr(directory, &name) {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(error) => {
+                scan.report.incomplete = true;
+                scan.report.messages.push(format!(
+                    "Could not inspect selected interrupted-removal entry {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+
+        if is_tombstone {
+            match reconcile_selected_private_remove_tombstone(
+                SelectedRemoveParent {
+                    fd: directory,
+                    identity: expected_directory,
+                    logical_path: display_path,
+                },
+                &name,
+                &path,
+                identity,
+                select,
+                scan.deadline,
+            ) {
+                Ok(true) => scan.report.messages.push(format!(
+                    "Recovered selected interrupted bound-path cleanup: {}",
+                    path.display()
+                )),
+                Ok(false) => {}
+                Err(error) => {
+                    scan.report.unresolved = true;
+                    scan.report.messages.push(format!(
+                        "Retained unresolved selected interrupted-removal tombstone {}: {error:#}",
+                        path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if is_managed {
+            match reconcile_selected_private_remove_quarantine(
+                SelectedRemoveParent {
+                    fd: directory,
+                    identity: expected_directory,
+                    logical_path: display_path,
+                },
+                &name,
+                &path,
+                identity,
+                select,
+                scan.deadline,
+            ) {
+                Ok(Some(RemoveQuarantineRecoveryAction::Deleted)) => {
+                    scan.report.messages.push(format!(
+                        "Finalized selected interrupted bound-path removal: {}",
+                        path.display()
+                    ))
+                }
+                Ok(Some(RemoveQuarantineRecoveryAction::Restored)) => {
+                    scan.report.restored = true;
+                    scan.report.messages.push(format!(
+                        "Restored selected interrupted bound-path removal: {}",
+                        path.display()
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    scan.report.unresolved = true;
+                    scan.report.messages.push(format!(
+                        "Retained unresolved selected interrupted-removal quarantine {}: {error:#}",
+                        path.display()
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if identity.is_dir() {
+            child_directories.push((name, path, identity));
+        }
+    }
+
+    if scan.stop {
+        return Ok(());
+    }
+    if !scan.recursive {
+        if identity_for_fd(directory)? != expected_directory {
+            bail!(
+                "remove-quarantine scan directory identity changed: {}",
+                display_path.display()
+            );
+        }
+        return Ok(());
+    }
+    for (name, path, identity) in child_directories {
+        if scan.stop {
+            break;
+        }
+        if depth >= scan.max_depth {
+            scan.report.incomplete = true;
+            scan.report.messages.push(format!(
+                "Skipped directory beyond interrupted-removal recovery depth: {}",
+                path.display()
+            ));
+            continue;
+        }
+        if Instant::now() >= scan.deadline {
+            scan.stop_incomplete(format!(
+                "Stopped interrupted-removal recovery after its time limit in {}",
+                path.display()
+            ));
+            break;
+        }
+        let child = match openat_directory_cstr(directory, &name) {
+            Ok(child) => child,
+            Err(error) => {
+                scan.report.incomplete = true;
+                scan.report.messages.push(format!(
+                    "Skipped unreadable directory during selected interrupted-removal scan {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if identity_for_fd(&child)? != identity
+            || identity_at_cstr(directory, &name)? != Some(identity)
+        {
+            scan.report.incomplete = true;
+            scan.report.messages.push(format!(
+                "Skipped replaced directory during selected interrupted-removal scan: {}",
+                path.display()
+            ));
+            continue;
+        }
+        if let Err(error) = reconcile_selected_remove_quarantines_in_directory(
+            &child,
+            identity,
+            &path,
+            depth + 1,
+            scan,
+            select,
+        ) {
+            scan.report.incomplete = true;
+            scan.report.messages.push(format!(
+                "Skipped directory during selected interrupted-removal scan {}: {error:#}",
+                path.display()
+            ));
+        }
+    }
+
+    if identity_for_fd(directory)? != expected_directory {
+        bail!(
+            "remove-quarantine scan directory identity changed: {}",
+            display_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_selected_private_remove_quarantine<F>(
+    parent: SelectedRemoveParent<'_>,
+    name: &CStr,
+    display_path: &Path,
+    expected_quarantine: EntryIdentity,
+    select: &mut F,
+    deadline: Instant,
+) -> Result<Option<RemoveQuarantineRecoveryAction>>
+where
+    F: FnMut(&Path, &OsStr, EntryIdentity, bool, bool) -> Result<bool>,
+{
+    if !expected_quarantine.is_dir() || identity_for_fd(parent.fd)? != parent.identity {
+        bail!("interrupted-removal quarantine parent or type changed");
+    }
+    let quarantine = openat_directory_cstr(parent.fd, name).with_context(|| {
+        format!(
+            "failed to open selected quarantine {}",
+            display_path.display()
+        )
+    })?;
+    if identity_for_fd(&quarantine)? != expected_quarantine
+        || identity_at_cstr(parent.fd, name)? != Some(expected_quarantine)
+    {
+        bail!("interrupted-removal quarantine identity changed");
+    }
+    validate_private_recovery_directory(&quarantine, expected_quarantine, display_path, 0o700)?;
+    validate_private_quarantine_contents(&quarantine)?;
+    let (manifest, manifest_identity) = read_remove_quarantine_manifest_at(
+        &quarantine,
+        OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME),
+        "selected interrupted-removal manifest",
+    )?;
+    validate_remove_quarantine_manifest(
+        &manifest,
+        name,
+        parent.identity,
+        expected_quarantine,
+        false,
+    )?;
+    if manifest.version != REMOVE_QUARANTINE_MANIFEST_VERSION {
+        bail!("selected interrupted-removal manifest has no exact original-name record");
+    }
+    let original_name = manifest
+        .original_name_hex
+        .as_deref()
+        .map(decode_remove_quarantine_original_name)
+        .transpose()?
+        .context("selected interrupted-removal manifest has no original name")?;
+    let expected_entry = manifest_entry_identity(&manifest);
+    if Instant::now() >= deadline {
+        bail!("selected interrupted-removal recovery exceeded its time limit");
+    }
+    if !select(
+        parent.logical_path,
+        &original_name,
+        expected_entry,
+        manifest.recursive,
+        manifest.restore_requires_revalidation,
+    )
+    .context("failed to select interrupted bound-path removal")?
+    {
+        return Ok(None);
+    }
+    if Instant::now() >= deadline {
+        bail!("selected interrupted-removal recovery exceeded its time limit");
+    }
+
+    let current_entry = identity_at(&quarantine, OsStr::new("entry"))?;
+    let action = match current_entry {
+        Some(current) if current != expected_entry => {
+            bail!("interrupted-removal entry identity does not match its manifest")
+        }
+        Some(_) => {
+            restore_quarantined_entry(
+                parent.fd,
+                parent.identity,
+                &quarantine,
+                expected_quarantine,
+                &original_name,
+                expected_entry,
+            )?;
+            RemoveQuarantineRecoveryAction::Restored
+        }
+        None => {
+            match identity_at(parent.fd, &original_name)? {
+                Some(current) if current == expected_entry => {}
+                Some(_) => bail!("interrupted-removal destination contains a replacement"),
+                None => {}
+            }
+            RemoveQuarantineRecoveryAction::Deleted
+        }
+    };
+
+    let quarantine_name = CString::new(name.to_bytes())
+        .context("selected interrupted-removal quarantine name contains NUL")?;
+    finish_remove_quarantine_cleanup(
+        parent.fd,
+        parent.identity,
+        &quarantine_name,
+        &quarantine,
+        expected_quarantine,
+        &manifest,
+        Some(manifest_identity),
+    )?;
+    Ok(Some(action))
+}
+
+fn reconcile_selected_private_remove_tombstone<F>(
+    parent: SelectedRemoveParent<'_>,
+    tombstone_name: &CStr,
+    display_path: &Path,
+    expected_tombstone: EntryIdentity,
+    select: &mut F,
+    deadline: Instant,
+) -> Result<bool>
+where
+    F: FnMut(&Path, &OsStr, EntryIdentity, bool, bool) -> Result<bool>,
+{
+    if !expected_tombstone.is_file() || identity_for_fd(parent.fd)? != parent.identity {
+        bail!("interrupted-removal tombstone parent or type changed");
+    }
+    let tombstone_os_name = OsStr::new(
+        tombstone_name
+            .to_str()
+            .context("interrupted-removal tombstone name is not valid UTF-8")?,
+    );
+    let (manifest, tombstone_identity) = read_remove_quarantine_manifest_at(
+        parent.fd,
+        tombstone_os_name,
+        "selected interrupted-removal tombstone",
+    )?;
+    if tombstone_identity != expected_tombstone {
+        bail!("interrupted-removal tombstone identity changed");
+    }
+    let quarantine_name = CString::new(manifest.quarantine_name.as_bytes())
+        .context("interrupted-removal tombstone contains an invalid quarantine name")?;
+    if tombstone_name.to_bytes() != remove_quarantine_tombstone_name(&quarantine_name).as_bytes() {
+        bail!("interrupted-removal tombstone name does not match its manifest");
+    }
+    let expected_quarantine = manifest_quarantine_identity(&manifest)?;
+    validate_remove_quarantine_manifest(
+        &manifest,
+        &quarantine_name,
+        parent.identity,
+        expected_quarantine,
+        true,
+    )?;
+    if manifest.version != REMOVE_QUARANTINE_MANIFEST_VERSION {
+        bail!("selected interrupted-removal tombstone has no exact original-name record");
+    }
+    let original_name = manifest
+        .original_name_hex
+        .as_deref()
+        .map(decode_remove_quarantine_original_name)
+        .transpose()?
+        .context("selected interrupted-removal tombstone has no original name")?;
+    let expected_entry = manifest_entry_identity(&manifest);
+    if Instant::now() >= deadline {
+        bail!("selected interrupted-removal recovery exceeded its time limit");
+    }
+    if !select(
+        parent.logical_path,
+        &original_name,
+        expected_entry,
+        manifest.recursive,
+        manifest.restore_requires_revalidation,
+    )
+    .context("failed to select interrupted bound-path tombstone")?
+    {
+        return Ok(false);
+    }
+    if Instant::now() >= deadline {
+        bail!("selected interrupted-removal recovery exceeded its time limit");
+    }
+    complete_remove_quarantine_from_tombstone(
+        parent.fd,
+        parent.identity,
+        &quarantine_name,
+        expected_quarantine,
+        &manifest,
+        tombstone_name,
+        tombstone_identity,
+        display_path,
+    )?;
+    Ok(true)
+}
+
+fn manifest_entry_identity(manifest: &RemoveQuarantineManifest) -> EntryIdentity {
+    EntryIdentity {
+        device: manifest.entry_device,
+        inode: manifest.entry_inode,
+        file_type: if manifest.entry_is_directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        },
+    }
+}
+
+fn validate_private_quarantine_contents(quarantine: &OwnedFd) -> Result<()> {
+    let mut count = 0usize;
+    let reader = rustix::fs::Dir::read_from(quarantine)
+        .map_err(errno_to_io)
+        .context("failed to inspect selected remove quarantine")?;
+    for item in reader {
+        let item = item.map_err(errno_to_io)?;
+        let name = item.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        count += 1;
+        if count > 2 || !matches!(name.to_bytes(), b"entry" | b"manifest.json") {
+            bail!(
+                "selected remove quarantine contains an unexpected entry: {}",
+                name.to_string_lossy()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_private_remove_quarantine<F>(
     parent: &OwnedFd,
     expected_parent: EntryIdentity,
@@ -4029,9 +4686,8 @@ fn complete_remove_quarantine_from_tombstone(
         if identity_at(&directory, OsStr::new("entry"))?.is_some() {
             bail!("terminal remove quarantine unexpectedly contains its protected entry");
         }
-        if let Some(inner_identity) =
-            identity_at(&directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))?
-        {
+        let inner_identity = identity_at(&directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))?;
+        if let Some(inner_identity) = inner_identity {
             let (inner_manifest, opened_identity) = read_remove_quarantine_manifest_at(
                 &directory,
                 OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME),
@@ -4051,6 +4707,34 @@ fn complete_remove_quarantine_from_tombstone(
             {
                 bail!("interrupted-removal manifest changed before terminal cleanup");
             }
+        }
+        let entries = rustix::fs::Dir::read_from(&directory)
+            .map_err(errno_to_io)
+            .context("failed to inspect terminal remove quarantine")?;
+        for entry in entries {
+            let entry = entry
+                .map_err(errno_to_io)
+                .context("failed to read terminal remove quarantine entry")?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            if name.to_bytes() == REMOVE_QUARANTINE_MANIFEST_NAME.as_bytes()
+                && inner_identity.is_some()
+            {
+                continue;
+            }
+            bail!(
+                "terminal remove quarantine contains an unexpected entry: {}",
+                name.to_string_lossy()
+            );
+        }
+        if let Some(inner_identity) = inner_identity {
+            if identity_at(&directory, OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME))?
+                != Some(inner_identity)
+            {
+                bail!("terminal remove quarantine manifest changed before removal");
+            }
             rustix::fs::unlinkat(
                 &directory,
                 REMOVE_QUARANTINE_MANIFEST_NAME,
@@ -4059,25 +4743,6 @@ fn complete_remove_quarantine_from_tombstone(
             .map_err(errno_to_io)
             .context("failed to remove interrupted-removal manifest")?;
             sync_directory(&directory)?;
-        }
-        let entries = rustix::fs::Dir::read_from(&directory)
-            .map_err(errno_to_io)
-            .context("failed to inspect terminal remove quarantine")?
-            .map(|entry| {
-                entry
-                    .map(|entry| entry.file_name().to_owned())
-                    .map_err(errno_to_io)
-            })
-            .collect::<std::result::Result<Vec<_>, std::io::Error>>()
-            .context("failed to read terminal remove quarantine entry")?;
-        let unexpected = entries
-            .into_iter()
-            .find(|name| !matches!(name.as_bytes(), b"." | b".."));
-        if let Some(name) = unexpected {
-            bail!(
-                "terminal remove quarantine contains an unexpected entry: {}",
-                name.to_string_lossy()
-            );
         }
         if identity_at_cstr(parent, quarantine_name)? != Some(expected_quarantine) {
             bail!("terminal remove quarantine changed before directory removal");
@@ -6008,6 +6673,269 @@ mod tests {
             }));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_current_directory_recovery_restores_only_the_named_job_directory() {
+        let staging = temp_dir("selected-current-directory-recovery");
+        fs::create_dir_all(&staging).expect("staging root should create");
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+            .expect("staging root should be private");
+        let selected_path = staging.join("job-selected");
+        let sibling_path = staging.join("job-sibling");
+        fs::create_dir(&selected_path).expect("selected job should create");
+        fs::create_dir(&sibling_path).expect("sibling job should create");
+        let rooted = RootedFs::new(&staging).expect("staging root should bind");
+
+        let selected = rooted
+            .bind_entry(&selected_path, false)
+            .expect("selected job should bind");
+        let selected_identity = rooted
+            .bound_entry_identity(&selected)
+            .expect("selected job identity should read")
+            .expect("selected job should exist");
+        rooted
+            .leave_bound_dir_removal_quarantined_for_test(&selected, selected_identity)
+            .expect("selected rmdir should remain quarantined");
+
+        let sibling = rooted
+            .bind_entry(&sibling_path, false)
+            .expect("sibling job should bind");
+        let sibling_identity = rooted
+            .bound_entry_identity(&sibling)
+            .expect("sibling identity should read")
+            .expect("sibling job should exist");
+        rooted
+            .leave_bound_dir_removal_quarantined_for_test(&sibling, sibling_identity)
+            .expect("sibling rmdir should remain quarantined");
+
+        let mut selected_calls = 0;
+        let mut sibling_calls = 0;
+        let report = rooted
+            .reconcile_remove_quarantines_in_current_directory_with_status_and_selector(
+                16,
+                Instant::now() + Duration::from_secs(5),
+                |parent, original_name, identity, recursive, restore_required| {
+                    assert_eq!(parent, staging.as_path());
+                    assert!(!recursive);
+                    assert!(!restore_required);
+                    if original_name == OsStr::new("job-selected") {
+                        selected_calls += 1;
+                        assert_eq!(identity, selected_identity);
+                        Ok(true)
+                    } else if original_name == OsStr::new("job-sibling") {
+                        sibling_calls += 1;
+                        assert_eq!(identity, sibling_identity);
+                        Ok(false)
+                    } else {
+                        Ok(false)
+                    }
+                },
+            )
+            .expect("selected recovery should finish");
+
+        assert!(!report.unresolved);
+        assert!(!report.incomplete);
+        assert!(report.restored);
+        assert_eq!(selected_calls, 1);
+        assert_eq!(sibling_calls, 1);
+        assert!(selected_path.is_dir());
+        assert!(!sibling_path.exists());
+        let remaining_controls = fs::read_dir(&staging)
+            .expect("staging root should read")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX)
+            })
+            .count();
+        assert_eq!(
+            remaining_controls, 1,
+            "sibling transaction must remain untouched"
+        );
+        let _ = fs::remove_dir_all(staging);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_bound_tree_recovery_restores_only_transactions_inside_bound_job() {
+        let root = temp_dir("selected-bound-tree-recovery");
+        fs::create_dir_all(&root).expect("root should create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("root should be private");
+        let job = root.join("staging/job-1");
+        let nested = job.join("nested");
+        let sibling = root.join("staging/job-2");
+        fs::create_dir_all(&nested).expect("nested job directory should create");
+        fs::set_permissions(&job, fs::Permissions::from_mode(0o700))
+            .expect("selected job directory should be private");
+        fs::create_dir_all(&sibling).expect("sibling job directory should create");
+        let staged_file = nested.join("track.part");
+        let sibling_file = sibling.join("track.part");
+        fs::write(&staged_file, b"selected staged bytes").expect("staged file should write");
+        fs::write(&sibling_file, b"sibling staged bytes").expect("sibling file should write");
+
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        let job_entry = rooted.bind_entry(&job, false).expect("job should bind");
+        let job_identity = rooted
+            .bound_entry_identity(&job_entry)
+            .expect("job identity should read")
+            .expect("job should exist");
+        let staged_entry = rooted
+            .bind_entry(&staged_file, false)
+            .expect("selected staged file should bind");
+        let staged_identity = rooted
+            .bound_entry_identity(&staged_entry)
+            .expect("staged file identity should read")
+            .expect("staged file should exist");
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&staged_entry, staged_identity)
+            .expect("selected staged file should remain quarantined");
+
+        let sibling_entry = rooted
+            .bind_entry(&sibling_file, false)
+            .expect("sibling staged file should bind");
+        let sibling_identity = rooted
+            .bound_entry_identity(&sibling_entry)
+            .expect("sibling file identity should read")
+            .expect("sibling file should exist");
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&sibling_entry, sibling_identity)
+            .expect("sibling staged file should remain quarantined");
+
+        let mut selector_calls = 0;
+        let report = rooted
+            .reconcile_remove_quarantines_in_bound_directory_tree_with_status_and_selector(
+                &job_entry,
+                job_identity,
+                32,
+                4,
+                Instant::now() + Duration::from_secs(5),
+                |parent, original_name, identity, recursive, restore_required| {
+                    selector_calls += 1;
+                    assert_eq!(parent, nested.as_path());
+                    assert_eq!(original_name, OsStr::new("track.part"));
+                    assert_eq!(identity, staged_identity);
+                    assert!(!recursive);
+                    assert!(restore_required);
+                    Ok(true)
+                },
+            )
+            .expect("bound-tree recovery should finish");
+
+        assert!(!report.unresolved);
+        assert!(!report.incomplete);
+        assert!(report.restored);
+        assert_eq!(selector_calls, 1);
+        assert_eq!(fs::read(&staged_file).unwrap(), b"selected staged bytes");
+        assert!(!sibling_file.exists());
+        let sibling_controls = fs::read_dir(&sibling)
+            .expect("sibling should read")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX)
+            })
+            .count();
+        assert_eq!(
+            sibling_controls, 1,
+            "sibling transaction must remain untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_current_directory_recovery_finalizes_only_matching_tombstones() {
+        let staging = temp_dir("selected-current-directory-tombstone");
+        fs::create_dir_all(&staging).expect("staging root should create");
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
+            .expect("staging root should be private");
+        let removed_path = staging.join("job-file.part");
+        fs::write(&removed_path, b"already removed").expect("staged file should write");
+        let rooted = RootedFs::new(&staging).expect("staging root should bind");
+        let entry = rooted
+            .bind_entry(&removed_path, false)
+            .expect("staged file should bind");
+        let expected = rooted
+            .bound_entry_identity(&entry)
+            .expect("staged file identity should read")
+            .expect("staged file should exist");
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&entry, expected)
+            .expect("staged file removal should remain quarantined");
+
+        let quarantine_name = fs::read_dir(&staging)
+            .expect("staging root should read")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .find(|name| name.to_string_lossy().starts_with(REMOVE_QUARANTINE_PREFIX))
+            .expect("quarantine name should exist");
+        let quarantine_path = staging.join(&quarantine_name);
+        let quarantine_entry = rooted
+            .bind_entry(&quarantine_path, false)
+            .expect("quarantine should bind");
+        let quarantine_identity = rooted
+            .bound_entry_identity(&quarantine_entry)
+            .expect("quarantine identity should read")
+            .expect("quarantine should exist");
+        let quarantine = rooted
+            .open_bound_directory(&quarantine_entry, quarantine_identity)
+            .expect("quarantine should open");
+        let (manifest, _) = read_remove_quarantine_manifest_at(
+            quarantine.fd.as_ref(),
+            OsStr::new(REMOVE_QUARANTINE_MANIFEST_NAME),
+            "test remove manifest",
+        )
+        .expect("quarantine manifest should read");
+        rustix::fs::unlinkat(quarantine.fd.as_ref(), "entry", AtFlags::empty())
+            .expect("simulate completed staged-file unlink");
+        sync_directory(quarantine.fd.as_ref()).expect("quarantine unlink should persist");
+        let terminal = build_terminal_remove_quarantine_manifest(&manifest, quarantine_identity);
+        let quarantine_c_name = CString::new(quarantine_name.as_encoded_bytes())
+            .expect("quarantine name should have no NUL");
+        let tombstone_name = remove_quarantine_tombstone_name(&quarantine_c_name);
+        create_or_validate_remove_quarantine_tombstone(
+            rooted.root_fd.as_ref(),
+            &tombstone_name,
+            &terminal,
+        )
+        .expect("terminal tombstone should persist");
+
+        let report = rooted
+            .reconcile_remove_quarantines_in_current_directory_with_status_and_selector(
+                16,
+                Instant::now() + Duration::from_secs(5),
+                |parent, original_name, identity, recursive, restore_required| {
+                    assert_eq!(parent, staging.as_path());
+                    assert_eq!(original_name, OsStr::new("job-file.part"));
+                    assert_eq!(identity, expected);
+                    assert!(!recursive);
+                    assert!(restore_required);
+                    Ok(true)
+                },
+            )
+            .expect("matching tombstone should finalize");
+
+        assert!(!report.unresolved);
+        assert!(!report.incomplete);
+        assert!(!report.restored);
+        assert!(!removed_path.exists());
+        assert!(
+            fs::read_dir(&staging)
+                .expect("staging root should read")
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(REMOVE_QUARANTINE_PREFIX))
+        );
+        let _ = fs::remove_dir_all(staging);
     }
 
     #[test]

@@ -7,6 +7,8 @@
 //! owner/mode policy continue to identify the selected objects.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -97,22 +99,6 @@ pub(crate) fn identify_regular_file(path: &Path) -> Result<VerifiedFileIdentity>
     })
 }
 
-/// Return whether the exact manager-owned job directory exists, rejecting malformed paths and
-/// replaced/symlinked staging roots. A missing configured root or job is an idempotent no-op.
-pub(crate) fn staging_job_exists(staging_root: &Path, job_id: &str) -> Result<bool> {
-    validate_job_id(job_id)?;
-    let Some(root) = open_staging_root(staging_root)? else {
-        return Ok(false);
-    };
-    let job_path = root.root_path().join(job_id);
-    let entry = root.bind_entry(&job_path, false)?;
-    match root.bound_entry_identity(&entry)? {
-        None => Ok(false),
-        Some(identity) if identity.is_dir() => Ok(true),
-        Some(_) => bail!("Music staging job path is not a real directory"),
-    }
-}
-
 /// Remove only `staging_root/job_id`, after proving that the currently verified Music copy and
 /// uploaded archive are distinct from every selected file. The supplied external identities
 /// come from the current Music verification receipt and a fresh archive metadata check.
@@ -157,13 +143,108 @@ where
     };
     let job_path = root.root_path().join(job_id);
     let job_entry = root.bind_entry(&job_path, false)?;
-    let Some(job_identity) = root.bound_entry_identity(&job_entry)? else {
-        return Ok(());
+    let initial_job_identity = root.bound_entry_identity(&job_entry)?;
+    // This exact-name recovery must run even if the directory exists: a prior retry may have
+    // restored the job but crashed before removing its root-level tombstone/quarantine metadata.
+    // Valid sibling transactions remain untouched, and malformed records keep this job pending.
+    let mut selected_root_identity = None;
+    let root_recovery = root
+        .reconcile_remove_quarantines_in_current_directory_with_status_and_selector(
+            MAX_CLEANUP_ENTRIES,
+            Instant::now() + CLEANUP_TIMEOUT,
+            |parent, original_name, identity, recursive, restore_requires_revalidation| {
+                if parent != root.root_path() || original_name != OsStr::new(job_id) {
+                    return Ok(false);
+                }
+                if !identity.is_dir() || recursive || restore_requires_revalidation {
+                    bail!("selected Music job has an unsupported interrupted-removal transaction");
+                }
+                if selected_root_identity.replace(identity).is_some() {
+                    bail!("selected Music job has multiple interrupted-removal transactions");
+                }
+                // Restoring is non-destructive. The normal cleanup path will inventory the returned
+                // object, refresh Music/archive proofs and authorize its removal.
+                Ok(true)
+            },
+        )?;
+    let root_recovery_restored = root_recovery.restored;
+    ensure_recovery_complete(root_recovery)?;
+    root.validate_configured_root()?;
+    validate_private_root(&root)?;
+    let current_job_identity = root.bound_entry_identity(&job_entry)?;
+    let job_identity = match (
+        selected_root_identity,
+        root_recovery_restored,
+        initial_job_identity,
+        current_job_identity,
+    ) {
+        (Some(expected), true, _, Some(actual)) if expected == actual => expected,
+        (Some(_), true, _, Some(_)) => bail!("restored Music staging job was replaced"),
+        (Some(_), true, _, None) => bail!("restored Music staging job disappeared"),
+        (Some(expected), false, _, Some(actual)) if expected == actual => expected,
+        (Some(expected), false, initial, None)
+            if initial.is_none() || initial == Some(expected) =>
+        {
+            return Ok(());
+        }
+        (Some(_), false, _, None) => {
+            bail!("selected Music staging job disappeared during recovery");
+        }
+        (Some(_), false, _, Some(_)) => {
+            bail!("selected Music staging recovery found a replacement job");
+        }
+        (None, true, _, _) => {
+            bail!("Music staging recovery restored an unselected job object");
+        }
+        (None, false, Some(initial), Some(current)) if initial == current => initial,
+        (None, false, None, None) => return Ok(()),
+        (None, false, _, Some(_)) => {
+            bail!("Music staging job appeared without a matching recovery transaction");
+        }
+        (None, false, Some(_), None) => {
+            bail!("Music staging job disappeared during recovery");
+        }
     };
     if !job_identity.is_dir() {
         bail!("Music staging job path is not a real directory");
     }
     ensure_same_device(job_identity, root.root_identity(), &job_path)?;
+    validate_private_root(&root)?;
+    validate_private_directory_at(&root, &job_path)?;
+
+    let mut recovered_paths = HashSet::<(PathBuf, OsString)>::new();
+    let recovery = root
+        .reconcile_remove_quarantines_in_bound_directory_tree_with_status_and_selector(
+            &job_entry,
+            job_identity,
+            MAX_CLEANUP_ENTRIES,
+            MAX_CLEANUP_DEPTH,
+            Instant::now() + CLEANUP_TIMEOUT,
+            |parent, original_name, identity, recursive, restore_requires_revalidation| {
+                if !parent.starts_with(&job_path) || is_reserved_control_name(original_name) {
+                    return Ok(false);
+                }
+                let selected_shape = !recursive
+                    && ((identity.is_file() && restore_requires_revalidation)
+                        || (identity.is_dir() && !restore_requires_revalidation));
+                if !selected_shape {
+                    bail!("Music staging contains an unsupported interrupted-removal transaction");
+                }
+                validate_private_directory_at(&root, parent)?;
+                if !recovered_paths.insert((parent.to_path_buf(), original_name.to_os_string())) {
+                    bail!("Music staging has multiple interrupted removals for one selected path");
+                }
+                // The recovery API restores selected objects only. Re-inventorying below captures
+                // the restored identity before the usual fresh external guards authorize deletion.
+                Ok(true)
+            },
+        )?;
+    ensure_recovery_complete(recovery)?;
+    root.validate_configured_root()?;
+    validate_private_root(&root)?;
+    if root.bound_entry_identity(&job_entry)? != Some(job_identity) {
+        bail!("Music staging job identity changed during removal recovery");
+    }
 
     let scan_deadline = Instant::now() + CLEANUP_TIMEOUT;
     let mut inventory = ScanInventory::default();
@@ -518,6 +599,24 @@ fn validate_directory_policy(policy: DirectoryPolicy, path: &Path) -> Result<()>
     Ok(())
 }
 
+fn validate_private_directory_at(root: &RootedFs, path: &Path) -> Result<EntryIdentity> {
+    if !path.starts_with(root.root_path()) {
+        bail!("Music staging directory is outside its configured root");
+    }
+    let entry = root.bind_entry(path, false)?;
+    let identity = root
+        .bound_entry_identity(&entry)?
+        .context("Music staging directory disappeared during recovery")?;
+    if !identity.is_dir() {
+        bail!("Music staging parent is not a directory");
+    }
+    ensure_same_device(identity, root.root_identity(), path)?;
+    let directory = root.open_bound_directory(&entry, identity)?;
+    let (owner, group, mode) = directory.access_policy()?;
+    validate_directory_policy(DirectoryPolicy { owner, group, mode }, path)?;
+    Ok(identity)
+}
+
 fn validate_file_policy(policy: FilePolicy, path: &Path) -> Result<()> {
     if policy.owner != unsafe { libc::geteuid() }
         || policy.link_count != 1
@@ -645,6 +744,13 @@ fn is_reserved_control_name(name: &std::ffi::OsStr) -> bool {
         .is_some_and(|value| value.starts_with(".telegram-video-downloader-remove"))
 }
 
+fn ensure_recovery_complete(report: crate::safe_fs::RemoveQuarantineRecoveryReport) -> Result<()> {
+    if report.unresolved || report.incomplete {
+        bail!("Music staging interrupted-removal recovery is incomplete");
+    }
+    Ok(())
+}
+
 fn check_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
         bail!("Music staging cleanup exceeded its time limit");
@@ -759,6 +865,278 @@ mod tests {
 
         cleanup_staging_tree(&staging, job_id(), &music, &archive).unwrap();
         assert!(!job.exists());
+    }
+
+    #[test]
+    fn interrupted_nested_file_removal_is_restored_then_revalidated_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let video_output = root.join("video-output");
+        fs::create_dir(&video_output).unwrap();
+        let staging = root.join("custom/music-stage");
+        let job = staging.join(job_id());
+        let attempt = job.join("prepare-attempt-2");
+        let sibling = staging.join("mj1-fedcba9876543210fedcba98");
+        fs::create_dir_all(&attempt).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        for directory in [&staging, &job, &attempt, &sibling] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let original = attempt.join("original.flac");
+        fs::write(&original, b"selected staging source").unwrap();
+        fs::write(sibling.join("original.m4a"), b"sibling source").unwrap();
+        let (music, archive) = create_guards(&root);
+
+        let rooted = RootedFs::new(&staging).unwrap();
+        let entry = rooted.bind_entry(&original, false).unwrap();
+        let identity = rooted.bound_entry_identity(&entry).unwrap().unwrap();
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&entry, identity)
+            .unwrap();
+        assert!(!original.exists());
+        assert!(fs::read_dir(&attempt).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+
+        cleanup_staging_tree(&staging, job_id(), &music, &archive).unwrap();
+
+        assert!(!job.exists());
+        assert_eq!(
+            fs::read(sibling.join("original.m4a")).unwrap(),
+            b"sibling source"
+        );
+        assert_eq!(fs::read(&music.path).unwrap(), b"independent Music copy");
+        assert_eq!(fs::read(&archive.path).unwrap(), b"uploaded archive");
+    }
+
+    #[test]
+    fn unknown_interrupted_removal_manifest_is_retained_and_blocks_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let staging = root.join("custom/music-stage");
+        let job = staging.join(job_id());
+        let attempt = job.join("prepare-attempt-1");
+        fs::create_dir_all(&attempt).unwrap();
+        for directory in [&staging, &job, &attempt] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let original = attempt.join("original.m4a");
+        fs::write(&original, b"preserve while recovery is uncertain").unwrap();
+        let unknown = attempt.join(".telegram-video-downloader-remove-unknown");
+        fs::create_dir(&unknown).unwrap();
+        fs::set_permissions(&unknown, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = unknown.join("manifest.json");
+        fs::write(&manifest, b"{}\n").unwrap();
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+        let (music, archive) = create_guards(&root);
+
+        assert!(cleanup_staging_tree(&staging, job_id(), &music, &archive).is_err());
+
+        assert_eq!(
+            fs::read(&original).unwrap(),
+            b"preserve while recovery is uncertain"
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), b"{}\n");
+        assert!(job.is_dir());
+        assert_eq!(fs::read(&music.path).unwrap(), b"independent Music copy");
+        assert_eq!(fs::read(&archive.path).unwrap(), b"uploaded archive");
+    }
+
+    #[test]
+    fn interrupted_final_job_directory_removal_is_recovered_before_idempotent_return() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let video_output = root.join("video-output");
+        fs::create_dir(&video_output).unwrap();
+        let staging = root.join("custom/music-stage");
+        let job = staging.join(job_id());
+        let sibling = staging.join("mj1-fedcba9876543210fedcba98");
+        fs::create_dir_all(&job).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&job, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(sibling.join("keep.m4a"), b"sibling cache").unwrap();
+
+        let rooted = RootedFs::new(&staging).unwrap();
+        let entry = rooted.bind_entry(&job, false).unwrap();
+        let identity = rooted.bound_entry_identity(&entry).unwrap().unwrap();
+        rooted
+            .leave_bound_dir_removal_quarantined_for_test(&entry, identity)
+            .unwrap();
+        assert!(!job.exists());
+        let quarantines = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".telegram-video-downloader-remove"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(quarantines.len(), 1);
+
+        let (music, archive) = create_guards(&root);
+        cleanup_staging_tree(&staging, job_id(), &music, &archive).unwrap();
+
+        assert!(!job.exists());
+        assert!(fs::read_dir(&staging).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".telegram-video-downloader-remove")
+        }));
+        assert_eq!(
+            fs::read(sibling.join("keep.m4a")).unwrap(),
+            b"sibling cache"
+        );
+        assert_eq!(fs::read(&music.path).unwrap(), b"independent Music copy");
+        assert_eq!(fs::read(&archive.path).unwrap(), b"uploaded archive");
+    }
+
+    #[test]
+    fn restored_job_with_pending_root_quarantine_is_reconciled_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let staging = root.join("custom/music-stage");
+        let job = staging.join(job_id());
+        let sibling = staging.join("mj1-fedcba9876543210fedcba98");
+        fs::create_dir_all(&job).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&job, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(sibling.join("keep.m4a"), b"sibling cache").unwrap();
+
+        let rooted = RootedFs::new(&staging).unwrap();
+        let job_entry = rooted.bind_entry(&job, false).unwrap();
+        let identity = rooted.bound_entry_identity(&job_entry).unwrap().unwrap();
+        rooted
+            .leave_bound_dir_removal_quarantined_for_test(&job_entry, identity)
+            .unwrap();
+        let quarantine = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".telegram-video-downloader-remove"))
+            })
+            .unwrap();
+
+        // Simulate a crash after production has renamed the entry back but before it removes the
+        // quarantine manifest. The bound rename keeps the selected identity exact.
+        let quarantined_entry = rooted.bind_entry(&quarantine.join("entry"), false).unwrap();
+        rooted
+            .rename_via_bound_parents_noreplace_if_identity(
+                &quarantined_entry,
+                &job_entry,
+                identity,
+            )
+            .unwrap();
+        assert_eq!(
+            rooted.bound_entry_identity(&job_entry).unwrap(),
+            Some(identity)
+        );
+        assert!(!quarantine.join("entry").exists());
+        assert!(quarantine.join("manifest.json").is_file());
+        let (music, archive) = create_guards(&root);
+
+        cleanup_staging_tree(&staging, job_id(), &music, &archive).unwrap();
+
+        assert!(!job.exists());
+        assert!(!quarantine.exists());
+        assert_eq!(
+            fs::read(sibling.join("keep.m4a")).unwrap(),
+            b"sibling cache"
+        );
+        assert_eq!(fs::read(&music.path).unwrap(), b"independent Music copy");
+        assert_eq!(fs::read(&archive.path).unwrap(), b"uploaded archive");
+    }
+
+    #[test]
+    fn missing_job_does_not_reconcile_a_valid_sibling_job_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let staging = root.join("custom/music-stage");
+        let sibling = staging.join("mj1-fedcba9876543210fedcba98");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        let rooted = RootedFs::new(&staging).unwrap();
+        let entry = rooted.bind_entry(&sibling, false).unwrap();
+        let identity = rooted.bound_entry_identity(&entry).unwrap().unwrap();
+        rooted
+            .leave_bound_dir_removal_quarantined_for_test(&entry, identity)
+            .unwrap();
+        let quarantine = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(".telegram-video-downloader-remove"))
+            })
+            .unwrap();
+        assert!(!sibling.exists());
+        assert!(quarantine.join("entry").is_dir());
+
+        let mut refresh_calls = 0;
+        cleanup_staging_tree_with_refresh(&staging, job_id(), || {
+            refresh_calls += 1;
+            bail!("a missing selected job must not query external guards")
+        })
+        .unwrap();
+
+        assert_eq!(refresh_calls, 0);
+        assert!(!sibling.exists());
+        assert!(quarantine.join("entry").is_dir());
+    }
+
+    #[test]
+    fn interrupted_file_removal_wont_replace_a_new_object_at_the_original_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let staging = root.join("custom/music-stage");
+        let job = staging.join(job_id());
+        let attempt = job.join("prepare-attempt-1");
+        fs::create_dir_all(&attempt).unwrap();
+        for directory in [&staging, &job, &attempt] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let original = attempt.join("original.m4a");
+        fs::write(&original, b"quarantined object").unwrap();
+        let rooted = RootedFs::new(&staging).unwrap();
+        let entry = rooted.bind_entry(&original, false).unwrap();
+        let identity = rooted.bound_entry_identity(&entry).unwrap().unwrap();
+        rooted
+            .leave_validated_file_removal_quarantined_for_test(&entry, identity)
+            .unwrap();
+        fs::write(&original, b"replacement object").unwrap();
+        let (music, archive) = create_guards(&root);
+
+        assert!(cleanup_staging_tree(&staging, job_id(), &music, &archive).is_err());
+
+        assert_eq!(fs::read(&original).unwrap(), b"replacement object");
+        assert!(job.is_dir());
+        assert_eq!(
+            fs::read_dir(&attempt)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".telegram-video-downloader-remove"))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(&music.path).unwrap(), b"independent Music copy");
+        assert_eq!(fs::read(&archive.path).unwrap(), b"uploaded archive");
     }
 
     #[test]

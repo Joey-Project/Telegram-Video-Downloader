@@ -30,6 +30,8 @@ bytes; it did not remove these separate staging files.
   the track again; cleanup failure must not turn a completed import into failure.
 - Bound traversal and anchor deletion to validated directory descriptors. Reject
   links, object replacements and paths outside the selected job directory.
+- Recover validated interrupted removal transactions in the selected job before
+  resuming cleanup, including custom Music staging outside the video root.
 - Exercise the lifecycle through mock Telegram/backend E2E, including recovery,
   safe retry, deduplication with absent source files and preserved failures.
 
@@ -43,12 +45,17 @@ bytes; it did not remove these separate staging files.
 - Filesystem tests cover links, unsafe paths, aliases, object replacement,
   partial deletion/retry and metadata-only platform flags. A live metadata-only
   probe left an existing evicted iCloud original dataless with zero local blocks.
-- Final full workspace run with `test-runtime`: 1,503 main tests and 35 converter
+- Nine review regressions cover bounded selected recovery, file and final-directory
+  removal interruptions, recovery interrupted after restoration, custom staging,
+  malformed controls, destination replacement and sibling isolation.
+- Final full workspace run with `test-runtime`: 1,512 main tests and 35 converter
   tests passed, zero failures; 17 pre-existing tests remained ignored. Existing
   Rust CI includes the new tests through its workspace/all-targets commands.
 - Strict workspace Clippy, formatting and journal validation passed. The large
   completed-history fixture alone has a 30-second completion wait for loaded
   hosts; its assertions are unchanged and timeout includes state diagnostics.
+- After a mechanical Clippy parameter-context grouping, all 55 filesystem tests
+  and 108 Music tests passed again.
 - Telegram, Music and iCloud behavior in automated tests is mocked; no new live
   Music import or production feature deployment is part of this validation.
 

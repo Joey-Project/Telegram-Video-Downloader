@@ -476,12 +476,8 @@ impl NativeMusicBackend {
     ) -> anyhow::Result<()> {
         use crate::music_staging_cleanup::{
             VerifiedFileIdentity, cleanup_staging_tree_with_refresh, identify_regular_file,
-            staging_job_exists,
         };
 
-        if !staging_job_exists(&self.settings.staging_dir, job_id)? {
-            return Ok(());
-        }
         if paths_overlap(&self.settings.staging_dir, &self.settings.state_dir)
             || paths_overlap(&self.settings.staging_dir, &self.settings.archive_dir)
         {
