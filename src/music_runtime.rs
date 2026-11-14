@@ -138,6 +138,19 @@ impl MusicService {
         self.manager().await?.enqueue_local_batch(batch).await
     }
 
+    /// Looks up existing local Music jobs by durable source key without admitting new jobs.
+    pub async fn lookup_local_jobs(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: Vec<String>,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        self.manager()
+            .await?
+            .lookup_local_jobs(chat_id, user_id, source_keys)
+            .await
+    }
+
     /// Reads selected local job states without contacting Music or sending per-track messages.
     pub async fn local_job_status(
         &self,

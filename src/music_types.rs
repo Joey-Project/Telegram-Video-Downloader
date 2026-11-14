@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 #[path = "music_local.rs"]
 mod local_snapshot;
 
+pub(crate) use local_snapshot::validate_source_key as validate_local_source_key;
+
 /// Recognized Telegram download outcomes safe to show to the upload owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MusicDownloadFailure {

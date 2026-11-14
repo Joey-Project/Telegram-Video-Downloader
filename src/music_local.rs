@@ -84,12 +84,7 @@ pub(super) fn capture_source(
 }
 
 pub(super) fn validate_source_shape(file: &LocalMusicFile, max_file_bytes: u64) -> Result<()> {
-    if file.source_key.is_empty()
-        || file.source_key.len() > MAX_SOURCE_KEY_BYTES
-        || file.source_key.chars().any(char::is_control)
-    {
-        bail!("selected local source key is invalid");
-    }
+    validate_source_key(&file.source_key)?;
     validate_root_path(&file.source_root)?;
     validate_root_path(&file.proof.resolved_root)?;
     validate_relative_path(&file.relative_path)?;
@@ -114,6 +109,16 @@ pub(super) fn validate_source_shape(file: &LocalMusicFile, max_file_bytes: u64) 
         || !is_sha256(&file.proof.sha256)
     {
         bail!("selected local file size or content proof is invalid");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_source_key(source_key: &str) -> Result<()> {
+    if source_key.is_empty()
+        || source_key.len() > MAX_SOURCE_KEY_BYTES
+        || source_key.chars().any(char::is_control)
+    {
+        bail!("selected local source key is invalid");
     }
     Ok(())
 }

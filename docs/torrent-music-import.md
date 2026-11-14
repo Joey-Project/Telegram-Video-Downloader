@@ -144,6 +144,14 @@ closed without modifying the payload; a retry never silently accepts new bytes o
 a replacement object. An uncertain Music add retains the existing
 no-blind-reimport protection.
 
+After an interrupted Music handoff, the bot first looks up existing jobs by
+their saved source keys. It retains any job it finds, including when the file
+was later deselected. If no job exists, a still-selected file requires a fresh
+review and confirmation; a cleared selection is retired without importing.
+Newly completed files do not change the identity of an interrupted batch.
+Status refreshes use bounded requests even for large, long-lived selections,
+and retain known completed results when old Music job records have been pruned.
+
 ## Cloud ingress and release
 
 Cloud mode uses the existing authorized `message` and `callback_query` ingress.

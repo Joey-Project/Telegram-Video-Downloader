@@ -102,6 +102,9 @@ pub fn parse_metainfo(bytes: &[u8], max_bytes: usize, max_files: usize) -> Resul
 
     let files = match (has_v1, has_v2) {
         (true, true) => {
+            let piece_length = u64::try_from(int_field(info_dict, b"piece length")?)
+                .context("hybrid torrent piece length is invalid")?;
+            validate_v1_padding(&v1_files, piece_length)?;
             ensure!(
                 same_file_set(&v1_files, &v2_files),
                 "hybrid torrent layouts disagree"
@@ -620,20 +623,42 @@ fn validate_file_paths(files: &[MetainfoFile]) -> Result<()> {
 }
 
 fn same_file_set(left: &[MetainfoFile], right: &[MetainfoFile]) -> bool {
-    if left.len() != right.len() {
+    let payload_files: Vec<_> = left.iter().filter(|file| !file.is_padding).collect();
+    if payload_files.len() != right.len() || right.iter().any(|file| file.is_padding) {
         return false;
     }
-    let mut left = left
-        .iter()
-        .map(|file| (&file.relative_path, file.size, file.is_padding))
-        .collect::<Vec<_>>();
-    let mut right = right
-        .iter()
-        .map(|file| (&file.relative_path, file.size, file.is_padding))
-        .collect::<Vec<_>>();
-    left.sort();
-    right.sort();
-    left == right
+    payload_files
+        .into_iter()
+        .zip(right)
+        .all(|(left, right)| left.relative_path == right.relative_path && left.size == right.size)
+}
+
+fn validate_v1_padding(files: &[MetainfoFile], piece_length: u64) -> Result<()> {
+    ensure!(piece_length > 0, "hybrid torrent piece length is invalid");
+    let mut offset = 0_u64;
+    for file in files {
+        if file.is_padding {
+            let remainder = offset % piece_length;
+            ensure!(
+                remainder != 0,
+                "hybrid torrent contains unnecessary padding"
+            );
+            let expected = piece_length - remainder;
+            ensure!(
+                file.size == expected,
+                "hybrid torrent padding length does not align the file layout"
+            );
+        } else if file.size > 0 {
+            ensure!(
+                offset.is_multiple_of(piece_length),
+                "hybrid torrent payload file is not piece-aligned"
+            );
+        }
+        offset = offset
+            .checked_add(file.size)
+            .ok_or_else(|| anyhow!("hybrid torrent file sizes overflow"))?;
+    }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -808,6 +833,134 @@ mod tests {
         assert!(parsed.identity.v1.is_some());
         assert!(parsed.identity.v2.is_some());
         assert_eq!(parsed.files.len(), 1);
+    }
+
+    fn hybrid_with_padding(padding_size: i64, second_v2_size: i64) -> Vec<u8> {
+        let v1_files = list(vec![
+            dict(vec![
+                (b"length".to_vec(), integer(2)),
+                (b"path".to_vec(), list(vec![text("folder"), text("a.bin")])),
+            ]),
+            dict(vec![
+                (b"attr".to_vec(), text("p")),
+                (b"length".to_vec(), integer(padding_size)),
+                (
+                    b"path".to_vec(),
+                    list(vec![text(".pad"), text(&padding_size.to_string())]),
+                ),
+            ]),
+            dict(vec![
+                (b"length".to_vec(), integer(3)),
+                (b"path".to_vec(), list(vec![text("folder"), text("b.bin")])),
+            ]),
+        ]);
+        let v2_leaf = |size| {
+            dict(vec![
+                (b"length".to_vec(), integer(size)),
+                (b"pieces root".to_vec(), bencode_bytes(&[5; 32])),
+            ])
+        };
+        let tree = dict(vec![(
+            b"folder".to_vec(),
+            dict(vec![
+                (b"a.bin".to_vec(), dict(vec![(b"".to_vec(), v2_leaf(2))])),
+                (
+                    b"b.bin".to_vec(),
+                    dict(vec![(b"".to_vec(), v2_leaf(second_v2_size))]),
+                ),
+            ]),
+        )]);
+        let info = dict(vec![
+            (b"file tree".to_vec(), tree),
+            (b"files".to_vec(), v1_files),
+            (b"meta version".to_vec(), integer(2)),
+            (b"name".to_vec(), text("folder")),
+            (b"piece length".to_vec(), integer(16_384)),
+            (b"pieces".to_vec(), bencode_bytes(&[4; 40])),
+        ]);
+        dict(vec![(b"info".to_vec(), info)])
+    }
+
+    #[test]
+    fn hybrid_padding_is_omitted_from_v2_comparison_but_keeps_v1_indexes() {
+        let parsed = parse_metainfo(&hybrid_with_padding(16_382, 3), 4096, 10)
+            .expect("valid hybrid padding aligns the following v2 payload");
+
+        assert_eq!(parsed.files.len(), 3);
+        assert_eq!(parsed.files[0].index, 0);
+        assert_eq!(parsed.files[0].relative_path, PathBuf::from("folder/a.bin"));
+        assert!(!parsed.files[0].is_padding);
+        assert_eq!(parsed.files[1].index, 1);
+        assert!(parsed.files[1].is_padding);
+        assert_eq!(parsed.files[1].size, 16_382);
+        assert_eq!(parsed.files[2].index, 2);
+        assert_eq!(parsed.files[2].relative_path, PathBuf::from("folder/b.bin"));
+        assert!(!parsed.files[2].is_padding);
+    }
+
+    #[test]
+    fn hybrid_rejects_malformed_padding_and_payload_mismatch() {
+        assert!(
+            parse_metainfo(&hybrid_with_padding(16_381, 3), 4096, 10).is_err(),
+            "padding must fill exactly to the next piece boundary"
+        );
+        assert!(
+            parse_metainfo(&hybrid_with_padding(16_382, 4), 4096, 10).is_err(),
+            "hybrid payload sizes must match between v1 and v2 layouts"
+        );
+    }
+
+    fn hybrid_with_trailing_padding(padding_size: i64) -> Vec<u8> {
+        let v1_files = list(vec![
+            dict(vec![
+                (b"length".to_vec(), integer(2)),
+                (b"path".to_vec(), list(vec![text("folder"), text("a.bin")])),
+            ]),
+            dict(vec![
+                (b"attr".to_vec(), text("p")),
+                (b"length".to_vec(), integer(padding_size)),
+                (
+                    b"path".to_vec(),
+                    list(vec![text(".pad"), text(&padding_size.to_string())]),
+                ),
+            ]),
+        ]);
+        let v2_file = dict(vec![
+            (b"length".to_vec(), integer(2)),
+            (b"pieces root".to_vec(), bencode_bytes(&[5; 32])),
+        ]);
+        let tree = dict(vec![(
+            b"folder".to_vec(),
+            dict(vec![(
+                b"a.bin".to_vec(),
+                dict(vec![(b"".to_vec(), v2_file)]),
+            )]),
+        )]);
+        let info = dict(vec![
+            (b"file tree".to_vec(), tree),
+            (b"files".to_vec(), v1_files),
+            (b"meta version".to_vec(), integer(2)),
+            (b"name".to_vec(), text("folder")),
+            (b"piece length".to_vec(), integer(16_384)),
+            (b"pieces".to_vec(), bencode_bytes(&[4; 20])),
+        ]);
+        dict(vec![(b"info".to_vec(), info)])
+    }
+
+    #[test]
+    fn hybrid_allows_exact_trailing_alignment_padding_only() {
+        let parsed = parse_metainfo(&hybrid_with_trailing_padding(16_382), 4096, 10)
+            .expect("a final padding entry may align the v1 layout");
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files[0].index, 0);
+        assert_eq!(parsed.files[1].index, 1);
+        assert!(parsed.files[1].is_padding);
+        assert_eq!(parsed.files[1].size, 16_382);
+
+        assert!(
+            parse_metainfo(&hybrid_with_trailing_padding(16_381), 4096, 10).is_err(),
+            "a trailing pad must still fill exactly to the piece boundary"
+        );
     }
 
     #[test]

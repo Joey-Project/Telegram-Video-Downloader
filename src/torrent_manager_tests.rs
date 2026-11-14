@@ -28,6 +28,8 @@ struct TestBackendState {
     sent_cards: usize,
     updated_cards: Vec<TorrentSnapshot>,
     music_batches: Vec<(String, Vec<CompletedTorrentFile>)>,
+    music_lookup_calls: usize,
+    music_lookup_failures: usize,
     complete_music_status: bool,
 }
 
@@ -58,6 +60,8 @@ impl TestBackend {
                 sent_cards: 0,
                 updated_cards: Vec::new(),
                 music_batches: Vec::new(),
+                music_lookup_calls: 0,
+                music_lookup_failures: 0,
                 complete_music_status: false,
             }),
             next_card_id: AtomicI64::new(100),
@@ -98,6 +102,14 @@ impl TestBackend {
 
     fn report_music_complete(&self) {
         self.state.lock().unwrap().complete_music_status = true;
+    }
+
+    fn fail_next_music_lookups(&self, count: usize) {
+        self.state.lock().unwrap().music_lookup_failures = count;
+    }
+
+    fn music_lookup_calls(&self) -> usize {
+        self.state.lock().unwrap().music_lookup_calls
     }
 }
 
@@ -211,6 +223,35 @@ impl TorrentBackend for TestBackend {
                 job_id: format!("music-job-{index}"),
             })
             .collect();
+        Box::pin(async move { Ok(refs) })
+    }
+
+    fn lookup_music_jobs(
+        &self,
+        _chat_id: i64,
+        _user_id: i64,
+        source_keys: Vec<String>,
+    ) -> crate::torrent_types::TorrentFuture<'_, Vec<TorrentMusicJobRef>> {
+        let mut state = self.state.lock().unwrap();
+        state.music_lookup_calls += 1;
+        if state.music_lookup_failures > 0 {
+            state.music_lookup_failures -= 1;
+            return Box::pin(async { anyhow::bail!("mock local Music lookup failure") });
+        }
+        let refs = state
+            .music_batches
+            .iter()
+            .flat_map(|(_, files)| {
+                files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, file)| source_keys.contains(&file.source_key))
+                    .map(|(index, file)| TorrentMusicJobRef {
+                        source_key: file.source_key.clone(),
+                        job_id: format!("music-job-{index}"),
+                    })
+            })
+            .collect::<Vec<_>>();
         Box::pin(async move { Ok(refs) })
     }
 

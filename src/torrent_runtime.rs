@@ -417,6 +417,23 @@ impl TorrentBackend for RuntimeTorrentBackend {
         })
     }
 
+    fn lookup_music_jobs(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: Vec<String>,
+    ) -> TorrentFuture<'_, Vec<TorrentMusicJobRef>> {
+        Box::pin(async move {
+            let music = self.music.as_ref().context("Music imports are disabled")?;
+            Ok(music
+                .lookup_local_jobs(chat_id, user_id, source_keys)
+                .await?
+                .into_iter()
+                .map(Into::into)
+                .collect())
+        })
+    }
+
     fn music_status(
         &self,
         chat_id: i64,

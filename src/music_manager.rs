@@ -1,6 +1,6 @@
 //! Durable, single-worker music upload orchestration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -31,6 +31,7 @@ const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOBS: usize = 1_000;
 const MAX_ACTIVE_JOBS: usize = 1_000;
+const MAX_LOCAL_JOB_LOOKUP_KEYS: usize = MAX_ACTIVE_JOBS;
 const MAX_CATALOG_ENTRIES: usize = 2_048;
 const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 512;
@@ -518,6 +519,45 @@ impl MusicStore {
         })
     }
 
+    fn lookup_local_jobs(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: &[String],
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        if chat_id <= 0 || user_id != chat_id {
+            bail!("local Music owner identifiers are invalid");
+        }
+        if source_keys.len() > MAX_LOCAL_JOB_LOOKUP_KEYS {
+            bail!("local Music source-key lookup exceeds its item limit");
+        }
+        for source_key in source_keys {
+            crate::music_types::validate_local_source_key(source_key)?;
+        }
+        let source_keys = source_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let state = self.snapshot()?;
+        Ok(state
+            .jobs
+            .values()
+            .filter_map(|job| {
+                let source = job.local_source.as_ref()?;
+                if source.chat_id != chat_id
+                    || source.user_id != user_id
+                    || !source_keys.contains(source.file.source_key.as_str())
+                {
+                    return None;
+                }
+                Some(LocalMusicJobRef {
+                    source_key: source.file.source_key.clone(),
+                    job_id: job.job_id.clone(),
+                })
+            })
+            .collect())
+    }
+
     fn set_job(&self, job_id: &str, update: impl FnOnce(&mut StoredJob)) -> Result<()> {
         self.transact(|state| {
             let job = state
@@ -982,6 +1022,23 @@ impl MusicManager {
         .context("local Music batch admission worker stopped")??;
         self.notify.notify_one();
         Ok(refs)
+    }
+
+    /// Looks up existing local jobs by durable source key without admitting or modifying jobs.
+    pub async fn lookup_local_jobs(
+        self: &Arc<Self>,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: Vec<String>,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        let manager = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            manager
+                .store
+                .lookup_local_jobs(chat_id, user_id, &source_keys)
+        })
+        .await
+        .context("local Music job lookup worker stopped")?
     }
 
     /// Starts one serial background worker and returns its task handle.

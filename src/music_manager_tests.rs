@@ -3267,6 +3267,134 @@ async fn local_batch_replay_is_owner_scoped_and_metadata_conflicts_are_atomic() 
 }
 
 #[tokio::test]
+async fn local_job_lookup_is_read_only_owner_scoped_and_survives_restart() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("lookup-downloads");
+    fs::create_dir_all(&source_root).expect("create lookup source root");
+    fs::write(source_root.join("lookup.m4a"), b"lookup fixture audio")
+        .expect("write lookup source");
+    let source_key = "torrent-hash:lookup".to_string();
+    let file = capture_local_file(
+        &source_root,
+        "lookup.m4a",
+        &source_key,
+        settings.max_file_bytes,
+    );
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+
+    let admitted = manager
+        .enqueue_local_batch(local_batch(42, 42, "lookup-batch", vec![file]))
+        .await
+        .expect("admit local Music source");
+    assert_eq!(admitted.len(), 1);
+    let failed_id = admitted[0].job_id.clone();
+    manager
+        .store
+        .set_job(&failed_id, |job| {
+            job.stage = JobStage::Failed;
+            job.error = Some("terminal lookup fixture".into());
+        })
+        .expect("mark lookup fixture as terminal");
+
+    let state_path = manager.store.state_path.clone();
+    let before_lookup = fs::read(&state_path).expect("read state before lookup");
+    let existing = manager
+        .lookup_local_jobs(42, 42, vec![source_key.clone()])
+        .await
+        .expect("find existing local job");
+    assert_eq!(existing, admitted);
+    assert_eq!(
+        manager
+            .lookup_local_jobs(42, 42, vec!["missing-source-key".into()])
+            .await
+            .expect("missing source lookup is an empty result"),
+        Vec::<LocalMusicJobRef>::new()
+    );
+    assert_eq!(
+        manager
+            .lookup_local_jobs(43, 43, vec![source_key.clone()])
+            .await
+            .expect("another private owner sees no matching job"),
+        Vec::<LocalMusicJobRef>::new()
+    );
+    assert_eq!(
+        fs::read(&state_path).expect("read state after lookup"),
+        before_lookup,
+        "lookup and missing/foreign keys must not rewrite Music state"
+    );
+    drop(manager);
+
+    let restarted = open_manager(settings, &server, backend as Arc<dyn MusicBackend>).await;
+    let before_restart_lookup = fs::read(&state_path).expect("read restarted state");
+    assert_eq!(
+        restarted
+            .lookup_local_jobs(42, 42, vec![source_key])
+            .await
+            .expect("find the same local job after restart"),
+        admitted
+    );
+    assert_eq!(
+        fs::read(&state_path).expect("read state after restart lookup"),
+        before_restart_lookup,
+        "read-only lookup after restart must not rewrite state"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn local_job_lookup_rejects_invalid_owners_keys_and_oversized_requests() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        MockBackend::new(settings.archive_dir.clone()),
+    )
+    .await;
+
+    assert!(manager.lookup_local_jobs(0, 0, Vec::new()).await.is_err());
+    assert!(manager.lookup_local_jobs(42, 43, Vec::new()).await.is_err());
+    assert!(
+        manager
+            .lookup_local_jobs(42, 42, vec![String::new()])
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .lookup_local_jobs(42, 42, vec!["invalid\nkey".into()])
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .lookup_local_jobs(42, 42, vec!["x".repeat(513)])
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .lookup_local_jobs(
+                42,
+                42,
+                vec!["valid-key".to_string(); MAX_LOCAL_JOB_LOOKUP_KEYS + 1],
+            )
+            .await
+            .is_err()
+    );
+    server.stop();
+}
+
+#[tokio::test]
 async fn local_batch_capacity_failure_admits_no_partial_jobs() {
     let fixture = TestDirectory::new();
     let settings = fixture.settings();

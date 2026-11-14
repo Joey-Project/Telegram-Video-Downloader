@@ -129,19 +129,32 @@ superseded_by: ""
 - Existing-source records validate and reopen after restart, then use the common
   Music admission/status worker after metadata verification. Opening an unchanged
   task preserves confirmations; changed source inventory invalidates them.
-- The final torrent-focused suite passed 63 tests, including all three mocked
+- The final torrent-focused suite passed 73 tests, including all three mocked
   Telegram/qBittorrent/Music E2Es. The separate qBittorrent HTTP/parser suite passed
-  13 tests. Strict workspace/all-targets Clippy and formatting passed.
+  13 tests. Formatting passed. Strict workspace/all-targets Clippy is enforced
+  by the existing macOS CI job.
 - Music admission revalidates the complete captured selection before persisting
   the exact batch intent, and keeps result associations through later selection
   or inventory changes. Transient qBittorrent failures preserve confirmations
   behind bounded refresh retries. Layout changes repair the browser cursor;
   explicit card refresh also reconciles externally retried Music jobs without
   adding idle polling for terminal jobs.
-- A broader local run passed 1,585 bot tests with 17 existing ignores. It exposed
-  a catalog fixture issue corrected by the final E2E run, and an unchanged Cloud
-  413 test exceeded its 20-second wait; that test passed in isolation. This was
-  not a wholly green local full-suite run.
+- Interrupted Music handoffs use a read-only owner-scoped source-key lookup
+  before new admission. Recovered jobs retain their exact association; a missing
+  selected job requires fresh confirmation, while a deselected missing job is
+  retired without an import. Newly completed files cannot change a saved batch.
+- Music status requests are split at the service limit, preserving cached
+  completed results if old job records have been pruned. Unattached card refresh
+  follows submission reconciliation and respects transient-error backoff.
+- Hybrid metainfo compares payload layouts separately from v1 padding while
+  preserving the original v1 file indexes used by qBittorrent.
+- A broader local run passed 1,597 bot tests with 17 existing ignores and two
+  timeouts in file-library E2Es. The 101-item bulk test passed from the same
+  artifact in isolation; the migration mid-copy restart test still timed out
+  during source-fragment cleanup. Its implementation and test are unchanged;
+  the shared Cloud fixture only adds `torrent: None`. This was not a wholly
+  green local full-suite run. Native conversion passed 27 unit tests and eight
+  E2Es in that run.
 - Real independent-bot acceptance browsed the local catalog, adopted the private
   sample in place, selected and reviewed one approved completed FLAC, and
   resumed its single saved confirmation after a test-process restart. Its

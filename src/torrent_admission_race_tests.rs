@@ -63,6 +63,15 @@ impl TorrentBackend for BlockingEnqueueBackend {
     ) -> TorrentFuture<'_, Vec<TorrentMusicJobStatus>> {
         self.inner.music_status(chat_id, job_ids)
     }
+
+    fn lookup_music_jobs(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: Vec<String>,
+    ) -> TorrentFuture<'_, Vec<TorrentMusicJobRef>> {
+        self.inner.lookup_music_jobs(chat_id, user_id, source_keys)
+    }
 }
 
 async fn prepare_completed_import(
@@ -299,4 +308,291 @@ async fn explicit_torrent_refresh_reconciles_terminal_music_job_once() {
         "a terminal Music job should not keep scheduling status polls"
     );
     assert_eq!(backend.music_batches().len(), 1);
+}
+
+fn persist_orphan_intent(manager: &TorrentManager, task_id: &str, batch_id: &str) {
+    manager
+        .store
+        .transact(|state| {
+            let task = state.tasks.get_mut(task_id).expect("task remains stored");
+            let request = task.imports.get_mut(&0).expect("selected import exists");
+            request.music_job = None;
+            request.music_stage = None;
+            request.enqueue_intent = true;
+            request.batch_id = Some(batch_id.to_string());
+            request.next_retry_at = 0;
+            Ok(())
+        })
+        .expect("persist interrupted Music enqueue intent");
+}
+
+fn clear_import_selection(fixture: &Fixture, manager: &TorrentManager, task_id: &str) {
+    let snapshot = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, task_id)
+        .unwrap();
+    manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            snapshot.card_message_id.expect("task card should be sent"),
+            task_id,
+            snapshot.inventory_revision,
+            TorrentAction::ClearSelection,
+        )
+        .expect("clear selection while enqueue intent is durable");
+}
+
+fn two_audio_fixture() -> Fixture {
+    let mut fixture = Fixture::new();
+    let files = vec![
+        dict(vec![
+            (b"length".to_vec(), integer(4)),
+            (
+                b"path".to_vec(),
+                list(vec![text("album"), text("song.mp3")]),
+            ),
+        ]),
+        dict(vec![
+            (b"length".to_vec(), integer(5)),
+            (
+                b"path".to_vec(),
+                list(vec![text("album"), text("other.mp3")]),
+            ),
+        ]),
+    ];
+    let info = dict(vec![
+        (b"files".to_vec(), list(files)),
+        (b"name".to_vec(), text("album")),
+        (b"piece length".to_vec(), integer(16_384)),
+        (b"pieces".to_vec(), bencode_bytes(&[8; 20])),
+    ]);
+    fixture.raw_torrent = dict(vec![(b"info".to_vec(), info)]);
+    fixture.metainfo = parse_metainfo(
+        &fixture.raw_torrent,
+        DEFAULT_MAX_TORRENT_BYTES,
+        DEFAULT_MAX_FILES,
+    )
+    .expect("parse two-audio-file torrent");
+    fixture.upload.file_size = fixture.raw_torrent.len() as u64;
+    fixture
+}
+
+#[tokio::test]
+async fn reopened_orphan_intent_binds_existing_music_job_without_reenqueue() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let (task_id, _) = prepare_completed_import(&fixture, &manager).await;
+    let ready = manager.store.task(&task_id).unwrap().unwrap();
+    manager.enqueue_ready_imports(ready).await;
+    let admitted = manager.store.task(&task_id).unwrap().unwrap();
+    let batch_id = admitted.imports[&0]
+        .batch_id
+        .clone()
+        .expect("Music admission should retain its batch ID");
+    persist_orphan_intent(&manager, &task_id, &batch_id);
+    clear_import_selection(&fixture, &manager, &task_id);
+    drop(manager);
+
+    let reopened =
+        TorrentManager::open(fixture.settings(), backend.clone()).expect("reopen manager");
+    reopened.process_task_once_for_test(&task_id).await;
+    let tracked = reopened.store.task(&task_id).unwrap().unwrap();
+    let request = &tracked.imports[&0];
+    assert!(tracked.selected_indexes.is_empty());
+    assert!(request.music_job.is_some());
+    assert!(!request.enqueue_intent);
+    assert_eq!(backend.music_batches().len(), 1);
+    assert_eq!(backend.music_lookup_calls(), 1);
+
+    reopened.process_task_once_for_test(&task_id).await;
+    let idle = reopened.store.task(&task_id).unwrap().unwrap();
+    assert!(!task_has_action_due(&idle, unix_seconds()));
+    assert_eq!(backend.music_batches().len(), 1);
+}
+
+#[tokio::test]
+async fn reopened_missing_orphan_intent_is_retired_without_admission() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let (task_id, _) = prepare_completed_import(&fixture, &manager).await;
+    persist_orphan_intent(&manager, &task_id, "missing-music-batch");
+    clear_import_selection(&fixture, &manager, &task_id);
+    drop(manager);
+
+    let reopened =
+        TorrentManager::open(fixture.settings(), backend.clone()).expect("reopen manager");
+    reopened.process_task_once_for_test(&task_id).await;
+    let reconciled = reopened.store.task(&task_id).unwrap().unwrap();
+    assert!(reconciled.selected_indexes.is_empty());
+    assert!(reconciled.imports.is_empty());
+    assert!(backend.music_batches().is_empty());
+    assert_eq!(backend.music_lookup_calls(), 1);
+}
+
+#[tokio::test]
+async fn reopened_missing_selected_intent_requires_fresh_confirmation() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let (task_id, _) = prepare_completed_import(&fixture, &manager).await;
+    persist_orphan_intent(&manager, &task_id, "missing-selected-music-batch");
+    drop(manager);
+
+    let reopened =
+        TorrentManager::open(fixture.settings(), backend.clone()).expect("reopen manager");
+    reopened.process_task_once_for_test(&task_id).await;
+    let reconciled = reopened.store.task(&task_id).unwrap().unwrap();
+    let request = &reconciled.imports[&0];
+    assert!(reconciled.selected_indexes.contains(&0));
+    assert!(!request.enqueue_intent);
+    assert!(request.batch_id.is_none());
+    assert_eq!(request.confirmed_selection_revision, 0);
+    assert!(request.error.is_some());
+    assert!(!reopened.has_ready_imports(&reconciled));
+    assert!(backend.music_batches().is_empty());
+}
+
+#[tokio::test]
+async fn orphan_music_lookup_failure_is_backed_off_without_worker_hotloop() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let (task_id, _) = prepare_completed_import(&fixture, &manager).await;
+    persist_orphan_intent(&manager, &task_id, "lookup-failure-music-batch");
+    clear_import_selection(&fixture, &manager, &task_id);
+    backend.fail_next_music_lookups(1);
+    drop(manager);
+
+    let reopened =
+        TorrentManager::open(fixture.settings(), backend.clone()).expect("reopen manager");
+    reopened.process_task_once_for_test(&task_id).await;
+    let deferred = reopened.store.task(&task_id).unwrap().unwrap();
+    assert!(deferred.imports[&0].enqueue_intent);
+    assert!(deferred.imports[&0].next_retry_at > unix_seconds());
+    assert_eq!(backend.music_lookup_calls(), 1);
+
+    reopened.process_task_once_for_test(&task_id).await;
+    let idle = reopened.store.task(&task_id).unwrap().unwrap();
+    assert_eq!(backend.music_lookup_calls(), 1);
+    assert!(!task_has_action_due(&idle, unix_seconds()));
+    assert!(backend.music_batches().is_empty());
+}
+
+#[tokio::test]
+async fn recovered_intent_does_not_block_newly_completed_selected_file() {
+    let fixture = two_audio_fixture();
+    let incomplete_remote =
+        remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 0.5], 0.8, 1);
+    let backend = fixture.backend(vec![incomplete_remote.clone()], None);
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+    let task_id = parse_task(&manager, fixture.upload.clone()).await;
+    manager
+        .attach_remote(&task_id, incomplete_remote)
+        .expect("attach one-complete one-pending file inventory");
+    let initial = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, &task_id)
+        .unwrap();
+    let card_id = initial.card_message_id.expect("task card should be sent");
+    let selected_first = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            card_id,
+            &task_id,
+            initial.inventory_revision,
+            TorrentAction::SetFile {
+                index: 0,
+                selected: true,
+            },
+        )
+        .expect("select first completed file");
+    let selected_both = manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            card_id,
+            &task_id,
+            selected_first.inventory_revision,
+            TorrentAction::SetFile {
+                index: 1,
+                selected: true,
+            },
+        )
+        .expect("select second pending file");
+    manager
+        .apply_action(
+            fixture.upload.chat_id,
+            fixture.upload.user_id,
+            card_id,
+            &task_id,
+            selected_both.selection_revision,
+            TorrentAction::ImportSelected,
+        )
+        .expect("confirm both selected files");
+    manager
+        .enqueue_ready_imports(manager.store.task(&task_id).unwrap().unwrap())
+        .await;
+    assert_eq!(backend.music_batches().len(), 1);
+    let first_admission = manager.store.task(&task_id).unwrap().unwrap();
+    let batch_id = first_admission.imports[&0]
+        .batch_id
+        .clone()
+        .expect("first file should have a durable batch ID");
+    manager
+        .store
+        .transact(|state| {
+            let task = state.tasks.get_mut(&task_id).expect("task remains stored");
+            let request = task.imports.get_mut(&0).expect("first import exists");
+            request.music_job = None;
+            request.music_stage = None;
+            request.enqueue_intent = true;
+            request.next_retry_at = 0;
+            task.next_refresh_at = Some(0);
+            Ok(())
+        })
+        .expect("persist in-flight first-file intent before crash");
+    drop(manager);
+
+    backend.set_visible_candidate(remote_snapshot(
+        &fixture.metainfo,
+        &fixture.source_root,
+        &[1.0, 1.0],
+        1.0,
+        0,
+    ));
+    let reopened =
+        TorrentManager::open(fixture.settings(), backend.clone()).expect("reopen manager");
+    reopened.process_task_once_for_test(&task_id).await;
+    reopened.process_task_once_for_test(&task_id).await;
+
+    let reconciled = reopened.store.task(&task_id).unwrap().unwrap();
+    assert!(reconciled.imports[&0].music_job.is_some());
+    assert!(!reconciled.imports[&0].enqueue_intent);
+    assert!(reconciled.imports[&1].music_job.is_none());
+    assert_eq!(backend.music_lookup_calls(), 1);
+    assert_eq!(backend.music_batches().len(), 1);
+
+    reopened.process_task_once_for_test(&task_id).await;
+    let batches = backend.music_batches();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].0, batch_id);
+    assert_eq!(
+        batches[0]
+            .1
+            .iter()
+            .map(|file| file.source_key.as_str())
+            .collect::<Vec<_>>(),
+        vec![reconciled.imports[&0].source_key.as_str()]
+    );
+    assert_eq!(
+        batches[1]
+            .1
+            .iter()
+            .map(|file| file.source_key.as_str())
+            .collect::<Vec<_>>(),
+        vec![reconciled.imports[&1].source_key.as_str()]
+    );
+    assert_ne!(batches[0].0, batches[1].0);
 }

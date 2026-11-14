@@ -40,6 +40,7 @@ const MAX_ERROR_BYTES: usize = 256;
 const MAX_REOPEN_REQUEST_KEYS: usize = 64;
 const MAX_ACTIVE_WORKERS: usize = 16;
 const MAX_MUSIC_BATCH_FILES: usize = 16;
+const MAX_MUSIC_STATUS_JOB_IDS: usize = 1_000;
 const MUSIC_STATUS_POLL_SECONDS: u64 = 30;
 const BASE_RETRY_SECONDS: u64 = 5;
 const MAX_RETRY_SECONDS: u64 = 5 * 60;
@@ -741,6 +742,29 @@ impl TorrentManager {
             }
             return;
         }
+        if task.remote.is_none() {
+            if task.existing.is_some() {
+                self.process_existing(task).await;
+            } else {
+                if task.manual_refresh
+                    || task.next_refresh_at.is_some_and(|at| at <= unix_seconds())
+                {
+                    let task_id = task.task_id.clone();
+                    let _ = self.store.transact(|state| {
+                        let current = state
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+                        current.manual_refresh = false;
+                        current.next_refresh_at = None;
+                        touch(current);
+                        Ok(((), true))
+                    });
+                }
+                self.reconcile_or_submit(task).await;
+            }
+            return;
+        }
         if task.manual_refresh || task.next_refresh_at.is_some_and(|at| at <= unix_seconds()) {
             if task.existing.is_some() {
                 self.process_existing(task).await;
@@ -749,16 +773,16 @@ impl TorrentManager {
             }
             return;
         }
-        if task.remote.is_none() {
-            if task.existing.is_some() {
-                self.process_existing(task).await;
-            } else {
-                self.reconcile_or_submit(task).await;
-            }
-            return;
-        }
         if !task.retry_job_ids.is_empty() {
             self.retry_music_jobs(task).await;
+            return;
+        }
+        if task.imports.values().any(|request| {
+            request.music_job.is_none()
+                && request.enqueue_intent
+                && request.next_retry_at <= unix_seconds()
+        }) {
+            self.reconcile_orphan_music_intents(&task).await;
             return;
         }
         if self.has_ready_imports(&task) {
@@ -1565,6 +1589,143 @@ impl TorrentManager {
         })
     }
 
+    async fn reconcile_orphan_music_intents(&self, task: &StoredTorrent) {
+        let captured = task
+            .imports
+            .iter()
+            .filter(|(_, request)| {
+                request.music_job.is_none()
+                    && request.enqueue_intent
+                    && request.next_retry_at <= unix_seconds()
+            })
+            .take(MAX_MUSIC_BATCH_FILES)
+            .map(|(index, request)| (*index, request.source_key.clone(), request.batch_id.clone()))
+            .collect::<Vec<_>>();
+        if captured.is_empty() {
+            return;
+        }
+        let source_keys = captured
+            .iter()
+            .map(|(_, source_key, _)| source_key.clone())
+            .collect::<Vec<_>>();
+        let lookup = self
+            .backend
+            .lookup_music_jobs(task.source_ids().0, task.source_ids().1, source_keys)
+            .await;
+        let jobs = match lookup {
+            Ok(jobs) => jobs,
+            Err(_) => {
+                let _ = self.store.transact(|state| {
+                    let current = state
+                        .tasks
+                        .get_mut(&task.task_id)
+                        .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+                    let retry_at = unix_seconds();
+                    let mut changed = false;
+                    for (index, source_key, batch_id) in &captured {
+                        if let Some(request) = current.imports.get_mut(index)
+                            && request.source_key == *source_key
+                            && request.batch_id == *batch_id
+                            && request.enqueue_intent
+                            && request.music_job.is_none()
+                        {
+                            request.attempts = request.attempts.saturating_add(1);
+                            request.next_retry_at =
+                                retry_at.saturating_add(backoff(request.attempts));
+                            request.error = Some(
+                                "Music could not confirm an interrupted import; retry is scheduled."
+                                    .to_string(),
+                            );
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        current.next_action_at = current
+                            .imports
+                            .values()
+                            .map(|request| request.next_retry_at)
+                            .min()
+                            .unwrap_or(u64::MAX);
+                        touch(current);
+                    }
+                    Ok(((), changed))
+                });
+                return;
+            }
+        };
+
+        let _ = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(&task.task_id)
+                .ok_or_else(|| anyhow!("torrent task disappeared"))?;
+            let now = unix_seconds();
+            let mut changed = false;
+            let mut found_jobs = false;
+            for (index, source_key, batch_id) in &captured {
+                let found = batch_id.as_ref().and_then(|_| {
+                    jobs.iter().find(|job| {
+                        job.source_key == *source_key && !job.job_id.is_empty()
+                    })
+                });
+                let selected = current.selected_indexes.contains(index);
+                let remove_request = {
+                    let Some(request) = current.imports.get_mut(index) else {
+                        continue;
+                    };
+                    if request.source_key != *source_key
+                        || request.batch_id != *batch_id
+                        || !request.enqueue_intent
+                        || request.music_job.is_some()
+                    {
+                        continue;
+                    }
+                    if let Some(job) = found {
+                        request.music_job = Some(job.clone());
+                        request.music_stage = Some(TorrentMusicStage::Pending);
+                        request.enqueue_intent = false;
+                        request.error = None;
+                        request.next_retry_at = now;
+                        found_jobs = true;
+                        false
+                    } else if selected {
+                        request.enqueue_intent = false;
+                        request.batch_id = None;
+                        request.confirmed_inventory_revision = 0;
+                        request.confirmed_selection_revision = 0;
+                        request.error = Some(
+                            "The interrupted Music import was not found. Review and confirm this file again."
+                                .to_string(),
+                        );
+                        request.next_retry_at = now;
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if remove_request {
+                    current.imports.remove(index);
+                }
+                changed = true;
+            }
+            if changed {
+                current.phase = aggregate_phase(current);
+                if found_jobs {
+                    current.next_music_status_at =
+                        Some(now.saturating_add(MUSIC_STATUS_POLL_SECONDS));
+                }
+                current.next_action_at = current
+                    .imports
+                    .values()
+                    .map(|request| request.next_retry_at)
+                    .min()
+                    .unwrap_or(u64::MAX);
+                touch(current);
+            }
+            Ok(((), changed))
+        });
+    }
+
     async fn enqueue_ready_imports(&self, task: StoredTorrent) {
         let Some(remote) = task.remote.as_ref() else {
             return;
@@ -1766,21 +1927,17 @@ impl TorrentManager {
         if refs.is_empty() {
             return;
         }
-        let statuses = match self.backend.music_status(task.source_ids().0, refs).await {
-            Ok(statuses) => statuses,
-            Err(_) => {
-                let _ = self.store.transact(|state| {
-                    let current = state
-                        .tasks
-                        .get_mut(&task.task_id)
-                        .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-                    current.next_music_status_at = has_pending_music_jobs(current)
-                        .then(|| unix_seconds().saturating_add(MUSIC_STATUS_POLL_SECONDS));
-                    Ok(((), true))
-                });
-                return;
+        let mut statuses = Vec::new();
+        for chunk in refs.chunks(MAX_MUSIC_STATUS_JOB_IDS) {
+            let job_ids = chunk.to_vec();
+            if let Ok(mut chunk_statuses) = self
+                .backend
+                .music_status(task.source_ids().0, job_ids)
+                .await
+            {
+                statuses.append(&mut chunk_statuses);
             }
-        };
+        }
         let _ = self.store.transact(|state| {
             let current = state
                 .tasks
@@ -1934,8 +2091,7 @@ impl TorrentStore {
                 }
                 for import in task.imports.values_mut() {
                     if import.enqueue_intent && import.music_job.is_none() {
-                        // Retain the same source key and batch ID. The local Music service dedupes
-                        // replayed source keys if a previous enqueue reached it before a crash.
+                        // Retain the same source key and batch ID for read-only Music lookup.
                         import.next_retry_at = unix_seconds();
                     }
                 }

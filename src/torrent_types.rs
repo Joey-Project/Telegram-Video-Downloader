@@ -470,6 +470,16 @@ pub trait TorrentBackend: Send + Sync + 'static {
         files: Vec<CompletedTorrentFile>,
     ) -> TorrentFuture<'_, Vec<TorrentMusicJobRef>>;
 
+    /// Read existing local Music jobs by their durable source keys without admitting work.
+    fn lookup_music_jobs(
+        &self,
+        _chat_id: i64,
+        _user_id: i64,
+        _source_keys: Vec<String>,
+    ) -> TorrentFuture<'_, Vec<TorrentMusicJobRef>> {
+        Box::pin(async { anyhow::bail!("local Music source lookup is not configured") })
+    }
+
     fn music_status(
         &self,
         chat_id: i64,
