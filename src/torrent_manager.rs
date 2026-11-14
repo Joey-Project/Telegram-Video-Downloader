@@ -317,22 +317,10 @@ impl TorrentManager {
     }
 
     fn defer_existing_revalidation(&self, task_id: &str) {
-        let _ = self.store.transact(|state| {
-            let task = state
-                .tasks
-                .get_mut(task_id)
-                .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-            task.manual_refresh = false;
-            let retry_at = unix_seconds().saturating_add(self.settings.poll_seconds);
-            task.inventory_revision = task.inventory_revision.saturating_add(1).max(1);
-            task.selection_revision = task.selection_revision.saturating_add(1).max(1);
-            task.next_refresh_at = Some(retry_at);
-            task.next_action_at = retry_at;
-            task.error =
-                Some("The fresh qBittorrent inventory could not be attached safely.".to_string());
-            touch(task);
-            Ok(((), true))
-        });
+        self.defer_existing(
+            task_id,
+            "The fresh qBittorrent inventory could not be attached safely; retry is available.",
+        );
     }
 
     fn enqueue_source(
@@ -469,7 +457,10 @@ impl TorrentManager {
                 task.phase != TorrentPhase::Invalid,
                 "torrent task is no longer available"
             );
-            ensure!(!task.manual_refresh, "torrent inventory is being refreshed");
+            ensure!(
+                !task.manual_refresh || matches!(&action, TorrentAction::Refresh),
+                "torrent inventory is being refreshed"
+            );
             ensure!(
                 task.card_message_id == Some(card_message_id),
                 "torrent card is no longer current"
@@ -490,8 +481,10 @@ impl TorrentManager {
             }
             match action {
                 TorrentAction::Refresh => {
+                    let now = unix_seconds();
                     task.manual_refresh = true;
-                    task.next_action_at = unix_seconds();
+                    task.next_action_at = now;
+                    task.next_music_status_at = Some(now);
                 }
                 TorrentAction::Browse { folder_id, page } => {
                     validate_browse(task, folder_id, page)?;
@@ -730,6 +723,12 @@ impl TorrentManager {
         if task.phase == TorrentPhase::Invalid {
             return;
         }
+        if task.manual_refresh
+            && task.next_refresh_at.is_some_and(|at| at > unix_seconds())
+            && task.next_action_at > unix_seconds()
+        {
+            return;
+        }
         if task.existing.is_some() && task.metainfo.is_none() {
             self.process_existing(task).await;
             return;
@@ -769,7 +768,10 @@ impl TorrentManager {
         if task
             .next_music_status_at
             .is_some_and(|at| at <= unix_seconds())
-            && has_pending_music_jobs(&task)
+            && task
+                .imports
+                .values()
+                .any(|request| request.music_job.is_some())
         {
             self.refresh_music_status(task).await;
         }
@@ -1050,9 +1052,9 @@ impl TorrentManager {
                 return;
             }
             Err(_) => {
-                self.mark_existing_invalid(
+                self.defer_existing(
                     &task_id,
-                    "The selected qBittorrent task is no longer available.",
+                    "Could not refresh the selected qBittorrent task; retry is available.",
                 );
                 return;
             }
@@ -1073,7 +1075,9 @@ impl TorrentManager {
                 );
                 return;
             }
-            let _ = self.attach_remote(&task_id, remote);
+            if self.attach_remote(&task_id, remote).is_ok() {
+                self.resume_existing_imports(&task_id);
+            }
             return;
         }
 
@@ -1142,8 +1146,8 @@ impl TorrentManager {
             touch(current);
             Ok(((), true))
         });
-        if saved.is_ok() {
-            let _ = self.attach_remote(&task_id, remote);
+        if saved.is_ok() && self.attach_remote(&task_id, remote).is_ok() {
+            self.resume_existing_imports(&task_id);
         }
     }
 
@@ -1153,10 +1157,42 @@ impl TorrentManager {
                 .tasks
                 .get_mut(task_id)
                 .context("torrent task disappeared")?;
-            current.phase = TorrentPhase::DownloadingMetainfo;
+            if current.metainfo.is_none() {
+                current.phase = TorrentPhase::DownloadingMetainfo;
+            }
+            current.manual_refresh = true;
             current.attempts = current.attempts.saturating_add(1);
-            current.next_action_at = unix_seconds().saturating_add(backoff(current.attempts));
+            let retry_at = unix_seconds().saturating_add(backoff(current.attempts));
+            current.next_action_at = retry_at;
+            current.next_refresh_at = Some(retry_at);
+            for request in current.imports.values_mut() {
+                if request.music_job.is_none() {
+                    request.next_retry_at = retry_at;
+                }
+            }
             current.error = Some(message.to_owned());
+            touch(current);
+            Ok(((), true))
+        });
+    }
+
+    fn resume_existing_imports(&self, task_id: &str) {
+        let _ = self.store.transact(|state| {
+            let current = state
+                .tasks
+                .get_mut(task_id)
+                .context("torrent task disappeared")?;
+            let now = unix_seconds();
+            for (index, request) in &mut current.imports {
+                if request.music_job.is_none()
+                    && current.selected_indexes.contains(index)
+                    && request.confirmed_inventory_revision == current.inventory_revision
+                    && request.confirmed_selection_revision == current.selection_revision
+                {
+                    request.next_retry_at = now;
+                }
+            }
+            current.next_action_at = now;
             touch(current);
             Ok(((), true))
         });
@@ -1480,6 +1516,11 @@ impl TorrentManager {
                     .as_ref()
                     .map(|old| !same_inventory(old, &remote))
                     .unwrap_or_else(|| !same_metainfo_inventory(metainfo, &remote));
+                let cursor_path_before_refresh = task_snapshot(task)
+                    .folders
+                    .into_iter()
+                    .find(|folder| folder.id == task.cursor_folder_id)
+                    .map(|folder| folder.relative_path);
                 if inventory_changed {
                     task.inventory_revision = task.inventory_revision.saturating_add(1).max(1);
                     task.selection_revision = task.selection_revision.saturating_add(1).max(1);
@@ -1490,6 +1531,9 @@ impl TorrentManager {
                     TorrentPhase::Downloading
                 };
                 task.remote = Some(remote.clone());
+                if inventory_changed {
+                    reconcile_cursor_after_inventory_change(task, cursor_path_before_refresh);
+                }
                 task.manual_refresh = false;
                 task.attempts = 0;
                 task.next_refresh_at = (!remote.is_complete())
@@ -1579,37 +1623,54 @@ impl TorrentManager {
             .map(|file| file.source_key.clone())
             .collect::<BTreeSet<_>>();
         let task_id = task.task_id.clone();
+        let expected_inventory_revision = task.inventory_revision;
+        let expected_selection_revision = task.selection_revision;
         let intent = self.store.transact(|state| {
             let current = state
                 .tasks
                 .get_mut(&task_id)
                 .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-            if current.inventory_revision != task.inventory_revision {
-                return Ok((false, false));
+            if current.inventory_revision != expected_inventory_revision
+                || current.selection_revision != expected_selection_revision
+            {
+                return Ok(false);
             }
-            let current_inventory_revision = current.inventory_revision;
-            let current_selection_revision = current.selection_revision;
-            let selected_indexes = current.selected_indexes.clone();
-            for (index, _, _) in &eligible {
-                if included_indexes.contains(index)
-                    && let Some(current_request) = current.imports.get_mut(index)
-                    && current_request.music_job.is_none()
-                    && current_request.confirmed_inventory_revision == current_inventory_revision
-                    && current_request.confirmed_selection_revision == current_selection_revision
-                    && selected_indexes.contains(index)
-                {
-                    current_request.enqueue_intent = true;
-                    current_request.batch_id = Some(batch_id.clone());
-                    current_request.next_retry_at = unix_seconds()
-                        .saturating_add(backoff(current_request.attempts.saturating_add(1)));
+            let intent_at = unix_seconds();
+            for (index, captured_request, _) in &eligible {
+                if !included_indexes.contains(index) {
+                    continue;
                 }
+                let Some(current_request) = current.imports.get(index) else {
+                    return Ok(false);
+                };
+                if current_request.source_key != captured_request.source_key
+                    || current_request.music_job.is_some()
+                    || !current.selected_indexes.contains(index)
+                    || current_request.confirmed_inventory_revision != expected_inventory_revision
+                    || current_request.confirmed_selection_revision != expected_selection_revision
+                    || current_request.next_retry_at > intent_at
+                    || (current_request.enqueue_intent
+                        && current_request.batch_id.as_deref() != Some(batch_id.as_str()))
+                {
+                    return Ok(false);
+                }
+            }
+            for index in &included_indexes {
+                let current_request = current
+                    .imports
+                    .get_mut(index)
+                    .expect("validated import request remains present");
+                current_request.enqueue_intent = true;
+                current_request.batch_id = Some(batch_id.clone());
+                current_request.next_retry_at =
+                    intent_at.saturating_add(backoff(current_request.attempts.saturating_add(1)));
             }
             current.phase = TorrentPhase::Importing;
             current.next_action_at = unix_seconds().saturating_add(self.settings.poll_seconds);
             touch(current);
-            Ok((true, true))
+            Ok(true)
         });
-        if !matches!(intent, Ok((true, true))) {
+        if !matches!(intent, Ok(true)) {
             return;
         }
         let result = self
@@ -1628,18 +1689,19 @@ impl TorrentManager {
                         .tasks
                         .get_mut(&task_id)
                         .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-                    if current.inventory_revision != task.inventory_revision {
-                        return Ok(((), false));
-                    }
+                    let mut tracked_any = false;
                     for job in refs {
                         if !source_keys.contains(&job.source_key) {
                             continue;
                         }
-                        if let Some((index, request)) = current
-                            .imports
-                            .iter_mut()
-                            .find(|(_, request)| request.source_key == job.source_key)
+                        if let Some((index, request)) =
+                            current.imports.iter_mut().find(|(_, request)| {
+                                request.source_key == job.source_key
+                                    && request.enqueue_intent
+                                    && request.batch_id.as_deref() == Some(batch_id.as_str())
+                            })
                         {
+                            tracked_any = true;
                             if request.music_job.is_none() {
                                 request.music_job = Some(job.clone());
                                 request.music_stage = Some(TorrentMusicStage::Pending);
@@ -1648,6 +1710,9 @@ impl TorrentManager {
                             }
                             let _ = index;
                         }
+                    }
+                    if !tracked_any {
+                        return Ok(((), false));
                     }
                     current.phase = aggregate_phase(current);
                     current.next_music_status_at =
@@ -1660,14 +1725,26 @@ impl TorrentManager {
             Err(_) => {
                 let _ = self.store.transact(|state| {
                     let current = state.tasks.get_mut(&task_id).ok_or_else(|| anyhow!("torrent task disappeared"))?;
-                    for (index, _, _) in &eligible {
-                        if let Some(request) = current.imports.get_mut(index) {
+                    let mut matched_old_batch = false;
+                    for (index, captured_request, _) in &eligible {
+                        if !included_indexes.contains(index) {
+                            continue;
+                        }
+                        if let Some(request) = current.imports.get_mut(index)
+                            && request.source_key == captured_request.source_key
+                            && request.enqueue_intent
+                            && request.batch_id.as_deref() == Some(batch_id.as_str())
+                        {
+                            matched_old_batch = true;
                             request.attempts = request.attempts.saturating_add(1);
                             request.enqueue_intent = false;
                             request.batch_id = None;
                             request.error = Some("The selected local files could not be verified or Music is not ready; retry is available.".to_string());
                             request.next_retry_at = unix_seconds().saturating_add(backoff(request.attempts));
                         }
+                    }
+                    if !matched_old_batch {
+                        return Ok(((), false));
                     }
                     current.phase = aggregate_phase(current);
                     current.error = Some("One or more selected Music imports are waiting for a safe retry.".to_string());
@@ -1697,8 +1774,8 @@ impl TorrentManager {
                         .tasks
                         .get_mut(&task.task_id)
                         .ok_or_else(|| anyhow!("torrent task disappeared"))?;
-                    current.next_music_status_at =
-                        Some(unix_seconds().saturating_add(MUSIC_STATUS_POLL_SECONDS));
+                    current.next_music_status_at = has_pending_music_jobs(current)
+                        .then(|| unix_seconds().saturating_add(MUSIC_STATUS_POLL_SECONDS));
                     Ok(((), true))
                 });
                 return;
@@ -2060,6 +2137,29 @@ fn exit_review(task: &mut StoredTorrent) {
     }
 }
 
+fn reconcile_cursor_after_inventory_change(
+    task: &mut StoredTorrent,
+    previous_folder_path: Option<PathBuf>,
+) {
+    // Review pages index the selected-file list rather than the current folder. An inventory
+    // change invalidates that page, but the browser can keep its location when the same path
+    // still exists in the replacement inventory.
+    exit_review(task);
+    let folders = task_folders(task).unwrap_or_default();
+    task.cursor_folder_id = previous_folder_path
+        .as_ref()
+        .and_then(|path| {
+            folders
+                .iter()
+                .find(|folder| &folder.relative_path == path)
+                .map(|folder| folder.id)
+        })
+        .unwrap_or(0);
+    if validate_browse(task, task.cursor_folder_id, task.cursor_page).is_err() {
+        task.cursor_page = 0;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredImport {
@@ -2093,6 +2193,12 @@ fn task_has_action_due(task: &StoredTorrent, now: u64) -> bool {
     if task.phase == TorrentPhase::Invalid {
         return false;
     }
+    if task.manual_refresh
+        && task.next_refresh_at.is_some_and(|at| at > now)
+        && task.next_action_at > now
+    {
+        return false;
+    }
     if task.manual_refresh || task.next_refresh_at.is_some_and(|at| at <= now) {
         return true;
     }
@@ -2106,7 +2212,12 @@ fn task_has_action_due(task: &StoredTorrent, now: u64) -> bool {
     }) {
         return true;
     }
-    if task.next_music_status_at.is_some_and(|at| at <= now) && has_pending_music_jobs(task) {
+    if task.next_music_status_at.is_some_and(|at| at <= now)
+        && task
+            .imports
+            .values()
+            .any(|request| request.music_job.is_some())
+    {
         return true;
     }
     task.remote.as_ref().is_some_and(|remote| {

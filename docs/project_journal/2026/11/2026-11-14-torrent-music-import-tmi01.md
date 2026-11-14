@@ -129,9 +129,15 @@ superseded_by: ""
 - Existing-source records validate and reopen after restart, then use the common
   Music admission/status worker after metadata verification. Opening an unchanged
   task preserves confirmations; changed source inventory invalidates them.
-- The final torrent-focused suite passed 56 tests, including all three mocked
+- The final torrent-focused suite passed 63 tests, including all three mocked
   Telegram/qBittorrent/Music E2Es. The separate qBittorrent HTTP/parser suite passed
   13 tests. Strict workspace/all-targets Clippy and formatting passed.
+- Music admission revalidates the complete captured selection before persisting
+  the exact batch intent, and keeps result associations through later selection
+  or inventory changes. Transient qBittorrent failures preserve confirmations
+  behind bounded refresh retries. Layout changes repair the browser cursor;
+  explicit card refresh also reconciles externally retried Music jobs without
+  adding idle polling for terminal jobs.
 - A broader local run passed 1,585 bot tests with 17 existing ignores. It exposed
   a catalog fixture issue corrected by the final E2E run, and an unchanged Cloud
   413 test exceeded its 20-second wait; that test passed in isolation. This was

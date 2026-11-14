@@ -8,6 +8,13 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use tempfile::TempDir;
 
+#[path = "torrent_admission_race_tests.rs"]
+mod admission_race;
+#[path = "torrent_card_recovery_tests.rs"]
+mod card_recovery;
+#[path = "torrent_refresh_recovery_tests.rs"]
+mod refresh_recovery;
+
 struct TestBackendState {
     visible_candidates: Vec<TorrentRemoteSnapshot>,
     accepted_on_submit: Option<TorrentRemoteSnapshot>,
