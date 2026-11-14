@@ -85,6 +85,7 @@ mod queue_metadata_tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         tokio_timeout(Duration::from_secs(10), process_job_after_duplicate_check(
             context, CHAT_ID, 1, id.to_string(), 0, job,

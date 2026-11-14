@@ -1,6 +1,6 @@
 //! Durable, single-worker music upload orchestration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -19,7 +19,8 @@ use tokio::task::JoinHandle;
 
 use crate::file_provider::{QueueFileProvider, platform_queue_file_provider};
 use crate::music_types::{
-    ArchiveState, AudioBytes, MusicBackend, MusicCancellation, MusicDownloadFailure, MusicSettings,
+    ArchiveState, AudioBytes, JobStage, LocalMusicBatch, LocalMusicFile, LocalMusicJobRef,
+    LocalMusicJobStatus, MusicBackend, MusicCancellation, MusicDownloadFailure, MusicSettings,
     MusicTrack, MusicUpload, PreparedAudio,
 };
 use crate::telegram::TelegramClient;
@@ -30,6 +31,7 @@ const STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_JOBS: usize = 1_000;
 const MAX_ACTIVE_JOBS: usize = 1_000;
+const MAX_LOCAL_JOB_LOOKUP_KEYS: usize = MAX_ACTIVE_JOBS;
 const MAX_CATALOG_ENTRIES: usize = 2_048;
 const MAX_ID_BYTES: usize = 256;
 const MAX_NAME_BYTES: usize = 512;
@@ -63,62 +65,15 @@ impl std::fmt::Display for MusicCapacityFull {
 
 impl std::error::Error for MusicCapacityFull {}
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum JobStage {
-    Queued,
-    Downloading,
-    Preparing,
-    Archiving,
-    CatalogDedupe,
-    Importing,
-    Querying,
-    WaitingMusicCloud,
-    VerifyingCopy,
-    ArchiveUploading,
-    WaitingArchiveCloud,
-    Evicting,
-    Complete,
-    Failed,
-    Cancelled,
-    OutcomeUnknown,
-}
-
-impl JobStage {
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::Complete | Self::Failed | Self::Cancelled | Self::OutcomeUnknown
-        )
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Downloading => "downloading",
-            Self::Preparing => "preparing audio",
-            Self::Archiving => "saving archive copy",
-            Self::CatalogDedupe => "checking existing music",
-            Self::Importing => "importing into Music",
-            Self::Querying => "checking Music",
-            Self::WaitingMusicCloud => "waiting for Music cloud sync",
-            Self::VerifyingCopy => "verifying the Music copy",
-            Self::ArchiveUploading => "waiting for archive upload",
-            Self::WaitingArchiveCloud => "waiting for archive upload",
-            Self::Evicting => "evicting verified archive bytes",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::OutcomeUnknown => "import outcome unknown; no automatic retry",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredJob {
     job_id: String,
     origin_key: String,
-    upload: MusicUpload,
+    // `Option` preserves old Telegram records. Local records persist `null` here, which makes
+    // older binaries (whose schema requires a MusicUpload object) fail closed on read.
+    upload: Option<MusicUpload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_source: Option<StoredLocalMusicSource>,
     stage: JobStage,
     created_at: u64,
     updated_at: u64,
@@ -155,6 +110,48 @@ struct StoredJob {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredLocalMusicSource {
+    chat_id: i64,
+    user_id: i64,
+    batch_id: String,
+    file: LocalMusicFile,
+}
+
+impl StoredJob {
+    fn chat_id(&self) -> i64 {
+        self.upload
+            .as_ref()
+            .map(|upload| upload.chat_id)
+            .or_else(|| self.local_source.as_ref().map(|source| source.chat_id))
+            .unwrap_or_default()
+    }
+
+    fn file_name(&self) -> &str {
+        self.upload
+            .as_ref()
+            .map(|upload| upload.file_name.as_str())
+            .or_else(|| {
+                self.local_source
+                    .as_ref()
+                    .map(|source| source.file.file_name.as_str())
+            })
+            .unwrap_or_default()
+    }
+
+    fn file_size(&self) -> u64 {
+        self.upload
+            .as_ref()
+            .map(|upload| upload.file_size)
+            .or_else(|| {
+                self.local_source
+                    .as_ref()
+                    .map(|source| source.file.file_size)
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogEntry {
     add_intent: bool,
     persistent_id: Option<String>,
@@ -181,6 +178,8 @@ impl Default for StoredState {
 
 struct MusicStore {
     state_path: PathBuf,
+    state_dir: PathBuf,
+    staging_dir: PathBuf,
     archive_dir: PathBuf,
     provider: Arc<dyn QueueFileProvider>,
     state: Mutex<StoredState>,
@@ -198,9 +197,16 @@ impl MusicStore {
 
         let state_path = settings.state_dir.join(STATE_FILE);
         let state = read_state(&state_path, provider.as_ref())?.unwrap_or_default();
-        validate_stored_state(&state, &settings.archive_dir)?;
+        validate_stored_state(
+            &state,
+            &settings.state_dir,
+            &settings.staging_dir,
+            &settings.archive_dir,
+        )?;
         let store = Self {
             state_path,
+            state_dir: settings.state_dir.clone(),
+            staging_dir: settings.staging_dir.clone(),
             archive_dir: settings.archive_dir.clone(),
             provider,
             state: Mutex::new(state),
@@ -221,9 +227,16 @@ impl MusicStore {
         let owner_lock = acquire_owner_lock(&owner_lock_path, provider.as_ref())?;
         let state_path = settings.state_dir.join(STATE_FILE);
         let state = read_state(&state_path, provider.as_ref())?.unwrap_or_default();
-        validate_stored_state(&state, &settings.archive_dir)?;
+        validate_stored_state(
+            &state,
+            &settings.state_dir,
+            &settings.staging_dir,
+            &settings.archive_dir,
+        )?;
         Ok(Self {
             state_path,
+            state_dir: settings.state_dir.clone(),
+            staging_dir: settings.staging_dir.clone(),
             archive_dir: settings.archive_dir.clone(),
             provider,
             state: Mutex::new(state),
@@ -275,7 +288,7 @@ impl MusicStore {
             .map_err(|_| anyhow!("music job state lock was poisoned"))?;
         let mut next = guard.clone();
         let output = update(&mut next)?;
-        validate_stored_state(&next, &self.archive_dir)?;
+        validate_stored_state(&next, &self.state_dir, &self.staging_dir, &self.archive_dir)?;
         write_state_atomic(&self.state_path, &next, self.provider.as_ref())?;
         *guard = next;
         Ok(output)
@@ -292,7 +305,7 @@ impl MusicStore {
         let mut next = guard.clone();
         let (output, changed) = update(&mut next)?;
         if changed {
-            validate_stored_state(&next, &self.archive_dir)?;
+            validate_stored_state(&next, &self.state_dir, &self.staging_dir, &self.archive_dir)?;
             write_state_atomic(&self.state_path, &next, self.provider.as_ref())?;
             *guard = next;
         }
@@ -336,7 +349,10 @@ impl MusicStore {
         let (job_id, origin_key) = job_identity(&upload);
         self.transact(|state| {
             if let Some(existing) = state.jobs.get(&job_id) {
-                if existing.origin_key != origin_key || existing.upload != upload {
+                if existing.origin_key != origin_key
+                    || existing.upload.as_ref() != Some(&upload)
+                    || existing.local_source.is_some()
+                {
                     bail!("conflicting metadata was supplied for an existing music upload");
                 }
                 return Ok(Admission {
@@ -351,7 +367,8 @@ impl MusicStore {
                 StoredJob {
                     job_id: job_id.clone(),
                     origin_key,
-                    upload,
+                    upload: Some(upload),
+                    local_source: None,
                     stage: JobStage::Queued,
                     created_at: now,
                     updated_at: now,
@@ -386,6 +403,159 @@ impl MusicStore {
                 created: true,
             })
         })
+    }
+
+    fn enqueue_local_batch(
+        &self,
+        batch: LocalMusicBatch,
+        settings: &MusicSettings,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        validate_local_batch(&batch, settings)?;
+        let mut plan = Vec::new();
+        let mut seen_in_batch = BTreeMap::<String, LocalMusicFile>::new();
+        for file in &batch.files {
+            if let Some(existing) = seen_in_batch.get(&file.source_key) {
+                if existing != file {
+                    bail!("conflicting metadata was supplied for one local Music source key");
+                }
+                continue;
+            }
+            seen_in_batch.insert(file.source_key.clone(), file.clone());
+            let (job_id, origin_key) =
+                local_job_identity(batch.chat_id, batch.user_id, &file.source_key);
+            plan.push((job_id, origin_key, file.clone()));
+        }
+
+        self.transact(|state| {
+            // Resolve every prior key and every conflict before mutating the transaction copy.
+            let protected_ids = plan
+                .iter()
+                .map(|(job_id, _, _)| (job_id.clone(), ()))
+                .collect::<BTreeMap<_, _>>();
+            for (job_id, origin_key, file) in &plan {
+                if let Some(existing) = state.jobs.get(job_id)
+                    && (existing.origin_key != *origin_key
+                        || existing.upload.is_some()
+                        || existing.local_source.as_ref().is_none_or(|source| {
+                            source.chat_id != batch.chat_id
+                                || source.user_id != batch.user_id
+                                || source.file != *file
+                        }))
+                {
+                    bail!("conflicting metadata was supplied for an existing local Music source");
+                }
+            }
+
+            let new_count = plan
+                .iter()
+                .filter(|(job_id, _, _)| !state.jobs.contains_key(job_id))
+                .count();
+            let active_count = state
+                .jobs
+                .values()
+                .filter(|job| !job.stage.is_terminal())
+                .count();
+            if active_count.saturating_add(new_count) > MAX_ACTIVE_JOBS {
+                return Err(MusicCapacityFull.into());
+            }
+
+            let now = unix_seconds();
+            for (job_id, origin_key, file) in &plan {
+                if state.jobs.contains_key(job_id) {
+                    continue;
+                }
+                make_room_for_admission_excluding(state, &protected_ids)?;
+                state.jobs.insert(
+                    job_id.clone(),
+                    StoredJob {
+                        job_id: job_id.clone(),
+                        origin_key: origin_key.clone(),
+                        upload: None,
+                        local_source: Some(StoredLocalMusicSource {
+                            chat_id: batch.chat_id,
+                            user_id: batch.user_id,
+                            batch_id: batch.batch_id.clone(),
+                            file: file.clone(),
+                        }),
+                        stage: JobStage::Queued,
+                        created_at: now,
+                        updated_at: now,
+                        attempt: 0,
+                        prepare_attempt: 0,
+                        archive_attempt: 0,
+                        download_path: None,
+                        download_complete: false,
+                        prepared: None,
+                        archive: None,
+                        persistent_id: None,
+                        track: None,
+                        local_copy_verified: false,
+                        add_intent: false,
+                        cancel_requested: false,
+                        next_poll_at: None,
+                        error: None,
+                        status_message_id: None,
+                        status_send_attempted: false,
+                        status_text: None,
+                        status_pending_text: None,
+                        status_edit_attempts: 0,
+                        status_next_attempt_at: None,
+                        staging_cleanup_completed: false,
+                        staging_cleanup_attempts: 0,
+                        staging_cleanup_next_attempt_at: None,
+                    },
+                );
+                make_room_for_serialized_admission_excluding(state, job_id, &protected_ids)?;
+            }
+
+            Ok(batch
+                .files
+                .iter()
+                .map(|file| LocalMusicJobRef {
+                    source_key: file.source_key.clone(),
+                    job_id: local_job_identity(batch.chat_id, batch.user_id, &file.source_key).0,
+                })
+                .collect())
+        })
+    }
+
+    fn lookup_local_jobs(
+        &self,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: &[String],
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        if chat_id <= 0 || user_id != chat_id {
+            bail!("local Music owner identifiers are invalid");
+        }
+        if source_keys.len() > MAX_LOCAL_JOB_LOOKUP_KEYS {
+            bail!("local Music source-key lookup exceeds its item limit");
+        }
+        for source_key in source_keys {
+            crate::music_types::validate_local_source_key(source_key)?;
+        }
+        let source_keys = source_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let state = self.snapshot()?;
+        Ok(state
+            .jobs
+            .values()
+            .filter_map(|job| {
+                let source = job.local_source.as_ref()?;
+                if source.chat_id != chat_id
+                    || source.user_id != user_id
+                    || !source_keys.contains(source.file.source_key.as_str())
+                {
+                    return None;
+                }
+                Some(LocalMusicJobRef {
+                    source_key: source.file.source_key.clone(),
+                    job_id: job.job_id.clone(),
+                })
+            })
+            .collect())
     }
 
     fn set_job(&self, job_id: &str, update: impl FnOnce(&mut StoredJob)) -> Result<()> {
@@ -582,7 +752,7 @@ impl MusicStore {
                 .jobs
                 .get(job_id)
                 .ok_or_else(|| anyhow!("music job was not found"))?;
-            if existing.upload.chat_id != chat_id {
+            if existing.chat_id() != chat_id {
                 bail!("music job was not found in this chat");
             }
             if existing.stage == JobStage::OutcomeUnknown {
@@ -631,7 +801,7 @@ impl MusicStore {
                 .jobs
                 .get_mut(job_id)
                 .ok_or_else(|| anyhow!("music job was not found"))?;
-            if job.upload.chat_id != chat_id {
+            if job.chat_id() != chat_id {
                 bail!("music job was not found in this chat");
             }
             if job.stage.is_terminal() {
@@ -689,7 +859,7 @@ impl MusicStore {
         let mut jobs: Vec<_> = state
             .jobs
             .values()
-            .filter(|job| job.upload.chat_id == chat_id)
+            .filter(|job| job.chat_id() == chat_id)
             .collect();
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         jobs.truncate(20);
@@ -706,6 +876,39 @@ impl MusicStore {
             }
         }
         Ok(lines.join("\n"))
+    }
+
+    fn local_job_status(
+        &self,
+        chat_id: i64,
+        job_ids: &[String],
+    ) -> Result<Vec<LocalMusicJobStatus>> {
+        if chat_id == 0 || job_ids.len() > MAX_JOBS {
+            bail!("local Music status request is invalid or too large");
+        }
+        let state = self.snapshot()?;
+        let mut statuses = Vec::new();
+        for job_id in job_ids {
+            if job_id.is_empty() || job_id.len() > MAX_ID_BYTES {
+                bail!("local Music status contains an invalid job ID");
+            }
+            let Some(job) = state.jobs.get(job_id) else {
+                continue;
+            };
+            let Some(source) = job.local_source.as_ref() else {
+                continue;
+            };
+            if source.chat_id != chat_id {
+                continue;
+            }
+            statuses.push(LocalMusicJobStatus {
+                job_id: job.job_id.clone(),
+                source_key: source.file.source_key.clone(),
+                stage: job.stage.clone(),
+                error: job.error.clone(),
+            });
+        }
+        Ok(statuses)
     }
 }
 
@@ -806,6 +1009,38 @@ impl MusicManager {
         Ok(admission)
     }
 
+    /// Inserts every selected local source durably or leaves the queue unchanged.
+    pub async fn enqueue_local_batch(
+        self: &Arc<Self>,
+        batch: LocalMusicBatch,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        let manager = Arc::clone(self);
+        let refs = tokio::task::spawn_blocking(move || {
+            manager.store.enqueue_local_batch(batch, &manager.settings)
+        })
+        .await
+        .context("local Music batch admission worker stopped")??;
+        self.notify.notify_one();
+        Ok(refs)
+    }
+
+    /// Looks up existing local jobs by durable source key without admitting or modifying jobs.
+    pub async fn lookup_local_jobs(
+        self: &Arc<Self>,
+        chat_id: i64,
+        user_id: i64,
+        source_keys: Vec<String>,
+    ) -> Result<Vec<LocalMusicJobRef>> {
+        let manager = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            manager
+                .store
+                .lookup_local_jobs(chat_id, user_id, &source_keys)
+        })
+        .await
+        .context("local Music job lookup worker stopped")?
+    }
+
     /// Starts one serial background worker and returns its task handle.
     pub fn start(self: &Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let manager = Arc::clone(self);
@@ -904,6 +1139,19 @@ impl MusicManager {
         tokio::task::spawn_blocking(move || store.summary(chat_id))
             .await
             .context("music summary worker stopped")?
+    }
+
+    /// Reads local task states without contacting Music or sending Telegram messages.
+    pub async fn local_job_status(
+        &self,
+        chat_id: i64,
+        job_ids: &[String],
+    ) -> Result<Vec<LocalMusicJobStatus>> {
+        let store = Arc::clone(&self.store);
+        let job_ids = job_ids.to_vec();
+        tokio::task::spawn_blocking(move || store.local_job_status(chat_id, &job_ids))
+            .await
+            .context("local Music status worker stopped")?
     }
 
     pub async fn retry(&self, chat_id: i64, job_id: &str) -> Result<()> {
@@ -1044,7 +1292,10 @@ impl MusicManager {
     }
 
     async fn download_job(&self, job_id: &str, job: &StoredJob, cancellation: &MusicCancellation) {
-        let extension = match supported_extension(&job.upload.file_name) {
+        let file_name = job.file_name().to_string();
+        let file_size = job.file_size();
+        let local_file = job.local_source.as_ref().map(|source| source.file.clone());
+        let extension = match supported_extension(&file_name) {
             Some(extension) => extension,
             None => {
                 self.fail_job(
@@ -1061,34 +1312,40 @@ impl MusicManager {
                 .await;
             return;
         }
-        let destination = job_dir.join(format!("original.{extension}"));
-        match completed_download(&destination, job.upload.file_size, false) {
-            Ok(true) => {
-                if self
-                    .store
-                    .set_job(job_id, |current| {
-                        current.download_path = Some(destination.clone());
-                        current.download_complete = true;
-                        current.stage = JobStage::Preparing;
-                        current.error = None;
-                    })
-                    .is_ok()
-                {
-                    let _ = self.update_status(job_id).await;
+        let attempt = job.attempt.saturating_add(1);
+        let destination = if local_file.is_some() && attempt > 1 {
+            job_dir.join(format!("original-attempt-{attempt}.{extension}"))
+        } else {
+            job_dir.join(format!("original.{extension}"))
+        };
+        if job.upload.is_some() {
+            match completed_download(&destination, file_size, false) {
+                Ok(true) => {
+                    if self
+                        .store
+                        .set_job(job_id, |current| {
+                            current.download_path = Some(destination.clone());
+                            current.download_complete = true;
+                            current.stage = JobStage::Preparing;
+                            current.error = None;
+                        })
+                        .is_ok()
+                    {
+                        let _ = self.update_status(job_id).await;
+                    }
+                    return;
                 }
-                return;
-            }
-            Ok(false) => {}
-            Err(_) => {
-                self.fail_job(
-                    job_id,
-                    "The retained Telegram audio file is invalid; it was preserved for inspection.",
-                )
-                .await;
-                return;
+                Ok(false) => {}
+                Err(_) => {
+                    self.fail_job(
+                        job_id,
+                        "The retained Telegram audio file is invalid; it was preserved for inspection.",
+                    )
+                    .await;
+                    return;
+                }
             }
         }
-        let attempt = job.attempt.saturating_add(1);
         if self
             .store
             .set_job(job_id, |current| {
@@ -1105,14 +1362,32 @@ impl MusicManager {
         }
         let _ = self.update_status(job_id).await;
 
-        let backend = Arc::clone(&self.backend);
-        let upload = job.upload.clone();
         let destination_for_backend = destination.clone();
-        let cancellation = cancellation.clone();
-        let result = run_blocking(move || {
-            backend.download(&upload, &destination_for_backend, &cancellation)
-        })
-        .await;
+        let result = if let Some(upload) = job.upload.clone() {
+            let backend = Arc::clone(&self.backend);
+            let cancellation_for_transfer = cancellation.clone();
+            run_blocking(move || {
+                backend.download(
+                    &upload,
+                    &destination_for_backend,
+                    &cancellation_for_transfer,
+                )
+            })
+            .await
+        } else if let Some(source) = local_file.clone() {
+            let max_file_bytes = self.settings.max_file_bytes;
+            let cancellation_for_copy = cancellation.clone();
+            run_blocking(move || {
+                source.copy_verified_snapshot(
+                    &destination_for_backend,
+                    max_file_bytes,
+                    &cancellation_for_copy,
+                )
+            })
+            .await
+        } else {
+            Err(anyhow!("music job has no source"))
+        };
         if let Err(error) = result {
             if self.job_cancel_requested(job_id) && !self.job_add_intent(job_id) {
                 let _ = self.store.set_job(job_id, |current| {
@@ -1122,21 +1397,27 @@ impl MusicManager {
                 });
                 let _ = self.update_status(job_id).await;
             } else {
-                let safe_message = error
-                    .downcast_ref::<MusicDownloadFailure>()
-                    .map(|failure| failure.safe_message())
-                    .unwrap_or("The Telegram audio download failed; retry is available.");
+                let safe_message = if local_file.is_some() {
+                    "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry."
+                } else {
+                    error
+                        .downcast_ref::<MusicDownloadFailure>()
+                        .map(|failure| failure.safe_message())
+                        .unwrap_or("The Telegram audio download failed; retry is available.")
+                };
                 self.fail_job(job_id, safe_message).await;
             }
             return;
         }
-        if !matches!(
-            completed_download(&destination, job.upload.file_size, true),
-            Ok(true)
-        ) {
+        let copied = matches!(completed_download(&destination, file_size, true), Ok(true));
+        if !copied {
             self.fail_job(
                 job_id,
-                "The downloaded audio is incomplete; its partial file was retained for retry.",
+                if job.local_source.is_some() {
+                    "The selected torrent source is unavailable, not materialized, or changed; its private staging was retained for retry."
+                } else {
+                    "The downloaded audio is incomplete; its partial file was retained for retry."
+                },
             )
             .await;
             return;
@@ -1171,6 +1452,25 @@ impl MusicManager {
             .await;
             return;
         };
+        if let Some(source) = job.local_source.as_ref() {
+            let source = source.file.clone();
+            let original_for_verify = original.clone();
+            let max_file_bytes = self.settings.max_file_bytes;
+            let cancellation = cancellation.clone();
+            if run_blocking(move || {
+                source.verify_existing_snapshot(&original_for_verify, max_file_bytes, &cancellation)
+            })
+            .await
+            .is_err()
+            {
+                self.fail_job(
+                    job_id,
+                    "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry.",
+                )
+                .await;
+                return;
+            }
+        }
         let prepare_attempt = job.prepare_attempt.saturating_add(1);
         let work_dir = self
             .settings
@@ -1206,7 +1506,13 @@ impl MusicManager {
         let prepared = match prepared {
             Ok(prepared)
                 if validate_prepared_audio(&prepared, MAX_CONFIGURED_FILE_BYTES).is_ok()
-                    && prepared.original.size == job.upload.file_size =>
+                    && prepared.original.size == job.file_size()
+                    && job.local_source.as_ref().is_none_or(|source| {
+                        job.download_path.as_ref() == Some(&prepared.original.path)
+                            && source
+                                .file
+                                .matches_content(&prepared.original.sha256, prepared.original.size)
+                    }) =>
             {
                 prepared
             }
@@ -1252,12 +1558,12 @@ impl MusicManager {
         // interrupted copy. Put the discriminator first so long-name truncation cannot
         // remove it; the native backend retains the original-content hash as well.
         let archive_name = if archive_attempt == 1 {
-            job.upload.file_name.clone()
+            job.file_name().to_string()
         } else {
-            let basename = Path::new(&job.upload.file_name)
+            let basename = Path::new(job.file_name())
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or(&job.upload.file_name);
+                .unwrap_or_else(|| job.file_name());
             format!("[retry {archive_attempt}] {basename}")
         };
         let backend = Arc::clone(&self.backend);
@@ -1905,6 +2211,9 @@ impl MusicManager {
             Ok(Some(job)) => job,
             _ => return,
         };
+        let Some(upload) = job.upload.as_ref() else {
+            return;
+        };
         let text = render_status(&job);
         if job.status_message_id.is_none() {
             if job.status_send_attempted {
@@ -1921,7 +2230,7 @@ impl MusicManager {
             }
             // An uncertain send is never repeated. The attempt marker is durable before I/O.
             let sent_text = text.clone();
-            if let Ok(message_id) = self.telegram.send_message(job.upload.chat_id, text).await
+            if let Ok(message_id) = self.telegram.send_message(upload.chat_id, text).await
                 && message_id > 0
             {
                 let _ = self.store.set_job(job_id, |current| {
@@ -1966,7 +2275,7 @@ impl MusicManager {
         // keep status_text as the last text confirmed by Telegram.
         if self
             .telegram
-            .edit_message_text(job.upload.chat_id, message_id, text.clone())
+            .edit_message_text(upload.chat_id, message_id, text.clone())
             .await
             .is_ok()
         {
@@ -2097,6 +2406,52 @@ fn validate_upload(upload: &MusicUpload, settings: &MusicSettings) -> Result<()>
     Ok(())
 }
 
+fn validate_local_batch(batch: &LocalMusicBatch, settings: &MusicSettings) -> Result<()> {
+    if batch.chat_id == 0 || batch.user_id <= 0 {
+        bail!("local Music owner identifiers are invalid");
+    }
+    if batch.batch_id.is_empty()
+        || batch.batch_id.len() > MAX_ID_BYTES
+        || batch.batch_id.chars().any(char::is_control)
+    {
+        bail!("local Music batch identifier is invalid");
+    }
+    if batch.files.is_empty() || batch.files.len() > MAX_ACTIVE_JOBS {
+        bail!("local Music batch is empty or exceeds its item limit");
+    }
+    let managed_roots = local_managed_roots([
+        &settings.state_dir,
+        &settings.staging_dir,
+        &settings.archive_dir,
+    ]);
+    for file in &batch.files {
+        validate_local_file(file, settings.max_file_bytes)?;
+        let selected_path = file.resolved_path();
+        if source_inside_music_managed_directory(&selected_path, &managed_roots) {
+            bail!("selected torrent source is inside a Music-managed directory");
+        }
+    }
+    Ok(())
+}
+
+fn validate_local_file(file: &LocalMusicFile, max_file_bytes: u64) -> Result<()> {
+    file.validate_shape(max_file_bytes)?;
+    if supported_extension(&file.file_name).is_none() {
+        bail!("selected local filename must end in .m4a, .mp3, .aac, .flac, or .wav");
+    }
+    Ok(())
+}
+
+fn local_managed_roots(paths: [&Path; 3]) -> [PathBuf; 3] {
+    paths.map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+fn source_inside_music_managed_directory(source_path: &Path, managed_roots: &[PathBuf; 3]) -> bool {
+    managed_roots
+        .iter()
+        .any(|managed_root| source_path.starts_with(managed_root))
+}
+
 fn supported_extension(file_name: &str) -> Option<&'static str> {
     let extension = file_name.rsplit_once('.')?.1;
     if extension.eq_ignore_ascii_case("m4a") {
@@ -2151,7 +2506,25 @@ fn job_identity(upload: &MusicUpload) -> (String, String) {
     (format!("mj1-{}", &digest[..24]), digest)
 }
 
+fn local_job_identity(chat_id: i64, user_id: i64, source_key: &str) -> (String, String) {
+    let mut digest = Sha256::new();
+    digest.update(b"music-local-job-origin-v1\0");
+    digest.update(chat_id.to_be_bytes());
+    digest.update(user_id.to_be_bytes());
+    digest.update((source_key.len() as u64).to_be_bytes());
+    digest.update(source_key.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    (format!("mjl1-{}", &digest[..24]), digest)
+}
+
 fn make_room_for_admission(state: &mut StoredState) -> Result<()> {
+    make_room_for_admission_excluding(state, &BTreeMap::new())
+}
+
+fn make_room_for_admission_excluding(
+    state: &mut StoredState,
+    protected_ids: &BTreeMap<String, ()>,
+) -> Result<()> {
     let active_jobs = state
         .jobs
         .values()
@@ -2165,7 +2538,9 @@ fn make_room_for_admission(state: &mut StoredState) -> Result<()> {
         let oldest_safe_complete = state
             .jobs
             .values()
-            .filter(|job| safe_to_evict_completed_job(state, job))
+            .filter(|job| {
+                !protected_ids.contains_key(&job.job_id) && safe_to_evict_completed_job(state, job)
+            })
             .min_by_key(|job| (job.created_at, job.updated_at, job.job_id.clone()))
             .map(|job| job.job_id.clone());
         let Some(job_id) = oldest_safe_complete else {
@@ -2177,6 +2552,14 @@ fn make_room_for_admission(state: &mut StoredState) -> Result<()> {
 }
 
 fn make_room_for_serialized_admission(state: &mut StoredState, new_job_id: &str) -> Result<()> {
+    make_room_for_serialized_admission_excluding(state, new_job_id, &BTreeMap::new())
+}
+
+fn make_room_for_serialized_admission_excluding(
+    state: &mut StoredState,
+    new_job_id: &str,
+    protected_ids: &BTreeMap<String, ()>,
+) -> Result<()> {
     loop {
         if serde_json::to_vec(state)?.len() <= MAX_STATE_BYTES {
             return Ok(());
@@ -2184,7 +2567,11 @@ fn make_room_for_serialized_admission(state: &mut StoredState, new_job_id: &str)
         let oldest_safe_complete = state
             .jobs
             .values()
-            .filter(|job| job.job_id != new_job_id && safe_to_evict_completed_job(state, job))
+            .filter(|job| {
+                job.job_id != new_job_id
+                    && !protected_ids.contains_key(&job.job_id)
+                    && safe_to_evict_completed_job(state, job)
+            })
             .min_by_key(|job| (job.created_at, job.updated_at, job.job_id.clone()))
             .map(|job| job.job_id.clone());
         let Some(job_id) = oldest_safe_complete else {
@@ -2199,15 +2586,29 @@ fn safe_to_evict_completed_job(state: &StoredState, job: &StoredJob) -> bool {
         || !job.staging_cleanup_completed
         || !job.add_intent
         || !job.local_copy_verified
-        || job.status_message_id.is_none()
-        || job.status_pending_text.is_some()
-        || job.status_edit_attempts != 0
-        || job.status_next_attempt_at.is_some()
     {
         return false;
     }
-    let desired_status = render_status(job);
-    if job.status_text.as_deref() != Some(desired_status.as_str()) {
+    let status_is_safe = match (&job.upload, &job.local_source) {
+        (Some(_), None) => {
+            let desired_status = render_status(job);
+            job.status_message_id.is_some()
+                && job.status_text.as_deref() == Some(desired_status.as_str())
+                && job.status_pending_text.is_none()
+                && job.status_edit_attempts == 0
+                && job.status_next_attempt_at.is_none()
+        }
+        (None, Some(_)) => {
+            job.status_message_id.is_none()
+                && !job.status_send_attempted
+                && job.status_text.is_none()
+                && job.status_pending_text.is_none()
+                && job.status_edit_attempts == 0
+                && job.status_next_attempt_at.is_none()
+        }
+        _ => false,
+    };
+    if !status_is_safe {
         return false;
     }
     let (Some(prepared), Some(persistent_id), Some(track), Some(archive)) = (
@@ -2371,7 +2772,12 @@ fn validate_archive_state(archive: &ArchiveState, archive_dir: &Path) -> Result<
     Ok(())
 }
 
-fn validate_stored_state(state: &StoredState, archive_dir: &Path) -> Result<()> {
+fn validate_stored_state(
+    state: &StoredState,
+    state_dir: &Path,
+    staging_dir: &Path,
+    archive_dir: &Path,
+) -> Result<()> {
     if state.version != STATE_VERSION
         || state.jobs.len() > MAX_JOBS
         || state.content_catalog.len() > MAX_CATALOG_ENTRIES
@@ -2387,15 +2793,60 @@ fn validate_stored_state(state: &StoredState, archive_dir: &Path) -> Result<()> 
     {
         bail!("music state exceeds the active job limit");
     }
+    let managed_roots = local_managed_roots([state_dir, staging_dir, archive_dir]);
     for (job_id, job) in &state.jobs {
         if job_id != &job.job_id || job_id.len() > MAX_ID_BYTES {
             bail!("music state contains an invalid job ID");
         }
-        // Historic jobs must remain readable when operators lower today's admission limit.
-        validate_upload_shape(&job.upload, MAX_CONFIGURED_FILE_BYTES)?;
-        let (expected_id, expected_origin) = job_identity(&job.upload);
-        if job_id != &expected_id || job.origin_key != expected_origin {
-            bail!("music state contains a mismatched upload origin");
+        match (&job.upload, &job.local_source) {
+            (Some(upload), None) => {
+                // Historic Telegram jobs remain readable when operators lower today's limit.
+                validate_upload_shape(upload, MAX_CONFIGURED_FILE_BYTES)?;
+                let (expected_id, expected_origin) = job_identity(upload);
+                if job_id != &expected_id || job.origin_key != expected_origin {
+                    bail!("music state contains a mismatched upload origin");
+                }
+            }
+            (None, Some(source)) => {
+                if source.chat_id == 0
+                    || source.user_id <= 0
+                    || source.batch_id.is_empty()
+                    || source.batch_id.len() > MAX_ID_BYTES
+                    || source.batch_id.chars().any(char::is_control)
+                {
+                    bail!("music state contains an invalid local source owner");
+                }
+                validate_local_file(&source.file, MAX_CONFIGURED_FILE_BYTES)?;
+                let source_path = source.file.resolved_path();
+                if source_inside_music_managed_directory(&source_path, &managed_roots) {
+                    bail!("music state selects a source inside a Music-managed directory");
+                }
+                let (expected_id, expected_origin) =
+                    local_job_identity(source.chat_id, source.user_id, &source.file.source_key);
+                if job_id != &expected_id || job.origin_key != expected_origin {
+                    bail!("music state contains a mismatched local source origin");
+                }
+                if job.status_message_id.is_some()
+                    || job.status_send_attempted
+                    || job.status_text.is_some()
+                    || job.status_pending_text.is_some()
+                    || job.status_edit_attempts != 0
+                    || job.status_next_attempt_at.is_some()
+                {
+                    bail!("local Music job contains per-track Telegram status metadata");
+                }
+                if job.download_path.as_ref().is_some_and(|path| {
+                    let job_staging = staging_dir.join(job_id);
+                    path == &job_staging
+                        || !path.starts_with(&job_staging)
+                        || path.components().any(|component| {
+                            matches!(component, Component::CurDir | Component::ParentDir)
+                        })
+                }) {
+                    bail!("local Music snapshot path is outside its private job staging subtree");
+                }
+            }
+            _ => bail!("music state must contain exactly one Telegram or local source"),
         }
         if job
             .prepared
@@ -2556,6 +3007,9 @@ fn render_status(job: &StoredJob) -> String {
 }
 
 fn status_schedule(job: &StoredJob, now: u64) -> StatusSchedule {
+    if job.upload.is_none() {
+        return StatusSchedule::None;
+    }
     if job.status_message_id.is_none() {
         return if job.status_send_attempted {
             StatusSchedule::None

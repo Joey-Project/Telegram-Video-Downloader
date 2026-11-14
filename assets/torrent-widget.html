@@ -1,0 +1,253 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; padding: 8px 12px; color: var(--tg-theme-text-color, inherit); font: inherit; }
+    header { margin-bottom: 7px; }
+    header strong { display: block; overflow-wrap: anywhere; }
+    .muted, #notice { color: var(--tg-theme-hint-color, inherit); font-size: .92em; }
+    #listing { display: grid; gap: 5px; }
+    .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px; align-items: center; }
+    button { min-height: 32px; max-width: 100%; border: 0; border-radius: 8px; padding: 5px 9px; color: var(--tg-theme-button-text-color, inherit); background: var(--tg-theme-button-color, var(--tg-theme-secondary-bg-color, transparent)); font: inherit; }
+    button:disabled { opacity: .55; }
+    .name { overflow: hidden; text-overflow: ellipsis; text-align: left; }
+    .wide { width: 100%; }
+    #pages, #actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+    #notice { min-height: 1.2em; margin: 4px 0; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><strong id="title">Torrent selection</strong><span id="summary" class="muted"></span></header>
+    <div id="notice" role="status"></div>
+    <div id="listing"></div>
+    <nav id="pages"></nav>
+    <div id="actions"></div>
+  </main>
+  <script>
+  (function () {
+    'use strict';
+    var W = window.TelegramWidget;
+    var titleNode = document.getElementById('title');
+    var summaryNode = document.getElementById('summary');
+    var noticeNode = document.getElementById('notice');
+    var listingNode = document.getElementById('listing');
+    var pagesNode = document.getElementById('pages');
+    var actionsNode = document.getElementById('actions');
+    var state = null;
+    var busy = false;
+    var confirmingImport = false;
+    var armedSelectionRevision = null;
+    var controls = [];
+
+    function setNotice(message) { noticeNode.textContent = message || ''; }
+    function addButton(parent, label, handler, disabled, wide) {
+      var button = document.createElement('button');
+      button.textContent = label;
+      button.disabled = !!disabled || busy;
+      if (wide) button.className = 'wide';
+      button.addEventListener('click', handler);
+      parent.appendChild(button);
+      controls.push(button);
+      return button;
+    }
+    function clear(node) { node.replaceChildren(); }
+    function formatBytes(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '';
+      if (value < 1024) return value + ' B';
+      var units = ['KiB', 'MiB', 'GiB', 'TiB'];
+      var amount = value;
+      var unit = -1;
+      do { amount /= 1024; unit += 1; } while (amount >= 1024 && unit < units.length - 1);
+      return amount.toFixed(amount < 10 ? 1 : 0) + ' ' + units[unit];
+    }
+    function stageLabel(stage) {
+      return ({ 1: 'Import queued', 2: 'Imported', 3: 'Import failed', 4: 'Import cancelled', 5: 'Check import status' })[stage] || '';
+    }
+    function request(op, args, expectedRevision) {
+      if (!W || !state || busy) return;
+      var revision = String(expectedRevision || (op === 'i' ? state.s : state.i) || '');
+      if (!/^[0-9a-f]{16}$/.test(revision)) {
+        setNotice('This widget state is invalid. Use Refresh to request a current view.');
+        return;
+      }
+      var data = ['t1', state.t, revision, op].concat(args || []).join(':');
+      busy = true;
+      controls.forEach(function (button) { button.disabled = true; });
+      setNotice('Updating…');
+      var pending;
+      try { pending = W.request(data); }
+      catch (error) {
+        busy = false;
+        setNotice('Could not update: ' + ((error && error.code) || 'FAILED'));
+        draw();
+        return;
+      }
+      pending.then(function (answer) {
+        busy = false;
+        var result = answer && answer.result;
+        if (typeof result === 'string') {
+          try {
+            var candidate = JSON.parse(result);
+            if (candidate && candidate.error) {
+              setNotice(String(candidate.error));
+              draw();
+              return;
+            }
+            if (candidate && candidate.v === 1 && candidate.t === state.t &&
+              /^[0-9a-f]{16}$/.test(String(candidate.i || '')) &&
+              /^[0-9a-f]{16}$/.test(String(candidate.s || '')) &&
+              /^[0-9a-f]{16}$/.test(String(candidate.r || '')) && String(candidate.r) >= String(state.r)) {
+              var selectionChanged = String(candidate.s) !== String(state.s);
+              state = candidate;
+              if (selectionChanged) {
+                confirmingImport = false;
+                armedSelectionRevision = null;
+                setNotice('The selection changed. Review the selected tracks again before importing.');
+              } else {
+                setNotice('');
+              }
+              draw();
+              return;
+            }
+          } catch (_) {}
+        }
+        setNotice('Saved. Waiting for the latest torrent status…');
+        draw();
+      }, function (error) {
+        busy = false;
+        setNotice('Could not update: ' + ((error && error.code) || 'FAILED'));
+        draw();
+      });
+    }
+    function loadState() {
+      var next = null;
+      try { next = W && W.chatData ? JSON.parse(W.chatData) : null; } catch (_) {}
+      if (!next || next.v !== 1 || typeof next.t !== 'string' ||
+        !/^[0-9a-f]{16}$/.test(String(next.i || '')) ||
+        !/^[0-9a-f]{16}$/.test(String(next.s || '')) ||
+        !/^[0-9a-f]{16}$/.test(String(next.r || ''))) return;
+      if (state && next.t === state.t && String(next.r) < String(state.r)) return;
+      if (state && next.t !== state.t) {
+        confirmingImport = false;
+        armedSelectionRevision = null;
+      } else if (state && String(next.s) !== String(state.s) && confirmingImport) {
+        confirmingImport = false;
+        armedSelectionRevision = null;
+        setNotice('The selection changed. Review the selected tracks again before importing.');
+      } else {
+        setNotice('');
+      }
+      state = next;
+      draw();
+    }
+    function makeRow() {
+      var row = document.createElement('div');
+      row.className = 'row';
+      return row;
+    }
+    function draw() {
+      controls = [];
+      clear(listingNode);
+      clear(pagesNode);
+      clear(actionsNode);
+      if (!W) {
+        titleNode.textContent = 'Torrent selection';
+        summaryNode.textContent = '';
+        setNotice('Open this message in a Telegram app that supports widgets.');
+        return;
+      }
+      if (!state) {
+        titleNode.textContent = 'Torrent selection';
+        summaryNode.textContent = '';
+        setNotice('Torrent details are not available in this message.');
+        return;
+      }
+      titleNode.textContent = state.x || 'Torrent selection';
+      var progress = state.p === null || state.p === undefined ? '' : ' · ' + state.p + '%';
+      var bytes = state.b !== null && state.b !== undefined && state.B !== null && state.B !== undefined
+        ? ' · ' + formatBytes(state.b) + ' / ' + formatBytes(state.B) : '';
+      summaryNode.textContent = (state.q || '') + progress + bytes + ' · ' + (state.c || 0) + ' selected';
+      if (state.z) setNotice(state.z);
+
+      if (state.d !== null && state.d !== undefined) {
+        var parentRow = makeRow();
+        addButton(parentRow, '‹ Parent folder', function () { request('b', [String(state.d), '0']); }, false, true);
+        listingNode.appendChild(parentRow);
+      }
+      (state.e || []).forEach(function (entry) {
+        var row = makeRow();
+        if (entry.k === 'd') {
+          addButton(row, '📁 ' + entry.n + ' · ' + entry.f + ' files', function () {
+            request('b', [String(entry.i), '0']);
+          }, false, true);
+          var allSelected = entry.m > 0 && entry.c >= entry.m;
+          addButton(row, allSelected ? 'Clear' : 'Select', function () {
+            request('d', [String(entry.i), allSelected ? '0' : '1']);
+          }, entry.m === 0, false);
+        } else {
+          var complete = !!entry.d;
+          var selected = !!entry.s;
+          var stateText = entry.u ? stageLabel(entry.u) : (complete ? 'Ready' : (entry.p + '% downloaded'));
+          var label = (selected ? '☑ ' : '□ ') + entry.n + ' · ' + formatBytes(entry.z) + ' · ' + stateText;
+          addButton(row, label, function () {
+            request('f', [String(entry.i), selected ? '0' : '1']);
+          }, !entry.m || !complete, true);
+        }
+        listingNode.appendChild(row);
+      });
+
+      var page = Number(state.g) || 0;
+      var pageCount = Math.max(1, Number(state.G) || 1);
+      if (page > 0) addButton(pagesNode, '‹ Previous', function () { request('b', [String(state.f), String(page - 1)]); }, false, false);
+      addButton(pagesNode, 'Refresh', function () { request('r', []); }, false, false);
+      if (page + 1 < pageCount) addButton(pagesNode, 'Next ›', function () { request('b', [String(state.f), String(page + 1)]); }, false, false);
+
+      if (state.c > 0) {
+        if (confirmingImport) {
+          addButton(actionsNode, 'Confirm import of ' + state.c + ' selected', function () {
+            var revision = armedSelectionRevision;
+            if (!revision || revision !== String(state.s)) {
+              confirmingImport = false;
+              armedSelectionRevision = null;
+              setNotice('The selection changed. Review the selected tracks again before importing.');
+              draw();
+              return;
+            }
+            confirmingImport = false;
+            armedSelectionRevision = null;
+            request('i', [], revision);
+          }, false, false);
+          addButton(actionsNode, 'Cancel', function () {
+            confirmingImport = false;
+            armedSelectionRevision = null;
+            setNotice('');
+            draw();
+          }, false, false);
+        } else {
+          addButton(actionsNode, 'Review ' + state.c + ' selected', function () {
+            confirmingImport = true;
+            armedSelectionRevision = String(state.s);
+            setNotice('Confirm to start importing these selected tracks into Music.');
+            draw();
+          }, false, false);
+          addButton(actionsNode, 'Clear selection', function () { request('c', []); }, false, false);
+        }
+      }
+      if (state.a > 0) addButton(actionsNode, 'Retry failed imports (' + state.a + ')', function () { request('y', []); }, false, false);
+      if (state.u > 0 || state.o > 0 || state.a > 0) {
+        var counts = document.createElement('div');
+        counts.className = 'muted';
+        counts.textContent = state.u + ' pending · ' + state.o + ' imported · ' + state.a + ' failed';
+        actionsNode.appendChild(counts);
+      }
+    }
+    if (W && typeof W.onEvent === 'function') W.onEvent('chatDataChanged', loadState);
+    loadState();
+  })();
+  </script>
+</body>
+</html>

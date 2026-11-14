@@ -39,6 +39,7 @@ mod music_staging_cleanup;
 mod music_transfer;
 mod music_types;
 mod pgc_metadata_backfill;
+mod qbittorrent;
 mod queue;
 mod redaction;
 mod router;
@@ -48,6 +49,16 @@ mod staging_cleanup_bot;
 #[cfg(test)]
 mod staging_cleanup_tests;
 mod telegram;
+mod torrent_backup;
+mod torrent_bot;
+mod torrent_catalog;
+mod torrent_inline;
+mod torrent_magnet;
+mod torrent_manager;
+mod torrent_metainfo;
+mod torrent_runtime;
+mod torrent_types;
+mod torrent_widget;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::RandomState};
 use std::future::Future;
@@ -277,6 +288,7 @@ struct BotContext {
     queue: Arc<QueueManager>,
     queue_start_retry_delay: Duration,
     music: Option<Arc<music_runtime::MusicService>>,
+    torrent: Option<Arc<torrent_runtime::TorrentService>>,
 }
 
 struct JobProgressContext {
@@ -406,6 +418,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     music_runtime::validate_test_profile(&config)?;
     let telegram = TelegramClient::new(config.telegram.token.clone());
     let music_shutdown = shutdown_receiver.clone();
+    let torrent_shutdown = shutdown_receiver.clone();
     let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
     tokio::pin!(shutdown);
     let setup_config = Arc::clone(&config);
@@ -474,6 +487,20 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
         service
     });
 
+    let torrent = if config.torrent.enabled {
+        let service = torrent_runtime::TorrentService::new(
+            config.torrent.clone(),
+            telegram.clone(),
+            music.clone(),
+            config.music.max_file_bytes,
+            torrent_shutdown,
+        )?;
+        service.start();
+        Some(service)
+    } else {
+        None
+    };
+
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
@@ -501,6 +528,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
         queue: Arc::clone(&queue),
         queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
         music,
+        torrent,
     };
     if let Some(cloud_config) = &config.cloud {
         return run_cloud_bot(context, cloud_config.clone(), &mut shutdown).await;
@@ -4566,7 +4594,10 @@ async fn dispatch_cloud_telegram(
             .with_context(|| format!("Telegram cloud update {} failed", update.update_id))?;
     }
     if let Some(callback_query) = update.callback_query {
-        handle_callback_query(bot, callback_query).await;
+        handle_callback_query(bot.clone(), callback_query).await;
+    }
+    if let Some(widget_query) = update.widget_query {
+        torrent_bot::handle_widget(bot, widget_query).await;
     }
     Ok(CloudDispatchOutcome {
         status: InboxStatus::Completed,
@@ -6660,6 +6691,7 @@ async fn process_telegram_updates(
         queue: Arc::clone(queue),
         queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
         music: None,
+        torrent: None,
     };
     process_telegram_updates_with_context(&context, updates, offset).await
 }
@@ -6677,7 +6709,9 @@ async fn process_telegram_updates_with_context(
                 .await
                 .with_context(|| format!("telegram message update {update_id} failed"))
             {
-                if err.is::<MusicAdmissionFailure>() {
+                if err.is::<MusicAdmissionFailure>()
+                    || err.is::<torrent_bot::TorrentAdmissionFailure>()
+                {
                     return Err(err);
                 } else if is_file_provider_access_error(&err) {
                     warn!(
@@ -6701,6 +6735,9 @@ async fn process_telegram_updates_with_context(
         }
         if let Some(callback_query) = update.callback_query {
             handle_callback_query((*context).clone(), callback_query).await;
+        }
+        if let Some(widget_query) = update.widget_query {
+            torrent_bot::handle_widget((*context).clone(), widget_query).await;
         }
         *offset = Some(update_id + 1);
     }
@@ -7025,6 +7062,9 @@ async fn handle_telegram_message(
         if !owner {
             return Ok(());
         }
+        if torrent_bot::admit_document(&context, update_id, message).await? {
+            return Ok(());
+        }
         match music_upload_from_message(update_id, message, context.config.music.max_file_bytes) {
             Ok(Some(upload)) => {
                 if let Some(service) = &context.music {
@@ -7088,6 +7128,32 @@ async fn handle_message(
 
     if !config.telegram.is_chat_allowed(chat_id) {
         warn!(chat_id, "ignoring message from unauthorized chat");
+        return Ok(());
+    }
+
+    if torrent_bot::admit_magnet_text(
+        &context,
+        update_id,
+        message_id,
+        submitter_user_id,
+        chat_id,
+        is_private_chat,
+        text,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    if torrent_bot::handle_command(
+        &context,
+        update_id,
+        submitter_user_id,
+        chat_id,
+        is_private_chat,
+        text,
+    )
+    .await
+    {
         return Ok(());
     }
 
@@ -7261,6 +7327,14 @@ fn default_bot_commands() -> Vec<BotCommand> {
             description: "View, retry or cancel music imports.".to_string(),
         },
         BotCommand {
+            command: "torrents".to_string(),
+            description: "View torrent downloads and choose Music imports.".to_string(),
+        },
+        BotCommand {
+            command: "magnet".to_string(),
+            description: "Download a magnet link using local qBittorrent.".to_string(),
+        },
+        BotCommand {
             command: "bbdown".to_string(),
             description: "Manage BBDown Bilibili login state.".to_string(),
         },
@@ -7390,6 +7464,8 @@ fn help_message() -> String {
         "Send Bilibili or YouTube links directly to download videos.",
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
         "Send .m4a, .mp3, .aac, .flac or .wav files in the allowed private chat to import music automatically.",
+        "Send .torrent files to download all contents in local qBittorrent, then choose music to import in the task card.",
+        "Paste one magnet link directly, or use /magnet LINK, to create the same kind of download task.",
         "",
         "Commands:",
         "/help - Show this help.",
@@ -7398,6 +7474,8 @@ fn help_message() -> String {
         "/settings - Manage media libraries and download defaults in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
         "/music - View music imports; /music retry TASK_ID or /music cancel TASK_ID.",
+        "/torrents - Manage qBittorrent tasks and choose music to import; /torrents saved shows retained imports.",
+        "/magnet LINK - Download a magnet link and wait for its file list.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
         "/bbdown logout - Clear the local BBDown credential state.",
@@ -11445,6 +11523,9 @@ async fn queue_queued_task(
 }
 
 async fn handle_callback_query(context: BotContext, callback_query: CallbackQuery) {
+    if torrent_bot::handle_callback(&context, &callback_query).await {
+        return;
+    }
     let telegram = context.telegram.clone();
     let config = Arc::clone(&context.config);
     let queue = Arc::clone(&context.queue);
@@ -16165,6 +16246,7 @@ mod tests {
             queue,
             queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             music: None,
+            torrent: None,
         };
         let hints = queue_source_hints(&bot).expect("queue source hints should build");
         assert_eq!(hints.len(), 1);
@@ -17713,7 +17795,7 @@ mod tests {
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "help", "pdf", "queue", "file", "settings", "music", "bbdown"
+                "help", "pdf", "queue", "file", "settings", "music", "torrents", "magnet", "bbdown"
             ]
         );
         assert_eq!(
@@ -18330,8 +18412,10 @@ mod tests {
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
                 music: None,
+                torrent: None,
             },
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "stale-bilibili-selection".to_string(),
                 data: Some(bilibili_selection_callback_data(token, "latest")),
                 message: Some(crate::telegram::Message {
@@ -19737,6 +19821,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::from_secs(30),
             music: None,
+            torrent: None,
         };
         process_telegram_updates_with_context(&context, updates, &mut offset)
             .await
@@ -19820,6 +19905,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         assert!(
             prepare_persisted_task_for_job(&context, 123_456_789, task_id, 0, false).await,
@@ -19898,6 +19984,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         assert!(
             prepare_persisted_task_for_job(
@@ -19976,6 +20063,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         let job = JobRequest::Bilibili {
             url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
@@ -20082,6 +20170,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         prompt_bilibili_selection(
             &context,
@@ -20590,6 +20679,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
 
         assert!(
@@ -20688,6 +20778,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
 
         assert!(
@@ -21233,6 +21324,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         tokio_timeout(
             Duration::from_secs(5),
@@ -21332,6 +21424,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         tokio_timeout(
             Duration::from_secs(5),
@@ -21399,6 +21492,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         let cancel = Arc::new(Notify::new());
         cancel.notify_one();
@@ -21499,6 +21593,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         assert!(
             persist_queued_task_state(
@@ -21897,6 +21992,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         let mut offset = None;
         process_telegram_updates_with_context(&context, updates, &mut offset)
@@ -21987,6 +22083,7 @@ mod tests {
             queue: Arc::clone(&queue),
             queue_start_retry_delay: Duration::ZERO,
             music: None,
+            torrent: None,
         };
         handle_queue_callback(
             context.clone(),
@@ -22821,8 +22918,10 @@ mod tests {
                 queue: Arc::clone(&queue),
                 queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
                 music: None,
+                torrent: None,
             },
             crate::telegram::CallbackQuery {
+                from: None,
                 id: "next-page".to_string(),
                 data: Some(next_callback_data),
                 message: Some(crate::telegram::Message {

@@ -38,6 +38,26 @@ conversion_timeout_seconds = 1800
 # staging_dir = "~/Movies/Downloads/.telegram-video-downloader-staging/music"
 archive_dir = "~/Library/Mobile Documents/com~apple~CloudDocs/Collection/Music"
 
+# Optional .torrent uploads use an existing local qBittorrent WebUI API.
+# Download every file; choose audio for Music separately with the task's buttons.
+# Existing qBittorrent tasks keep their paths, categories and seeding files.
+# New magnets use a task folder below qBittorrent's default download directory.
+[torrent]
+enabled = false
+base_url = "http://127.0.0.1:8080"
+# Leave credentials unset when the existing service permits localhost clients.
+# Otherwise use the private config file; never publish WebUI credentials.
+# username = ""
+# password = ""
+# state_dir defaults to <video root>/.telegram-video-downloader-torrents.
+# Optional read-only fallback for magnets with qBittorrent older than 4.5:
+# metainfo_dir = "~/Library/Application Support/qBittorrent/BT_backup"
+max_torrent_bytes = 4194304 # 4 MiB of metainfo, not the payload size
+max_files = 5000
+poll_seconds = 10
+request_timeout_seconds = 10
+max_api_response_bytes = 2097152 # Increase for unusually large file lists; max 16 MiB
+
 [bilibili]
 # Legacy CLI fields accept only mapped bbdown-core options. Unsupported values, non-empty
 # plan_args, and a BBDown.config file in video_dir fail startup instead of being ignored.
