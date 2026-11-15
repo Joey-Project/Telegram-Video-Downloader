@@ -238,6 +238,7 @@ describe("torrent selection Mini App", () => {
     ui.root.querySelector<HTMLButtonElement>(`[data-torrent-open="${hashB}"]`)!.click();
     await ui.settle();
     expect(ui.view.currentTaskId()).toBe(hashB);
+    expect(ui.root.querySelector("h2")?.textContent).toBe("Task B");
     if (submitTiming === "while the POST is pending") {
       expect(ui.sent()).toHaveLength(2);
       expect(ui.root.textContent).toContain("Waiting for the previous request to finish");
@@ -257,6 +258,7 @@ describe("torrent selection Mini App", () => {
     expect(ui.root.textContent).not.toContain("Task A/old-track.flac");
     expect(ui.root.querySelector('[data-torrent-file="3"]')).toBeNull();
     expect(ui.root.textContent).toContain("Waiting for task files");
+    expect(ui.root.querySelector("h2")?.textContent).toBe("Task B");
 
     ui.publish(detailB.requestId, 12, {
       ...detailResult({ entries: [{ kind: "file", index: 4, path: "Task B/current-track.flac", size: 8192,

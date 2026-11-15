@@ -42,6 +42,10 @@ struct MiniAppTestEnvironment {
 }
 
 impl MiniAppTestBackend {
+    pub fn set_catalog_name(&self, name: &str) {
+        self.remote.lock().expect("remote lock").name = name.to_string();
+    }
+
     pub fn music_payloads(&self) -> Vec<Vec<CompletedTorrentFile>> {
         self.music_payloads
             .lock()
@@ -326,6 +330,64 @@ async fn hash_adoption_reuses_owner_task_without_cards_or_cross_owner_access() {
         .await;
     assert!(wrong_owner.is_err());
     fixture.shutdown.send(true).expect("stop Mini App fixture");
+}
+
+#[tokio::test]
+async fn miniapp_catalog_and_detail_preserve_synthetic_audio_title_punctuation() {
+    let fixture = miniapp_test_fixture().await.expect("Mini App fixture");
+    let catalog_title = "[Synthetic FLAC 48kHz/24bit]";
+    fixture.backend.set_catalog_name(catalog_title);
+    let catalog = fixture
+        .service
+        .handle_miniapp_action(
+            fixture.owner_chat,
+            "catalog-title:1",
+            &serde_json::json!({ "operation": "catalog", "page": 0 }),
+        )
+        .await
+        .expect("catalog title");
+    assert_eq!(catalog["rows"][0]["name"], catalog_title);
+
+    let detail = fixture
+        .service
+        .handle_miniapp_action(
+            fixture.owner_chat,
+            "detail-title:2",
+            &serde_json::json!({
+                "operation": "detail",
+                "task_id": fixture.task_id,
+                "page": 0,
+            }),
+        )
+        .await
+        .expect("detail title");
+    assert_eq!(detail["task"]["name"], "青い夜のアルバム／特別版");
+    fixture.shutdown.send(true).expect("stop Mini App fixture");
+}
+
+#[test]
+fn display_names_preserve_internal_punctuation_and_redact_only_rooted_paths() {
+    let title = "[Synthetic FLAC 48kHz/24bit]／青い夜＋CJK\\Side A";
+    assert_eq!(crate::torrent_miniapp::safe_display_name(title), title);
+
+    for path in [
+        "/tmp/synthetic-music/demo.flac",
+        "\\rooted\\synthetic-music\\demo.flac",
+        "C:\\synthetic\\music\\demo.flac",
+        "\\\\synthetic-server\\share\\demo.flac",
+        "file:///tmp/synthetic-music/demo.flac",
+    ] {
+        assert_eq!(
+            crate::torrent_miniapp::safe_display_name(path),
+            "Torrent task"
+        );
+    }
+    assert_eq!(
+        crate::torrent_miniapp::safe_display_name("Synthetic\nAlbum"),
+        "Torrent task"
+    );
+    let oversized = "青".repeat(300);
+    assert!(crate::torrent_miniapp::safe_display_name(&oversized).len() <= 512);
 }
 
 #[tokio::test]
@@ -687,7 +749,10 @@ fn metainfo_fixture() -> Vec<u8> {
         .collect();
     let info = dict(vec![
         (b"files".to_vec(), list(files)),
-        (b"name".to_vec(), bytes(b"release")),
+        (
+            b"name".to_vec(),
+            bytes("青い夜のアルバム／特別版".as_bytes()),
+        ),
         (b"piece length".to_vec(), integer(16_384)),
         (b"pieces".to_vec(), bytes(&[7; 20])),
     ]);
