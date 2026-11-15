@@ -1,4 +1,5 @@
 import { HttpError } from "./types";
+import { validateTorrentActionPayload } from "./torrent_actions";
 import type {
   ActionRequest,
   BoundLibraryMutationIdentity,
@@ -872,7 +873,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
   const supportedKinds = [
     "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
     "metadata_recover", "file_preview", "file_confirm", "preview_cancel", "legacy_import", "download_submit", "library_migration_preview",
-    "library_migration_confirm", "library_migration_control", "staging_cleanup",
+    "library_migration_confirm", "library_migration_control", "staging_cleanup", "torrent_action",
   ];
   if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
     throw new HttpError(400, "kind is not supported");
@@ -882,6 +883,9 @@ export function validateActionRequest(value: unknown): ActionRequest {
   const kind = value.kind as Exclude<RequestKind, "telegram">;
   let payload: Record<string, unknown>;
   switch (kind) {
+    case "torrent_action":
+      payload = validateTorrentActionPayload(value.payload);
+      break;
     case "library_scan":
       if (!onlyKeys(value.payload, ["library_id"])) throw new HttpError(400, "library_scan payload has an invalid shape");
       payload = parseOptionalLibraryId(value.payload.library_id);

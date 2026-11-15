@@ -11,6 +11,8 @@ use crate::library_migration::{MigrationScope, MigrationStatus};
 const MAX_OPERATION_SNAPSHOT_RECORDS: usize = 100;
 const MAX_OPERATION_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COMPACT_OPERATION_RESULT_BYTES: usize = 2 * 1024;
+const MAX_TORRENT_ACTION_RESULT_BYTES: usize = 192 * 1024;
+const PRIORITIZED_TORRENT_ACTION_RESULTS: usize = 4;
 pub(crate) const MAX_METADATA_RECOVERY_RESULT_BYTES: usize = 512 * 1024;
 const MAX_OPERATION_ERROR_JSON_BYTES: usize = 1024;
 const MAX_OPERATION_KIND_JSON_BYTES: usize = 128;
@@ -640,15 +642,47 @@ pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>
         }
     }
 
+    // Keep the latest small torrent actions usable by the Mini App even when older, larger
+    // management receipts are still present in the bounded operation history.
+    let mut prioritized_torrent_actions = Vec::new();
+    for (index, record) in selected.iter().enumerate().rev() {
+        if !is_usable_completed_torrent_action_record(record) {
+            continue;
+        }
+        if restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes) {
+            prioritized_torrent_actions.push(index);
+            if prioritized_torrent_actions.len() == PRIORITIZED_TORRENT_ACTION_RESULTS {
+                break;
+            }
+        }
+    }
+
     // Allocate the remaining budget to other full results newest first.
     for (index, record) in selected.iter().enumerate().rev() {
-        if Some(index) == prioritized_legacy_import || Some(index) == prioritized_recovery {
+        if Some(index) == prioritized_legacy_import
+            || Some(index) == prioritized_recovery
+            || prioritized_torrent_actions.contains(&index)
+        {
             continue;
         }
         restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes);
     }
 
     Ok(snapshots)
+}
+
+fn is_usable_completed_torrent_action_record(record: &InboxRecord) -> bool {
+    if record.request.kind != "torrent_action" || record.status != InboxStatus::Completed {
+        return false;
+    }
+    let Some(result) = record.result.as_ref() else {
+        return false;
+    };
+    let operation = result.get("operation").and_then(Value::as_str);
+    matches!(
+        operation,
+        Some("catalog" | "detail" | "review" | "confirm" | "control")
+    ) && json_size_within(result, MAX_TORRENT_ACTION_RESULT_BYTES).is_some()
 }
 
 fn restore_full_operation_if_fits(
@@ -1654,6 +1688,12 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
             fields.insert("root_binding".to_string(), json!(root_binding));
         }
     }
+    if record.request.kind == "torrent_action"
+        && let Some(request_id) = cloud_action_request_id(record)
+        && let Some(fields) = operation.as_object_mut()
+    {
+        fields.insert("request_id".to_string(), json!(request_id));
+    }
     if let Some(identity) = metadata_recovery_receipt_identity(record) {
         operation["recovery_identity"] = identity;
     }
@@ -1957,6 +1997,18 @@ fn file_preview_library_identity(record: &InboxRecord) -> Option<(&str, &str)> {
 
 fn file_preview_request_id(record: &InboxRecord) -> Option<&str> {
     if record.request.kind != "file_preview" {
+        return None;
+    }
+    let request_id = record.request.extra.get("request_id")?.as_str()?;
+    (!request_id.is_empty()
+        && request_id.trim() == request_id
+        && request_id.len() <= MAX_CLOUD_REQUEST_ID_BYTES
+        && !request_id.chars().any(char::is_control))
+    .then_some(request_id)
+}
+
+fn cloud_action_request_id(record: &InboxRecord) -> Option<&str> {
+    if record.request.kind != "torrent_action" {
         return None;
     }
     let request_id = record.request.extra.get("request_id")?.as_str()?;
@@ -3236,6 +3288,54 @@ mod tests {
         assert_eq!(operations[0]["root_binding"], TEST_ROOT_BINDING);
         assert_eq!(operations[0]["details_incomplete"], true);
         assert_eq!(operations[0]["result_truncated"], true);
+        assert!(serde_json::to_vec(&operations).unwrap().len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn latest_torrent_results_keep_request_identity_and_survive_large_history() {
+        let mut latest_torrent = record(
+            1,
+            "torrent_action",
+            InboxStatus::Completed,
+            Some(json!({
+                "operation": "detail",
+                "task": {"task_id": "task-a", "inventory_revision": 7},
+                "entries": [{"kind": "file", "path": "Album/Track.flac"}],
+            })),
+            None,
+        );
+        let request_id = "action:00000000-0000-4000-8000-000000000001";
+        latest_torrent
+            .request
+            .extra
+            .insert("request_id".to_string(), json!(request_id));
+
+        let large_history = (2..=100)
+            .map(|seq| {
+                record(
+                    seq,
+                    "file_confirm",
+                    InboxStatus::Completed,
+                    Some(json!({
+                        "preview_id": format!("preview-{seq}"),
+                        "revision": format!("revision-{seq}"),
+                        "operation": {"items": [{"summary": "x".repeat(24 * 1024)}]},
+                    })),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut refs = vec![&latest_torrent];
+        refs.extend(large_history.iter());
+
+        let operations = operation_snapshots(&refs).expect("operation receipts should fit");
+        let torrent = operations
+            .iter()
+            .find(|operation| operation["kind"] == "torrent_action")
+            .expect("torrent action should stay in operation history");
+        assert_eq!(torrent["request_id"], request_id);
+        assert_eq!(torrent["result"]["operation"], "detail");
+        assert_eq!(torrent.get("details_incomplete"), None);
         assert!(serde_json::to_vec(&operations).unwrap().len() <= MAX_OPERATION_SNAPSHOT_BYTES);
     }
 

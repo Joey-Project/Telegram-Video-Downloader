@@ -50,6 +50,7 @@
 
           <nav class="view-tabs" aria-label="Library sections">
             <button class="view-tab active" data-view="library" type="button" aria-current="page">Library <span id="library-count" class="tab-count">—</span></button>
+            <button class="view-tab" data-view="torrents" type="button">Torrents <span id="torrents-count" class="tab-count">—</span></button>
             <button class="view-tab" data-view="needs" type="button">Needs organizing <span id="needs-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="temporary" type="button">Video staging <span id="staging-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="waiting" type="button">Requests <span id="waiting-count" class="tab-count">0</span></button>
@@ -71,6 +72,10 @@
             <div id="library-summary" class="section-summary"></div>
             <div id="library-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">▱</div><h2>Your library is ready when you are</h2><p>Start a scan on the connected computer to discover videos and their sidecar files.</p><button class="primary-button" data-scan type="button">Scan library</button></div>
             <div id="library-list" class="library-list" aria-live="polite"></div>
+          </section>
+
+          <section id="view-torrents" class="view-panel hidden">
+            <div id="torrent-view" class="torrent-view" aria-live="polite"></div>
           </section>
 
           <section id="view-temporary" class="view-panel hidden">

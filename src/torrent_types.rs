@@ -121,6 +121,16 @@ pub struct TorrentExisting {
     pub hash: String,
 }
 
+/// Provenance for an existing qBittorrent task first associated through the private Mini App.
+/// Unlike `TorrentExisting`, this source has no Telegram message and must never be rendered as
+/// one or used to manufacture a card callback identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TorrentMiniAppSource {
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub hash: String,
+}
+
 impl fmt::Debug for TorrentMagnet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

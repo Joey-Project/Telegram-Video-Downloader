@@ -39,7 +39,7 @@ The three secrets must be supplied through the runtime's secret store. They are 
 - `POST /webhook`: verify Telegram's webhook secret, persist supported owner-private updates, then send a best-effort live notification.
 - `GET /api/state` and `GET /api/library`: owner-only Mini App reads. The state endpoint includes safe summaries of up to 100 unacknowledged cloud inbox requests, without their payloads.
 - `POST /api/updates/session` and `GET /api/updates/ws`: owner-authenticated Mini App subscription setup and hibernating WebSocket notifications. The browser obtains a short-lived connection ticket using Telegram authorization, then supplies it through WebSocket subprotocol headers. The ticket is never placed in the URL or persistent browser storage; no additional manually managed credentials are required.
-- `POST /api/actions`: owner-only validated and idempotent file-management, settings, download-submission, metadata-recovery, and migration requests. Apply all pending D1 migrations before enabling their action kinds.
+- `POST /api/actions`: owner-only validated and idempotent file-management, settings, download-submission, metadata-recovery, migration, and torrent-selection requests. Apply all pending D1 migrations before enabling their action kinds.
 - `GET /api/local/requests`, `POST /api/local/ack`, `POST /api/local/state`, and `GET /api/local/ws`: shared-secret desktop integration. Inbox acknowledgment means durable local receipt, not completion.
 
 ## Metadata recovery upgrades
@@ -57,6 +57,16 @@ The migration expands the durable inbox constraint while preserving pending requ
 acknowledged history, payload hashes, and sequence history. Install and verify the
 matching desktop staging-cleanup support before deploying the Worker and Mini App
 assets; rolling back code does not roll back D1 data.
+
+For torrent Mini App upgrades, back up the intended D1 database and apply
+`0008_torrent_action_kind.sql`. It preserves existing receipts and their sequence
+high-water mark while adding `torrent_action`. Install and verify the matching
+desktop service before serving the new Worker and Mini App assets. The Worker
+injects the verified private owner into torrent requests; the desktop compares
+that identity with its configured owner. Catalog, detail and read-only review
+results use the existing bounded operation snapshots. Final confirmation loads
+the saved review; file indexes and revisions are not accepted as replacement
+confirmation fields. This adds no idle polling or global inventory publishing.
 
 ## On-demand time snapshots
 

@@ -52,10 +52,15 @@ mod telegram;
 mod torrent_backup;
 mod torrent_bot;
 mod torrent_catalog;
+#[cfg(test)]
+mod torrent_cloud_bridge_tests;
 mod torrent_inline;
 mod torrent_magnet;
 mod torrent_manager;
 mod torrent_metainfo;
+mod torrent_miniapp;
+#[cfg(test)]
+pub(crate) mod torrent_miniapp_tests;
 mod torrent_runtime;
 mod torrent_types;
 mod torrent_widget;
@@ -488,12 +493,13 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     });
 
     let torrent = if config.torrent.enabled {
-        let service = torrent_runtime::TorrentService::new(
+        let service = torrent_runtime::TorrentService::new_with_miniapp_worker_url(
             config.torrent.clone(),
             telegram.clone(),
             music.clone(),
             config.music.max_file_bytes,
             torrent_shutdown,
+            config.cloud.as_ref().map(|cloud| cloud.worker_url.clone()),
         )?;
         service.start();
         Some(service)
@@ -4269,6 +4275,17 @@ struct LegacyImportPayload {
     text: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TorrentCloudConfirmRequest {
+    operation: String,
+    review_seq: u64,
+    review_id: String,
+}
+
+const MAX_TORRENT_CLOUD_RESULT_BYTES: usize = 192 * 1024;
+const MAX_TORRENT_CLOUD_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 async fn dispatch_cloud_preview_cancel(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
@@ -4620,6 +4637,9 @@ async fn dispatch_cloud_management(
     }
     if request.kind == "preview_cancel" {
         return dispatch_cloud_preview_cancel(runtime, request).await;
+    }
+    if request.kind == "torrent_action" {
+        return dispatch_cloud_torrent_action(runtime, request).await;
     }
     if !matches!(
         request.kind.as_str(),
@@ -5149,6 +5169,228 @@ async fn dispatch_cloud_management(
             request.kind
         ))),
     }
+}
+
+async fn dispatch_cloud_torrent_action(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    let Some(owner_chat) = configured_cloud_management_chat_id(&runtime.bot.config) else {
+        return Ok(cloud_dispatch_failure(
+            "torrent Mini App requires one configured private cloud owner",
+        ));
+    };
+    let Some(request_id) = cloud_action_request_id(request) else {
+        return Ok(cloud_dispatch_failure(
+            "torrent action is missing a valid cloud request identity",
+        ));
+    };
+    let Some(payload_object) = request.payload.as_object() else {
+        return Ok(cloud_dispatch_failure(
+            "torrent action payload must be an object",
+        ));
+    };
+    let Some(actor_user_id) = torrent_action_actor(payload_object, owner_chat) else {
+        return Ok(cloud_dispatch_failure(
+            "torrent action actor is missing or does not match the configured private owner",
+        ));
+    };
+    let Some(service) = runtime.bot.torrent.as_ref() else {
+        return Ok(cloud_dispatch_failure("torrent management is disabled"));
+    };
+
+    let mut service_payload = request.payload.clone();
+    let Some(service_fields) = service_payload.as_object_mut() else {
+        unreachable!("payload object was checked above");
+    };
+    service_fields.remove("actor_user_id");
+    let Some(operation) = service_payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(cloud_dispatch_failure(
+            "torrent action must name an operation",
+        ));
+    };
+
+    let identity = format!("{request_id}:{}", request.seq);
+    if operation == "confirm" {
+        let confirm: TorrentCloudConfirmRequest = match serde_json::from_value(service_payload) {
+            Ok(confirm) => confirm,
+            Err(error) => {
+                return Ok(cloud_dispatch_failure(format!(
+                    "invalid torrent confirm payload: {error}"
+                )));
+            }
+        };
+        if confirm.operation != "confirm"
+            || confirm.review_seq == 0
+            || confirm.review_seq > MAX_TORRENT_CLOUD_SAFE_INTEGER
+            || !valid_torrent_review_id(&confirm.review_id)
+        {
+            return Ok(cloud_dispatch_failure("torrent review identity is invalid"));
+        }
+        let inbox = Arc::clone(&runtime.inbox);
+        let review_seq = confirm.review_seq;
+        let review_record = tokio::task::spawn_blocking(move || inbox.record(review_seq))
+            .await
+            .context("torrent review receipt lookup worker failed")??;
+        let Some(review_record) = review_record else {
+            return Ok(cloud_dispatch_failure(
+                "torrent review receipt is no longer available; create a fresh review",
+            ));
+        };
+        let Some(review_payload) = review_record.request.payload.as_object() else {
+            return Ok(cloud_dispatch_failure(
+                "saved torrent review receipt is invalid; create a fresh review",
+            ));
+        };
+        let review_actor = review_payload
+            .get("actor_user_id")
+            .and_then(serde_json::Value::as_str);
+        let review_result = review_record.result.as_ref();
+        if review_record.request.seq != confirm.review_seq
+            || review_record.request.kind != "torrent_action"
+            || review_record.status != InboxStatus::Completed
+            || review_record.error.is_some()
+            || cloud_action_request_id(&review_record.request).is_none()
+            || review_payload
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                != Some("review")
+            || review_actor != Some(actor_user_id)
+            || review_result
+                .and_then(|result| result.get("operation"))
+                .and_then(serde_json::Value::as_str)
+                != Some("review")
+            || review_result
+                .and_then(|result| result.get("review_id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(confirm.review_id.as_str())
+        {
+            return Ok(cloud_dispatch_failure(
+                "torrent review does not match a successful review by this owner",
+            ));
+        }
+        let Some(review_result) = review_result else {
+            return Ok(cloud_dispatch_failure(
+                "torrent review result is unavailable; create a fresh review",
+            ));
+        };
+        let Some(task_id) = review_result
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| valid_torrent_review_id(value))
+        else {
+            return Ok(cloud_dispatch_failure(
+                "saved torrent review task identity is invalid",
+            ));
+        };
+        let Some(inventory_revision) = review_result
+            .get("inventory_revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0 && *value <= MAX_TORRENT_CLOUD_SAFE_INTEGER)
+        else {
+            return Ok(cloud_dispatch_failure(
+                "saved torrent review inventory revision is invalid",
+            ));
+        };
+        let Some(selection_revision) = review_result
+            .get("selection_revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0 && *value <= MAX_TORRENT_CLOUD_SAFE_INTEGER)
+        else {
+            return Ok(cloud_dispatch_failure(
+                "saved torrent review selection revision is invalid",
+            ));
+        };
+        let Some(selected_indexes) = validated_torrent_review_indexes(review_result) else {
+            return Ok(cloud_dispatch_failure(
+                "saved torrent review selection is invalid",
+            ));
+        };
+        service_payload = serde_json::json!({
+            "operation": "confirm",
+            "task_id": task_id,
+            "review_id": confirm.review_id,
+            "inventory_revision": inventory_revision,
+            "selection_revision": selection_revision,
+            "selected_indexes": selected_indexes,
+        });
+    }
+
+    let result = match service
+        .handle_miniapp_action(owner_chat, &identity, &service_payload)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(cloud_dispatch_failure(format!("{error:#}"))),
+    };
+    if result.get("operation").and_then(serde_json::Value::as_str) != Some(operation.as_str()) {
+        return Ok(cloud_dispatch_failure(
+            "torrent service returned a mismatched operation result",
+        ));
+    }
+    let result_bytes = serde_json::to_vec(&result)?;
+    if result_bytes.len() > MAX_TORRENT_CLOUD_RESULT_BYTES {
+        return Ok(cloud_dispatch_failure(
+            "torrent result exceeded the cloud receipt limit; reload the task and try again",
+        ));
+    }
+    Ok(CloudDispatchOutcome {
+        status: InboxStatus::Completed,
+        result: Some(result),
+        error: None,
+        related_preview: None,
+    })
+}
+
+fn cloud_action_request_id(request: &CloudRequest) -> Option<&str> {
+    let request_id = request.extra.get("request_id")?.as_str()?;
+    (!request_id.is_empty()
+        && request_id.len() <= 256
+        && request_id.trim() == request_id
+        && !request_id.chars().any(char::is_control))
+    .then_some(request_id)
+}
+
+fn torrent_action_actor(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    owner_chat: i64,
+) -> Option<&str> {
+    if owner_chat <= 0 {
+        return None;
+    }
+    let actor_user_id = payload.get("actor_user_id")?.as_str()?;
+    (actor_user_id == owner_chat.to_string()).then_some(actor_user_id)
+}
+
+fn valid_torrent_review_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validated_torrent_review_indexes(review_result: &serde_json::Value) -> Option<Vec<u64>> {
+    use std::collections::HashSet;
+
+    let indexes = review_result.get("selected_indexes")?.as_array()?;
+    if indexes.len() > 5_000
+        || review_result.get("selected_count")?.as_u64()? as usize != indexes.len()
+    {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(indexes.len());
+    indexes
+        .iter()
+        .map(|value| {
+            let index = value.as_u64()?;
+            (index < 5_000 && seen.insert(index)).then_some(index)
+        })
+        .collect()
 }
 
 fn cloud_dispatch_failure(message: impl Into<String>) -> CloudDispatchOutcome {

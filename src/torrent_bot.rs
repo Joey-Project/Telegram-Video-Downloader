@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::telegram::{
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WidgetQuery,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo, WidgetQuery,
 };
 use crate::torrent_runtime::{card_presentation, phase_label};
 use crate::torrent_types::{TorrentAction, TorrentMagnet, TorrentUpload};
@@ -301,6 +301,19 @@ pub(crate) async fn handle_command(
         return true;
     }
     if matches!(parts.as_slice(), [_] | [_, "list"]) {
+        if context.config.cloud.is_some() {
+            if context.torrent.is_none() {
+                send_or_log(
+                    &context.telegram,
+                    chat_id,
+                    "Torrent downloads are disabled on this bot.".into(),
+                )
+                .await;
+            } else if let Some(cloud) = &context.config.cloud {
+                open_miniapp(context, chat_id, &cloud.worker_url, None).await;
+            }
+            return true;
+        }
         if let Some(user_id) = user_id {
             crate::torrent_catalog::open_catalog(context, update_id, user_id, chat_id).await;
         }
@@ -332,8 +345,23 @@ pub(crate) async fn handle_command(
                     text.push_str(&format!("\n{title}\n/torrents {}\n", task.task_id));
                     rows.push(vec![InlineKeyboardButton {
                         text: label.chars().take(64).collect(),
-                        callback_data: format!("torrent:open:{}", task.task_id),
-                        web_app: None,
+                        callback_data: if context.config.cloud.is_some() {
+                            String::new()
+                        } else {
+                            format!("torrent:open:{}", task.task_id)
+                        },
+                        web_app: context
+                            .config
+                            .cloud
+                            .as_ref()
+                            .and_then(|cloud| {
+                                crate::torrent_inline::miniapp_url(
+                                    &cloud.worker_url,
+                                    Some(&task.task_id),
+                                )
+                                .ok()
+                            })
+                            .map(|url| WebAppInfo { url }),
                     }]);
                 }
                 if total > 12 { text.push_str("\nShowing the 12 most recent torrent uploads."); }
@@ -344,6 +372,10 @@ pub(crate) async fn handle_command(
             Err(_) => send_or_log(&context.telegram, chat_id, "Saved torrent tasks are temporarily unavailable. Existing downloads and selections are retained; try /torrents saved again shortly.".into()).await,
         },
         [_, task_id] if valid_task_id(task_id) => {
+            if let Some(cloud) = &context.config.cloud {
+                open_miniapp(context, chat_id, &cloud.worker_url, Some(task_id)).await;
+                return true;
+            }
             let result = service.reopen_card(chat_id, chat_id, (*task_id).into(), format!("update:{update_id}")).await;
             if result.is_err() {
                 send_or_log(&context.telegram, chat_id, "This torrent card could not be opened. Refresh /torrents and choose the task again.".into()).await;
@@ -352,6 +384,39 @@ pub(crate) async fn handle_command(
         _ => send_or_log(&context.telegram, chat_id, "Usage: /torrents or /torrents TASK_ID.".into()).await,
     }
     true
+}
+
+async fn open_miniapp(context: &BotContext, chat_id: i64, worker_url: &str, task_id: Option<&str>) {
+    let app_url = match crate::torrent_inline::miniapp_url(worker_url, task_id) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not build torrent Mini App URL");
+            send_or_log(
+                &context.telegram,
+                chat_id,
+                "The torrent manager is temporarily unavailable.".into(),
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(error) = context
+        .telegram
+        .send_message_with_inline_keyboard(
+            chat_id,
+            "Manage qBittorrent tasks and Music selections.".to_string(),
+            InlineKeyboardMarkup {
+                inline_keyboard: vec![vec![InlineKeyboardButton {
+                    text: "Open torrent manager".to_string(),
+                    callback_data: String::new(),
+                    web_app: Some(WebAppInfo { url: app_url }),
+                }]],
+            },
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "could not send torrent Mini App launcher");
+    }
 }
 
 pub(crate) async fn handle_callback(context: &BotContext, query: &CallbackQuery) -> bool {

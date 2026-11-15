@@ -2,14 +2,16 @@
 
 Send a `.torrent` document or a magnet URI (also `/magnet LINK`) to the bot in its authorized private chat. qBittorrent
 downloads the entire torrent using its existing save location and category
-settings. Music selection is a separate, optional action: the task card shows
-download progress and supports folder navigation, file selection and explicit
-Music import. A torrent without supported audio remains an ordinary qBittorrent
-download.
+settings. Music selection is a separate, optional action. With Cloud ingress,
+`/torrents` opens the **Torrents** view in the existing file-management Mini App;
+task cards retain download summaries and an **Open Mini App** button. Browse an
+album by folder, search or filter tracks, select across pages, then review and
+explicitly confirm the selection. A torrent without supported audio remains an
+ordinary qBittorrent download. Configurations without Cloud ingress retain the
+native Telegram catalog and selection keyboard.
 
-`/torrents` opens a paginated catalog of existing qBittorrent tasks, including
-per-task progress. On a task, tap **Choose music** to adopt that exact task in the bot's
-local records and open its existing selection card. Adoption reads and validates
+The Mini App lists existing qBittorrent tasks with progress and exact-task
+pause/resume controls. Opening a task reads and validates
 the selected task; it does not submit another torrent, change its save location
 or file priorities, or move or delete payload files. **Pause** and **Resume** act
 on only the selected qBittorrent task. Pausing temporarily stops its download or
@@ -18,7 +20,7 @@ Bot-submitted torrents request every file; adopting an existing qBittorrent task
 preserves its current priorities. Music selection does not change those
 priorities, and the payload remains available for seeding when the task is active.
 
-The catalog list is a private, in-memory view bound to the authorized owner and
+Without Cloud ingress, the Telegram catalog list is a private, in-memory view bound to the authorized owner and
 the Telegram list message. Its callback session expires after one hour idle and the
 process retains at most 48 sessions; a new `/torrents` request creates a fresh
 list message, and its **Refresh** button updates that message. The catalog view
@@ -110,19 +112,49 @@ limits.
 API responses default to 2 MiB; `torrent.max_api_response_bytes` can be increased
 up to 16 MiB for inventories with unusually long paths.
 
-## Telegram card and recovery
+## Mini App selection and recovery
+
+The **Torrents** tab belongs to the existing `/file/` Mini App. A task card can
+deep-link to its opaque bot task ID. The authenticated owner can browse task
+folders, inspect file names/sizes and download/import status, search or filter,
+and select a whole folder or individual tracks across pages. Pages contain at
+most 50 entries; the supported inventory limit remains 5,000 files.
+
+Checkbox edits stay in a browser draft. **Review** obtains a read-only server
+preview and **Confirm** submits exactly that preview. Cancelling review leaves
+previously submitted selections and waiting imports unchanged. Confirmation
+checks both file-inventory and selection revisions atomically; another device
+changing either requires a new review. A replay cannot restore an older saved
+selection after a later change. Ordinary download progress does not invalidate
+the reviewed file identity.
+
+The Worker verifies Telegram initData and injects the authenticated private owner
+into the durable request; the Mac independently compares that identity with its
+configured owner. Display metadata and operation results are bounded and paged.
+Absolute paths, tracker credentials and Telegram card authority are not browser
+inputs. Opening an existing task can save an association without posting a new
+Telegram selection message or starting a Music import.
+
+Opening the view, pressing refresh and explicit operations obtain current Mac
+data. Results use the existing request inbox, operation snapshots and WebSocket
+invalidations; there is no new polling loop. The view displays the latest
+available snapshot, with an explicit pending or unavailable state when the Mac
+cannot answer. Missing or stale review data requires a fresh review.
+
+## Native Telegram fallback
 
 The card uses ordinary Telegram messages and inline keyboard buttons. Four rows per
 page support individual track selection, folder selection, navigation, clearing,
 and a separate paginated review with explicit import confirmation. The Mac retains
 the selection across pages. Buttons carry short task identifiers and revisions;
-neither absolute paths nor tracker URLs are sent. No Mini App is needed.
+neither absolute paths nor tracker URLs are sent. This fallback is used when the
+bot has no Cloud ingress configuration.
 
 Telegram currently restricts Widgets for ordinary bots, including private chats.
 The live API returned `INPUT_MEDIA_WIDGET_NOT_ALLOWED`; the restriction is also
 [confirmed by Telegram's maintainer](https://github.com/tdlib/telegram-bot-api/issues/947).
 
-`/torrents` browses the qBittorrent task catalog eight tasks per page (up to
+The native `/torrents` fallback browses the qBittorrent task catalog eight tasks per page (up to
 20,000 tasks). Its summary shows
 task name, state, progress and size without exposing save paths. **Choose music**
 opens the native selection card for that existing task; the card then supports
@@ -154,7 +186,11 @@ and retain known completed results when old Music job records have been pruned.
 
 ## Cloud ingress and release
 
-Cloud mode uses the existing authorized `message` and `callback_query` ingress.
+Cloud mode uses the existing authorized `message` and `callback_query` ingress,
+plus the owner-authenticated `torrent_action` Mini App request kind. Apply the
+D1 migrations, including `0008_torrent_action_kind.sql`, with the Worker update;
+the migration preserves pending/acknowledged receipts and the sequence high-water
+mark. Torrent action results share the existing bounded operation snapshot.
 Preserve the existing webhook URL, secret token and pending updates. Never register a second
 polling consumer to test a production webhook. The Worker durably stores the
 original authorized update and the Mac processes it through its local inbox.
@@ -162,7 +198,8 @@ original authorized update and the Mac processes it through its local inbox.
 Callback queries are answered promptly; qBittorrent requests, source hashing,
 conversion and Music operations run on background workers. Card refresh is
 explicit, and active progress edits go directly from the Mac to the Telegram Bot
-API. This feature adds no idle Mini App polling or repeated D1 state snapshots.
+API. Mini App data refreshes only on user operations through the existing
+on-demand snapshot mechanism, without idle polling or repeated full inventories.
 
 Install the Mac change only through the existing fixed-identity signed release
 procedure in [macOS bot signing](macos-bot-signing.md), using the production
