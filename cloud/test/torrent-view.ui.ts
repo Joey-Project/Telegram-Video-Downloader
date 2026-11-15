@@ -379,6 +379,55 @@ describe("torrent selection Mini App", () => {
     ui.view.dispose();
   });
 
+  it("locks only the confirming task draft until its confirmation receipt settles", async () => {
+    const ui = mount();
+    ui.view.open("task-A");
+    await ui.settle();
+    const detailA = sentAt(ui.sent());
+    ui.publish(detailA.requestId, 70, detailResult({
+      taskId: "task-A", taskName: "Task A", scopeIndexes: [2],
+    }));
+    ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')!.click();
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-review]")!.click();
+    await ui.settle();
+    const reviewA = sentAt(ui.sent(), 1);
+    ui.publish(reviewA.requestId, 71, reviewResult([2], "task-A"));
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-confirm]")!.click();
+    await ui.settle();
+    const confirmA = sentAt(ui.sent(), 2);
+
+    const file = ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')!;
+    expect(file.disabled).toBe(true);
+    file.checked = false;
+    file.dispatchEvent(new Event("change", { bubbles: true }));
+    const folder = ui.root.querySelector<HTMLInputElement>('[data-torrent-folder-select="1"]')!;
+    expect(folder.disabled).toBe(true);
+    folder.checked = true;
+    folder.dispatchEvent(new Event("change", { bubbles: true }));
+    const selectScope = ui.root.querySelector<HTMLButtonElement>("[data-torrent-select-scope]")!;
+    const clearScope = ui.root.querySelector<HTMLButtonElement>("[data-torrent-clear-scope]")!;
+    expect(selectScope.disabled).toBe(true);
+    expect(clearScope.disabled).toBe(true);
+    selectScope.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    clearScope.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}")["task-A"].indexes).toEqual([2]);
+
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-detail-refresh]")!.click();
+    await ui.settle();
+    const changedDetail = sentAt(ui.sent(), 3);
+    ui.publish(changedDetail.requestId, 72, detailResult({
+      taskId: "task-A", taskName: "Task A", inventoryRevision: 2, selectionRevision: 2,
+      selectedIndexes: [0], scopeIndexes: [0],
+    }));
+    const rebase = ui.root.querySelector<HTMLButtonElement>("[data-torrent-rebase]")!;
+    expect(rebase.disabled).toBe(true);
+    rebase.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const draft = JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}")["task-A"];
+    expect(draft).toEqual({ inventoryRevision: 1, selectionRevision: 1, indexes: [2] });
+    expect(confirmA.payload).toEqual({ operation: "confirm", review_seq: 71, review_id: "review-owner-1" });
+    ui.view.dispose();
+  });
+
   it("rejects a confirmation result for a different task without deleting the reviewed draft", async () => {
     const ui = mount();
     ui.view.open("task-A");

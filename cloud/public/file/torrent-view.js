@@ -220,6 +220,10 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       .includes(String(operation.status ?? "").toLowerCase());
   }
 
+  function confirmationPendingFor(taskId) {
+    return Boolean(taskId && state.confirmTaskId === taskId && actionPending(state.confirmRequestId));
+  }
+
   function saveDraft() {
     const draft = draftFor();
     if (draft) drafts.set(state.taskId, draft);
@@ -650,12 +654,12 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
         || operation.details_incomplete === true || operation.result_truncated === true);
     const detailError = state.detailError || (detailMissing ? "Task details were incomplete or expired. Refresh files before selecting." : operation?.result?.error ?? "");
     const detailBusy = Boolean(pending || detailStatus === "processing" || detailStatus === "pending" || detailStatus === "retryable");
-    const selectionDisabled = Boolean(detailError || detailBusy || state.draftStale);
+    const selectionDisabled = Boolean(detailError || detailBusy || state.draftStale || confirmationPendingFor(task?.task_id));
     const folderLabel = state.folderTrail.at(-1)?.path ?? "Task root";
     return `<div class="torrent-heading"><div><button class="torrent-back" type="button" data-torrent-back>← All tasks</button><p class="eyebrow">MUSIC SELECTION</p><h2>${escapeHtml(boundedText(task?.name ?? "Torrent task"))}</h2><p>${escapeHtml(taskStatusLabel(task))} · ${escapeHtml(progress)}</p></div><button class="secondary-button" type="button" data-torrent-detail-refresh ${state.commandBusy ? "disabled" : ""}>Refresh files</button></div>
       ${detailError ? `<p class="torrent-message error" role="alert">${escapeHtml(detailError)}</p>` : state.deferredDetailRequest ? `<p class="torrent-message" role="status">Waiting for the previous request to finish before loading this task…</p>` : pending ? `<p class="torrent-message" role="status">Waiting for task files…</p>` : detailStatus === "processing" ? `<p class="torrent-message" role="status">Your computer is checking the task files…</p>` : ""}
       ${task ? `<div class="torrent-summary"><span>${selectedCount.toLocaleString()} selected</span><span>${Number(task.import_count ?? 0).toLocaleString()} imported</span></div>` : ""}
-      ${state.draftStale ? `<aside class="torrent-stale" role="alert"><strong>Task files or saved selection changed.</strong><span>This draft is tied to older revisions and cannot be reviewed or confirmed.</span><button class="secondary-button" type="button" data-torrent-rebase ${state.commandBusy ? "disabled" : ""}>Discard draft and use current selection</button></aside>` : ""}
+      ${state.draftStale ? `<aside class="torrent-stale" role="alert"><strong>Task files or saved selection changed.</strong><span>This draft is tied to older revisions and cannot be reviewed or confirmed.</span><button class="secondary-button" type="button" data-torrent-rebase ${state.commandBusy || confirmationPendingFor(task?.task_id) ? "disabled" : ""}>Discard draft and use current selection</button></aside>` : ""}
       <form class="torrent-search" data-torrent-detail-search><label class="search-box"><span aria-hidden="true">⌕</span><input type="search" name="query" maxlength="256" value="${escapeHtml(state.detailQuery)}" placeholder="Search folders and files" aria-label="Search task files"></label><select name="filter" class="select-control" aria-label="Filter files"><option value="music" ${state.filter === "music" ? "selected" : ""}>Music files</option><option value="all" ${state.filter === "all" ? "selected" : ""}>All files</option><option value="ready" ${state.filter === "ready" ? "selected" : ""}>Ready for Music</option><option value="waiting" ${state.filter === "waiting" ? "selected" : ""}>Waiting for download</option><option value="imported" ${state.filter === "imported" ? "selected" : ""}>Imported</option></select><button class="quiet-button" type="submit">Apply</button></form>
       <div class="torrent-folder-tools">${state.folderId ? `<button class="quiet-button" type="button" data-torrent-up ${detailBusy ? "disabled" : ""}>↑ Up</button>` : ""}<span class="field-hint">${escapeHtml(boundedText(folderLabel))}</span><button class="quiet-button" type="button" data-torrent-select-scope ${result?.scope_indexes?.length && !selectionDisabled ? "" : "disabled"}>Select matching (${Number(result?.scope_indexes?.length ?? 0).toLocaleString()})</button><button class="quiet-button" type="button" data-torrent-clear-scope ${selectedCount && !selectionDisabled ? "" : "disabled"}>Clear task selection</button></div>
       <div class="torrent-file-list" aria-live="polite">${folders.map((folder) => {
@@ -679,7 +683,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
   function selectionForIndexes(indexes, selected) {
     const task = state.detailResult?.task;
     const draft = draftFor(task?.task_id);
-    if (!draft || state.draftStale) return;
+    if (!draft || state.draftStale || confirmationPendingFor(task?.task_id)) return;
     for (const index of indexes) {
       if (!validIndex(index)) continue;
       if (selected) draft.indexes.add(index);
@@ -790,7 +794,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     if (target.hasAttribute("data-torrent-confirm")) { confirmReview(); return; }
     if (target.hasAttribute("data-torrent-rebase")) {
       const task = state.detailResult?.task;
-      if (!task) return;
+      if (!task || confirmationPendingFor(task.task_id)) return;
       drafts.set(task.task_id, {
         inventoryRevision: task.inventory_revision,
         selectionRevision: task.selection_revision,

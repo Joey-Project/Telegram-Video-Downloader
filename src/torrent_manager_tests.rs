@@ -32,6 +32,7 @@ struct TestBackendState {
     exported_metainfo: Option<Vec<u8>>,
     export_failures: usize,
     export_count: usize,
+    export_threads: Vec<std::thread::ThreadId>,
     export_barrier: Option<Arc<ExportBarrier>>,
     sent_cards: usize,
     updated_cards: Vec<TorrentSnapshot>,
@@ -84,6 +85,7 @@ impl TestBackend {
                 exported_metainfo: None,
                 export_failures: 0,
                 export_count: 0,
+                export_threads: Vec::new(),
                 export_barrier: None,
                 sent_cards: 0,
                 updated_cards: Vec::new(),
@@ -122,6 +124,10 @@ impl TestBackend {
 
     fn export_count(&self) -> usize {
         self.state.lock().unwrap().export_count
+    }
+
+    fn export_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.state.lock().unwrap().export_threads.clone()
     }
 
     fn pause_exports(&self) -> Arc<ExportBarrier> {
@@ -204,6 +210,7 @@ impl TorrentBackend for TestBackend {
     fn export_metainfo(&self, _hash: String) -> crate::torrent_types::TorrentFuture<'_, Vec<u8>> {
         let mut state = self.state.lock().unwrap();
         state.export_count += 1;
+        state.export_threads.push(std::thread::current().id());
         if state.export_failures > 0 {
             state.export_failures -= 1;
             return Box::pin(async { anyhow::bail!("mocked metadata is not ready") });
@@ -1001,8 +1008,9 @@ async fn existing_catalog_task_survives_manager_restart() {
     assert!(restored.files.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn cancelled_miniapp_metadata_fetch_keeps_exclusive_slot_and_retry_safe() {
+    let caller_thread = std::thread::current().id();
     let fixture = Fixture::new();
     let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
     let hash = remote.hash.clone();
@@ -1040,6 +1048,11 @@ async fn cancelled_miniapp_metadata_fetch_keeps_exclusive_slot_and_retry_safe() 
     assert!(
         manager.active_workers.lock().await.contains(&task_id),
         "inline metadata retrieval must claim the per-task worker slot"
+    );
+    assert_ne!(
+        backend.export_threads()[0],
+        caller_thread,
+        "metadata initialization must run on the blocking worker"
     );
 
     adoption.abort();

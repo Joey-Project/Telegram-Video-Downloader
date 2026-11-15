@@ -61,7 +61,7 @@ its default file-selection interface.
 - The torrent-focused Rust suite passed 93 tests, including the mock service
   E2Es and durable inbox review/confirmation/replay tests. Workspace all-targets
   Clippy passed with warnings denied; formatting passed.
-- Worker tests passed 437 cases, the Mini App UI suite passed 106 cases, and
+- Worker tests passed 437 cases, the Mini App UI suite passed 107 cases, and
   Widget regressions passed four cases. Type, syntax and bundle checks passed.
 - The actual app-shell E2E covers queued action receipts, review cancellation,
   confirmation and refreshed detail results. Request IDs take precedence over
@@ -76,6 +76,9 @@ its default file-selection interface.
 - Confirmation receipts apply only to the reviewed task and preserve another
   task's draft and review. Folder listings exclude their own synthetic root;
   task-ID and hash deep links both reopen the corresponding task.
+- Metadata filesystem work and worker-slot cleanup stay on blocking workers.
+  The submitted task's selection is locked until confirmation settles, so later
+  edits cannot be lost; other tasks remain browsable and editable.
 - Synthetic mobile rendering at 320, 375 and 420 pixels showed no horizontal
   overflow or offscreen controls. Physical Telegram client acceptance is separate.
 

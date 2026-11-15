@@ -1184,17 +1184,20 @@ impl TorrentManager {
 
         let manager = self.clone();
         let worker_task_id = task_id.clone();
-        let worker = tokio::spawn(async move {
-            if let Ok(Some(task)) = manager.store.task(&worker_task_id)
-                && task.metainfo.is_none()
-                && task_has_existing_qb_source(&task)
-            {
-                manager.process_existing(task).await;
-            }
-            manager.release_active_worker(&worker_task_id).await;
+        let worker_handle = Handle::current();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_handle.block_on(async move {
+                if let Ok(Some(task)) = manager.store.task(&worker_task_id)
+                    && task.metainfo.is_none()
+                    && task_has_existing_qb_source(&task)
+                {
+                    manager.process_existing(task).await;
+                }
+                manager.release_active_worker(&worker_task_id).await;
+            });
         });
-        // The detached worker owns the active slot and continues if its Mini App request is
-        // cancelled while qBittorrent metadata retrieval is in progress.
+        // The detached blocking worker owns the active slot and continues if its Mini App request
+        // is cancelled while metadata retrieval or coordinated filesystem access is in progress.
         let _ = worker.await;
     }
 
