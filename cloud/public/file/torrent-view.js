@@ -179,6 +179,8 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     taskId: "",
     taskRef: "",
     taskRefType: "task_id",
+    taskNameHint: "",
+    taskNameHintRef: "",
     requestedTaskId: "",
     detailPage: 0,
     folderId: 0,
@@ -320,10 +322,12 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     }, actionId(), "detailRequestId");
   }
 
-  function enterTask(taskRef, refType = "task_id") {
+  function enterTask(taskRef, refType = "task_id", taskNameHint = "") {
     const safeId = String(taskRef ?? "");
     if (!SAFE_ID.test(safeId)) {
       state.taskId = "";
+      state.taskNameHint = "";
+      state.taskNameHintRef = "";
       state.mode = "catalog";
       state.detailError = "The task link is invalid. Return to the task list and choose a task.";
       render();
@@ -333,6 +337,8 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     if (state.taskRef !== safeId || state.taskRefType !== safeType) {
       state.taskRef = safeId;
       state.taskRefType = safeType;
+      state.taskNameHint = "";
+      state.taskNameHintRef = safeId;
       state.taskId = "";
       state.folderId = 0;
       state.folderTrail = [];
@@ -348,6 +354,10 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       state.reviewSeq = null;
       state.draftStale = false;
       state.requestedTaskId = "";
+    }
+    if (typeof taskNameHint === "string" && taskNameHint.length > 0) {
+      state.taskNameHint = boundedText(taskNameHint);
+      state.taskNameHintRef = safeId;
     }
     state.mode = "detail";
     if (state.requestedTaskId !== safeId) {
@@ -612,7 +622,8 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       <div class="torrent-task-list" aria-live="polite">${rows.map((row) => {
         const paused = /paused|stopped/iu.test(String(row.state ?? ""));
         const controlBusy = actionPending(state.controlRequestId);
-        return `<article class="torrent-task-row"><button class="torrent-task-open" type="button" data-torrent-open="${escapeHtml(row.hash)}" ${pending ? "disabled" : ""}><strong>${escapeHtml(boundedText(row.name))}</strong><span>${escapeHtml(humanTorrentState(row.state))} · ${escapeHtml(formatProgress(row.progress))} · ${escapeHtml(formatBytes(row.size))}</span></button><button class="quiet-button torrent-control" type="button" data-torrent-control="${paused ? "resume" : "pause"}" data-torrent-hash="${escapeHtml(row.hash)}" ${state.commandBusy || controlBusy ? "disabled" : ""}>${paused ? "Resume" : "Pause"}</button></article>`;
+        const rowName = boundedText(row.name);
+        return `<article class="torrent-task-row"><button class="torrent-task-open" type="button" data-torrent-open="${escapeHtml(row.hash)}" data-torrent-name="${escapeHtml(rowName)}" ${pending ? "disabled" : ""}><strong>${escapeHtml(rowName)}</strong><span>${escapeHtml(humanTorrentState(row.state))} · ${escapeHtml(formatProgress(row.progress))} · ${escapeHtml(formatBytes(row.size))}</span></button><button class="quiet-button torrent-control" type="button" data-torrent-control="${paused ? "resume" : "pause"}" data-torrent-hash="${escapeHtml(row.hash)}" ${state.commandBusy || controlBusy ? "disabled" : ""}>${paused ? "Resume" : "Pause"}</button></article>`;
       }).join("") || (result && !rows.length ? `<div class="empty-state"><h3>No matching tasks</h3><p>Change the search or refresh the list.</p></div>` : "")}</div>
       <nav class="torrent-pagination" aria-label="Task list pages"><button class="quiet-button" type="button" data-torrent-catalog-page="-1" ${!result || result.page <= 0 || state.commandBusy ? "disabled" : ""}>Previous</button><span>Page ${Number(result?.page ?? state.catalogPage) + 1}</span><button class="quiet-button" type="button" data-torrent-catalog-page="1" ${!result?.has_more || state.commandBusy ? "disabled" : ""}>Next</button></nav>
       ${state.controlError ? `<p class="torrent-message" role="status">${escapeHtml(state.controlError)}</p>` : ""}`;
@@ -656,7 +667,8 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     const detailBusy = Boolean(pending || detailStatus === "processing" || detailStatus === "pending" || detailStatus === "retryable");
     const selectionDisabled = Boolean(detailError || detailBusy || state.draftStale || confirmationPendingFor(task?.task_id));
     const folderLabel = state.folderTrail.at(-1)?.path ?? "Task root";
-    return `<div class="torrent-heading"><div><button class="torrent-back" type="button" data-torrent-back>← All tasks</button><p class="eyebrow">MUSIC SELECTION</p><h2>${escapeHtml(boundedText(task?.name ?? "Torrent task"))}</h2><p>${escapeHtml(taskStatusLabel(task))} · ${escapeHtml(progress)}</p></div><button class="secondary-button" type="button" data-torrent-detail-refresh ${state.commandBusy ? "disabled" : ""}>Refresh files</button></div>
+    const taskTitle = task?.name || (state.taskNameHintRef === state.taskRef ? state.taskNameHint : "") || "Torrent task";
+    return `<div class="torrent-heading"><div><button class="torrent-back" type="button" data-torrent-back>← All tasks</button><p class="eyebrow">MUSIC SELECTION</p><h2>${escapeHtml(boundedText(taskTitle))}</h2><p>${escapeHtml(taskStatusLabel(task))} · ${escapeHtml(progress)}</p></div><button class="secondary-button" type="button" data-torrent-detail-refresh ${state.commandBusy ? "disabled" : ""}>Refresh files</button></div>
       ${detailError ? `<p class="torrent-message error" role="alert">${escapeHtml(detailError)}</p>` : state.deferredDetailRequest ? `<p class="torrent-message" role="status">Waiting for the previous request to finish before loading this task…</p>` : pending ? `<p class="torrent-message" role="status">Waiting for task files…</p>` : detailStatus === "processing" ? `<p class="torrent-message" role="status">Your computer is checking the task files…</p>` : ""}
       ${task ? `<div class="torrent-summary"><span>${selectedCount.toLocaleString()} selected</span><span>${Number(task.import_count ?? 0).toLocaleString()} imported</span></div>` : ""}
       ${state.draftStale ? `<aside class="torrent-stale" role="alert"><strong>Task files or saved selection changed.</strong><span>This draft is tied to older revisions and cannot be reviewed or confirmed.</span><button class="secondary-button" type="button" data-torrent-rebase ${state.commandBusy || confirmationPendingFor(task?.task_id) ? "disabled" : ""}>Discard draft and use current selection</button></aside>` : ""}
@@ -740,6 +752,8 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       state.mode = "catalog";
       state.taskId = "";
       state.taskRef = "";
+      state.taskNameHint = "";
+      state.taskNameHintRef = "";
       state.requestedTaskId = "";
       state.detailRequestId = null;
       state.deferredDetailRequest = null;
@@ -758,7 +772,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     if (target.hasAttribute("data-torrent-detail-refresh")) { requestDetail({ page: state.detailPage }); return; }
     if (target.hasAttribute("data-torrent-catalog-page")) { requestCatalog({ page: state.catalogPage + Number(target.dataset.torrentCatalogPage) }); return; }
     if (target.hasAttribute("data-torrent-detail-page")) { requestDetail({ page: state.detailPage + Number(target.dataset.torrentDetailPage) }); return; }
-    if (target.hasAttribute("data-torrent-open")) { enterTask(target.dataset.torrentOpen, "hash"); return; }
+    if (target.hasAttribute("data-torrent-open")) { enterTask(target.dataset.torrentOpen, "hash", target.dataset.torrentName ?? ""); return; }
     if (target.hasAttribute("data-torrent-folder")) {
       state.folderTrail.push({ id: state.folderId, path: target.dataset.torrentFolderPath ?? "" });
       requestDetail({ page: 0, folderId: Number(target.dataset.torrentFolder) });

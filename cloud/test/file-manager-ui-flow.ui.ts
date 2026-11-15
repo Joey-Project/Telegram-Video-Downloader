@@ -1159,6 +1159,83 @@ describe("file manager UI flow", () => {
     expect(fixture.actions.filter((action) => action.kind === "torrent_action")).toHaveLength(1);
   });
 
+  it("keeps the catalog title while detail loads and restores its original row title on back", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const hash = "d".repeat(40);
+    const taskId = "torrent-title-task-1";
+    const catalogName = "48kHz/24bit";
+    const detailName = "48kHz／24bit";
+    const detailGate = deferredSignal();
+    let snapshot: Record<string, any> = {
+      ...ownerSnapshot,
+      state_version: 1,
+      operations: [],
+      pending_requests: [],
+    };
+    const fixture = await mountFileManagerFixture(snapshot, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("torrent_action");
+      const payload = action.payload as Record<string, any>;
+      let result: Record<string, any>;
+      if (payload.operation === "catalog") {
+        result = {
+          operation: "catalog", page: payload.page, page_size: 50, total: 1, has_more: false,
+          query: payload.query,
+          rows: [{ hash, name: catalogName, state: "downloading", progress: 0.48, size: 4096 }],
+        };
+      } else if (payload.operation === "detail") {
+        await detailGate.promise;
+        result = {
+          operation: "detail",
+          task: {
+            task_id: taskId, name: detailName, phase: "downloading", state: "downloading",
+            progress: 0.48, inventory_revision: 1, selection_revision: 1,
+            selected_indexes: [], selected_count: 0, import_count: 0, error: null,
+          },
+          page: payload.page, page_size: 50, total: 0, has_more: false,
+          folder_id: payload.folder_id, query: payload.query, filter: payload.filter,
+          scope_indexes: [], entries: [],
+        };
+      } else {
+        throw new Error(`Unexpected torrent operation: ${String(payload.operation)}`);
+      }
+      const operation = {
+        seq,
+        kind: action.kind,
+        request_id: action.request_id,
+        status: "completed",
+        result,
+      };
+      snapshot = {
+        ...snapshot,
+        state_version: Number(snapshot.state_version) + 1,
+        operations: [...snapshot.operations, operation],
+        pending_requests: [],
+      };
+      await publishSnapshot(snapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    }, 1250);
+
+    try {
+      element<HTMLButtonElement>('[data-view="torrents"]').click();
+      await vi.waitFor(() => expect(element<HTMLElement>("#torrent-view").textContent).toContain(catalogName));
+      const taskRow = element<HTMLButtonElement>("[data-torrent-open]");
+      expect(taskRow.textContent).toContain(catalogName);
+      taskRow.click();
+      await vi.waitFor(() => expect(fixture.actions.map((action) => action.payload.operation)).toEqual(["catalog", "detail"]));
+      expect(element<HTMLElement>("#torrent-view").querySelector("h2")?.textContent).toBe(catalogName);
+
+      detailGate.release();
+      await vi.waitFor(() => expect(element<HTMLElement>("#torrent-view").querySelector("h2")?.textContent).toBe(detailName));
+      element<HTMLButtonElement>("[data-torrent-back]").click();
+      await vi.waitFor(() => expect(element<HTMLButtonElement>("[data-torrent-open]").textContent).toContain(catalogName));
+      expect(element<HTMLButtonElement>("[data-torrent-open]").textContent).not.toContain(detailName);
+      expect(fixture.actions.map((action) => action.payload.operation)).toEqual(["catalog", "detail"]);
+    } finally {
+      detailGate.release();
+    }
+  });
+
   it("completes torrent Music review through the real app action queue and receipts", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

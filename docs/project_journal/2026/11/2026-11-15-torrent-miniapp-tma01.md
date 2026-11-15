@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-15
 updated: 2026-11-15
 branch: "codex/torrent-miniapp"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/74"
 supersedes: []
 superseded_by: ""
 ---
@@ -30,6 +30,10 @@ its default file-selection interface.
   reviewed selection. Replayed confirmations cannot restore an older selection.
 - Keep source files available for seeding and reuse the existing Music source
   validation, lossless conversion, original archive and content deduplication.
+- Treat task names as display text: preserve internal slashes, backslashes and
+  Unicode punctuation while redacting rooted local paths and control text.
+  Keep the clicked catalog name visible during detail loading, scoped to that
+  task, and retain the original catalog label when returning to the list.
 
 ## Architecture boundaries
 
@@ -58,14 +62,17 @@ its default file-selection interface.
 - Ordinary tests use local mock qBittorrent/Telegram/Music services and synthetic
   files. Production deployment and real Music imports are separate operations.
 
-- The torrent-focused Rust suite passed 93 tests, including the mock service
+- The torrent-focused Rust suite passed 95 tests, including the mock service
   E2Es and durable inbox review/confirmation/replay tests. Workspace all-targets
   Clippy passed with warnings denied; formatting passed.
-- Worker tests passed 437 cases, the Mini App UI suite passed 107 cases, and
+- Worker tests passed 437 cases, the Mini App UI suite passed 108 cases, and
   Widget regressions passed four cases. Type, syntax and bundle checks passed.
 - The actual app-shell E2E covers queued action receipts, review cancellation,
   confirmation and refreshed detail results. Request IDs take precedence over
   sequence numbers when correlating retained operation results.
+- Display-name regressions cover catalog/detail punctuation, rooted-path and
+  control-text redaction, bounded Unicode text, and the catalog-to-loading-to-
+  detail-to-catalog transition with ASCII and fullwidth slashes.
 - Task navigation ignores late results from a previously opened task, including
   while its submission is still pending. Imported totals include only completed
   Music jobs. Search folders use disjoint child scopes, keeping 5,000-track

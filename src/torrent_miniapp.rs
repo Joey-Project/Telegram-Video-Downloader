@@ -609,12 +609,26 @@ fn safe_task_error(error: Option<&str>) -> Option<String> {
     })
 }
 
-fn safe_display_name(value: &str) -> String {
-    if value.chars().any(char::is_control) || value.contains('/') || value.contains('\\') {
+pub(super) fn safe_display_name(value: &str) -> String {
+    if value.chars().any(char::is_control) || is_absolute_local_path(value) {
         "Torrent task".to_string()
     } else {
         display_text(value, MAX_DISPLAY_BYTES)
     }
+}
+
+fn is_absolute_local_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let rooted_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || rooted_drive
+        || value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
 }
 
 fn finite_progress(progress: f64) -> f64 {
