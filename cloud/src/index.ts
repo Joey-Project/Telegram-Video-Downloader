@@ -81,6 +81,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "library_migration_confirm",
   "library_migration_control",
   "staging_cleanup",
+  "torrent_action",
 ]);
 
 function isRequestKind(value: unknown): value is RequestKind {
@@ -179,9 +180,14 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleAction(request: Request, env: Env): Promise<Response> {
-  await requireOwner(request, env);
+  const owner = await requireOwner(request, env);
   const action = validateActionRequest(await readJsonBody(request, MAX_ACTION_BODY_BYTES));
-  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, action.payload, {
+  // Only the verified Telegram identity supplies this field. Torrent actions are
+  // checked against the Mac's configured private owner before local execution.
+  const payload = action.kind === "torrent_action"
+    ? { ...action.payload, actor_user_id: owner.userId }
+    : action.payload;
+  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, payload, {
     queued_at_ms: action.queued_at_ms,
     replay_expires_at_ms: action.replay_expires_at_ms,
   });

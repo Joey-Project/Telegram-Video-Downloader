@@ -1123,6 +1123,7 @@ beforeEach(() => {
 afterEach(async () => {
   window.dispatchEvent(new Event("pagehide"));
   await releaseMountedFixture();
+  window.history.replaceState({}, "", "/file/");
   activeMockSockets.length = 0;
   vi.clearAllTimers();
   vi.useRealTimers();
@@ -1141,6 +1142,146 @@ afterEach(async () => {
 });
 
 describe("file manager UI flow", () => {
+  it("keeps the file selection tray out of the Torrents view while preserving its draft", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const fixture = await mountFileManagerFixture(ownerSnapshot, makeMemoryStorage());
+    const tray = element<HTMLElement>("#selection-actions");
+    element<HTMLInputElement>('[data-select-item="item-alpha"]').click();
+    await vi.waitFor(() => expect(tray.classList.contains("hidden")).toBe(false));
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("1 item selected");
+
+    element<HTMLButtonElement>('[data-view="torrents"]').click();
+    expect(tray.classList.contains("hidden")).toBe(true);
+    expect(element<HTMLElement>("#view-torrents").classList.contains("hidden")).toBe(false);
+    await vi.waitFor(() => expect(fixture.actions.some((action) => action.kind === "torrent_action")).toBe(true));
+    expect(document.querySelectorAll(".selection-actions:not(.hidden)")).toHaveLength(0);
+    expect(fixture.actions.filter((action) => action.kind === "torrent_action")).toHaveLength(1);
+  });
+
+  it("completes torrent Music review through the real app action queue and receipts", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const hash = "c".repeat(40);
+    const taskId = "torrent-owner-task-1";
+    let confirmed = false;
+    let snapshot: Record<string, any> = {
+      ...ownerSnapshot,
+      state_version: 1,
+      operations: [],
+      pending_requests: [],
+    };
+    const fixture = await mountFileManagerFixture(snapshot, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("torrent_action");
+      expect(typeof action.request_id).toBe("string");
+      const payload = action.payload as Record<string, any>;
+      let result: Record<string, any>;
+      if (payload.operation === "catalog") {
+        result = {
+          operation: "catalog", page: payload.page, page_size: 50, total: 1, has_more: false,
+          query: payload.query,
+          rows: [{ hash, name: "App-shell album", state: "downloading", progress: 1, size: 4096 }],
+        };
+      } else if (payload.operation === "detail") {
+        result = {
+          operation: "detail",
+          task: {
+            task_id: taskId, name: "App-shell album", phase: "downloading", state: "downloading",
+            progress: 1, inventory_revision: 1, selection_revision: confirmed ? 2 : 1,
+            selected_indexes: confirmed ? [0] : [], selected_count: confirmed ? 1 : 0,
+            import_count: 0, error: null,
+          },
+          page: payload.page, page_size: 50, total: 1, has_more: false,
+          folder_id: payload.folder_id, query: payload.query, filter: payload.filter,
+          scope_indexes: [0],
+          entries: [{ kind: "file", index: 0, path: "Artist/Track.flac", size: 4096,
+            progress: 1, complete: true, selected: confirmed, supported_music: true,
+            needs_reconfirm: false, music_stage: "ready" }],
+        };
+      } else if (payload.operation === "review") {
+        result = {
+          operation: "review", review_id: `review-${seq}`, task_id: taskId,
+          inventory_revision: 1, selection_revision: 1,
+          selected_indexes: payload.selected_indexes, selected_count: payload.selected_indexes.length,
+          total_bytes: 4096, ready_count: payload.selected_indexes.length,
+          waiting_count: 0, existing_import_count: 0, removed_pending_count: 0,
+          entries: [{ kind: "file", index: 0, path: "Artist/Track.flac", size: 4096,
+            progress: 1, complete: true, selected: true, supported_music: true,
+            needs_reconfirm: false, music_stage: "ready" }],
+          more_count: 0,
+        };
+      } else if (payload.operation === "confirm") {
+        confirmed = true;
+        result = { operation: "confirm", confirmed: true, task_id: taskId };
+      } else {
+        throw new Error(`Unexpected torrent operation: ${String(payload.operation)}`);
+      }
+      const operation = {
+        seq,
+        kind: action.kind,
+        request_id: action.request_id,
+        status: "completed",
+        result,
+      };
+      snapshot = {
+        ...snapshot,
+        state_version: Number(snapshot.state_version) + 1,
+        operations: [...snapshot.operations, operation],
+        pending_requests: [],
+      };
+      await publishSnapshot(snapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    }, 1200);
+
+    element<HTMLButtonElement>('[data-view="torrents"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#view-torrents").textContent).toContain("App-shell album"));
+    element<HTMLButtonElement>("[data-torrent-open]").click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#torrent-view").textContent).toContain("Artist/Track.flac"));
+    element<HTMLInputElement>('[data-torrent-file="0"]').click();
+    element<HTMLButtonElement>("[data-torrent-review]").click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#torrent-view").textContent).toContain("READ-ONLY REVIEW"));
+    expect(fixture.actions.map((action) => action.payload.operation)).toEqual(["catalog", "detail", "review"]);
+    await vi.waitFor(() => {
+      expect(element<HTMLButtonElement>("[data-torrent-review-cancel]").disabled).toBe(false);
+    });
+    element<HTMLButtonElement>("[data-torrent-review-cancel]").click();
+    expect(fixture.actions).toHaveLength(3);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(3);
+    expect(element<HTMLElement>("#torrent-view").textContent).toContain("1 selected");
+
+    element<HTMLButtonElement>("[data-torrent-review]").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(4));
+    await vi.waitFor(() => {
+      const confirm = element<HTMLElement>("#torrent-view").querySelector<HTMLButtonElement>("[data-torrent-confirm]");
+      expect(confirm).not.toBeNull();
+      expect(confirm?.disabled).toBe(false);
+    });
+    element<HTMLButtonElement>("[data-torrent-confirm]").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(6));
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#torrent-view").textContent).toContain("Selection saved.");
+      expect(element<HTMLElement>("#torrent-view").querySelector('[data-torrent-file="0"]')).not.toBeNull();
+    });
+    expect(element<HTMLElement>("#torrent-view").textContent).toContain("1 selected");
+
+    const expectedPayloads = [
+      { operation: "catalog", page: 0, query: "" },
+      { operation: "detail", hash, page: 0, folder_id: 0, query: "", filter: "music" },
+      { operation: "review", task_id: taskId, inventory_revision: 1, selection_revision: 1, selected_indexes: [0] },
+      { operation: "review", task_id: taskId, inventory_revision: 1, selection_revision: 1, selected_indexes: [0] },
+      { operation: "confirm", review_seq: 1203, review_id: "review-1203" },
+      { operation: "detail", hash, page: 0, folder_id: 0, query: "", filter: "music" },
+    ];
+    expect(fixture.actions.map((action) => action.payload)).toEqual(expectedPayloads);
+    const completedOperations = fixture.currentSnapshot.operations.filter((operation: Record<string, any>) => operation.kind === "torrent_action");
+    expect(completedOperations.map((operation: Record<string, any>) => ({ seq: operation.seq, request_id: operation.request_id })))
+      .toEqual(fixture.actions.map((action, index) => ({ seq: 1200 + index, request_id: action.request_id })));
+    expect(fixture.actions.every((action) => /^[0-9a-f-]{36}$/u.test(action.request_id))).toBe(true);
+    await fixtureTaskBoundary();
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(6);
+    expect(JSON.parse((window.localStorage.getItem("file-manager.actions.v1") ?? "[]"))).toEqual([]);
+  });
+
   it("reviews a compact 5,000-item preview as a bounded sample and confirms only its saved identity", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

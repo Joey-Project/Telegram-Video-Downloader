@@ -14,7 +14,7 @@ use crate::music_runtime::MusicService;
 use crate::music_types::{LocalMusicBatch, LocalMusicFile, MusicCancellation};
 use crate::qbittorrent::QbittorrentClient;
 use crate::telegram::TelegramClient;
-use crate::torrent_manager::TorrentManager;
+use crate::torrent_manager::{TorrentManager, TorrentMiniAppConfirm};
 use crate::torrent_types::{
     CompletedTorrentFile, SubmitResult, TorrentAction, TorrentBackend, TorrentEnqueueResult,
     TorrentExisting, TorrentFuture, TorrentIdentity, TorrentMagnet, TorrentMusicJobRef,
@@ -38,12 +38,31 @@ pub struct TorrentService {
 }
 
 impl TorrentService {
+    #[cfg(test)]
     pub fn new(
         settings: TorrentSettings,
         telegram: TelegramClient,
         music: Option<Arc<MusicService>>,
         music_max_bytes: u64,
         shutdown: watch::Receiver<bool>,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_miniapp_worker_url(
+            settings,
+            telegram,
+            music,
+            music_max_bytes,
+            shutdown,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_miniapp_worker_url(
+        settings: TorrentSettings,
+        telegram: TelegramClient,
+        music: Option<Arc<MusicService>>,
+        music_max_bytes: u64,
+        shutdown: watch::Receiver<bool>,
+        miniapp_worker_url: Option<String>,
     ) -> Result<Arc<Self>> {
         let backend = Arc::new(RuntimeTorrentBackend {
             qbit: QbittorrentClient::new(&settings)?,
@@ -54,6 +73,7 @@ impl TorrentService {
             metainfo_dir: settings.metainfo_dir.clone(),
             metainfo_readers: Arc::new(Semaphore::new(1)),
             shutdown: shutdown.clone(),
+            miniapp_worker_url,
         });
         Ok(Self::with_backend(settings, backend, shutdown))
     }
@@ -232,6 +252,110 @@ impl TorrentService {
         self.backend.set_active(hash, active).await
     }
 
+    /// Dispatch one strictly validated private Mini App action.
+    pub async fn handle_miniapp_action(
+        &self,
+        owner_chat: i64,
+        request_identity: &str,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        crate::torrent_miniapp::handle_action(self, owner_chat, request_identity, payload).await
+    }
+
+    pub(crate) async fn miniapp_detail(
+        &self,
+        owner_chat: i64,
+        task_id: String,
+    ) -> Result<TorrentSnapshot> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(manager.miniapp_refresh_task(owner_chat, owner_chat, &task_id))
+        })
+        .await
+        .context("Mini App torrent detail worker stopped")?
+    }
+
+    pub(crate) async fn miniapp_review_context(
+        &self,
+        owner_chat: i64,
+        task_id: String,
+        inventory_revision: u64,
+        selection_revision: u64,
+        selected_indexes: Vec<u32>,
+    ) -> Result<crate::torrent_manager::TorrentMiniAppReviewContext> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager.miniapp_review_context(
+                owner_chat,
+                owner_chat,
+                &task_id,
+                inventory_revision,
+                selection_revision,
+                &selected_indexes,
+            )
+        })
+        .await
+        .context("Mini App torrent review worker stopped")?
+    }
+
+    pub(crate) async fn miniapp_adopt(
+        &self,
+        owner_chat: i64,
+        hash: String,
+    ) -> Result<TorrentSnapshot> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            runtime.block_on(manager.miniapp_adopt_existing(owner_chat, owner_chat, hash))
+        })
+        .await
+        .context("Mini App torrent adoption worker stopped")?
+    }
+
+    pub(crate) async fn miniapp_confirm(
+        &self,
+        owner_chat: i64,
+        confirmation: TorrentMiniAppConfirm,
+    ) -> Result<crate::torrent_manager::TorrentMiniAppConfirmResult> {
+        let manager = self.manager().await?;
+        let permit = self.reserve_state_operation()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager.miniapp_confirm_selection(owner_chat, owner_chat, confirmation)
+        })
+        .await
+        .context("Mini App torrent confirmation worker stopped")?
+    }
+
+    pub(crate) async fn miniapp_control(&self, hash: String, active: bool) -> Result<()> {
+        ensure_miniapp_hash(&hash)?;
+        let hash = hash.to_ascii_lowercase();
+        let before = self.backend.task_summary(hash.clone()).await?;
+        anyhow::ensure!(
+            before.hash.eq_ignore_ascii_case(&hash),
+            "qBittorrent returned a different torrent hash"
+        );
+        self.backend.set_active(hash.clone(), active).await?;
+        let after = self.backend.task_summary(hash.clone()).await?;
+        anyhow::ensure!(
+            after.hash.eq_ignore_ascii_case(&hash),
+            "qBittorrent returned a different torrent hash after control"
+        );
+        let paused = torrent_state_is_paused(&after.state);
+        anyhow::ensure!(
+            paused == Some(!active),
+            "qBittorrent control outcome is uncertain; refresh the catalog before retrying"
+        );
+        Ok(())
+    }
+
     /// Adopt an already-existing task. Manager filesystem work runs on a blocking thread while
     /// the state permit remains owned through completion.
     pub async fn adopt_existing(
@@ -259,6 +383,33 @@ impl TorrentService {
     }
 }
 
+fn ensure_miniapp_hash(hash: &str) -> Result<()> {
+    anyhow::ensure!(
+        matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "qBittorrent hash is invalid"
+    );
+    Ok(())
+}
+
+fn torrent_state_is_paused(state: &str) -> Option<bool> {
+    let state = state.to_ascii_lowercase();
+    if state.starts_with("paused") || state.starts_with("stopped") {
+        Some(true)
+    } else if state.starts_with("downloading")
+        || state.starts_with("uploading")
+        || state.starts_with("stalledup")
+        || state.starts_with("stalleddl")
+        || state.starts_with("queued")
+        || state.starts_with("checking")
+        || state.starts_with("allocating")
+        || state.starts_with("moving")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 struct RuntimeTorrentBackend {
     qbit: QbittorrentClient,
     telegram: TelegramClient,
@@ -268,6 +419,7 @@ struct RuntimeTorrentBackend {
     metainfo_dir: Option<PathBuf>,
     metainfo_readers: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
+    miniapp_worker_url: Option<String>,
 }
 
 impl TorrentBackend for RuntimeTorrentBackend {
@@ -340,7 +492,10 @@ impl TorrentBackend for RuntimeTorrentBackend {
 
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64> {
         Box::pin(async move {
-            let card = crate::torrent_inline::render_torrent_inline(&snapshot)?;
+            let card = crate::torrent_inline::render_torrent_inline_with_miniapp(
+                &snapshot,
+                self.miniapp_worker_url.as_deref(),
+            )?;
             self.telegram
                 .send_message_with_inline_keyboard(snapshot.chat_id, card.text, card.reply_markup)
                 .await
@@ -352,7 +507,10 @@ impl TorrentBackend for RuntimeTorrentBackend {
             let message_id = snapshot
                 .card_message_id
                 .context("torrent card is not registered")?;
-            let card = crate::torrent_inline::render_torrent_inline(&snapshot)?;
+            let card = crate::torrent_inline::render_torrent_inline_with_miniapp(
+                &snapshot,
+                self.miniapp_worker_url.as_deref(),
+            )?;
             self.telegram
                 .edit_message_text_with_inline_keyboard(
                     snapshot.chat_id,

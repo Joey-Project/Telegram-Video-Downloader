@@ -15,7 +15,8 @@ export type RequestKind =
   | "library_migration_preview"
   | "library_migration_confirm"
   | "library_migration_control"
-  | "staging_cleanup";
+  | "staging_cleanup"
+  | "torrent_action";
 
 export interface InboxEnvelope {
   seq: number;

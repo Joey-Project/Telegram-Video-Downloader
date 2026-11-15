@@ -30,11 +30,13 @@ import { buildDownloadSubmitPayload, isBoundDownloadLibraryOption } from "./down
 import { createFileQueuedAction, fileActionRequestBody } from "./file-action-dispatch.js";
 import { buildFilePreviewPayloadFromRenderedOption, buildLegacyMetadataPreviewPayloadFromRenderedOption, buildSelectedFilePreviewPayloadFromRenderedOption, clearFileIdentityScopedStateOnSnapshot, fileOperationIdentityMatches, fileOperationLibraryIdentity } from "./file-preview-identity.js";
 import { PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, PREVIEW_CANCELLATION_STORAGE_KEY, readPreviewCancellationDismissals, readPreviewCancellations, writePreviewCancellationDismissals, writePreviewCancellations } from "./preview-cancellation-state.js";
+import { createTorrentView } from "./torrent-view.js";
 
 const API = "/api";
 const loadOwnerSnapshot = createOwnerSnapshotLoader();
 const CACHE_KEY = "file-manager.snapshot.v1";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
+const actionReceiptCallbacks = new Map();
 const MAX_LEGACY_BYTES = 256 * 1024;
 const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
 const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import", "staging_cleanup"]);
@@ -43,7 +45,7 @@ const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "r
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), stagingSelected: new Set(), stagingQuery: "", stagingPage: 0, stagingScanKey: "", groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoverySelectionQueue: null, metadataRecoverySelectionRequestId: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), stagingSelected: new Set(), stagingQuery: "", stagingPage: 0, stagingScanKey: "", groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: initialParams.get("view") === "torrents" ? "torrents" : "library", torrentRouteOpened: false, query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoverySelectionQueue: null, metadataRecoverySelectionRequestId: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let snapshotRefreshPending = false;
@@ -67,6 +69,29 @@ let metadataRecoveryPreviewRestoreAttempted = false;
 let previewCancellationRestoreAttempted = false;
 
 const byId = (id) => document.getElementById(id);
+const torrentView = createTorrentView({
+  root: byId("torrent-view"),
+  submit: (payload, requestId) => submitAction("torrent_action", payload, {
+    requestId,
+    onReceipt: (_action, receipt) => torrentView.recordReceipt(requestId, receipt),
+  }),
+  onMessage: (message) => showToast(message),
+  onTaskBack: () => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "torrents");
+    url.searchParams.delete("task_id");
+    url.searchParams.delete("hash");
+    window.history.replaceState(null, "", url.toString());
+  },
+  onTaskOpen: (taskRef, refType) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "torrents");
+    url.searchParams.delete("task_id");
+    url.searchParams.delete("hash");
+    url.searchParams.set(refType, taskRef);
+    window.history.replaceState(null, "", url.toString());
+  },
+});
 let cachedFolderLibrary = null;
 let cachedFolders = [];
 const formatBytes = (value) => {
@@ -855,6 +880,21 @@ function syncLibraryUrl() {
   window.history.replaceState(null, "", url.toString());
 }
 
+function syncTorrentUrl() {
+  const url = new URL(window.location.href);
+  if (state.view === "torrents") url.searchParams.set("view", "torrents");
+  else url.searchParams.delete("view");
+  if (state.view === "torrents" && torrentView.currentTaskId()) {
+    url.searchParams.delete("task_id");
+    url.searchParams.delete("hash");
+    url.searchParams.set(torrentView.currentTaskRefType(), torrentView.currentTaskId());
+  } else if (state.view === "torrents") {
+    url.searchParams.delete("task_id");
+    url.searchParams.delete("hash");
+  }
+  window.history.replaceState(null, "", url.toString());
+}
+
 function renderLibrarySelector() {
   const selector = byId("library-select");
   const entries = mediaLibraryEntries(state.snapshot);
@@ -1110,7 +1150,7 @@ function updateSnapshotInterest() {
   restoreAwaitingOperationResults();
   const pendingQueuedAction = readActionQueue().some((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE)
     && action.delivery_outcome !== "outcome_unknown");
-  const visibleResultView = state.view === "waiting" || state.view === "organizing" || state.view === "temporary";
+  const visibleResultView = state.view === "waiting" || state.view === "organizing" || state.view === "temporary" || state.view === "torrents";
   const downloadHistory = state.downloadSubmission
     ? inspectDownloadSubmissionHistory(state.downloadSubmission, state.snapshot)
     : { kind: "unaccepted" };
@@ -1154,7 +1194,7 @@ function restoreAwaitingOperationResults() {
     }
   }
   for (const action of queue) {
-    if (!["library_scan", "legacy_import", "staging_cleanup"].includes(action.kind)
+    if (!["library_scan", "legacy_import", "staging_cleanup", "torrent_action"].includes(action.kind)
         || state.quarantinedActionIds.has(action.request_id)
         || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
         || actionReplayStatus(action).status !== "valid"
@@ -1196,7 +1236,8 @@ function reconcileAwaitingOperationResults(snapshot) {
   let changed = false;
   for (const [requestId, tracker] of state.awaitingOperationResults) {
     if (!Number.isSafeInteger(tracker.seq)) continue;
-    const operation = operations.find((entry) => entry?.seq === tracker.seq && entry?.kind === tracker.kind);
+    const operation = operations.find((entry) => entry?.kind === tracker.kind
+      && (entry?.seq === tracker.seq || entry?.request_id === requestId || entry?.request_id === `action:${requestId}`));
     const operationStatus = String(operation?.status ?? "").toLowerCase();
     const stagingPreviewReadyForReview = tracker.kind === "staging_cleanup"
       && operation?.operation === "preview"
@@ -1310,6 +1351,11 @@ function acceptFreshSnapshot(snapshot) {
   recoverFileActionReceipts();
   promoteMissingPreviewCancellationIntents(state.snapshot);
   const params = new URLSearchParams(window.location.search);
+  torrentView.setSnapshot(state.snapshot);
+  if (state.view === "torrents" && !state.torrentRouteOpened) {
+    state.torrentRouteOpened = true;
+    torrentView.open(params.get("task_id") ?? "", params.get("hash") ?? "");
+  }
   if (params.get("download") === "1" && !state.downloadFormOpened) {
     state.downloadFormOpened = true;
     openDownloadForm({ updateUrl: false, requestFreshReferences: false });
@@ -1535,7 +1581,7 @@ function refreshScopeForCurrentPage() {
   if (byId("download-dialog")?.open) {
     return { scope: "download", libraryId: byId("download-library-select")?.value || activeLibraryId() };
   }
-  if (["waiting", "organizing", "history"].includes(state.view)) return { scope: "operations" };
+  if (["waiting", "organizing", "history", "torrents"].includes(state.view)) return { scope: "operations" };
   return { scope: "library", ...(activeLibraryId() ? { libraryId: activeLibraryId() } : {}) };
 }
 
@@ -1903,6 +1949,8 @@ async function drainActionQueue({ quiet = false } = {}) {
           });
           if (applicationDisposed || pageGeneration !== applicationGeneration) return recorded;
           updateAwaitingOperationResultReceipt(action, receipt);
+          actionReceiptCallbacks.get(action?.request_id)?.(action, receipt);
+          actionReceiptCallbacks.delete(action?.request_id);
           if (action?.kind === "preview_cancel" && recorded.acknowledgementBlocked) {
             state.quarantinedActionIds.add(action.request_id);
             renderQueueCount();
@@ -2109,7 +2157,7 @@ async function drainActionQueue({ quiet = false } = {}) {
   return sentAny;
 }
 
-async function submitAction(kind, payload, { onQueued, requestId: suppliedRequestId } = {}) {
+async function submitAction(kind, payload, { onQueued, onReceipt, requestId: suppliedRequestId } = {}) {
   if (applicationDisposed || !mayDispatchActions(state)) return false;
   if (kind === "download_submit" && unknownFileActionForKind(readActionQueue(), kind, state.unknownActionOutcomes)) {
     state.downloadMessage = "A previous download has an unknown delivery outcome. Check your computer and dismiss its notice before adding another request.";
@@ -2207,7 +2255,8 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     writeQueue: writeActionQueue,
     onQueued: (queuedAction) => {
       onQueued?.(queuedAction);
-      if (["library_scan", "legacy_import"].includes(kind)) {
+      if (typeof onReceipt === "function") actionReceiptCallbacks.set(queuedAction.request_id, onReceipt);
+      if (["library_scan", "legacy_import", "torrent_action"].includes(kind)) {
         state.awaitingOperationResults.set(queuedAction.request_id, awaitingOperationResultTracker(queuedAction));
       }
       if (kind === "staging_cleanup") {
@@ -2490,7 +2539,7 @@ function renderLibrary() {
   byId("preview-move").disabled = !canOperate || state.selected.size === 0;
   byId("import-legacy").disabled = !canOperate;
   const selectionActions = byId("selection-actions");
-  selectionActions.classList.toggle("hidden", state.selected.size === 0 || ["waiting", "history"].includes(state.view) || byId("status-filter").value === "moved");
+  selectionActions.classList.toggle("hidden", state.selected.size === 0 || ["waiting", "history", "torrents"].includes(state.view) || byId("status-filter").value === "moved");
   byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
   byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
   byId("recover-selected").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
@@ -4158,6 +4207,7 @@ function render() {
   renderOperations();
   renderTabCounts();
   renderQueueCount();
+  torrentView.setSnapshot(state.snapshot);
   for (const tab of document.querySelectorAll(".view-tab")) {
     const active = tab.dataset.view === state.view;
     tab.classList.toggle("active", active);
@@ -5057,7 +5107,16 @@ function bindEvents() {
     const groupCheckbox = event.target.closest("[data-select-group]");
     if (groupCheckbox) { event.stopPropagation(); return; }
     const tab = event.target.closest("[data-view]");
-    if (tab) { state.view = tab.dataset.view; render(); return; }
+    if (tab) {
+      const previousView = state.view;
+      state.view = tab.dataset.view;
+      if (state.view === "torrents") {
+        syncTorrentUrl();
+        if (previousView !== "torrents") torrentView.open();
+      } else syncTorrentUrl();
+      render();
+      return;
+    }
     const details = event.target.closest("[data-details]");
     if (details) { state.detailId = details.dataset.details; renderDetail(); return; }
     const confirm = event.target.closest("[data-confirm]");
@@ -5196,6 +5255,10 @@ function start() {
   const requestOpenSnapshot = () => {
     if (privateAccessExpired || applicationDisposed) return;
     const route = new URLSearchParams(window.location.search);
+    if (route.get("view") === "torrents") {
+      void refreshState({ reason: "open", scope: "operations", quiet: true });
+      return;
+    }
     if (route.get("download") === "1") {
       void refreshState({ reason: "open", scope: "download", libraryId: route.get("library_id") || activeLibraryId(), quiet: true });
       return;

@@ -5,6 +5,7 @@ use crate::torrent_types::{
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
+use tokio::sync::Semaphore;
 
 use tempfile::TempDir;
 
@@ -31,6 +32,8 @@ struct TestBackendState {
     exported_metainfo: Option<Vec<u8>>,
     export_failures: usize,
     export_count: usize,
+    export_threads: Vec<std::thread::ThreadId>,
+    export_barrier: Option<Arc<ExportBarrier>>,
     sent_cards: usize,
     updated_cards: Vec<TorrentSnapshot>,
     music_batches: Vec<(String, Vec<CompletedTorrentFile>)>,
@@ -43,6 +46,25 @@ struct TestBackend {
     raw_torrent: Vec<u8>,
     state: Mutex<TestBackendState>,
     next_card_id: AtomicI64,
+}
+
+struct ExportBarrier {
+    entered: Semaphore,
+    release: Semaphore,
+}
+
+impl ExportBarrier {
+    async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("export barrier remains open")
+            .forget();
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 impl TestBackend {
@@ -63,6 +85,8 @@ impl TestBackend {
                 exported_metainfo: None,
                 export_failures: 0,
                 export_count: 0,
+                export_threads: Vec::new(),
+                export_barrier: None,
                 sent_cards: 0,
                 updated_cards: Vec::new(),
                 music_batches: Vec::new(),
@@ -100,6 +124,19 @@ impl TestBackend {
 
     fn export_count(&self) -> usize {
         self.state.lock().unwrap().export_count
+    }
+
+    fn export_threads(&self) -> Vec<std::thread::ThreadId> {
+        self.state.lock().unwrap().export_threads.clone()
+    }
+
+    fn pause_exports(&self) -> Arc<ExportBarrier> {
+        let barrier = Arc::new(ExportBarrier {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        self.state.lock().unwrap().export_barrier = Some(Arc::clone(&barrier));
+        barrier
     }
 
     fn set_visible_candidate(&self, remote: TorrentRemoteSnapshot) {
@@ -173,12 +210,25 @@ impl TorrentBackend for TestBackend {
     fn export_metainfo(&self, _hash: String) -> crate::torrent_types::TorrentFuture<'_, Vec<u8>> {
         let mut state = self.state.lock().unwrap();
         state.export_count += 1;
+        state.export_threads.push(std::thread::current().id());
         if state.export_failures > 0 {
             state.export_failures -= 1;
             return Box::pin(async { anyhow::bail!("mocked metadata is not ready") });
         }
         let bytes = state.exported_metainfo.clone();
-        Box::pin(async move { bytes.ok_or_else(|| anyhow!("mock metadata is unavailable")) })
+        let barrier = state.export_barrier.clone();
+        Box::pin(async move {
+            if let Some(barrier) = barrier {
+                barrier.entered.add_permits(1);
+                barrier
+                    .release
+                    .acquire()
+                    .await
+                    .map_err(|_| anyhow!("export barrier closed"))?
+                    .forget();
+            }
+            bytes.ok_or_else(|| anyhow!("mock metadata is unavailable"))
+        })
     }
 
     fn refresh(
@@ -958,6 +1008,135 @@ async fn existing_catalog_task_survives_manager_restart() {
     assert!(restored.files.is_empty());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_miniapp_metadata_fetch_keeps_exclusive_slot_and_retry_safe() {
+    let caller_thread = std::thread::current().id();
+    let fixture = Fixture::new();
+    let remote = remote_snapshot(&fixture.metainfo, &fixture.source_root, &[1.0, 1.0], 1.0, 0);
+    let hash = remote.hash.clone();
+    let backend = fixture.backend(vec![remote], None);
+    backend.configure_magnet(
+        fixture.source_root.clone(),
+        Some(fixture.raw_torrent.clone()),
+        0,
+    );
+    let export_barrier = backend.pause_exports();
+    let manager = TorrentManager::open(fixture.settings(), backend.clone()).expect("open manager");
+
+    let adopting_manager = Arc::clone(&manager);
+    let adoption_hash = hash.clone();
+    let adoption = tokio::spawn(async move {
+        adopting_manager
+            .miniapp_adopt_existing(17, 17, adoption_hash)
+            .await
+    });
+    export_barrier.wait_until_entered().await;
+
+    let task_id = manager
+        .store
+        .snapshot()
+        .expect("read in-flight Mini App task")
+        .tasks
+        .values()
+        .find(|task| {
+            task.miniapp
+                .as_ref()
+                .is_some_and(|source| source.chat_id == 17 && source.user_id == 17)
+        })
+        .map(|task| task.task_id.clone())
+        .expect("Mini App task was persisted before metadata retrieval");
+    assert!(
+        manager.active_workers.lock().await.contains(&task_id),
+        "inline metadata retrieval must claim the per-task worker slot"
+    );
+    assert_ne!(
+        backend.export_threads()[0],
+        caller_thread,
+        "metadata initialization must run on the blocking worker"
+    );
+
+    adoption.abort();
+    assert!(adoption.await.is_err(), "caller request is cancelled");
+    manager.dispatch_ready().await;
+    assert_eq!(
+        backend.export_count(),
+        1,
+        "dispatcher must not fetch metadata twice"
+    );
+
+    let finished = manager.notify.notified();
+    tokio::pin!(finished);
+    export_barrier.release_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut finished)
+        .await
+        .expect("detached metadata worker completes and releases its slot");
+    let ready = manager
+        .miniapp_adopt_existing(17, 17, hash)
+        .await
+        .expect("retry reads the metadata fetched by the surviving worker");
+    assert_eq!(ready.files.len(), 2);
+    assert!(ready.files.iter().all(|file| file.complete));
+
+    let mut stale_candidate = manager
+        .store
+        .task(&ready.task_id)
+        .expect("read initialized task")
+        .expect("initialized task remains stored");
+    stale_candidate.metainfo = None;
+    stale_candidate.raw_sha256 = None;
+    stale_candidate.remote = None;
+    manager.process_existing_if_unclaimed(stale_candidate).await;
+    let after_stale_candidate = manager
+        .miniapp_task_snapshot(17, 17, &ready.task_id)
+        .expect("read task after a stale worker candidate");
+    assert_eq!(
+        after_stale_candidate.inventory_revision,
+        ready.inventory_revision
+    );
+    assert!(after_stale_candidate.files.iter().all(|file| file.complete));
+    assert_eq!(
+        backend.export_count(),
+        1,
+        "stale candidates do not refetch metadata"
+    );
+
+    manager
+        .miniapp_review_context(
+            17,
+            17,
+            &after_stale_candidate.task_id,
+            after_stale_candidate.inventory_revision,
+            after_stale_candidate.selection_revision,
+            &[0],
+        )
+        .expect("review selection after metadata fetch");
+    manager
+        .miniapp_confirm_selection(
+            17,
+            17,
+            TorrentMiniAppConfirm {
+                task_id: after_stale_candidate.task_id.clone(),
+                inventory_revision: after_stale_candidate.inventory_revision,
+                selection_revision: after_stale_candidate.selection_revision,
+                command_key: "inline-race-confirm:1".into(),
+                review_id: "inline-race-review".into(),
+                selected_indexes: vec![0],
+            },
+        )
+        .expect("confirm selection against the initialized inventory");
+
+    let confirmed = manager
+        .miniapp_task_snapshot(17, 17, &after_stale_candidate.task_id)
+        .expect("read confirmed Mini App selection");
+    assert_eq!(
+        confirmed.inventory_revision,
+        after_stale_candidate.inventory_revision
+    );
+    assert!(confirmed.files[0].selected);
+    assert!(!confirmed.files[0].needs_reconfirm);
+    assert_eq!(backend.export_count(), 1);
+}
+
 #[tokio::test]
 async fn restart_reconciles_unknown_add_outcome_without_a_second_post() {
     let fixture = Fixture::new();
@@ -1633,6 +1812,60 @@ async fn clearing_unadmitted_import_restores_completed_torrent_phase() {
     assert_eq!(cleared.phase, TorrentPhase::Completed);
     assert_eq!(cleared.selected_count, 0);
     assert_eq!(cleared.import_count, 0);
+}
+
+#[tokio::test]
+async fn snapshot_import_count_includes_only_completed_music_jobs() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend).expect("open manager");
+    let task_id = parse_task(&manager, fixture.upload.clone()).await;
+
+    manager
+        .store
+        .transact(|state| {
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| anyhow!("torrent test task disappeared"))?;
+            for (index, stage) in [
+                TorrentMusicStage::Pending,
+                TorrentMusicStage::Complete,
+                TorrentMusicStage::Failed,
+                TorrentMusicStage::Cancelled,
+                TorrentMusicStage::OutcomeUnknown,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source_key = format!("music-source-{index}");
+                task.imports.insert(
+                    index as u32,
+                    StoredImport {
+                        source_key: source_key.clone(),
+                        confirmed_inventory_revision: task.inventory_revision,
+                        confirmed_selection_revision: task.selection_revision,
+                        enqueue_intent: false,
+                        batch_id: Some("music-batch".into()),
+                        music_job: Some(TorrentMusicJobRef {
+                            source_key,
+                            job_id: format!("music-job-{index}"),
+                        }),
+                        music_stage: Some(stage),
+                        error: None,
+                        attempts: 0,
+                        next_retry_at: 0,
+                    },
+                );
+            }
+            Ok(((), true))
+        })
+        .expect("store Music stages");
+
+    let snapshot = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, &task_id)
+        .expect("read Music import snapshot");
+    assert_eq!(snapshot.import_count, 1);
 }
 
 #[tokio::test]

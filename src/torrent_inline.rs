@@ -2,9 +2,9 @@
 
 use std::path::{Component, Path};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
-use crate::telegram::{InlineKeyboardButton, InlineKeyboardMarkup};
+use crate::telegram::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo};
 use crate::torrent_types::{
     TorrentFileSnapshot, TorrentFolder, TorrentMusicStage, TorrentPhase, TorrentSnapshot,
 };
@@ -57,11 +57,54 @@ impl ImportCounts {
     }
 }
 
+#[cfg(test)]
 pub fn render_torrent_inline(snapshot: &TorrentSnapshot) -> Result<TorrentInlinePresentation> {
+    render_torrent_inline_with_miniapp(snapshot, None)
+}
+
+pub(crate) fn render_torrent_inline_with_miniapp(
+    snapshot: &TorrentSnapshot,
+    miniapp_worker_url: Option<&str>,
+) -> Result<TorrentInlinePresentation> {
     ensure!(
         valid_task_id(&snapshot.task_id),
         "torrent task identifier is invalid"
     );
+
+    if let Some(worker_url) = miniapp_worker_url {
+        let app_url = miniapp_url(worker_url, Some(&snapshot.task_id))?;
+        let downloaded = snapshot.files.iter().fold(0_u64, |total, file| {
+            total.saturating_add((file.size as f64 * file.progress.clamp(0.0, 1.0)) as u64)
+        });
+        let total = snapshot
+            .files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.size));
+        let text = format!(
+            "Torrent: {}\nStatus: {} · {} · {} / {}\nMusic: {} selected · {} imported",
+            bounded_text(&snapshot.name, BODY_TITLE_LIMIT_UTF16),
+            phase_label(&snapshot.phase),
+            progress_text(snapshot.progress),
+            crate::human_bytes(downloaded),
+            crate::human_bytes(total),
+            supported_selected_count(snapshot),
+            ImportCounts::from_snapshot(snapshot).complete,
+        );
+        ensure!(
+            text.encode_utf16().count() <= TELEGRAM_MESSAGE_LIMIT_UTF16,
+            "torrent summary exceeds Telegram's message limit"
+        );
+        return Ok(TorrentInlinePresentation {
+            text,
+            reply_markup: InlineKeyboardMarkup {
+                inline_keyboard: vec![vec![InlineKeyboardButton {
+                    text: "Manage torrent".to_string(),
+                    callback_data: String::new(),
+                    web_app: Some(WebAppInfo { url: app_url }),
+                }]],
+            },
+        });
+    }
 
     let mut keyboard = Vec::new();
     let text = if snapshot.review_selection {
@@ -80,6 +123,24 @@ pub fn render_torrent_inline(snapshot: &TorrentSnapshot) -> Result<TorrentInline
             inline_keyboard: keyboard,
         },
     })
+}
+
+pub(crate) fn miniapp_url(worker_url: &str, task_id: Option<&str>) -> Result<String> {
+    let mut worker = url::Url::parse(worker_url).context("cloud worker URL is invalid")?;
+    if !worker.path().ends_with('/') {
+        worker.set_path(&format!("{}/", worker.path()));
+    }
+    let mut app = worker
+        .join("file/")
+        .context("could not build the torrent Mini App URL")?;
+    {
+        let mut query = app.query_pairs_mut();
+        query.append_pair("view", "torrents");
+        if let Some(task_id) = task_id {
+            query.append_pair("task_id", task_id);
+        }
+    }
+    Ok(app.to_string())
 }
 
 fn render_browser(
@@ -685,6 +746,26 @@ mod tests {
             callbacks
                 .iter()
                 .all(|value| value.len() <= CALLBACK_DATA_LIMIT_BYTES)
+        );
+    }
+
+    #[test]
+    fn cloud_cards_show_a_bounded_summary_and_task_specific_miniapp_button() {
+        let source = snapshot();
+        let rendered =
+            render_torrent_inline_with_miniapp(&source, Some("https://worker.example.test/bot"))
+                .unwrap();
+        assert!(rendered.text.contains("Torrent:"));
+        assert!(!rendered.text.contains("sample.txt"));
+        assert_eq!(rendered.reply_markup.inline_keyboard.len(), 1);
+        let button = &rendered.reply_markup.inline_keyboard[0][0];
+        assert_eq!(button.text, "Manage torrent");
+        assert!(button.callback_data.is_empty());
+        assert_eq!(
+            button.web_app.as_ref().map(|web_app| web_app.url.as_str()),
+            Some(
+                "https://worker.example.test/bot/file/?view=torrents&task_id=0123456789abcdef0123456789abcdef"
+            )
         );
     }
 

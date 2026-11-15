@@ -2367,6 +2367,7 @@ async fn existing_qbittorrent_catalog_adopts_and_imports_without_add_or_source_m
         "imported existing task",
     )
     .await;
+
     drop(manager);
     let _ = torrent_shutdown_tx.send(true);
     drop(context);
