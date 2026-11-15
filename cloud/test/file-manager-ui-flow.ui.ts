@@ -1212,7 +1212,7 @@ describe("file manager UI flow", () => {
         };
       } else if (payload.operation === "confirm") {
         confirmed = true;
-        result = { operation: "confirm", confirmed: true };
+        result = { operation: "confirm", confirmed: true, task_id: taskId };
       } else {
         throw new Error(`Unexpected torrent operation: ${String(payload.operation)}`);
       }

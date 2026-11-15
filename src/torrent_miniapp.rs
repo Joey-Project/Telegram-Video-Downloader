@@ -385,7 +385,9 @@ fn direct_entries(
 ) -> Result<Vec<Value>> {
     let mut entries = Vec::new();
     for folder in folders {
-        if folder.relative_path.parent().unwrap_or(Path::new("")) == current_path {
+        if !folder.relative_path.as_os_str().is_empty()
+            && folder.relative_path.parent() == Some(current_path)
+        {
             let descendants = files
                 .iter()
                 .filter(|file| path_is_within(&file.relative_path, &folder.relative_path))

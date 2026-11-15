@@ -39,6 +39,8 @@ function detailResult({
   inventoryRevision = 1,
   selectionRevision = 1,
   selectedIndexes = [],
+  taskId = TASK_ID,
+  taskName = "Example torrent",
   entries,
   scopeIndexes = [0, 1, 2],
   hasMore = false,
@@ -48,6 +50,8 @@ function detailResult({
   inventoryRevision?: number;
   selectionRevision?: number;
   selectedIndexes?: number[];
+  taskId?: string;
+  taskName?: string;
   entries?: Array<Record<string, unknown>>;
   scopeIndexes?: number[];
   hasMore?: boolean;
@@ -55,8 +59,8 @@ function detailResult({
   return {
     operation: "detail",
     task: {
-      task_id: TASK_ID,
-      name: "Example torrent",
+      task_id: taskId,
+      name: taskName,
       phase: "downloading",
       state: "downloading",
       progress: 0.42,
@@ -85,11 +89,11 @@ function detailResult({
   };
 }
 
-function reviewResult(indexes: number[]) {
+function reviewResult(indexes: number[], taskId = TASK_ID) {
   return {
     operation: "review",
     review_id: "review-owner-1",
-    task_id: TASK_ID,
+    task_id: taskId,
     inventory_revision: 1,
     selection_revision: 1,
     selected_indexes: indexes,
@@ -133,6 +137,19 @@ function mount() {
 }
 
 describe("torrent selection Mini App", () => {
+  it("opens a hash deep link supplied by the app shell", async () => {
+    const ui = mount();
+    ui.view.open("", HASH);
+    await ui.settle();
+
+    expect(ui.taskRoutes).toEqual([["hash", HASH]]);
+    expect(sentAt(ui.sent()).payload).toEqual({
+      operation: "detail", hash: HASH, page: 0, folder_id: 0, query: "", filter: "music",
+    });
+    expect(() => validateTorrentActionPayload(sentAt(ui.sent()).payload)).not.toThrow();
+    ui.view.dispose();
+  });
+
   it("opens catalog after the owner gate, navigates by hash, and keeps drafts across pages and search", async () => {
     const ui = mount();
     expect(ui.submit).not.toHaveBeenCalled();
@@ -303,6 +320,86 @@ describe("torrent selection Mini App", () => {
     expect(confirm.payload).toEqual({ operation: "confirm", review_seq: 22, review_id: "review-owner-1" });
     expect(() => validateTorrentActionPayload(confirm.payload)).not.toThrow();
     expect(ui.sent().some(({ payload }) => payload.operation === "review" && "selected_indexes" in payload)).toBe(true);
+    ui.view.dispose();
+  });
+
+  it("settles a late Task A confirmation without clearing Task B state", async () => {
+    const ui = mount();
+    const hashB = "b".repeat(40);
+    ui.view.open("task-A");
+    await ui.settle();
+    const detailA = sentAt(ui.sent());
+    ui.publish(detailA.requestId, 50, detailResult({
+      taskId: "task-A", taskName: "Task A", scopeIndexes: [2],
+    }));
+    ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')!.click();
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-review]")!.click();
+    await ui.settle();
+    const reviewA = sentAt(ui.sent(), 1);
+    ui.publish(reviewA.requestId, 51, reviewResult([2], "task-A"));
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-confirm]")!.click();
+    await ui.settle();
+    const confirmA = sentAt(ui.sent(), 2);
+    expect(confirmA.payload).toEqual({ operation: "confirm", review_seq: 51, review_id: "review-owner-1" });
+
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-back]")!.click();
+    const catalog = sentAt(ui.sent(), 3);
+    ui.publish(catalog.requestId, 52, {
+      operation: "catalog", page: 0, page_size: 50, total: 1, has_more: false, query: "",
+      rows: [{ hash: hashB, name: "Task B", state: "downloading", progress: 0.75, size: 8192 }],
+    });
+    await ui.settle();
+    ui.root.querySelector<HTMLButtonElement>(`[data-torrent-open="${hashB}"]`)!.click();
+    const detailB = sentAt(ui.sent(), 4);
+    await ui.settle();
+    ui.publish(detailB.requestId, 53, detailResult({
+      taskId: "task-B", taskName: "Task B", entries: [{ kind: "file", index: 4,
+        path: "Task B/current-track.flac", size: 8192, progress: 1, complete: true,
+        selected: false, supported_music: true, needs_reconfirm: false, music_stage: "ready" }],
+      scopeIndexes: [4],
+    }));
+    ui.root.querySelector<HTMLInputElement>('[data-torrent-file="4"]')!.click();
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-review]")!.click();
+    await ui.settle();
+    const reviewB = sentAt(ui.sent(), 5);
+    ui.publish(reviewB.requestId, 54, reviewResult([4], "task-B"));
+    expect(ui.root.textContent).toContain("READ-ONLY REVIEW");
+    expect(ui.root.textContent).toContain("Task B/current-track.flac");
+    expect(ui.root.querySelector<HTMLButtonElement>("[data-torrent-confirm]")?.disabled).toBe(true);
+
+    ui.publish(confirmA.requestId, 55, { operation: "confirm", confirmed: true, task_id: "task-A" });
+    expect(ui.sent()).toHaveLength(6);
+    expect(ui.root.textContent).toContain("Task B/current-track.flac");
+    expect(ui.root.textContent).toContain("READ-ONLY REVIEW");
+    expect(ui.root.querySelector<HTMLInputElement>('[data-torrent-file="4"]')?.checked).toBe(true);
+    expect(ui.root.querySelector<HTMLButtonElement>("[data-torrent-confirm]")?.disabled).toBe(false);
+    const savedDrafts = JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}");
+    expect(savedDrafts["task-A"]).toBeUndefined();
+    expect(savedDrafts["task-B"].indexes).toEqual([4]);
+    ui.view.dispose();
+  });
+
+  it("rejects a confirmation result for a different task without deleting the reviewed draft", async () => {
+    const ui = mount();
+    ui.view.open("task-A");
+    await ui.settle();
+    const detail = sentAt(ui.sent());
+    ui.publish(detail.requestId, 60, detailResult({ taskId: "task-A", taskName: "Task A", scopeIndexes: [2] }));
+    ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')!.click();
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-review]")!.click();
+    await ui.settle();
+    const review = sentAt(ui.sent(), 1);
+    ui.publish(review.requestId, 61, reviewResult([2], "task-A"));
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-confirm]")!.click();
+    await ui.settle();
+    const confirm = sentAt(ui.sent(), 2);
+
+    ui.publish(confirm.requestId, 62, { operation: "confirm", confirmed: true, task_id: "task-B" });
+    expect(ui.root.textContent).toContain("did not match the reviewed task");
+    expect(ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')?.checked).toBe(true);
+    expect(ui.root.querySelector<HTMLInputElement>('[data-torrent-file="2"]')?.disabled).toBe(true);
+    expect(ui.root.querySelector("[data-torrent-confirm]")).toBeNull();
+    expect(JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}")["task-A"].indexes).toEqual([2]);
     ui.view.dispose();
   });
 

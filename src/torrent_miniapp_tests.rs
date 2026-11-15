@@ -483,6 +483,109 @@ fn deep_search_metadata_stays_bounded_and_all_5000_file_indexes_remain_pageable(
     assert_eq!(visible_indexes.last(), Some(&4_999));
 }
 
+#[test]
+fn direct_browsing_hides_synthetic_root_and_keeps_real_root_contents() {
+    let album = PathBuf::from("Album");
+    let bonus = album.join("Bonus");
+    let snapshot = TorrentSnapshot {
+        task_id: "root-browser-fixture".to_string(),
+        chat_id: 17,
+        user_id: 17,
+        upload_message_id: 0,
+        card_message_id: None,
+        inventory_revision: 1,
+        selection_revision: 1,
+        render_revision: 1,
+        name: "Root browsing fixture".to_string(),
+        identity: None,
+        phase: TorrentPhase::Completed,
+        state: Some("uploading".to_string()),
+        progress: 1.0,
+        cursor_folder_id: 0,
+        cursor_page: 0,
+        review_selection: false,
+        folders: vec![
+            TorrentFolder {
+                id: 0,
+                relative_path: PathBuf::new(),
+                file_count: 1,
+            },
+            TorrentFolder {
+                id: 1,
+                relative_path: album.clone(),
+                file_count: 2,
+            },
+            TorrentFolder {
+                id: 2,
+                relative_path: bonus,
+                file_count: 1,
+            },
+        ],
+        files: vec![
+            root_music_file(0, "loose.flac"),
+            root_music_file(1, "Album/track.flac"),
+            root_music_file(2, "Album/Bonus/extra.flac"),
+        ],
+        selected_count: 0,
+        import_count: 0,
+        error: None,
+    };
+
+    let root = crate::torrent_miniapp::detail(
+        snapshot.clone(),
+        0,
+        0,
+        "",
+        crate::torrent_miniapp::FileFilter::Music,
+    )
+    .expect("root detail");
+    let root_entries = root["entries"].as_array().unwrap();
+    assert!(root_entries.iter().any(|entry| {
+        entry["kind"] == "folder" && entry["id"] == 1 && entry["path"] == "Album"
+    }));
+    assert!(root_entries.iter().any(|entry| {
+        entry["kind"] == "file" && entry["index"] == 0 && entry["path"] == "loose.flac"
+    }));
+    assert!(
+        !root_entries.iter().any(|entry| {
+            entry["kind"] == "folder" && (entry["id"] == 0 || entry["path"] == "")
+        })
+    );
+
+    let album_view = crate::torrent_miniapp::detail(
+        snapshot,
+        0,
+        1,
+        "",
+        crate::torrent_miniapp::FileFilter::Music,
+    )
+    .expect("album detail");
+    let album_entries = album_view["entries"].as_array().unwrap();
+    assert!(album_entries.iter().any(|entry| {
+        entry["kind"] == "folder" && entry["id"] == 2 && entry["path"] == "Album/Bonus"
+    }));
+    assert!(album_entries.iter().any(|entry| {
+        entry["kind"] == "file" && entry["index"] == 1 && entry["path"] == "Album/track.flac"
+    }));
+    assert!(!album_entries.iter().any(|entry| {
+        entry["kind"] == "folder" && (entry["id"] == 1 || entry["path"] == "Album")
+    }));
+}
+
+fn root_music_file(index: u32, path: &str) -> TorrentFileSnapshot {
+    TorrentFileSnapshot {
+        index,
+        relative_path: PathBuf::from(path),
+        size: 1024,
+        progress: 1.0,
+        complete: true,
+        selected: false,
+        supported_music: true,
+        needs_reconfirm: false,
+        music_stage: None,
+    }
+}
+
 fn deep_search_snapshot(file_count: usize) -> TorrentSnapshot {
     let segments = [
         "Artist", "Album", "Edition", "Disc", "Part", "Side", "Batch", "Set", "Volume", "Disk",

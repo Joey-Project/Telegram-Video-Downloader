@@ -196,6 +196,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     reviewError: "",
     reviewCancelled: false,
     confirmRequestId: null,
+    confirmTaskId: null,
     confirmError: "",
     controlRequestId: null,
     controlError: "",
@@ -244,6 +245,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       if (!queued && state[field] === requestId) {
         state[field] = null;
         state[`${field.replace("RequestId", "Error")}`] = "The request could not be saved or sent. Reconnect and try again.";
+        if (field === "confirmRequestId") state.confirmTaskId = null;
       }
       if (!dispatchDeferredDetail()) render();
     }).catch((error) => {
@@ -253,6 +255,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       if (state[field] === requestId) {
         state[field] = null;
         if (errorField in state) state[errorField] = String(error?.message ?? "The request could not be sent.");
+        if (field === "confirmRequestId") state.confirmTaskId = null;
       }
       if (!dispatchDeferredDetail()) render();
     });
@@ -350,10 +353,11 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     } else render();
   }
 
-  function open(taskId) {
+  function open(taskId, hash) {
     if (state.disposed) return;
     state.opened = true;
     if (taskId) return enterTask(taskId);
+    if (hash) return enterTask(hash, "hash");
     if (state.mode === "detail" && state.taskRef) return render();
     state.mode = "catalog";
     if (!state.catalogRequestId && !catalogCurrent()) requestCatalog({ page: state.catalogPage, query: state.catalogQuery });
@@ -400,7 +404,10 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
         if (field === "catalogError") state.catalogRequestId = null;
         else if (field === "detailError") state.detailRequestId = null;
         else if (field === "reviewError") state.reviewRequestId = null;
-        else if (field === "confirmError") state.confirmRequestId = null;
+        else if (field === "confirmError") {
+          state.confirmRequestId = null;
+          state.confirmTaskId = null;
+        }
         else state.controlRequestId = null;
         continue;
       }
@@ -409,7 +416,10 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
         if (field === "catalogError") state.catalogRequestId = null;
         else if (field === "detailError") state.detailRequestId = null;
         else if (field === "reviewError") state.reviewRequestId = null;
-        else if (field === "confirmError") state.confirmRequestId = null;
+        else if (field === "confirmError") {
+          state.confirmRequestId = null;
+          state.confirmTaskId = null;
+        }
         else state.controlRequestId = null;
       }
     }
@@ -480,29 +490,51 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       const status = String(confirmOp.status ?? "").toLowerCase();
       if (["completed", "complete", "succeeded"].includes(status)) {
         const result = confirmOp.result;
+        const confirmedTaskId = state.confirmTaskId;
+        const isCurrentConfirmedTask = typeof confirmedTaskId === "string"
+          && state.detailResult?.task?.task_id === confirmedTaskId;
+        state.confirmRequestId = null;
+        state.confirmTaskId = null;
         if (result?.operation === "confirm" && result.confirmed === true
+            && typeof confirmedTaskId === "string" && result.task_id === confirmedTaskId
             && confirmOp.details_incomplete !== true && confirmOp.result_truncated !== true) {
-          state.confirmError = "Selection saved. Music imports will follow the task as its files complete; downloads and seeding continue.";
-          state.confirmRequestId = null;
+          state.confirmError = isCurrentConfirmedTask
+            ? "Selection saved. Music imports will follow the task as its files complete; downloads and seeding continue."
+            : "";
           const folder = state.folderId;
-          const taskId = state.detailResult?.task?.task_id;
-          if (taskId) {
-            drafts.delete(taskId);
-            if (!writeDrafts(draftStorage, drafts)) onMessage("The saved selection was confirmed, but this browser could not clear its local draft.", "error");
+          drafts.delete(confirmedTaskId);
+          if (!writeDrafts(draftStorage, drafts)) {
+            onMessage("The saved selection was confirmed, but this browser could not clear its local draft.", "error");
           }
-          state.reviewRequestId = null;
-          state.reviewSeq = null;
-          state.reviewResult = null;
-          state.detailResult = null;
-          state.draftStale = false;
-          requestDetail({ page: state.detailPage, folderId: folder, query: state.detailQuery, filter: state.filter });
+          if (isCurrentConfirmedTask) {
+            state.detailRequestId = null;
+            state.deferredDetailRequest = null;
+            state.reviewRequestId = null;
+            state.reviewSeq = null;
+            state.reviewResult = null;
+            state.detailResult = null;
+            state.draftStale = false;
+            requestDetail({ page: state.detailPage, folderId: folder, query: state.detailQuery, filter: state.filter });
+          }
         } else {
-          state.confirmError = "The confirmation result was incomplete or expired. Refresh the task to verify its saved selection before trying again.";
-          state.confirmRequestId = null;
+          const mismatch = "The confirmation response did not match the reviewed task. Refresh files and review the selection again.";
+          if (isCurrentConfirmedTask && result?.task_id !== confirmedTaskId) {
+            state.detailError = mismatch;
+            state.reviewRequestId = null;
+            state.reviewSeq = null;
+            state.reviewResult = null;
+            state.reviewError = "";
+            state.confirmError = "";
+          } else {
+            state.confirmError = isCurrentConfirmedTask
+              ? "The confirmation result was incomplete or expired. Refresh the task to verify its saved selection before trying again."
+              : "";
+          }
         }
       } else if (["failed", "stale", "rejected", "uncertain"].includes(status)) {
         state.confirmError = String(confirmOp.error ?? confirmOp.result?.error ?? "The selection was not confirmed.");
         state.confirmRequestId = null;
+        state.confirmTaskId = null;
       }
     }
     const controlOp = actionOperation(state.controlRequestId);
@@ -693,6 +725,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       return;
     }
     state.confirmError = "Saving the reviewed selection…";
+    state.confirmTaskId = state.reviewResult.task_id;
     send({ operation: "confirm", review_seq: state.reviewSeq, review_id: state.reviewResult.review_id }, actionId(), "confirmRequestId");
   }
 
@@ -808,11 +841,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
   });
 
   return {
-    open(taskId, hash) {
-      if (taskId) enterTask(taskId, "task_id");
-      else if (hash) enterTask(hash, "hash");
-      else open();
-    },
+    open,
     currentTaskId() { return state.taskRef; },
     currentTaskRefType() { return state.taskRefType; },
     recordReceipt,

@@ -737,7 +737,7 @@ impl TorrentManager {
             if stored.metainfo.is_some() {
                 self.attach_remote(task_id, remote)?;
             } else if task_has_existing_qb_source(&stored) {
-                self.process_existing(stored).await;
+                self.process_existing_if_unclaimed(stored).await;
             }
         }
         self.miniapp_task_snapshot(chat_id, user_id, task_id)
@@ -849,9 +849,9 @@ impl TorrentManager {
                 .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
             validate_owner(&stored, chat_id, user_id)?;
             if stored.metainfo.is_some() {
-                self.attach_remote(&task_id, remote)?;
+                self.attach_remote(&task_id, remote.clone())?;
             } else if task_has_existing_qb_source(&stored) {
-                let mut pending_remote = remote;
+                let mut pending_remote = remote.clone();
                 pending_remote.files.clear();
                 self.store.transact(|state| {
                     let task = state
@@ -866,6 +866,9 @@ impl TorrentManager {
                             ),
                         "qBittorrent task source changed"
                     );
+                    if task.metainfo.is_some() {
+                        return Ok(((), false));
+                    }
                     task.remote = Some(pending_remote.clone());
                     task.phase = TorrentPhase::DownloadingMetainfo;
                     task.manual_refresh = false;
@@ -881,8 +884,12 @@ impl TorrentManager {
                 .store
                 .task(&task_id)?
                 .ok_or_else(|| anyhow!("matched torrent task disappeared"))?;
-            if task_has_existing_qb_source(&refreshed) && refreshed.metainfo.is_none() {
-                self.process_existing(refreshed).await;
+            if task_has_existing_qb_source(&refreshed) {
+                if refreshed.metainfo.is_none() {
+                    self.process_existing_if_unclaimed(refreshed).await;
+                } else if refreshed.remote.is_none() {
+                    self.attach_remote(&task_id, remote)?;
+                }
             }
             self.notify.notify_one();
             return self.miniapp_task_snapshot(chat_id, user_id, &task_id);
@@ -960,7 +967,7 @@ impl TorrentManager {
             .task(&snapshot.task_id)?
             .ok_or_else(|| anyhow!("Mini App torrent task disappeared"))?;
         if task_has_existing_qb_source(&stored) && stored.metainfo.is_none() {
-            self.process_existing(stored).await;
+            self.process_existing_if_unclaimed(stored).await;
         }
         if created {
             self.notify.notify_one();
@@ -1164,6 +1171,36 @@ impl TorrentManager {
                 manager.notify.notify_one();
             });
         }
+    }
+
+    async fn process_existing_if_unclaimed(&self, task: StoredTorrent) {
+        let task_id = task.task_id.clone();
+        {
+            let mut active = self.active_workers.lock().await;
+            if active.len() >= MAX_ACTIVE_WORKERS || !active.insert(task_id.clone()) {
+                return;
+            }
+        }
+
+        let manager = self.clone();
+        let worker_task_id = task_id.clone();
+        let worker = tokio::spawn(async move {
+            if let Ok(Some(task)) = manager.store.task(&worker_task_id)
+                && task.metainfo.is_none()
+                && task_has_existing_qb_source(&task)
+            {
+                manager.process_existing(task).await;
+            }
+            manager.release_active_worker(&worker_task_id).await;
+        });
+        // The detached worker owns the active slot and continues if its Mini App request is
+        // cancelled while qBittorrent metadata retrieval is in progress.
+        let _ = worker.await;
+    }
+
+    async fn release_active_worker(&self, task_id: &str) {
+        self.active_workers.lock().await.remove(task_id);
+        self.notify.notify_one();
     }
 
     async fn process_task_once(&self, task_id: &str) {
