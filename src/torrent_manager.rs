@@ -3136,7 +3136,7 @@ fn task_snapshot(task: &StoredTorrent) -> TorrentSnapshot {
     let import_count = task
         .imports
         .values()
-        .filter(|request| request.music_job.is_some())
+        .filter(|request| request.music_stage == Some(TorrentMusicStage::Complete))
         .count();
     TorrentSnapshot {
         task_id: task.task_id.clone(),

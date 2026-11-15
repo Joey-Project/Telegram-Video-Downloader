@@ -1636,6 +1636,60 @@ async fn clearing_unadmitted_import_restores_completed_torrent_phase() {
 }
 
 #[tokio::test]
+async fn snapshot_import_count_includes_only_completed_music_jobs() {
+    let fixture = Fixture::new();
+    let backend = fixture.backend(Vec::new(), None);
+    let manager = TorrentManager::open(fixture.settings(), backend).expect("open manager");
+    let task_id = parse_task(&manager, fixture.upload.clone()).await;
+
+    manager
+        .store
+        .transact(|state| {
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| anyhow!("torrent test task disappeared"))?;
+            for (index, stage) in [
+                TorrentMusicStage::Pending,
+                TorrentMusicStage::Complete,
+                TorrentMusicStage::Failed,
+                TorrentMusicStage::Cancelled,
+                TorrentMusicStage::OutcomeUnknown,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source_key = format!("music-source-{index}");
+                task.imports.insert(
+                    index as u32,
+                    StoredImport {
+                        source_key: source_key.clone(),
+                        confirmed_inventory_revision: task.inventory_revision,
+                        confirmed_selection_revision: task.selection_revision,
+                        enqueue_intent: false,
+                        batch_id: Some("music-batch".into()),
+                        music_job: Some(TorrentMusicJobRef {
+                            source_key,
+                            job_id: format!("music-job-{index}"),
+                        }),
+                        music_stage: Some(stage),
+                        error: None,
+                        attempts: 0,
+                        next_retry_at: 0,
+                    },
+                );
+            }
+            Ok(((), true))
+        })
+        .expect("store Music stages");
+
+    let snapshot = manager
+        .snapshot(fixture.upload.chat_id, fixture.upload.user_id, &task_id)
+        .expect("read Music import snapshot");
+    assert_eq!(snapshot.import_count, 1);
+}
+
+#[tokio::test]
 async fn root_folder_selection_handles_nearly_five_thousand_files_once_per_index() {
     const FILE_COUNT: usize = 5_000;
     const AUDIO_COUNT: usize = 4_990;

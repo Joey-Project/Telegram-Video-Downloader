@@ -62,7 +62,7 @@ enum MiniAppAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FileFilter {
+pub(super) enum FileFilter {
     Music,
     All,
     Ready,
@@ -288,7 +288,7 @@ async fn catalog(service: &TorrentService, page: u32, query: &str) -> Result<Val
     }))
 }
 
-fn detail(
+pub(super) fn detail(
     snapshot: TorrentSnapshot,
     page: u32,
     folder_id: u32,
@@ -419,23 +419,44 @@ fn search_entries(
     files: &[&TorrentFileSnapshot],
     current_path: &Path,
 ) -> Result<Vec<Value>> {
+    let folders_by_path = folders
+        .iter()
+        .map(|folder| (folder.relative_path.clone(), folder))
+        .collect::<HashMap<_, _>>();
+    let mut matching_paths = BTreeSet::<PathBuf>::new();
+    let mut indexes_by_folder = HashMap::<PathBuf, Vec<u32>>::new();
+    for file in files {
+        let mut ancestor = file.relative_path.parent();
+        while let Some(path) = ancestor {
+            if path.as_os_str().is_empty()
+                || path == current_path
+                || !path_is_within(path, current_path)
+            {
+                break;
+            }
+            if folders_by_path.contains_key(path) {
+                matching_paths.insert(path.to_path_buf());
+                if file.supported_music && path.parent().unwrap_or(Path::new("")) == current_path {
+                    indexes_by_folder
+                        .entry(path.to_path_buf())
+                        .or_default()
+                        .push(file.index);
+                }
+            }
+            ancestor = path.parent();
+        }
+    }
     let mut entries = Vec::new();
     for folder in folders {
-        if !path_is_within(&folder.relative_path, current_path) {
+        if folder.relative_path.parent().unwrap_or(Path::new("")) != current_path
+            || !matching_paths.contains(&folder.relative_path)
+        {
             continue;
         }
-        let descendants = files
-            .iter()
-            .filter(|file| path_is_within(&file.relative_path, &folder.relative_path))
-            .collect::<Vec<_>>();
-        if descendants.is_empty() {
-            continue;
-        }
-        let indexes = descendants
-            .iter()
-            .filter(|file| file.supported_music)
-            .map(|file| file.index)
-            .collect::<Vec<_>>();
+        let indexes = indexes_by_folder
+            .get(&folder.relative_path)
+            .cloned()
+            .unwrap_or_default();
         entries.push(json!({
             "kind": "folder",
             "id": folder.id,

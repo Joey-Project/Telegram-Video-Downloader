@@ -9,8 +9,9 @@ use tokio::sync::watch;
 use crate::torrent_runtime::TorrentService;
 use crate::torrent_types::{
     CompletedTorrentFile, RemoteTorrentFile, SubmitResult, TorrentAction, TorrentBackend,
-    TorrentExisting, TorrentFuture, TorrentIdentity, TorrentMetainfo, TorrentMusicJobRef,
-    TorrentMusicJobStatus, TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot, TorrentUpload,
+    TorrentExisting, TorrentFileSnapshot, TorrentFolder, TorrentFuture, TorrentIdentity,
+    TorrentMetainfo, TorrentMusicJobRef, TorrentMusicJobStatus, TorrentPhase,
+    TorrentRemoteSnapshot, TorrentSettings, TorrentSnapshot, TorrentUpload,
 };
 
 pub(super) struct MiniAppTestFixture {
@@ -420,6 +421,126 @@ async fn miniapp_reuses_native_owner_selection_and_pending_import_without_new_ca
     assert_eq!(service.list(17).await.expect("owner task list").len(), 1);
     shutdown.send(true).expect("stop native Mini App fixture");
     drop(temp);
+}
+
+#[test]
+fn deep_search_metadata_stays_bounded_and_all_5000_file_indexes_remain_pageable() {
+    let snapshot = deep_search_snapshot(5_000);
+    let first = crate::torrent_miniapp::detail(
+        snapshot.clone(),
+        0,
+        0,
+        "flac",
+        crate::torrent_miniapp::FileFilter::Music,
+    )
+    .expect("bounded first search page");
+    assert!(
+        serde_json::to_vec(&first)
+            .expect("serialize first page")
+            .len()
+            <= 192 * 1024
+    );
+    assert_eq!(first["scope_indexes"].as_array().unwrap().len(), 5_000);
+    assert_eq!(first["total"], 5_001);
+    let first_folders = first["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "folder")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_folders.len(),
+        1,
+        "search shows only the immediate matching folder"
+    );
+    assert_eq!(first_folders[0]["id"], 1);
+    assert_eq!(first_folders[0]["indexes"].as_array().unwrap().len(), 5_000);
+
+    let mut visible_indexes = std::collections::BTreeSet::new();
+    for page in 0..=100 {
+        let response = crate::torrent_miniapp::detail(
+            snapshot.clone(),
+            page,
+            0,
+            "flac",
+            crate::torrent_miniapp::FileFilter::Music,
+        )
+        .expect("bounded search page");
+        assert!(
+            serde_json::to_vec(&response)
+                .expect("serialize search page")
+                .len()
+                <= 192 * 1024
+        );
+        for entry in response["entries"].as_array().unwrap() {
+            if entry["kind"] == "file" {
+                visible_indexes.insert(entry["index"].as_u64().unwrap() as u32);
+            }
+        }
+    }
+    assert_eq!(visible_indexes.len(), 5_000);
+    assert_eq!(visible_indexes.first(), Some(&0));
+    assert_eq!(visible_indexes.last(), Some(&4_999));
+}
+
+fn deep_search_snapshot(file_count: usize) -> TorrentSnapshot {
+    let segments = [
+        "Artist", "Album", "Edition", "Disc", "Part", "Side", "Batch", "Set", "Volume", "Disk",
+    ];
+    let mut folder_path = PathBuf::new();
+    let mut folders = vec![TorrentFolder {
+        id: 0,
+        relative_path: PathBuf::new(),
+        file_count: file_count as u32,
+    }];
+    for (offset, segment) in segments.iter().enumerate() {
+        folder_path.push(segment);
+        folders.push(TorrentFolder {
+            id: offset as u32 + 1,
+            relative_path: folder_path.clone(),
+            file_count: file_count as u32,
+        });
+    }
+    let files = (0..file_count)
+        .map(|index| {
+            let mut relative_path = folder_path.clone();
+            relative_path.push(format!("Track {index:04}.flac"));
+            TorrentFileSnapshot {
+                index: index as u32,
+                relative_path,
+                size: 48 * 1024 * 1024,
+                progress: 0.25,
+                complete: false,
+                selected: true,
+                supported_music: true,
+                needs_reconfirm: false,
+                music_stage: Some(crate::torrent_types::TorrentMusicStage::Pending),
+            }
+        })
+        .collect();
+    TorrentSnapshot {
+        task_id: "deep-search-fixture".to_string(),
+        chat_id: 17,
+        user_id: 17,
+        upload_message_id: 0,
+        card_message_id: None,
+        inventory_revision: 4,
+        selection_revision: 2,
+        render_revision: 1,
+        name: "青い夜のアルバム".to_string(),
+        identity: None,
+        phase: TorrentPhase::Downloading,
+        state: Some("downloading".to_string()),
+        progress: 0.5,
+        cursor_folder_id: 0,
+        cursor_page: 0,
+        review_selection: false,
+        folders,
+        files,
+        selected_count: file_count,
+        import_count: 0,
+        error: None,
+    }
 }
 
 fn remote_fixture(metainfo: &TorrentMetainfo, source_root: &Path) -> TorrentRemoteSnapshot {

@@ -58,14 +58,18 @@ its default file-selection interface.
 - Ordinary tests use local mock qBittorrent/Telegram/Music services and synthetic
   files. Production deployment and real Music imports are separate operations.
 
-- The torrent-focused Rust suite passed 89 tests, including the mock service
+- The torrent-focused Rust suite passed 91 tests, including the mock service
   E2Es and durable inbox review/confirmation/replay tests. Workspace all-targets
   Clippy passed with warnings denied; formatting passed.
-- Worker tests passed 437 cases, the Mini App UI suite passed 101 cases, and
+- Worker tests passed 437 cases, the Mini App UI suite passed 103 cases, and
   Widget regressions passed four cases. Type, syntax and bundle checks passed.
 - The actual app-shell E2E covers queued action receipts, review cancellation,
   confirmation and refreshed detail results. Request IDs take precedence over
   sequence numbers when correlating retained operation results.
+- Task navigation ignores late results from a previously opened task, including
+  while its submission is still pending. Imported totals include only completed
+  Music jobs. Search folders use disjoint child scopes, keeping 5,000-track
+  nested inventories within the result budget without losing file pages.
 - Synthetic mobile rendering at 320, 375 and 420 pixels showed no horizontal
   overflow or offscreen controls. Physical Telegram client acceptance is separate.
 

@@ -189,6 +189,85 @@ describe("torrent selection Mini App", () => {
     ui.view.dispose();
   });
 
+  it.each(["while the POST is pending", "after the POST is accepted"])(
+    "keeps late detail results scoped to the task selected after navigation %s",
+    async (submitTiming) => {
+    const ui = mount();
+    const hashA = "a".repeat(40);
+    const hashB = "b".repeat(40);
+    ui.view.open();
+    await ui.settle();
+    const catalog = sentAt(ui.sent());
+    ui.publish(catalog.requestId, 10, {
+      operation: "catalog", page: 0, page_size: 50, total: 2, has_more: false, query: "",
+      rows: [
+        { hash: hashA, name: "Task A", state: "downloading", progress: 0.25, size: 4096 },
+        { hash: hashB, name: "Task B", state: "downloading", progress: 0.75, size: 8192 },
+      ],
+    });
+
+    let finishTaskASubmit!: (queued: boolean) => void;
+    if (submitTiming === "while the POST is pending") {
+      ui.submit.mockImplementationOnce(() => new Promise<boolean>((resolve) => { finishTaskASubmit = resolve; }));
+    }
+    ui.root.querySelector<HTMLButtonElement>(`[data-torrent-open="${hashA}"]`)!.click();
+    const detailA = sentAt(ui.sent(), 1);
+    expect(detailA.payload).toMatchObject({ operation: "detail", hash: hashA });
+    if (submitTiming === "after the POST is accepted") await ui.settle();
+    ui.root.querySelector<HTMLButtonElement>("[data-torrent-back]")!.click();
+    expect(ui.root.querySelector<HTMLButtonElement>(`[data-torrent-open="${hashB}"]`)?.disabled).toBe(false);
+    expect(ui.root.querySelector<HTMLButtonElement>(`[data-torrent-control][data-torrent-hash="${hashB}"]`)?.disabled)
+      .toBe(submitTiming === "while the POST is pending");
+    ui.root.querySelector<HTMLButtonElement>(`[data-torrent-open="${hashB}"]`)!.click();
+    await ui.settle();
+    expect(ui.view.currentTaskId()).toBe(hashB);
+    if (submitTiming === "while the POST is pending") {
+      expect(ui.sent()).toHaveLength(2);
+      expect(ui.root.textContent).toContain("Waiting for the previous request to finish");
+      finishTaskASubmit(true);
+      await ui.settle();
+    }
+    expect(ui.sent()).toHaveLength(3);
+    const detailB = sentAt(ui.sent(), 2);
+    expect(detailB.payload).toMatchObject({ operation: "detail", hash: hashB });
+
+    ui.publish(detailA.requestId, 11, {
+      ...detailResult({ entries: [{ kind: "file", index: 3, path: "Task A/old-track.flac", size: 4096,
+        progress: 1, complete: true, selected: true, supported_music: true,
+        needs_reconfirm: false, music_stage: "ready" }], scopeIndexes: [3] }),
+      task: { ...detailResult().task, task_id: "task-A", name: "Task A", selected_indexes: [3], selected_count: 1 },
+    });
+    expect(ui.root.textContent).not.toContain("Task A/old-track.flac");
+    expect(ui.root.querySelector('[data-torrent-file="3"]')).toBeNull();
+    expect(ui.root.textContent).toContain("Waiting for task files");
+
+    ui.publish(detailB.requestId, 12, {
+      ...detailResult({ entries: [{ kind: "file", index: 4, path: "Task B/current-track.flac", size: 8192,
+        progress: 1, complete: true, selected: true, supported_music: true,
+        needs_reconfirm: false, music_stage: "ready" }], scopeIndexes: [4] }),
+      task: { ...detailResult().task, task_id: "task-B", name: "Task B", selected_indexes: [4], selected_count: 1 },
+    });
+    expect(ui.root.textContent).toContain("Task B");
+    expect(ui.root.textContent).toContain("Task B/current-track.flac");
+    expect(ui.root.textContent).not.toContain("Task A/old-track.flac");
+    expect(ui.root.querySelector<HTMLInputElement>('[data-torrent-file="4"]')?.checked).toBe(true);
+    const savedDrafts = JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}");
+    expect(savedDrafts["task-B"].indexes).toEqual([4]);
+    expect(savedDrafts["task-A"]).toBeUndefined();
+
+    ui.publish(detailA.requestId, 11, {
+      ...detailResult({ entries: [{ kind: "file", index: 3, path: "Task A/old-track.flac", size: 4096,
+        progress: 1, complete: true, selected: true, supported_music: true,
+        needs_reconfirm: false, music_stage: "ready" }], scopeIndexes: [3] }),
+      task: { ...detailResult().task, task_id: "task-A", name: "Task A", selected_indexes: [3], selected_count: 1 },
+    });
+    expect(ui.root.textContent).toContain("Task B/current-track.flac");
+    expect(ui.root.textContent).not.toContain("Task A/old-track.flac");
+    expect(ui.root.querySelector<HTMLInputElement>('[data-torrent-file="4"]')?.checked).toBe(true);
+    expect(JSON.parse(ui.storage.getItem(TORRENT_DRAFT_STORAGE_KEY) ?? "{}")["task-B"].indexes).toEqual([4]);
+    ui.view.dispose();
+  });
+
   it("cancels read-only review without confirming, then confirms only the exact saved review", async () => {
     const ui = mount();
     ui.view.open(TASK_ID);

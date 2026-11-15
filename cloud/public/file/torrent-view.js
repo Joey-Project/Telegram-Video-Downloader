@@ -186,6 +186,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     detailQuery: "",
     filter: "music",
     detailRequestId: null,
+    deferredDetailRequest: null,
     detailError: "",
     detailResult: null,
     draftStale: false,
@@ -224,6 +225,15 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     if (!writeDrafts(draftStorage, drafts)) onMessage("This browser could not save the task selection draft.", "error");
   }
 
+  function dispatchDeferredDetail() {
+    const deferred = state.deferredDetailRequest;
+    if (!deferred || state.commandBusy) return false;
+    state.deferredDetailRequest = null;
+    if (!state.taskRef) return false;
+    requestDetail(deferred);
+    return true;
+  }
+
   function send(payload, requestId, field) {
     state[field] = requestId;
     state.commandBusy = true;
@@ -231,18 +241,20 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     Promise.resolve(submit(payload, requestId)).then((queued) => {
       if (state.disposed) return;
       state.commandBusy = false;
-      if (!queued) {
+      if (!queued && state[field] === requestId) {
         state[field] = null;
         state[`${field.replace("RequestId", "Error")}`] = "The request could not be saved or sent. Reconnect and try again.";
       }
-      render();
+      if (!dispatchDeferredDetail()) render();
     }).catch((error) => {
       if (state.disposed) return;
       state.commandBusy = false;
-      state[field] = null;
       const errorField = field.replace("RequestId", "Error");
-      if (errorField in state) state[errorField] = String(error?.message ?? "The request could not be sent.");
-      render();
+      if (state[field] === requestId) {
+        state[field] = null;
+        if (errorField in state) state[errorField] = String(error?.message ?? "The request could not be sent.");
+      }
+      if (!dispatchDeferredDetail()) render();
     });
     return requestId;
   }
@@ -263,7 +275,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
   }
 
   function requestDetail({ page = 0, folderId = state.folderId, query = state.detailQuery, filter = state.filter } = {}) {
-    if (!state.taskRef || state.commandBusy || actionPending(state.detailRequestId)) return null;
+    if (!state.taskRef || actionPending(state.detailRequestId)) return null;
     const normalizedQuery = normalizeQuery(query);
     if (normalizedQuery === null) {
       state.detailError = "Search text cannot contain control characters.";
@@ -280,6 +292,17 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     state.reviewRequestId = null;
     state.reviewSeq = null;
     state.reviewError = "";
+    if (state.commandBusy) {
+      state.deferredDetailRequest = {
+        page: state.detailPage,
+        folderId: state.folderId,
+        query: state.detailQuery,
+        filter: state.filter,
+      };
+      render();
+      return null;
+    }
+    state.deferredDetailRequest = null;
     return send({
       operation: "detail",
       [state.taskRefType]: state.taskRef,
@@ -310,6 +333,9 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       state.detailQuery = "";
       state.filter = "music";
       state.detailResult = null;
+      state.detailRequestId = null;
+      state.deferredDetailRequest = null;
+      state.detailError = "";
       state.reviewResult = null;
       state.reviewRequestId = null;
       state.reviewSeq = null;
@@ -550,7 +576,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       <div class="torrent-task-list" aria-live="polite">${rows.map((row) => {
         const paused = /paused|stopped/iu.test(String(row.state ?? ""));
         const controlBusy = actionPending(state.controlRequestId);
-        return `<article class="torrent-task-row"><button class="torrent-task-open" type="button" data-torrent-open="${escapeHtml(row.hash)}" ${state.commandBusy || pending ? "disabled" : ""}><strong>${escapeHtml(boundedText(row.name))}</strong><span>${escapeHtml(humanTorrentState(row.state))} · ${escapeHtml(formatProgress(row.progress))} · ${escapeHtml(formatBytes(row.size))}</span></button><button class="quiet-button torrent-control" type="button" data-torrent-control="${paused ? "resume" : "pause"}" data-torrent-hash="${escapeHtml(row.hash)}" ${state.commandBusy || controlBusy ? "disabled" : ""}>${paused ? "Resume" : "Pause"}</button></article>`;
+        return `<article class="torrent-task-row"><button class="torrent-task-open" type="button" data-torrent-open="${escapeHtml(row.hash)}" ${pending ? "disabled" : ""}><strong>${escapeHtml(boundedText(row.name))}</strong><span>${escapeHtml(humanTorrentState(row.state))} · ${escapeHtml(formatProgress(row.progress))} · ${escapeHtml(formatBytes(row.size))}</span></button><button class="quiet-button torrent-control" type="button" data-torrent-control="${paused ? "resume" : "pause"}" data-torrent-hash="${escapeHtml(row.hash)}" ${state.commandBusy || controlBusy ? "disabled" : ""}>${paused ? "Resume" : "Pause"}</button></article>`;
       }).join("") || (result && !rows.length ? `<div class="empty-state"><h3>No matching tasks</h3><p>Change the search or refresh the list.</p></div>` : "")}</div>
       <nav class="torrent-pagination" aria-label="Task list pages"><button class="quiet-button" type="button" data-torrent-catalog-page="-1" ${!result || result.page <= 0 || state.commandBusy ? "disabled" : ""}>Previous</button><span>Page ${Number(result?.page ?? state.catalogPage) + 1}</span><button class="quiet-button" type="button" data-torrent-catalog-page="1" ${!result?.has_more || state.commandBusy ? "disabled" : ""}>Next</button></nav>
       ${state.controlError ? `<p class="torrent-message" role="status">${escapeHtml(state.controlError)}</p>` : ""}`;
@@ -595,7 +621,7 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
     const selectionDisabled = Boolean(detailError || detailBusy || state.draftStale);
     const folderLabel = state.folderTrail.at(-1)?.path ?? "Task root";
     return `<div class="torrent-heading"><div><button class="torrent-back" type="button" data-torrent-back>← All tasks</button><p class="eyebrow">MUSIC SELECTION</p><h2>${escapeHtml(boundedText(task?.name ?? "Torrent task"))}</h2><p>${escapeHtml(taskStatusLabel(task))} · ${escapeHtml(progress)}</p></div><button class="secondary-button" type="button" data-torrent-detail-refresh ${state.commandBusy ? "disabled" : ""}>Refresh files</button></div>
-      ${detailError ? `<p class="torrent-message error" role="alert">${escapeHtml(detailError)}</p>` : pending ? `<p class="torrent-message" role="status">Waiting for task files…</p>` : detailStatus === "processing" ? `<p class="torrent-message" role="status">Your computer is checking the task files…</p>` : ""}
+      ${detailError ? `<p class="torrent-message error" role="alert">${escapeHtml(detailError)}</p>` : state.deferredDetailRequest ? `<p class="torrent-message" role="status">Waiting for the previous request to finish before loading this task…</p>` : pending ? `<p class="torrent-message" role="status">Waiting for task files…</p>` : detailStatus === "processing" ? `<p class="torrent-message" role="status">Your computer is checking the task files…</p>` : ""}
       ${task ? `<div class="torrent-summary"><span>${selectedCount.toLocaleString()} selected</span><span>${Number(task.import_count ?? 0).toLocaleString()} imported</span></div>` : ""}
       ${state.draftStale ? `<aside class="torrent-stale" role="alert"><strong>Task files or saved selection changed.</strong><span>This draft is tied to older revisions and cannot be reviewed or confirmed.</span><button class="secondary-button" type="button" data-torrent-rebase ${state.commandBusy ? "disabled" : ""}>Discard draft and use current selection</button></aside>` : ""}
       <form class="torrent-search" data-torrent-detail-search><label class="search-box"><span aria-hidden="true">⌕</span><input type="search" name="query" maxlength="256" value="${escapeHtml(state.detailQuery)}" placeholder="Search folders and files" aria-label="Search task files"></label><select name="filter" class="select-control" aria-label="Filter files"><option value="music" ${state.filter === "music" ? "selected" : ""}>Music files</option><option value="all" ${state.filter === "all" ? "selected" : ""}>All files</option><option value="ready" ${state.filter === "ready" ? "selected" : ""}>Ready for Music</option><option value="waiting" ${state.filter === "waiting" ? "selected" : ""}>Waiting for download</option><option value="imported" ${state.filter === "imported" ? "selected" : ""}>Imported</option></select><button class="quiet-button" type="submit">Apply</button></form>
@@ -678,6 +704,9 @@ export function createTorrentView({ root, submit, onMessage = () => {}, onTaskBa
       state.taskId = "";
       state.taskRef = "";
       state.requestedTaskId = "";
+      state.detailRequestId = null;
+      state.deferredDetailRequest = null;
+      state.detailError = "";
       state.detailResult = null;
       state.reviewResult = null;
       state.reviewRequestId = null;
