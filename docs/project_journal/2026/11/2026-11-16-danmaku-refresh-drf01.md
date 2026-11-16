@@ -49,6 +49,17 @@ superseded_by: ""
 - Reserve bounded identities, counts and samples for pending previews before
   restoring complete details within the shared snapshot budget. Omitted details
   keep cancellation available; confirmation waits for the complete preview.
+- Validate proposed XML/ASS ownership with the scanner's filesystem-name and
+  longest-stem rules, then recheck a bounded current directory listing before
+  fetching and at publication checkpoints. Unrelated child additions are safe;
+  conflicting media, partial listings and unreadable evidence cannot prove an
+  output belongs to the selected video.
+- Charge received response chunks before size/error exits and reserve decoder
+  capacity before decoding. Failed reads and decodes cannot bypass the aggregate
+  budget; successful decoding refunds unused reserved capacity.
+- Retain bounded aggregate result counts through normal and rejected-upload
+  compaction. Older missing or malformed summaries display unavailable rather
+  than fabricated zero results.
 
 ## Validation
 
@@ -59,14 +70,14 @@ superseded_by: ""
   cancel actions, durable reload, results and failure states.
 - Additive D1 migration coverage preserves existing requests and high-water
   sequence values. Existing Rust and Cloud CI commands discover the new tests.
-- The final focused native run passes 50 danmaku cases, including mock Telegram
+- The final focused native run passes 63 danmaku cases, including mock Telegram
   replay, restart, cancellation, deadline deferral and XML-first interruption;
-  one opt-in graphical-render test stays ignored. All 38 snapshot budget tests
+  one opt-in graphical-render test stays ignored. All 40 snapshot budget tests
   pass, including multiple individually valid previews exceeding the shared cap.
   Deterministic E2E covers expiry between two videos as well as during a fetch,
   preserving completed results and allowing fresh-preview continuation.
   Native converter workspace coverage passes 27 unit and 8 E2E cases.
-- Cloud validation passes 442 Worker/helper cases, 113 Mini App cases and 4 Widget
+- Cloud validation passes 442 Worker/helper cases, 119 Mini App cases and 4 Widget
   regressions, plus typechecking and a Worker bundle dry run.
 - Formatting, strict workspace Clippy, diff and project-journal checks pass.
   The existing Rust and Cloud CI workflows discover the added tests and retain

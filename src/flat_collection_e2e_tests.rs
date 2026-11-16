@@ -267,6 +267,20 @@ fn write_legacy_nested_collection(video_root: &Path) -> Vec<LegacyEpisode> {
         .collect()
 }
 
+fn expected_moved_nfo(original: &[u8], target_media_path: &str) -> String {
+    let original = std::str::from_utf8(original).expect("fixture NFO should be UTF-8");
+    let target_filename = Path::new(target_media_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("moved media target should have a filename");
+    assert_eq!(original.matches("</movie>").count(), 1);
+    original.replacen(
+        "</movie>",
+        &format!("\n  <localfilename>{target_filename}</localfilename>\n</movie>"),
+        1,
+    )
+}
+
 #[tokio::test]
 async fn old_nested_collection_cloud_confirm_flattens_and_recovers_after_reopen() {
     let provider = Arc::new(FailSecondMoveOnce::default());
@@ -423,6 +437,17 @@ async fn old_nested_collection_cloud_confirm_flattens_and_recovers_after_reopen(
             == 1,
         "the interrupted episode should retain its primary media source"
     );
+    let completed_index = expected_targets
+        .iter()
+        .position(|(media, _, _)| harness.video_root.join(media).is_file())
+        .expect("one complete item should be published before the injected failure");
+    let completed_target = &expected_targets[completed_index];
+    assert_eq!(
+        fs::read_to_string(harness.video_root.join(&completed_target.1))
+            .expect("completed item's NFO should remain readable"),
+        expected_moved_nfo(&episodes[completed_index].nfo_bytes, &completed_target.0),
+        "the completed item should durably record its renamed primary filename"
+    );
 
     let preview_receipt = harness
         .runtime
@@ -487,7 +512,10 @@ async fn old_nested_collection_cloud_confirm_flattens_and_recovers_after_reopen(
         let nfo_target = harness.video_root.join(nfo);
         let subtitle_target = harness.video_root.join(subtitle);
         assert_eq!(fs::read(&media_target).unwrap(), episode.media_bytes);
-        assert_eq!(fs::read(&nfo_target).unwrap(), episode.nfo_bytes);
+        assert_eq!(
+            fs::read_to_string(&nfo_target).unwrap(),
+            expected_moved_nfo(&episode.nfo_bytes, media)
+        );
         assert_eq!(fs::read(&subtitle_target).unwrap(), episode.subtitle_bytes);
         assert!(!episode.media_source.exists());
         assert!(!episode.nfo_source.exists());

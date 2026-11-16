@@ -1272,6 +1272,41 @@ describe("file manager UI flow", () => {
     await vi.waitFor(() => expect(element<HTMLElement>("#operation-list").textContent).toContain("Danmaku preview cancelled"));
   });
 
+  it.each([
+    { name: "missing", summary: undefined, available: false },
+    { name: "partial", summary: { updated: 3 }, available: false },
+    { name: "malformed", summary: { updated: "3", unchanged: 0, skipped: 0, failed: 0, added_comments: 0 }, available: false },
+    { name: "negative", summary: { updated: 0, unchanged: 0, skipped: 0, failed: -1, added_comments: 0 }, available: false },
+    { name: "zero", summary: { updated: 0, unchanged: 0, skipped: 0, failed: 0, added_comments: 0 }, available: true },
+    { name: "retained", summary: { updated: 3, unchanged: 2, skipped: 1, failed: 4, added_comments: 12 }, available: true },
+  ])("keeps $name compact danmaku counts distinct from omitted results", async ({ name, summary, available }) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    await mountFileManagerFixture({
+      ...ownerSnapshot,
+      pending_requests: [], previews: [],
+      operations: [{
+        seq: 989, kind: "danmaku_refresh", operation: "confirm", status: "completed",
+        library_id: LIBRARY_ID, root_binding: ROOT_BINDING, details_incomplete: true,
+        result_truncated: true, created_at: Math.floor(Date.now() / 1000),
+        result: { operation: "confirm", incomplete: true, ...(summary ? { summary } : {}) },
+      }],
+    }, makeMemoryStorage());
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    const history = element<HTMLElement>("#operation-list");
+    if (available) {
+      const expected = name === "zero"
+        ? "0 updated · 0 unchanged · 0 skipped · 0 failed · 0 comments appended."
+        : "3 updated · 2 unchanged · 1 skipped · 4 failed · 12 comments appended.";
+      await vi.waitFor(() => expect(history.textContent).toContain(expected));
+      expect(history.textContent).not.toContain("Refresh counts are unavailable");
+    } else {
+      await vi.waitFor(() => expect(history.textContent).toContain("Refresh counts are unavailable"));
+      expect(history.textContent).not.toContain("0 updated");
+      expect(history.textContent).not.toContain("0 comments appended");
+    }
+  });
+
   it("keeps compact danmaku previews cancellable and restores review from complete details", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

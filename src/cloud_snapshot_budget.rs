@@ -188,9 +188,20 @@ fn validated_file_preview_summary<'a>(
 
     let metadata_patch_count = summary.get("metadata_patch_count")?.as_u64()? as usize;
     let changed_patch_count = summary.get("changed_metadata_patch_count")?.as_u64()? as usize;
-    if metadata_patch_count > MAX_FILE_PREVIEW_SELECTION_ITEMS
+    let requested_patch_count = requested_metadata_patch_count(record)?;
+    // A confirmed file move may synthesize one NFO patch per moved media item to preserve
+    // localfilename and portable attachment references. Metadata-only previews still contain
+    // exactly the requested patches; move summaries may include only the bounded generated
+    // patches above the request. Confirmation resolves the full saved plan by ID and revision.
+    let max_patch_count = if metadata_only {
+        requested_patch_count
+    } else {
+        requested_patch_count.saturating_add(moves)
+    };
+    if metadata_patch_count > MAX_FILE_PREVIEW_METADATA_PATCHES
         || changed_patch_count > metadata_patch_count
-        || metadata_patch_count != requested_metadata_patch_count(record)?
+        || metadata_patch_count < requested_patch_count
+        || metadata_patch_count > max_patch_count
     {
         return None;
     }
@@ -215,6 +226,7 @@ fn validated_file_preview_summary<'a>(
 }
 
 const MAX_FILE_PREVIEW_SELECTION_ITEMS: usize = 5_000;
+const MAX_FILE_PREVIEW_METADATA_PATCHES: usize = MAX_FILE_PREVIEW_SELECTION_ITEMS * 2;
 
 fn file_preview_request_identity(record: &InboxRecord) -> Option<(&str, &str)> {
     let payload_library_id = record.request.payload.get("library_id")?.as_str()?;
@@ -825,7 +837,11 @@ pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
             continue;
         }
 
-        let compacted = compact_result_summary(&original);
+        let compacted = if fields.get("kind").and_then(Value::as_str) == Some("danmaku_refresh") {
+            compact_danmaku_result_summary(&original)
+        } else {
+            compact_result_summary(&original)
+        };
         if fields.get("result") != Some(&compacted) {
             fields.insert("result".to_string(), compacted);
             changed = true;
@@ -1645,6 +1661,8 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
             let public_result = bound_library_public_result(result);
             if include_full_result {
                 public_result
+            } else if record.request.kind == "danmaku_refresh" {
+                compact_danmaku_result_summary(&public_result)
             } else {
                 compact_result_summary(&public_result)
             }
@@ -1908,6 +1926,37 @@ fn bound_operation_metadata(fields: &mut Map<String, Value>) -> bool {
         changed = true;
     }
     changed
+}
+
+fn compact_danmaku_result_summary(result: &Value) -> Value {
+    let mut compacted = compact_result_summary(result);
+    let Some(original_counts) = result.get("summary").and_then(Value::as_object) else {
+        return compacted;
+    };
+    let mut counts = Map::new();
+    for field in [
+        "updated",
+        "unchanged",
+        "skipped",
+        "failed",
+        "added_comments",
+    ] {
+        let Some(value) = original_counts
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= MAX_MIGRATION_SUMMARY_SAFE_INTEGER)
+        else {
+            return compacted;
+        };
+        counts.insert(field.to_owned(), json!(value));
+    }
+    compacted["summary"] = Value::Object(counts);
+    if json_size_within(&compacted, MAX_COMPACT_OPERATION_RESULT_BYTES).is_none()
+        && let Some(fields) = compacted.as_object_mut()
+    {
+        fields.remove("summary");
+    }
+    compacted
 }
 
 fn compact_result_summary(result: &Value) -> Value {
@@ -3244,6 +3293,65 @@ mod tests {
     }
 
     #[test]
+    fn compact_danmaku_results_preserve_bounded_aggregate_counts_in_both_paths() {
+        let counts = json!({"updated":3, "unchanged":2, "skipped":1, "failed":4,
+            "added_comments":12});
+        let mut receipt = record(
+            55,
+            "danmaku_refresh",
+            InboxStatus::Completed,
+            Some(json!({"operation":"confirm", "library_id":"ml-test-root",
+                "root_binding":TEST_ROOT_BINDING, "preview_id":"dmr-counts",
+                "revision":"counts-revision", "summary":counts,
+                "items":[{"item_id":"video-one", "reason":"x".repeat(12_000)}]})),
+            None,
+        );
+        receipt.request.payload = json!({"operation":"confirm", "library_id":"ml-test-root",
+            "root_binding":TEST_ROOT_BINDING, "preview_seq":54, "preview_id":"dmr-counts",
+            "revision":"counts-revision"});
+        receipt.result.as_mut().unwrap()["summary"]["private_unknown_field"] = json!("local-only");
+        let initial_compact = operation_snapshot(&receipt, false);
+        let mut rejected_upload = vec![operation_snapshot(&receipt, true)];
+        assert!(compact_operation_receipts(&mut rejected_upload));
+        for snapshot in [initial_compact, rejected_upload.remove(0)] {
+            assert_eq!(snapshot["result"]["summary"], counts);
+            assert_eq!(snapshot["result"]["preview_id"], "dmr-counts");
+            assert!(snapshot["result"].get("items").is_none());
+            assert!(
+                json_size_within(&snapshot["result"], MAX_COMPACT_OPERATION_RESULT_BYTES).is_some()
+            );
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("local-only")
+            );
+        }
+    }
+
+    #[test]
+    fn compact_danmaku_results_keep_zero_distinct_from_missing_or_invalid_counts() {
+        let zeros = json!({"updated":0, "unchanged":0, "skipped":0, "failed":0,
+            "added_comments":0});
+        assert_eq!(
+            compact_danmaku_result_summary(&json!({"summary":zeros}))["summary"],
+            zeros
+        );
+        for invalid in [
+            Value::Null,
+            json!({"updated":0}),
+            json!({"updated":"3", "unchanged":0, "skipped":0, "failed":0, "added_comments":0}),
+            json!({"updated":0, "unchanged":0, "skipped":0, "failed":-1, "added_comments":0}),
+            json!({"updated":u64::MAX, "unchanged":0, "skipped":0, "failed":0, "added_comments":0}),
+        ] {
+            assert!(
+                compact_danmaku_result_summary(&json!({"summary":invalid}))
+                    .get("summary")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn danmaku_preview_snapshots_strip_private_plans_and_keep_review_identity() {
         let mut receipt = record(
             54,
@@ -4141,6 +4249,48 @@ mod tests {
         assert_eq!(
             changed_summary["preview"]["changed_metadata_patch_count"],
             1
+        );
+    }
+
+    #[test]
+    fn compact_move_summary_allows_bounded_generated_nfo_patches_only() {
+        let mut receipt = generated_file_preview_record(506, 1);
+        receipt.result.as_mut().unwrap()["preview"]["metadata_patches"] = json!([{
+            "item_id": "item-0000",
+            "nfo_path": "target/item-0000.nfo",
+            "changed": true,
+            "added_source_ids": [],
+            "changes": [],
+        }]);
+        let compact = compact_file_preview_receipt_result(&receipt)
+            .expect("move preview should retain its generated NFO patch count");
+        let mut compact_receipt = receipt.clone();
+        compact_receipt.result = Some(compact);
+        assert_eq!(
+            compact_receipt.result.as_ref().unwrap()["preview"]["metadata_patch_count"],
+            1
+        );
+        assert!(is_valid_compact_file_preview_result(&compact_receipt));
+
+        let summary = compact_receipt.result.as_mut().unwrap();
+        summary["preview"]["metadata_patch_count"] = json!(2);
+        summary["preview"]["omitted_metadata_patch_count"] = json!(1);
+        assert!(
+            !is_valid_compact_file_preview_result(&compact_receipt),
+            "move summaries cannot claim more generated patches than moved media items"
+        );
+
+        let metadata_only = generated_metadata_only_preview_record(507, 1);
+        let compact = compact_file_preview_receipt_result(&metadata_only)
+            .expect("metadata-only preview should produce a bounded summary");
+        let mut tampered = metadata_only;
+        tampered.result = Some(compact);
+        let summary = tampered.result.as_mut().unwrap();
+        summary["preview"]["metadata_patch_count"] = json!(2);
+        summary["preview"]["omitted_metadata_patch_count"] = json!(1);
+        assert!(
+            !is_valid_compact_file_preview_result(&tampered),
+            "metadata-only summaries must still match the exact requested patch count"
         );
     }
 
