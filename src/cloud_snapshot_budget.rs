@@ -864,7 +864,7 @@ pub(crate) fn preview_snapshots(
             (matches!(
                 record.request.kind.as_str(),
                 "file_preview" | "library_migration_preview"
-            ) || record.request.is_staging_cleanup_preview())
+            ) || record.request.is_bound_preview())
                 && record.status == InboxStatus::AwaitingConfirmation
         })
         .collect::<Vec<_>>();
@@ -882,14 +882,13 @@ pub(crate) fn preview_snapshots(
     let invalid_staging_cleanup_preview_count = active
         .iter()
         .filter(|record| {
-            record.request.is_staging_cleanup_preview()
-                && staging_cleanup_preview_snapshot(record).is_none()
+            record.request.is_bound_preview() && bound_library_preview_snapshot(record).is_none()
         })
         .count();
     active.retain(|record| {
         (record.request.kind != "file_preview" || file_preview_has_valid_root_binding(record))
-            && (!record.request.is_staging_cleanup_preview()
-                || staging_cleanup_preview_snapshot(record).is_some())
+            && (!record.request.is_bound_preview()
+                || bound_library_preview_snapshot(record).is_some())
     });
 
     let locally_omitted = active.len().saturating_sub(MAX_PREVIEW_SNAPSHOT_RECORDS);
@@ -908,8 +907,8 @@ pub(crate) fn preview_snapshots(
         .iter()
         .map(|record| {
             let result = record.result.as_ref();
-            if record.request.is_staging_cleanup_preview()
-                && let Some(snapshot) = staging_cleanup_preview_snapshot(record)
+            if record.request.is_bound_preview()
+                && let Some(snapshot) = bound_library_preview_snapshot(record)
             {
                 return snapshot;
             }
@@ -1009,7 +1008,7 @@ pub(crate) fn preview_snapshots(
         .expect("preview placeholders should fit the bounded snapshot budget");
 
     for (index, record) in active.iter().enumerate().rev() {
-        if record.request.is_staging_cleanup_preview() {
+        if record.request.is_bound_preview() {
             continue;
         }
         let result = record.result.as_ref();
@@ -1532,6 +1531,7 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
     let envelope = json!({
         "seq": record.request.seq,
         "kind": record.request.kind,
+        "operation": "preview",
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
@@ -1586,8 +1586,8 @@ fn metadata_recovery_receipt_identity(record: &InboxRecord) -> Option<Value> {
     }))
 }
 
-fn staging_cleanup_request_identity(record: &InboxRecord) -> Option<Map<String, Value>> {
-    let operation = record.request.staging_cleanup_operation()?;
+fn bound_library_request_identity(record: &InboxRecord) -> Option<Map<String, Value>> {
+    let operation = record.request.bound_preview_operation()?;
     if !matches!(operation, "scan" | "preview" | "confirm" | "cancel") {
         return None;
     }
@@ -1626,8 +1626,11 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
     let result = record.result.as_ref().map(|result| {
         if record.request.kind == "library_scan" {
             library_scan_receipt(result)
-        } else if record.request.kind == "staging_cleanup" {
-            let public_result = staging_cleanup_public_result(result);
+        } else if matches!(
+            record.request.kind.as_str(),
+            "staging_cleanup" | "danmaku_refresh"
+        ) {
+            let public_result = bound_library_public_result(result);
             if include_full_result {
                 public_result
             } else {
@@ -1672,7 +1675,7 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         "result": result,
         "error": error,
     });
-    if let Some(identity) = staging_cleanup_request_identity(record)
+    if let Some(identity) = bound_library_request_identity(record)
         && let Some(fields) = operation.as_object_mut()
     {
         fields.extend(identity);
@@ -1715,34 +1718,33 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
     operation
 }
 
-fn staging_cleanup_public_result(result: &Value) -> Value {
+fn bound_library_public_result(result: &Value) -> Value {
     let mut public_result = result.clone();
-    strip_staging_cleanup_proofs(&mut public_result);
+    strip_bound_library_preview_proofs(&mut public_result);
     public_result
 }
 
-fn strip_staging_cleanup_proofs(value: &mut Value) {
+fn strip_bound_library_preview_proofs(value: &mut Value) {
     match value {
         Value::Array(values) => {
             for value in values {
-                strip_staging_cleanup_proofs(value);
+                strip_bound_library_preview_proofs(value);
             }
         }
         Value::Object(fields) => {
             fields.remove("proofs");
             fields.remove("cleanup_preview");
+            fields.remove("danmaku_preview");
             for value in fields.values_mut() {
-                strip_staging_cleanup_proofs(value);
+                strip_bound_library_preview_proofs(value);
             }
         }
         _ => {}
     }
 }
 
-fn staging_cleanup_preview_snapshot(record: &InboxRecord) -> Option<Value> {
-    if !record.request.is_staging_cleanup_preview()
-        || record.status != InboxStatus::AwaitingConfirmation
-    {
+fn bound_library_preview_snapshot(record: &InboxRecord) -> Option<Value> {
+    if !record.request.is_bound_preview() || record.status != InboxStatus::AwaitingConfirmation {
         return None;
     }
     let result = record.result.as_ref()?;
@@ -1776,11 +1778,11 @@ fn staging_cleanup_preview_snapshot(record: &InboxRecord) -> Option<Value> {
         return None;
     }
     let mut public_preview = preview.clone();
-    strip_staging_cleanup_proofs(&mut public_preview);
+    strip_bound_library_preview_proofs(&mut public_preview);
     json_size_within(&public_preview, MAX_PREVIEW_SNAPSHOT_BYTES)?;
     Some(json!({
         "seq": record.request.seq,
-        "kind": "staging_cleanup",
+        "kind": record.request.kind,
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
@@ -3153,6 +3155,49 @@ mod tests {
                 assert!(malformed.get("operation").is_none());
             }
         }
+    }
+
+    #[test]
+    fn danmaku_preview_snapshots_strip_private_plans_and_keep_review_identity() {
+        let mut receipt = record(
+            54,
+            "danmaku_refresh",
+            InboxStatus::AwaitingConfirmation,
+            Some(
+                json!({"operation":"preview", "preview_id":"danmaku-preview", "revision":"danmaku-revision",
+                    "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING,
+                    "preview":{"id":"danmaku-preview", "revision":"danmaku-revision",
+                        "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING,
+                        "ready":1, "skipped":0, "total":1,
+                        "items":[{"item_id":"video-one", "title":"Episode", "relative_path":"episode.mp4", "status":"ready"}]},
+                    "danmaku_preview":{"private_path":"/private/local-root/episode.xml", "proofs":["private-content-digest"]},
+                }),
+            ),
+            None,
+        );
+        receipt.request.payload = json!({"operation":"preview", "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING});
+        let operations = operation_snapshots(&[&receipt]).unwrap();
+        let previews = preview_snapshots(&[&receipt], 0);
+        assert_eq!(operations[0]["operation"], "preview");
+        assert_eq!(previews[0]["kind"], "danmaku_refresh");
+        assert_eq!(previews[0]["preview"]["ready"], 1);
+        for published in [&operations[0], &previews[0]] {
+            let encoded = serde_json::to_string(published).unwrap();
+            for private in [
+                "danmaku_preview",
+                "private_path",
+                "/private/local-root",
+                "proofs",
+                "private-content-digest",
+            ] {
+                assert!(
+                    !encoded.contains(private),
+                    "private danmaku proof leaked: {private}"
+                );
+            }
+        }
+        receipt.result.as_mut().unwrap()["root_binding"] = json!("root-replaced");
+        assert!(bound_library_preview_snapshot(&receipt).is_none());
     }
 
     #[test]

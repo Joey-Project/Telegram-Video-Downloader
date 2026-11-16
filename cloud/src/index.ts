@@ -81,6 +81,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "library_migration_confirm",
   "library_migration_control",
   "staging_cleanup",
+  "danmaku_refresh",
   "torrent_action",
 ]);
 

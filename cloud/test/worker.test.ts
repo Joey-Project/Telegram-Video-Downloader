@@ -2647,6 +2647,42 @@ describe("Mini App identity and actions", () => {
     expect(state.pending_requests.every((entry) => !("payload" in entry))).toBe(true);
   });
 
+  it("publishes danmaku refresh review identity while keeping selections out of cloud state", async () => {
+    const initData = await signInitData();
+    const identity = { library_id: "library-danmaku", root_binding: `v1:${"b".repeat(64)}` };
+    const preview = { preview_seq: 15, preview_id: "danmaku-preview-15", revision: "danmaku-revision-15" };
+    const requests = [
+      { operation: "preview", scope: "selected", expected_revision: "library-r7", item_ids: ["private-video-id"] },
+      { operation: "confirm", ...preview },
+      { operation: "cancel", ...preview },
+    ];
+    for (const [index, payload] of requests.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-00000000003${index}`,
+          kind: "danmaku_refresh",
+          payload: { ...payload, ...identity },
+        }),
+      });
+      expect(response.status).toBe(202);
+    }
+    const state = await responseJson<{ pending_requests: Array<Record<string, unknown>> }>(
+      await ownerRequest("/api/state", initData),
+    );
+    expect(state.pending_requests).toEqual(requests.map((payload, index) => ({
+      seq: index + 1,
+      kind: "danmaku_refresh",
+      created_at: expect.any(Number),
+      status: "waiting_for_local",
+      operation: payload.operation,
+      ...identity,
+      ...(payload.operation === "preview" ? {} : preview),
+    })));
+    expect(JSON.stringify(state.pending_requests)).not.toContain("private-video-id");
+    expect(state.pending_requests.every((entry) => !("payload" in entry))).toBe(true);
+  });
+
   it("preserves legacy line separators while enforcing decoded UTF-8 text bounds before enqueueing", async () => {
     const initData = await signInitData();
     const separatorText = "Line 1\r\n\tLine 2\n";

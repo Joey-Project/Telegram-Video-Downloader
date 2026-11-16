@@ -11,6 +11,8 @@ mod cloud;
 mod cloud_bot_tests;
 mod cloud_snapshot_budget;
 mod config;
+mod danmaku_refresh;
+mod danmaku_refresh_bot;
 mod disk_space;
 mod downloader;
 mod episode_retry;
@@ -624,6 +626,8 @@ struct CloudBotRuntime {
     test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
     #[cfg(test)]
     test_metadata_recovery_resolver: Option<metadata_recovery_bot::TestMetadataRecoveryResolver>,
+    #[cfg(test)]
+    test_danmaku_fetcher: Option<danmaku_refresh::TestDanmakuFetcher>,
     #[cfg(test)]
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(test)]
@@ -2109,6 +2113,8 @@ async fn run_cloud_bot(
         test_file_provider: None,
         #[cfg(test)]
         test_metadata_recovery_resolver: None,
+        #[cfg(test)]
+        test_danmaku_fetcher: None,
         #[cfg(test)]
         test_library_refresh_failure: Arc::new(std::sync::Mutex::new(None)),
         #[cfg(test)]
@@ -4628,6 +4634,9 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
+    if request.kind == "danmaku_refresh" && request.bound_preview_operation() == Some("cancel") {
+        return danmaku_refresh_bot::dispatch_cancel(runtime, request).await;
+    }
     if request.kind == "staging_cleanup"
         && request
             .staging_cleanup_operation()
@@ -4643,7 +4652,7 @@ async fn dispatch_cloud_management(
     }
     if !matches!(
         request.kind.as_str(),
-        "file_preview" | "file_confirm" | "legacy_import" | "staging_cleanup"
+        "file_preview" | "file_confirm" | "legacy_import" | "staging_cleanup" | "danmaku_refresh"
     ) {
         media_library_bot::refresh_library_bindings(runtime).await?;
     }
@@ -4656,7 +4665,11 @@ async fn dispatch_cloud_management(
     let mut owned_request = request.clone();
     let binding_scoped_action = matches!(
         request.kind.as_str(),
-        "file_preview" | "legacy_import" | "metadata_recover" | "staging_cleanup"
+        "file_preview"
+            | "legacy_import"
+            | "metadata_recover"
+            | "staging_cleanup"
+            | "danmaku_refresh"
     );
     let requested_library_id_value = if binding_scoped_action {
         owned_request
@@ -4704,7 +4717,12 @@ async fn dispatch_cloud_management(
     };
     let selected = if matches!(
         request.kind.as_str(),
-        "library_scan" | "file_preview" | "legacy_import" | "metadata_recover" | "staging_cleanup"
+        "library_scan"
+            | "file_preview"
+            | "legacy_import"
+            | "metadata_recover"
+            | "staging_cleanup"
+            | "danmaku_refresh"
     ) {
         match media_library_bot::scoped_runtime(runtime, requested_library_id.as_deref()) {
             Ok(selected) => Some(selected),
@@ -4718,6 +4736,19 @@ async fn dispatch_cloud_management(
         .map(|(runtime, _)| runtime)
         .unwrap_or(runtime);
     let request = &owned_request;
+    if request.kind == "danmaku_refresh" {
+        return danmaku_refresh_bot::dispatch(
+            runtime,
+            request,
+            requested_library_id
+                .as_deref()
+                .expect("danmaku refresh requires library_id"),
+            requested_root_binding
+                .as_deref()
+                .expect("danmaku refresh requires root_binding"),
+        )
+        .await;
+    }
     if request.kind == "metadata_recover" {
         return metadata_recovery_bot::dispatch(
             runtime,

@@ -67,8 +67,10 @@
               <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">Current items</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option><option value="moved">Moved history</option></select>
               <button id="download-here" class="secondary-button" type="button">Download here</button>
               <button id="select-visible" class="quiet-button" type="button">Select this page</button>
+              <button id="refresh-library-danmaku" class="quiet-button" type="button">Refresh all library danmaku</button>
             </div>
             <div class="library-context"><span id="library-local-status" class="badge">Availability not reported</span><code id="library-location">Media root unavailable</code><a class="small-button" href="/settings/">Manage libraries</a></div>
+            <p class="field-hint">Danmaku refresh appends new comments to existing sidecars and keeps their current comments. Video files are not downloaded.</p>
             <div id="library-summary" class="section-summary"></div>
             <div id="library-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">▱</div><h2>Your library is ready when you are</h2><p>Start a scan on the connected computer to discover videos and their sidecar files.</p><button class="primary-button" data-scan type="button">Scan library</button></div>
             <div id="library-list" class="library-list" aria-live="polite"></div>
@@ -169,6 +171,7 @@
               <span id="selection-count" class="selection-count"></span>
               <button id="organize-selected" class="primary-button" type="button">Organize selected</button>
               <button id="recover-selected" class="secondary-button" type="button">Analyze selected metadata</button>
+              <button id="refresh-selected-danmaku" class="secondary-button" type="button">Refresh selected danmaku</button>
               <button id="clear-selection" class="quiet-button" type="button">Clear selection</button>
             </div>
           </aside>

@@ -16,6 +16,7 @@ export type RequestKind =
   | "library_migration_confirm"
   | "library_migration_control"
   | "staging_cleanup"
+  | "danmaku_refresh"
   | "torrent_action";
 
 export interface InboxEnvelope {
@@ -99,6 +100,12 @@ export interface LibraryMigrationPreviewPayload {
 export type StagingCleanupPayload = BoundLibraryMutationIdentity & (
   | { operation: "scan" }
   | { operation: "preview"; item_ids: string[] }
+  | { operation: "confirm" | "cancel"; preview_seq: number; preview_id: string; revision: string }
+);
+
+export type DanmakuRefreshPayload = BoundLibraryMutationIdentity & (
+  | { operation: "preview"; scope: "selected"; expected_revision: string; item_ids: string[] }
+  | { operation: "preview"; scope: "library"; expected_revision: string }
   | { operation: "confirm" | "cancel"; preview_seq: number; preview_id: string; revision: string }
 );
 

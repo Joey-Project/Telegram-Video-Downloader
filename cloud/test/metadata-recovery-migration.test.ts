@@ -38,6 +38,7 @@ describe.each([
   { migrationName: "0005_metadata_recovery_kind", temporaryTable: "inbox_with_metadata_recovery_kind", newKind: "metadata_recover" },
   { migrationName: "0006_preview_cancel_kind", temporaryTable: "inbox_with_preview_cancel_kind", newKind: "preview_cancel" },
   { migrationName: "0007_staging_cleanup_kind", temporaryTable: "inbox_with_staging_cleanup_kind", newKind: "staging_cleanup" },
+  { migrationName: "0009_danmaku_refresh_kind", temporaryTable: "inbox_with_danmaku_refresh_kind", newKind: "danmaku_refresh" },
 ])("$migrationName inbox migration", ({ migrationName, temporaryTable, newKind }) => {
   const migration = (queries: string[]) => inboxProbeMigration(migrationName, temporaryTable, queries);
   it("preserves populated inbox fields and rolls back the failed migration atomically", async () => {
