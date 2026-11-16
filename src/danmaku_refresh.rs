@@ -33,6 +33,12 @@ const UNSUPPORTED_XML_REASON: &str = "The recorded danmaku XML is unreadable or 
 const UNSUPPORTED_ASS_REASON: &str =
     "The existing ASS sidecar is not a recognized rendering of this XML.";
 const UNSUPPORTED_SIDECAR_REASON: &str = "The danmaku sidecar association is ambiguous or unsafe.";
+const SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON: &str =
+    "The media directory could not be fully checked for danmaku sidecar ownership.";
+const SIDECAR_OWNERSHIP_CHANGED_REASON: &str =
+    "Danmaku sidecar ownership changed; create a fresh preview.";
+const SIDECAR_OWNERSHIP_CONFLICT_REASON: &str =
+    "Danmaku sidecar ownership is ambiguous or belongs to another media item.";
 const MEDIA_IDENTITY_REASON: &str = "The media file identity is unavailable.";
 const NOT_PRESENT_REASON: &str = "The media item is not currently available.";
 const DEFERRED_BATCH_REASON: &str =
@@ -289,8 +295,16 @@ enum CaptureError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublishFailure {
     Stale,
+    OwnershipConflict,
+    OwnershipUnverifiable,
     Guard,
     Io,
+}
+
+#[derive(Clone, Copy)]
+enum AttachmentOwnershipFailure {
+    Conflict,
+    Unverifiable,
 }
 
 struct FetchBudget {
@@ -346,13 +360,27 @@ pub(super) fn preview(
     let mut captured_bytes = 0_usize;
     let inspection_started = Instant::now();
     let mut inspection_deferred = false;
+    let primary_paths = snapshot
+        .items
+        .iter()
+        .filter(|item| item.presence == Presence::Present)
+        .map(|item| item.relative_path.clone())
+        .collect::<Vec<_>>();
+    let snapshot_primary_paths_complete = snapshot_primary_paths_complete(snapshot);
 
     for item in selected {
         if inspection_deferred {
             items.push(deferred_row(item));
             continue;
         }
-        match capture_item(root, item, &mut captured_bytes, inspection_started) {
+        match capture_item(
+            root,
+            item,
+            &primary_paths,
+            snapshot_primary_paths_complete,
+            &mut captured_bytes,
+            inspection_started,
+        ) {
             Ok(capture) => {
                 if !ready_paths.insert(capture.xml.relative_path.clone())
                     || !ready_paths.insert(capture.ass.relative_path.clone())
@@ -439,6 +467,8 @@ fn selected_items<'a>(
 fn capture_item(
     root: &RootedFs,
     item: &LibraryItem,
+    snapshot_primary_paths: &[String],
+    snapshot_primary_paths_complete: bool,
     aggregate_bytes: &mut usize,
     inspection_started: Instant,
 ) -> std::result::Result<CapturedItem, CaptureError> {
@@ -459,7 +489,12 @@ fn capture_item(
         return Err(CaptureError::Skip(MEDIA_IDENTITY_REASON));
     }
 
-    let (xml_relative, ass_relative) = sidecar_paths(root, item)?;
+    let (xml_relative, ass_relative) = sidecar_paths(
+        root,
+        item,
+        snapshot_primary_paths,
+        snapshot_primary_paths_complete,
+    )?;
     let xml = observe_for_preview(
         root,
         &xml_relative,
@@ -527,6 +562,8 @@ fn capture_item(
 fn sidecar_paths(
     root: &RootedFs,
     item: &LibraryItem,
+    snapshot_primary_paths: &[String],
+    snapshot_primary_paths_complete: bool,
 ) -> std::result::Result<(String, String), CaptureError> {
     let media_path = Path::new(&item.relative_path);
     validate_relative_path(media_path)
@@ -658,7 +695,43 @@ fn sidecar_paths(
             return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
         }
     }
+    let output_paths = [xml_relative.clone(), ass_relative.clone()];
+    if snapshot_primary_paths_complete {
+        let snapshot_owner =
+            crate::file_manager::sidecar_paths_are_unambiguously_owned_by_snapshot(
+                root,
+                &output_paths,
+                snapshot_primary_paths,
+                &item.relative_path,
+            )
+            .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
+        if !snapshot_owner {
+            return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+        }
+    }
+    let current_owner =
+        crate::file_manager::sidecar_paths_are_unambiguously_owned_by_current_directory(
+            root,
+            &output_paths,
+            &item.relative_path,
+        )
+        .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
+    if !current_owner {
+        return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+    }
     Ok((xml_relative, ass_relative))
+}
+
+fn snapshot_primary_paths_complete(snapshot: &LibrarySnapshot) -> bool {
+    !snapshot.warnings.iter().any(|warning| {
+        warning.starts_with("scan stopped at ")
+            || warning.starts_with("scan depth limit reached at ")
+            || warning.starts_with("directory unreadable at ")
+            || warning.starts_with("File Provider access unavailable at ")
+            || warning.starts_with("filesystem name semantics unavailable at ")
+            || warning.starts_with("scan was interrupted while enumerating directory ")
+            || warning.contains("containing directory was not fully enumerated")
+    })
 }
 
 fn preferred_candidate<'a>(candidates: &'a [String], preferred_name: &str) -> Option<&'a str> {
@@ -812,6 +885,8 @@ async fn execute_inner(
             append_remaining_results(items, &mut captures, &mut summary, &mut results)?;
             break;
         }
+        verify_attachment_ownership(&root, &capture)
+            .map_err(|failure| anyhow!(attachment_ownership_failure_reason(failure)))?;
         guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
         let fetched = match fetch_xml(
             capture.cid,
@@ -837,6 +912,8 @@ async fn execute_inner(
         };
 
         guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
+        verify_attachment_ownership(&root, &capture)
+            .map_err(|failure| anyhow!(attachment_ownership_failure_reason(failure)))?;
         verify_media_and_sidecars(&root, &capture).map_err(|_| anyhow!(REVIEWED_FILES_CHANGED))?;
         let observed_xml =
             observe_sidecar(&root, &capture.xml.relative_path, MAX_DANMAKU_BODY_BYTES)
@@ -916,6 +993,16 @@ async fn execute_inner(
             }
             Err(PublishFailure::Guard) => bail!(GUARD_STOPPED),
             Err(PublishFailure::Stale) => bail!(REVIEWED_FILES_CHANGED),
+            Err(PublishFailure::OwnershipConflict) => {
+                bail!(attachment_ownership_failure_reason(
+                    AttachmentOwnershipFailure::Conflict
+                ))
+            }
+            Err(PublishFailure::OwnershipUnverifiable) => {
+                bail!(attachment_ownership_failure_reason(
+                    AttachmentOwnershipFailure::Unverifiable
+                ))
+            }
             Err(PublishFailure::Io) => {
                 summary.failed += 1;
                 results.push(failed_row(&item));
@@ -1117,6 +1204,18 @@ async fn fetch_xml(
     budget: &mut FetchBudget,
     request_timeout: Duration,
 ) -> Result<FetchedXml> {
+    let url = comment_url(cid);
+    fetch_xml_at_url(cid, client, fetcher, budget, request_timeout, &url).await
+}
+
+async fn fetch_xml_at_url(
+    cid: u64,
+    client: Option<&reqwest::Client>,
+    fetcher: Option<&TestDanmakuFetcher>,
+    budget: &mut FetchBudget,
+    request_timeout: Duration,
+    url: &str,
+) -> Result<FetchedXml> {
     ensure!(cid > 0, "invalid recorded danmaku CID");
     let remaining_budget = MAX_AGGREGATE_REFRESH_BYTES.saturating_sub(budget.consumed_bytes);
     ensure!(
@@ -1131,12 +1230,16 @@ async fn fetch_xml(
         "danmaku refresh exceeded its time limit"
     );
     let bytes = match fetcher {
-        Some(fetcher) => tokio::time::timeout(timeout, fetcher.fetch(cid))
-            .await
-            .map_err(|_| anyhow!("danmaku source request timed out"))??,
+        Some(fetcher) => {
+            let bytes = tokio::time::timeout(timeout, fetcher.fetch(cid))
+                .await
+                .map_err(|_| anyhow!("danmaku source request timed out"))??;
+            let mut body = Vec::new();
+            account_wire_chunk(&mut body, &bytes, budget, wire_limit)?;
+            body
+        }
         None => {
             let client = client.context("danmaku request client is unavailable")?;
-            let url = comment_url(cid);
             let mut response = client
                 .get(url)
                 .header(reqwest::header::ACCEPT_ENCODING, "identity")
@@ -1154,24 +1257,19 @@ async fn fetch_xml(
                 bail!("danmaku source exceeds its response size limit");
             }
             let mut body = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| anyhow!("danmaku source response could not be read"))?
-            {
-                if body.len().saturating_add(chunk.len()) > wire_limit {
-                    bail!("danmaku source exceeds its response size limit");
-                }
-                body.extend_from_slice(&chunk);
+            loop {
+                let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| anyhow!("danmaku source response could not be read"))?
+                else {
+                    break;
+                };
+                account_wire_chunk(&mut body, &chunk, budget, wire_limit)?;
             }
             body
         }
     };
-    ensure!(
-        bytes.len() <= wire_limit,
-        "danmaku source exceeds its response size limit"
-    );
-    budget.consumed_bytes = budget.consumed_bytes.saturating_add(bytes.len());
     let decoded_limit = MAX_DANMAKU_BODY_BYTES
         .min(MAX_AGGREGATE_REFRESH_BYTES.saturating_sub(budget.consumed_bytes));
     ensure!(
@@ -1181,6 +1279,8 @@ async fn fetch_xml(
     // Reserve the bounded decompression allowance before decoding. If a malformed compressed
     // response consumes substantial output before failing validation, later rows cannot reuse
     // those already-spent bytes and trigger more source requests without bound.
+    // The full decoder allowance is reserved conservatively and is not refunded on decode
+    // failure, because the decoder may have consumed substantial intermediate output first.
     budget.consumed_bytes = budget.consumed_bytes.saturating_add(MAX_DANMAKU_BODY_BYTES);
     let xml = decode_danmaku_payload(&bytes, decoded_limit)?;
     budget.consumed_bytes = budget
@@ -1195,6 +1295,21 @@ async fn fetch_xml(
         "danmaku refresh exceeded its time limit"
     );
     Ok(FetchedXml { xml })
+}
+
+fn account_wire_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    budget: &mut FetchBudget,
+    wire_limit: usize,
+) -> Result<()> {
+    budget.consumed_bytes = budget.consumed_bytes.saturating_add(chunk.len());
+    ensure!(
+        body.len().saturating_add(chunk.len()) <= wire_limit,
+        "danmaku source exceeds its response size limit"
+    );
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn comment_url(cid: u64) -> String {
@@ -1499,6 +1614,32 @@ fn verify_captured_nfo(root: &RootedFs, capture: &CapturedItem) -> Result<()> {
     Ok(())
 }
 
+fn verify_attachment_ownership(
+    root: &RootedFs,
+    capture: &CapturedItem,
+) -> std::result::Result<(), AttachmentOwnershipFailure> {
+    let paths = [
+        capture.xml.relative_path.clone(),
+        capture.ass.relative_path.clone(),
+    ];
+    match crate::file_manager::sidecar_paths_are_unambiguously_owned_by_current_directory(
+        root,
+        &paths,
+        &capture.relative_path,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AttachmentOwnershipFailure::Conflict),
+        Err(_) => Err(AttachmentOwnershipFailure::Unverifiable),
+    }
+}
+
+fn attachment_ownership_failure_reason(failure: AttachmentOwnershipFailure) -> &'static str {
+    match failure {
+        AttachmentOwnershipFailure::Conflict => SIDECAR_OWNERSHIP_CHANGED_REASON,
+        AttachmentOwnershipFailure::Unverifiable => SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON,
+    }
+}
+
 fn observe_sidecar(root: &RootedFs, relative: &str, read_limit: usize) -> Result<ObservedSidecar> {
     observe_sidecar_with_budget(root, relative, read_limit, usize::MAX)?
         .context("sidecar unexpectedly exceeded an unlimited inspection budget")
@@ -1641,18 +1782,31 @@ fn publish_pair(
     verify_sidecar(root, &capture.xml).map_err(|_| PublishFailure::Stale)?;
     verify_sidecar(root, &capture.ass).map_err(|_| PublishFailure::Stale)?;
     verify_captured_nfo(root, capture).map_err(|_| PublishFailure::Stale)?;
+    verify_attachment_ownership(root, capture).map_err(publish_ownership_failure)?;
 
     let xml_after = publish_sidecar(root, &capture.xml, xml_bytes, guard, || {
-        verify_sidecar(root, &capture.ass).and_then(|()| verify_captured_nfo(root, capture))
+        verify_sidecar(root, &capture.ass).map_err(|_| PublishFailure::Stale)?;
+        verify_captured_nfo(root, capture).map_err(|_| PublishFailure::Stale)?;
+        verify_attachment_ownership(root, capture).map_err(publish_ownership_failure)
     })?;
 
     verify_sidecar(root, &capture.ass).map_err(|_| PublishFailure::Stale)?;
     verify_captured_nfo(root, capture).map_err(|_| PublishFailure::Stale)?;
+    verify_attachment_ownership(root, capture).map_err(publish_ownership_failure)?;
     verify_sidecar(root, &xml_after).map_err(|_| PublishFailure::Stale)?;
     publish_sidecar(root, &capture.ass, ass_bytes, guard, || {
-        verify_sidecar(root, &xml_after).and_then(|()| verify_captured_nfo(root, capture))
+        verify_sidecar(root, &xml_after).map_err(|_| PublishFailure::Stale)?;
+        verify_captured_nfo(root, capture).map_err(|_| PublishFailure::Stale)?;
+        verify_attachment_ownership(root, capture).map_err(publish_ownership_failure)
     })?;
     Ok(())
+}
+
+fn publish_ownership_failure(failure: AttachmentOwnershipFailure) -> PublishFailure {
+    match failure {
+        AttachmentOwnershipFailure::Conflict => PublishFailure::OwnershipConflict,
+        AttachmentOwnershipFailure::Unverifiable => PublishFailure::OwnershipUnverifiable,
+    }
 }
 
 fn publish_sidecar<F>(
@@ -1663,7 +1817,7 @@ fn publish_sidecar<F>(
     check_other: F,
 ) -> std::result::Result<SidecarCapture, PublishFailure>
 where
-    F: Fn() -> Result<()>,
+    F: Fn() -> std::result::Result<(), PublishFailure>,
 {
     verify_parent(root, &capture.parent).map_err(|_| PublishFailure::Stale)?;
     let absolute =
@@ -1701,10 +1855,13 @@ where
                     }
                     if verify_parent(root, &capture.parent)
                         .and_then(|()| verify_file_proof(root, &entry, &file, expected))
-                        .and_then(|()| check_other())
                         .is_err()
                     {
                         checkpoint_failure = Some(PublishFailure::Stale);
+                        bail!("reviewed sidecar changed before replacement");
+                    }
+                    if let Err(failure) = check_other() {
+                        checkpoint_failure = Some(failure);
                         bail!("reviewed sidecar changed before replacement");
                     }
                     Ok(())
@@ -1730,7 +1887,7 @@ where
             {
                 return Err(PublishFailure::Stale);
             }
-            check_other().map_err(|_| PublishFailure::Stale)?;
+            check_other()?;
             if guard().is_err() {
                 return Err(PublishFailure::Guard);
             }
@@ -1748,7 +1905,7 @@ fn publish_new_sidecar<F>(
     check_other: F,
 ) -> std::result::Result<SidecarCapture, PublishFailure>
 where
-    F: Fn() -> Result<()>,
+    F: Fn() -> std::result::Result<(), PublishFailure>,
 {
     let temp_relative =
         temporary_sibling(&capture.relative_path).map_err(|_| PublishFailure::Io)?;
@@ -1766,7 +1923,7 @@ where
         {
             return Err(PublishFailure::Stale);
         }
-        check_other().map_err(|_| PublishFailure::Stale)?;
+        check_other()?;
         if guard().is_err() {
             return Err(PublishFailure::Guard);
         }
@@ -1885,6 +2042,8 @@ fn encode_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn xml(comments: &[(&str, &str)]) -> String {
         let mut output = String::from("<i><chatserver>x</chatserver>");
@@ -2221,6 +2380,161 @@ mod tests {
         Ok(())
     }
 
+    fn single_item_snapshot(
+        root: &RootedFs,
+        root_path: &Path,
+        relative_path: &str,
+        warnings: Vec<String>,
+    ) -> Result<LibrarySnapshot> {
+        let media = root_path.join(relative_path);
+        if let Some(parent) = media.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&media, b"small media")?;
+        let bound = root
+            .open_bound_file(&media)?
+            .context("test media file should be present")?;
+        let mut item = test_item(vec!["cid12345".to_owned()]);
+        item.relative_path = relative_path.to_owned();
+        item.physical_identity = Some(bound.physical_identity()?);
+        Ok(LibrarySnapshot {
+            revision: "revision".to_owned(),
+            scanned_at: 1,
+            root_label: "test".to_owned(),
+            items: vec![item],
+            categories: Vec::new(),
+            warnings,
+        })
+    }
+
+    #[test]
+    fn sidecar_owner_rejects_duplicate_stems_and_ignores_incomplete_snapshot_proof() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = RootedFs::new(directory.path())?;
+        let media = directory.path().join("episode.mp4");
+        std::fs::write(&media, b"media")?;
+        std::fs::write(directory.path().join("episode.mkv"), b"duplicate stem")?;
+        let mut item = test_item(vec!["cid12345".to_owned()]);
+        item.relative_path = "episode.mp4".to_owned();
+        let duplicate_stems = vec!["episode.mp4".to_owned(), "episode.mkv".to_owned()];
+        assert!(matches!(
+            sidecar_paths(&root, &item, &duplicate_stems, true),
+            Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON))
+        ));
+
+        std::fs::remove_file(directory.path().join("episode.mkv"))?;
+        std::fs::write(directory.path().join("episode.danmaku.mp4"), b"peer media")?;
+        let truncated_snapshot_paths = vec!["episode.mp4".to_owned()];
+        let incomplete_snapshot = LibrarySnapshot {
+            revision: "revision".to_owned(),
+            scanned_at: 1,
+            root_label: "test".to_owned(),
+            items: vec![item.clone()],
+            categories: Vec::new(),
+            warnings: vec!["scan stopped at the 1-media-item limit".to_owned()],
+        };
+        assert!(!snapshot_primary_paths_complete(&incomplete_snapshot));
+        assert!(matches!(
+            sidecar_paths(
+                &root,
+                &item,
+                &truncated_snapshot_paths,
+                snapshot_primary_paths_complete(&incomplete_snapshot),
+            ),
+            Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON))
+        ));
+        assert!(!directory.path().join("episode.danmaku.xml").exists());
+        assert!(!directory.path().join("episode.danmaku.ass").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_primary_added_after_preview_blocks_publication() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = RootedFs::new(directory.path())?;
+        let snapshot = single_item_snapshot(&root, directory.path(), "episode.mp4", Vec::new())?;
+        let original_media = std::fs::read(directory.path().join("episode.mp4"))?;
+        let plan = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(plan.ready, 1);
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            let peer_path = directory.path().join("episode.danmaku.mp4");
+            let response = xml_with_chatid(12_345, "new comment").into_bytes();
+            TestDanmakuFetcher::new(Arc::new(move |_cid| {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                let peer_path = peer_path.clone();
+                let response = response.clone();
+                Box::pin(async move {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    std::fs::write(peer_path, b"new peer media")?;
+                    Ok(response)
+                })
+            }))
+        };
+        let guard: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
+        let result = execute_with_guard(
+            Arc::new(AppConfig::for_test()),
+            root,
+            plan,
+            Some(fetcher),
+            guard,
+        )
+        .await;
+        let error = result.expect_err("new primary should invalidate output ownership");
+        assert!(format!("{error:#}").contains(SIDECAR_OWNERSHIP_CHANGED_REASON));
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(directory.path().join("episode.mp4"))?,
+            original_media
+        );
+        assert!(directory.path().join("episode.danmaku.mp4").is_file());
+        assert!(!directory.path().join("episode.danmaku.xml").exists());
+        assert!(!directory.path().join("episode.danmaku.ass").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_child_added_after_preview_does_not_change_sidecar_owner() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = RootedFs::new(directory.path())?;
+        let snapshot = single_item_snapshot(&root, directory.path(), "episode.mp4", Vec::new())?;
+        let plan = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(plan.ready, 1);
+        std::fs::write(
+            directory.path().join("notes.txt"),
+            b"benign directory churn",
+        )?;
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            let response = xml_with_chatid(12_345, "new comment").into_bytes();
+            TestDanmakuFetcher::new(Arc::new(move |_cid| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let response = response.clone();
+                Box::pin(async move { Ok(response) })
+            }))
+        };
+        let guard: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
+        let result = execute_with_guard(
+            Arc::new(AppConfig::for_test()),
+            root,
+            plan,
+            Some(fetcher),
+            guard,
+        )
+        .await?;
+        assert_eq!(result.summary.updated, 1);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert!(directory.path().join("episode.danmaku.xml").is_file());
+        assert!(directory.path().join("episode.danmaku.ass").is_file());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn exhausted_fetch_budget_does_not_call_source() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2239,6 +2553,154 @@ mod tests {
                 .is_err()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn partial_http_read_is_charged_and_exhaustion_blocks_another_request() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nABCD\r\n",
+                )
+                .await?;
+            stream.shutdown().await?;
+            let second_request =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+            Ok::<bool, anyhow::Error>(second_request.is_ok())
+        });
+        let client = reqwest::Client::new();
+        let mut budget = FetchBudget {
+            consumed_bytes: MAX_AGGREGATE_REFRESH_BYTES - MAX_DANMAKU_BODY_BYTES - 4,
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
+        };
+        let url = format!("http://{address}/comment.xml");
+        let before = budget.consumed_bytes;
+        let result = fetch_xml_at_url(
+            123,
+            Some(&client),
+            None,
+            &mut budget,
+            MAX_REQUEST_TIMEOUT,
+            &url,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("truncated chunked response should fail"),
+        };
+        assert!(
+            format!("{error:#}").contains("response could not be read"),
+            "fixture must fail after yielding the charged chunk: {error:#}"
+        );
+        assert_eq!(budget.consumed_bytes, before + 4);
+
+        let second = fetch_xml_at_url(
+            124,
+            Some(&client),
+            None,
+            &mut budget,
+            MAX_REQUEST_TIMEOUT,
+            &url,
+        )
+        .await;
+        assert!(
+            second.is_err(),
+            "aggregate exhaustion should stop another request"
+        );
+        assert_eq!(
+            budget.consumed_bytes,
+            MAX_AGGREGATE_REFRESH_BYTES - MAX_DANMAKU_BODY_BYTES
+        );
+        assert!(
+            !server.await??,
+            "no second HTTP request should reach the mock server"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_test_fetcher_body_is_charged_before_rejection() {
+        let oversized = vec![b'x'; 5];
+        let oversized_len = oversized.len();
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let oversized = oversized.clone();
+            Box::pin(async move { Ok(oversized) })
+        }));
+        let initial = MAX_AGGREGATE_REFRESH_BYTES - MAX_DANMAKU_BODY_BYTES - 4;
+        let mut budget = FetchBudget {
+            consumed_bytes: initial,
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
+        };
+        assert!(
+            fetch_xml(123, None, Some(&fetcher), &mut budget, MAX_REQUEST_TIMEOUT,)
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.consumed_bytes, initial + oversized_len);
+    }
+
+    #[test]
+    fn oversized_stream_chunk_is_charged_before_size_rejection() {
+        let mut budget = FetchBudget {
+            consumed_bytes: 19,
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
+        };
+        let mut body = Vec::new();
+        assert!(account_wire_chunk(&mut body, b"12345", &mut budget, 4).is_err());
+        assert_eq!(budget.consumed_bytes, 24);
+        assert!(
+            body.is_empty(),
+            "an oversized chunk must not enter the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoder_failure_keeps_wire_bytes_and_full_conservative_reservation() {
+        let body = b"not a danmaku payload".to_vec();
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let body = body.clone();
+            Box::pin(async move { Ok(body) })
+        }));
+        let initial = 17;
+        let mut budget = FetchBudget {
+            consumed_bytes: initial,
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
+        };
+        assert!(
+            fetch_xml(123, None, Some(&fetcher), &mut budget, MAX_REQUEST_TIMEOUT,)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            budget.consumed_bytes,
+            initial + b"not a danmaku payload".len() + MAX_DANMAKU_BODY_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_test_fetcher_charges_wire_and_decoded_output_only() -> Result<()> {
+        let body = xml_with_chatid(123, "new comment").into_bytes();
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let body = body.clone();
+            Box::pin(async move { Ok(body) })
+        }));
+        let initial = 29;
+        let mut budget = FetchBudget {
+            consumed_bytes: initial,
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
+        };
+        let fetched =
+            fetch_xml(123, None, Some(&fetcher), &mut budget, MAX_REQUEST_TIMEOUT).await?;
+        assert_eq!(
+            budget.consumed_bytes,
+            initial + xml_with_chatid(123, "new comment").len() + fetched.xml.len()
+        );
+        Ok(())
     }
 
     #[test]

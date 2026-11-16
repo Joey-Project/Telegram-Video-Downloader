@@ -423,6 +423,171 @@ async fn danmaku_refresh_selected_cancel_confirm_repeat_and_restart_preserve_com
 }
 
 #[tokio::test]
+async fn danmaku_refresh_new_sidecars_are_owned_by_the_scanned_media_e2e() {
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = {
+        let fetch_calls = Arc::clone(&fetch_calls);
+        let remote_xml = danmaku_xml(&[("1.0", "new comment")]);
+        crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            let remote_xml = remote_xml.clone();
+            Box::pin(async move {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(remote_xml)
+            })
+        }))
+    };
+    let harness = danmaku_refresh_harness(
+        "danmaku-refresh-new-sidecar-owner",
+        &[("Series/episode.mp4", "Episode one", "123456789")],
+        fetcher,
+    )
+    .await;
+    let snapshot = harness.scan(1).await;
+    let preview_record = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    assert_eq!(preview["ready"], 1);
+    let confirmed = harness
+        .request(3, confirmation_payload(&harness, 2, &preview))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    harness.drain_dispatch().await;
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+
+    let refreshed = harness.scan(4).await;
+    let episode = refreshed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "Series/episode.mp4")
+        .expect("the episode should remain in the library");
+    for attachment in ["Series/episode.danmaku.xml", "Series/episode.danmaku.ass"] {
+        assert!(
+            episode["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["relative_path"] == attachment),
+            "a fresh scan should assign {attachment} to the media that created it"
+        );
+    }
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn danmaku_refresh_rejects_prefix_owned_sidecar_without_fetching_e2e() {
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = {
+        let fetch_calls = Arc::clone(&fetch_calls);
+        let remote_xml = danmaku_xml(&[("1.0", "must not be fetched")]);
+        crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            let remote_xml = remote_xml.clone();
+            Box::pin(async move {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(remote_xml)
+            })
+        }))
+    };
+    let harness = danmaku_refresh_harness(
+        "danmaku-refresh-prefix-owner",
+        &[
+            ("episode.mp4", "Episode", "123456789"),
+            ("episode.danmaku.mp4", "Episode Danmaku", "987654321"),
+        ],
+        fetcher,
+    )
+    .await;
+    let snapshot = harness.scan(1).await;
+    let episode_id = snapshot_item_id(&snapshot, "episode.mp4");
+    let preview_record = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "selected", "item_ids": [episode_id],
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    assert_eq!(preview["ready"], 0);
+    assert_eq!(preview["skipped"], 1);
+    assert!(
+        preview["items"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ownership")
+    );
+
+    let confirmed = harness
+        .request(3, confirmation_payload(&harness, 2, &preview))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    harness.drain_dispatch().await;
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    for sidecar in ["episode.danmaku.xml", "episode.danmaku.ass"] {
+        assert!(
+            !harness.fixture.archive_root.join(sidecar).exists(),
+            "a conflicting output {sidecar} must not be created"
+        );
+    }
+    let refreshed = harness.scan(4).await;
+    for path in ["episode.mp4", "episode.danmaku.mp4"] {
+        let item = refreshed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["relative_path"] == path)
+            .expect("both videos should remain indexed");
+        assert!(
+            !item["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attachment| {
+                    matches!(
+                        attachment["relative_path"].as_str(),
+                        Some("episode.danmaku.xml" | "episode.danmaku.ass")
+                    )
+                })
+        );
+    }
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn danmaku_refresh_library_preview_reports_unsupported_items_and_collection_rows_e2e() {
     let remote = danmaku_xml(&[("1.0", "collection comment")]);
     let harness = danmaku_refresh_harness(
@@ -513,7 +678,7 @@ async fn danmaku_refresh_deadline_keeps_completed_items_and_defers_remaining_e2e
                     }
                 })
             }),
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(3),
         )
     };
     let mut harness = danmaku_refresh_harness(

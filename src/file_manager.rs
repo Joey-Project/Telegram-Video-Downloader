@@ -17,7 +17,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -70,6 +70,8 @@ const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 const MAX_PATH_COMPONENT_BYTES: usize = MAX_FILENAME_COMPONENT_BYTES;
 const MAX_ENTRIES: usize = 200_000;
 const MAX_MEDIA_ITEMS: usize = 50_000;
+const MAX_SIDECAR_OWNER_DIRECTORY_ENTRIES: usize = 50_000;
+const SIDECAR_OWNER_DIRECTORY_BUDGET: Duration = Duration::from_secs(5);
 const MAX_PINNED_PREVIEWS: usize = 64;
 const MAX_PINNED_FILES_PER_PREVIEW: usize = 512;
 const MAX_PINNED_FILES_TOTAL: usize = 4096;
@@ -8426,6 +8428,188 @@ impl SidecarIndex {
             .get(media_relative_path)
             .map(String::as_str)
     }
+}
+
+/// Return whether a hypothetical sidecar would be attached to `expected_owner` by the same
+/// longest-stem rule used by `SidecarIndex`. The caller supplies only names from a complete
+/// snapshot; this helper deliberately does not infer filesystem ownership from a missing path.
+pub(crate) fn sidecar_paths_are_unambiguously_owned_by_snapshot(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    primary_relative_paths: &[String],
+    expected_owner: &str,
+) -> Result<bool> {
+    ensure!(
+        !sidecar_relative_paths.is_empty(),
+        "sidecar ownership check requires at least one path"
+    );
+    let sidecars = sidecar_relative_paths
+        .iter()
+        .map(|path| safe_relative_path(path, false))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    ensure!(
+        sidecars
+            .iter()
+            .all(|sidecar| sidecar.parent().unwrap_or_else(|| Path::new("")) == parent),
+        "sidecar ownership paths must share a parent directory"
+    );
+    let semantics = target_name_semantics_for_directory(root, parent)?;
+    sidecar_paths_are_owned_by_paths_with_semantics(
+        &sidecars,
+        primary_relative_paths,
+        expected_owner,
+        semantics,
+    )
+}
+
+/// Rebuild the owner candidates from a bounded live listing of the sidecar's parent directory.
+/// Unreadable directories and over-limit listings are errors, never partial evidence of unique
+/// ownership. Child additions unrelated to primary media do not change the matcher result.
+pub(crate) fn sidecar_paths_are_unambiguously_owned_by_current_directory(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    expected_owner: &str,
+) -> Result<bool> {
+    sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+        root,
+        sidecar_relative_paths,
+        expected_owner,
+        MAX_SIDECAR_OWNER_DIRECTORY_ENTRIES,
+    )
+}
+
+fn sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    expected_owner: &str,
+    entry_limit: usize,
+) -> Result<bool> {
+    ensure!(
+        !sidecar_relative_paths.is_empty(),
+        "sidecar ownership check requires at least one path"
+    );
+    let sidecars = sidecar_relative_paths
+        .iter()
+        .map(|path| safe_relative_path(path, false))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    ensure!(
+        sidecars
+            .iter()
+            .all(|sidecar| sidecar.parent().unwrap_or_else(|| Path::new("")) == parent),
+        "sidecar ownership paths must share a parent directory"
+    );
+    let parent_identity = directory_identity(root, parent)?;
+    let semantics =
+        target_name_semantics_for_directory_with_identity(root, parent, parent_identity)?;
+    let deadline = Instant::now() + SIDECAR_OWNER_DIRECTORY_BUDGET;
+    let entries = if parent.as_os_str().is_empty() {
+        root.list_root_directory_until(entry_limit, deadline)?
+    } else {
+        let absolute_parent = root.logical_root_path().join(parent);
+        let entry = root.bind_entry(&absolute_parent, false)?;
+        root.list_bound_directory_until(&entry, parent_identity, entry_limit, deadline)?
+    };
+    let mut primary_relative_paths = Vec::new();
+    for (name, identity) in entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let relative = parent.join(name);
+        let relative = path_to_relative_string(&relative)?;
+        if is_primary_media(&relative) {
+            primary_relative_paths.push(relative);
+        }
+    }
+    sidecar_paths_are_owned_by_paths_with_semantics(
+        &sidecars,
+        &primary_relative_paths,
+        expected_owner,
+        semantics,
+    )
+}
+
+fn directory_identity(root: &RootedFs, relative: &Path) -> Result<EntryIdentity> {
+    if relative.as_os_str().is_empty() {
+        return Ok(root.root_identity());
+    }
+    let absolute = root.logical_root_path().join(relative);
+    root.entry_identity(&absolute)?
+        .filter(|identity| identity.is_dir())
+        .ok_or_else(|| anyhow!("sidecar parent directory is unavailable"))
+}
+
+fn target_name_semantics_for_directory(
+    root: &RootedFs,
+    relative: &Path,
+) -> Result<TargetNameSemantics> {
+    let identity = directory_identity(root, relative)?;
+    target_name_semantics_for_directory_with_identity(root, relative, identity)
+}
+
+fn target_name_semantics_for_directory_with_identity(
+    root: &RootedFs,
+    relative: &Path,
+    identity: EntryIdentity,
+) -> Result<TargetNameSemantics> {
+    let directory = open_validated_target_directory(root, relative, identity)?;
+    target_name_semantics(&directory)
+        .context("filesystem name semantics unavailable for sidecar ownership")
+}
+
+fn sidecar_paths_are_owned_by_paths_with_semantics(
+    sidecars: &[PathBuf],
+    primary_relative_paths: &[String],
+    expected_owner: &str,
+    semantics: TargetNameSemantics,
+) -> Result<bool> {
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    let mut primary_stems: HashMap<String, PrimaryStemOwner> = HashMap::new();
+    for primary_relative_path in primary_relative_paths {
+        let primary = safe_relative_path(primary_relative_path, false)?;
+        if primary.parent().unwrap_or_else(|| Path::new("")) != parent {
+            continue;
+        }
+        let Some(stem) = primary.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let key = target_component_key_with(stem, semantics, platform_case_fold)?;
+        match primary_stems.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let owner = entry.get_mut();
+                owner.count = owner.count.saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PrimaryStemOwner {
+                    relative_path: primary_relative_path.clone(),
+                    count: 1,
+                });
+            }
+        }
+    }
+    for sidecar in sidecars {
+        let sidecar_stem = sidecar
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .context("sidecar filename has no valid stem")?;
+        let Some(owner) = longest_matching_primary_stem_with(
+            sidecar_stem,
+            &primary_stems,
+            semantics,
+            platform_case_fold,
+        )?
+        else {
+            return Ok(false);
+        };
+        if owner.count != 1 || owner.relative_path != expected_owner {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn longest_matching_primary_stem_with<'a, F>(
@@ -20470,6 +20654,27 @@ mod tests {
         assert_ne!(root_key, nested_key);
         assert_eq!(root_key.components, vec!["Clip.mp4".to_string()]);
         assert_eq!(nested_key.components, vec!["Clip.mp4".to_string()]);
+    }
+
+    #[test]
+    fn danmaku_sidecar_owner_check_refuses_a_partial_directory_listing() {
+        let root = TemporaryRoot::new("sidecar-owner-listing-limit");
+        fs::write(root.path().join("episode.mp4"), b"media").expect("primary fixture should write");
+        fs::write(root.path().join("notes.txt"), b"unrelated child")
+            .expect("unrelated fixture should write");
+        let rooted = RootedFs::new(root.path()).expect("media root should open");
+
+        let error = sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+            &rooted,
+            &[
+                "episode.danmaku.xml".to_owned(),
+                "episode.danmaku.ass".to_owned(),
+            ],
+            "episode.mp4",
+            1,
+        )
+        .expect_err("an over-limit listing must not prove unique ownership");
+        assert!(error.to_string().contains("entry limit"));
     }
 
     #[cfg(target_os = "macos")]

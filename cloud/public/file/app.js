@@ -4076,8 +4076,13 @@ function danmakuRefreshHistorySummary(entry) {
     return `Danmaku preview: ${Number(preview.ready ?? 0).toLocaleString()} ready, ${Number(preview.skipped ?? 0).toLocaleString()} skipped.`;
   }
   if (operation === "confirm") {
-    const summary = result.summary && typeof result.summary === "object" ? result.summary : {};
-    return `${Number(summary.updated ?? 0).toLocaleString()} updated · ${Number(summary.unchanged ?? 0).toLocaleString()} unchanged · ${Number(summary.skipped ?? 0).toLocaleString()} skipped · ${Number(summary.failed ?? 0).toLocaleString()} failed · ${Number(summary.added_comments ?? 0).toLocaleString()} comments appended.`;
+    const summary = result.summary;
+    if (!summary || typeof summary !== "object" || Array.isArray(summary)
+        || ["updated", "unchanged", "skipped", "failed", "added_comments"]
+          .some((field) => !Number.isSafeInteger(summary[field]) || summary[field] < 0)) {
+      return "Refresh counts are unavailable in this snapshot.";
+    }
+    return `${summary.updated.toLocaleString()} updated · ${summary.unchanged.toLocaleString()} unchanged · ${summary.skipped.toLocaleString()} skipped · ${summary.failed.toLocaleString()} failed · ${summary.added_comments.toLocaleString()} comments appended.`;
   }
   if (operation === "cancel") return result.cancelled === true
     ? "Danmaku preview cancelled. No comments were changed."
