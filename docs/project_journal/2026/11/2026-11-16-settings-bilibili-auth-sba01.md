@@ -68,10 +68,11 @@ superseded_by: ""
   completion and pauses each relevant poll. Publication acknowledgements precede
   the confirmation baseline; unchanged polls preserve both the auth timestamp
   and publication count, while expiration adds one state update. The revised
-  lifecycle E2E passed three consecutive isolated runs, and the shared-helper
-  generation E2E passed (`p2-auth-final-1-1794851490792430000.log`,
-  `p2-auth-final-2-1794851551117820000.log`,
-  `p2-auth-final-3-1794851566548857000.log`,
-  `p2-auth-generation-helper-1794851584961278000.log`).
+  lifecycle E2E passed three consecutive isolated runs after capturing each
+  count threshold before its triggering action, and the shared-helper generation
+  E2E passed (`p2-auth-barrier-1-1794851737791488000.log`,
+  `p2-auth-barrier-2-1794851797849651000.log`,
+  `p2-auth-barrier-3-1794851814509394000.log`,
+  `p2-auth-helper-final-1794851832473322000.log`).
 - Strict workspace/all-target Clippy passes with warnings denied. Production
   credentials, real login sessions and services are outside automated acceptance.
