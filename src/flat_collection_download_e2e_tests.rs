@@ -733,6 +733,23 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
     let nfo_text = std::str::from_utf8(&nfo_bytes).expect("generated NFO should be UTF-8");
     assert!(nfo_text.contains("<uniqueid type=\"bilibili\" default=\"true\">BV1</uniqueid>"));
     assert!(nfo_text.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
+    assert!(nfo_text.contains("<tvshowtitle>Segment Collection</tvshowtitle>"));
+    let primary_filename = report_primary_order[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("reported primary filename should be UTF-8");
+    assert!(nfo_text.contains(&format!(
+        "<localfilename>{primary_filename}</localfilename>"
+    )));
+    assert!(nfo_text.contains("<tvd_attachment role=\"danmaku\">danmaku.xml</tvd_attachment>"));
+    assert!(nfo_text.contains(
+        "<tvd_attachment role=\"subtitle\">subtitle-en-US-01-trackhash.srt</tvd_attachment>"
+    ));
+    assert!(
+        nfo_text
+            .contains("<tvd_attachment role=\"cover\">cover-image-deadbeef.jpg</tvd_attachment>")
+    );
+    assert!(nfo_text.contains("<thumb>cover-image-deadbeef.jpg</thumb>"));
     let directory_segment_order_after_nfo = root
         .list_bound_directory(&sdk_entry, sdk_entry_identity)
         .expect("SDK entry children should remain listable after writing its NFO")

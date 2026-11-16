@@ -23,6 +23,7 @@
 - In `/file`, open **Video staging**, choose a library and press **Scan staging** to inspect recorded temporary video downloads. Select eligible attempts, press **Preview cleanup**, then confirm or cancel in Requests. Confirmation permanently discards the selected fragments; retrying the task may require a fresh download. Active writers, migrations, completed unpublished downloads and unsafe or unknown ownership stay protected with an explanation. PDF downloads and Music staging/originals are outside this view. Scans run on the Mac only when requested; retention remains permanent unless the user confirms cleanup.
 - An uncollected video can be explicitly marked as standalone, or returned to unreviewed, through the same preview/confirmation flow. The declaration travels in its NFO and only suppresses the missing-collection reason; unavailable files, incomplete metadata, and uncertain matches still need attention.
 - `/settings` 管理多个媒体库及默认下载分类；`/file` 可选择媒体库，并通过“下载到这里”提交视频或合集。每个任务在入队时固定保存位置，之后修改默认设置只影响新任务。
+- `/settings` also shows saved Bilibili credential types and the current login attempt. Start Web, TV or access-key login there, then scan and confirm in the owner's Telegram chat. Cancel applies to the displayed attempt; logout requires confirmation and the displayed credential revision. QR codes, authorization links and credentials stay off Cloudflare. The snapshot reports saved credentials, not a live validity check; older or stale snapshots require refresh before scoped actions.
 - Optional `.torrent` uploads and magnet links use the existing local qBittorrent service. `/torrents` browses qBittorrent tasks (eight per page, up to 20,000 tasks) with progress and pause/resume controls; choosing a task adopts it in place and opens the existing card for optional Music selection. Bot-submitted torrents request every file; adopting an existing task preserves its current priorities. Catalog actions do not resubmit, move or delete payloads. Payloads remain available for seeding; only explicitly confirmed, completed audio is copied into the Music pipeline. `/torrents saved` lists retained bot records and `/torrents TASK_ID` recovers a saved card; `/magnet LINK` is also supported. See [torrent downloads and Music imports](docs/torrent-music-import.md).
 
 New Bilibili collection and season plans publish media and related files directly
@@ -50,6 +51,28 @@ A partial batch can be resumed with the same preview rather than starting again.
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
 - 任务开始后会发送一条状态消息，后续下载/混流进度会尽量通过 Telegram edit message 在同一条消息中刷新；视频 plan/metadata 解析完成后，同一条消息会持续显示已选媒体的预估大小、分辨率、帧率、视频/音频编码和全集条目数。上游未提供大小时会明确显示 `unknown`，混合已知与未知流时显示 `at least`，不会用码率伪造精确文件大小。
 - 持久任务记录保存在视频和 PDF 下载根目录下的隐藏私有队列目录；完成后，任务记录会移动到已发布文件旁边，并保存主媒体文件的 SHA-256。视频下载失败或取消时，隐藏的私有 staging 尝试目录会永久保留，后续成功任务也不会清理它。
+
+## 媒体库附件与 NFO
+
+媒体库扫描优先读取 NFO 中明确列出的本地附件。每项用一个重复的 `tvd_attachment` 元素声明，值必须是同目录的文件 basename：
+
+```xml
+<movie>
+  <localfilename>Film.mkv</localfilename>
+  <tvshowtitle>Collection name</tvshowtitle>
+  <thumb>封面.jpg</thumb>
+  <tvd_attachment role="cover">封面.jpg</tvd_attachment>
+  <tvd_attachment role="subtitle">Русский.srt</tvd_attachment>
+  <tvd_attachment role="subtitle">Sous-titres français.srt</tvd_attachment>
+  <tvd_attachment role="danmaku">danmaku.xml</tvd_attachment>
+</movie>
+```
+
+Supported roles are `cover` (`jpg`, `jpeg`, `png`, `webp`), `subtitle` (`srt`, `vtt`, `ass`) and `danmaku` (`xml`, `json`, `txt`, `ass`). Basenames may contain Unicode and spaces, up to 255 UTF-8 bytes. Paths, traversal, URI values, remote assets, symlinks, primary media, NFO files and private queue files are not attachments. A declaration must resolve to exactly one regular file in the same directory and match its role. Duplicate or conflicting claims remain unattached as ambiguous. Each NFO is limited to 128 attachment and local-thumb entries and the existing 1 MiB sidecar read cap; an over-limit manifest is rejected as a whole.
+
+For older libraries without declarations, conventional bare covers, language-tagged subtitles and danmaku sidecars are associated only in a complete leaf directory with exactly one primary media file. Other or ambiguous files stay untouched. A remote `<thumb>` value is ignored and never fetched; a safe local basename can be used as cover artwork.
+
+When NFO output is enabled and a new NFO is created, Bilibili and YouTube downloads include local attachment declarations. Existing NFOs are not replaced by download metadata. Confirmed organize or rename operations update `localfilename`, attachment declarations and local `<thumb>` references in the same durable operation; scans and previews do not write NFOs. Unknown NFO fields and clear source IDs are preserved. Missing `tvshowtitle` is filled from collection metadata. Migration keeps references when basenames stay stable and skips a KeepBoth rename when it cannot safely update a reference.
 
 ## 配置
 

@@ -65,6 +65,8 @@ use crate::safe_fs::{
     identity_for_open_file,
 };
 
+const NFO_ATTACHMENT_DECLARATION_LIMIT: usize = 128;
+
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static VIDEO_STAGING_CLEANUP_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_MISSING_VALIDATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -13199,7 +13201,8 @@ fn write_bilibili_nfos(
         let Some(primary_media) = bilibili_entry_primary_media(cwd, report_entry) else {
             continue;
         };
-        if !primary_media.is_file()
+        if !fs::symlink_metadata(&primary_media)
+            .is_ok_and(|metadata| metadata.file_type().is_file())
             || (!is_video_file(&primary_media) && !is_audio_file(&primary_media))
         {
             continue;
@@ -13223,6 +13226,17 @@ fn write_bilibili_nfos(
             .iter()
             .map(|(unique_id_type, unique_id)| (unique_id_type.as_str(), unique_id.as_str()))
             .collect::<Vec<_>>();
+        let primary_filename = primary_media
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let tvshowtitle = plan
+            .title
+            .trim()
+            .ne(title.unwrap_or_default().trim())
+            .then_some(plan.title.as_str())
+            .filter(|value| !value.trim().is_empty());
+        let attachments = bilibili_nfo_attachments(cwd, &primary_media, report_entry)?;
         let nfo_path = write_nfo_for_media(
             &primary_media,
             &MediaNfo {
@@ -13236,6 +13250,9 @@ fn write_bilibili_nfos(
                     .and_then(|entry| entry.uploader.as_deref())
                     .or(Some("Bilibili")),
                 premiered: plan_entry.and_then(|entry| entry.publish_date.as_deref()),
+                tvshowtitle,
+                localfilename: Some(primary_filename),
+                attachments,
             },
         )?;
         nfos.push(nfo_path);
@@ -13263,6 +13280,91 @@ struct BilibiliNfoIds {
     primary_unique_id_type: String,
     primary_unique_id: String,
     alternate_unique_ids: Vec<(String, String)>,
+}
+
+struct MediaNfoAttachment {
+    role: &'static str,
+    filename: String,
+}
+
+fn bilibili_nfo_attachments(
+    cwd: &Path,
+    primary_media: &Path,
+    report_entry: &BilibiliEntryDownloadReport,
+) -> Result<Vec<MediaNfoAttachment>> {
+    let Some(parent) = primary_media.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut by_filename = BTreeMap::<String, &'static str>::new();
+    let mut conflicted = BTreeSet::new();
+    for file in &report_entry.files {
+        let role = match file.kind.as_str() {
+            "cover" => "cover",
+            "subtitle" => "subtitle",
+            "danmaku" | "danmaku_ass" => "danmaku",
+            _ => continue,
+        };
+        let path = resolve_command_output_path(cwd, &file.path);
+        if path == primary_media || path.parent() != Some(parent) {
+            continue;
+        }
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            continue;
+        }
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !valid_nfo_attachment_basename(filename)
+            || !nfo_attachment_role_matches_extension(role, filename)
+        {
+            continue;
+        }
+        match by_filename.get(filename) {
+            Some(existing) if *existing != role => {
+                conflicted.insert(filename.to_string());
+            }
+            Some(_) => {}
+            None => {
+                by_filename.insert(filename.to_string(), role);
+                if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+                    bail!(
+                        "downloaded attachment manifest exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+                    );
+                }
+            }
+        }
+    }
+    Ok(by_filename
+        .into_iter()
+        .filter(|(filename, _)| !conflicted.contains(filename))
+        .map(|(filename, role)| MediaNfoAttachment { role, filename })
+        .collect())
+}
+
+fn valid_nfo_attachment_basename(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\', ':', '\0'])
+        && !value.chars().any(char::is_control)
+        && Path::new(value).components().count() == 1
+        && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+fn nfo_attachment_role_matches_extension(role: &str, filename: &str) -> bool {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match role {
+        "cover" => matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp"),
+        "subtitle" => matches!(extension.as_str(), "srt" | "vtt" | "ass"),
+        "danmaku" => matches!(extension.as_str(), "xml" | "json" | "txt" | "ass"),
+        _ => false,
+    }
 }
 
 fn bilibili_nfo_ids(entry: Option<&BilibiliDownloadEntry>) -> Option<BilibiliNfoIds> {
@@ -25759,6 +25861,9 @@ struct MediaNfo<'a> {
     source_url: &'a str,
     studio: Option<&'a str>,
     premiered: Option<&'a str>,
+    tvshowtitle: Option<&'a str>,
+    localfilename: Option<&'a str>,
+    attachments: Vec<MediaNfoAttachment>,
 }
 
 fn write_youtube_nfo_bound(
@@ -25777,6 +25882,7 @@ fn write_youtube_nfo_bound(
     let source_url = metadata.webpage_url.as_deref().unwrap_or(requested_url);
     let studio = metadata.uploader.as_deref().or(metadata.channel.as_deref());
     let premiered = metadata.upload_date.as_deref().and_then(format_yt_date);
+    let attachments = youtube_nfo_attachments(root, video_path, &video)?;
     let nfo = MediaNfo {
         title,
         plot: metadata.description.as_deref(),
@@ -25786,6 +25892,9 @@ fn write_youtube_nfo_bound(
         source_url,
         studio,
         premiered: premiered.as_deref(),
+        tvshowtitle: None,
+        localfilename: video_path.file_name().and_then(|name| name.to_str()),
+        attachments,
     };
     let title = nfo
         .title
@@ -25823,14 +25932,240 @@ fn write_youtube_nfo_bound(
     }
 }
 
+fn youtube_nfo_attachments(
+    root: &RootedFs,
+    video_path: &Path,
+    expected_video: &BoundFile,
+) -> Result<Vec<MediaNfoAttachment>> {
+    let parent = video_path
+        .parent()
+        .context("downloaded video has no parent directory")?;
+    let parent_identity = if parent == root.logical_root_path() {
+        root.root_identity()
+    } else {
+        root.entry_identity(parent)?
+            .ok_or_else(|| anyhow!("downloaded video directory disappeared"))?
+    };
+    if !parent_identity.is_dir() {
+        bail!("downloaded video parent is no longer a directory");
+    }
+    let entries = if parent == root.logical_root_path() {
+        root.list_root_directory()?
+    } else {
+        let parent_entry = root.bind_entry(parent, false)?;
+        root.list_bound_directory(&parent_entry, parent_identity)?
+    };
+    let mut primary_stems = BTreeMap::<String, usize>::new();
+    let mut primary_count = 0usize;
+    for (name, identity) in &entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let path = Path::new(name);
+        if is_video_file(path) || is_audio_file(path) {
+            if video_path
+                .file_name()
+                .is_some_and(|video_name| video_name == std::ffi::OsStr::new(name))
+            {
+                let current = root.open_bound_file(video_path)?;
+                if current.as_ref() != Some(expected_video)
+                    || current
+                        .as_ref()
+                        .is_none_or(|file| file.identity() != *identity)
+                {
+                    bail!("downloaded video identity changed during attachment discovery");
+                }
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            *primary_stems.entry(stem).or_default() += 1;
+            primary_count = primary_count.saturating_add(1);
+        }
+    }
+    let expected_stem = video_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("downloaded video has a non-UTF-8 filename"))?
+        .to_lowercase();
+    let mut by_filename = BTreeMap::<String, &'static str>::new();
+    for (name, identity) in entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(filename) = name.to_str() else {
+            continue;
+        };
+        if filename
+            .to_ascii_lowercase()
+            .starts_with(".telegram-video-downloader-")
+        {
+            continue;
+        }
+        let Some(sidecar_stem) = Path::new(filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        let matching_primary = primary_stems
+            .keys()
+            .filter(|stem| {
+                let stem = stem.as_str();
+                sidecar_stem == stem
+                    || sidecar_stem
+                        .strip_prefix(stem)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+            .max_by_key(|stem| stem.len());
+        let exact_owner = matching_primary.is_some_and(|stem| {
+            stem.as_str() == expected_stem && primary_stems.get(stem.as_str()).copied() == Some(1)
+        });
+        let unqualified = matching_primary.is_none()
+            && primary_count == 1
+            && youtube_is_conventional_unqualified_sidecar(filename);
+        let Some(role) = youtube_attachment_role(filename, exact_owner, unqualified) else {
+            continue;
+        };
+        if !valid_nfo_attachment_basename(filename)
+            || !nfo_attachment_role_matches_extension(role, filename)
+        {
+            continue;
+        }
+        by_filename.insert(filename.to_string(), role);
+        if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+            bail!(
+                "downloaded attachment manifest exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+            );
+        }
+    }
+    Ok(by_filename
+        .into_iter()
+        .map(|(filename, role)| MediaNfoAttachment { role, filename })
+        .collect())
+}
+
+fn youtube_attachment_role(
+    filename: &str,
+    exact_owner: bool,
+    unqualified: bool,
+) -> Option<&'static str> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?
+        .to_ascii_lowercase();
+    if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
+        && (exact_owner || unqualified && youtube_is_cover_stem(&stem))
+    {
+        return Some("cover");
+    }
+    if matches!(extension.as_str(), "srt" | "vtt" | "ass")
+        && (exact_owner || unqualified && youtube_is_language_stem(&stem))
+    {
+        return Some("subtitle");
+    }
+    if matches!(extension.as_str(), "xml" | "json" | "txt" | "ass")
+        && ((exact_owner && youtube_is_danmaku_stem(&stem))
+            || (unqualified && youtube_is_danmaku_stem(&stem)))
+    {
+        return Some("danmaku");
+    }
+    None
+}
+
+fn youtube_is_conventional_unqualified_sidecar(filename: &str) -> bool {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (youtube_is_cover_stem(&stem) && matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp"))
+        || (youtube_is_danmaku_stem(&stem)
+            && matches!(extension.as_str(), "xml" | "json" | "txt" | "ass"))
+        || (youtube_is_language_stem(&stem) && matches!(extension.as_str(), "srt" | "vtt" | "ass"))
+}
+
+fn youtube_is_cover_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "cover" | "poster" | "folder" | "thumb" | "fanart" | "banner" | "landscape"
+    )
+}
+
+fn youtube_is_danmaku_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "danmaku" | "danmu" | "barrage" | "comments" | "comment"
+    ) || [".danmaku", ".danmu", ".barrage"]
+        .iter()
+        .any(|suffix| stem.ends_with(suffix))
+}
+
+fn youtube_is_language_stem(stem: &str) -> bool {
+    let mut subtags = stem.split(['-', '_']);
+    let Some(language) = subtags.next() else {
+        return false;
+    };
+    const LANGUAGE_TAGS: &[&str] = &[
+        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+        "fr", "ga", "gl", "he", "hi", "hr", "hu", "id", "is", "it", "ja", "ko", "lt", "lv", "ms",
+        "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv", "th", "tr", "uk", "ur", "vi",
+        "zh", "chi", "deu", "eng", "fra", "fre", "ger", "ita", "jpn", "kor", "nld", "pol", "por",
+        "rus", "spa", "zho",
+    ];
+    LANGUAGE_TAGS.contains(&language)
+        && subtags.all(|subtag| {
+            (2..=8).contains(&subtag.len())
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+}
+
 fn write_nfo_for_media(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
+    if nfo.attachments.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+        bail!(
+            "NFO attachment list exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+        );
+    }
     let title = nfo
         .title
         .or_else(|| video_path.file_stem().and_then(|stem| stem.to_str()))
         .unwrap_or("Untitled");
     let nfo_path = video_path.with_extension("nfo");
-    fs::write(&nfo_path, render_nfo(title, nfo))
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&nfo_path)
+        .with_context(|| {
+            format!(
+                "failed to create {} without replacing existing metadata",
+                nfo_path.display()
+            )
+        })?;
+    output
+        .write_all(render_nfo(title, nfo).as_bytes())
         .with_context(|| format!("failed to write {}", nfo_path.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", nfo_path.display()))?;
     Ok(nfo_path)
 }
 
@@ -25849,6 +26184,36 @@ fn render_nfo(title: &str, nfo: &MediaNfo<'_>) -> String {
             xml_escape(unique_id_type),
             xml_escape(unique_id)
         ));
+    }
+    if let Some(tvshowtitle) = nfo.tvshowtitle.filter(|value| !value.trim().is_empty()) {
+        content.push_str(&format!(
+            "  <tvshowtitle>{}</tvshowtitle>\n",
+            xml_escape(tvshowtitle.trim())
+        ));
+    }
+    if let Some(localfilename) = nfo
+        .localfilename
+        .filter(|value| valid_nfo_attachment_basename(value))
+    {
+        content.push_str(&format!(
+            "  <localfilename>{}</localfilename>\n",
+            xml_escape(localfilename)
+        ));
+    }
+    let mut added_cover_thumb = false;
+    for attachment in &nfo.attachments {
+        content.push_str(&format!(
+            "  <tvd_attachment role=\"{}\">{}</tvd_attachment>\n",
+            attachment.role,
+            xml_escape(&attachment.filename)
+        ));
+        if attachment.role == "cover" && !added_cover_thumb {
+            content.push_str(&format!(
+                "  <thumb>{}</thumb>\n",
+                xml_escape(&attachment.filename)
+            ));
+            added_cover_thumb = true;
+        }
     }
     content.push_str(&format!(
         "  <trailer>{}</trailer>\n",
@@ -41724,6 +42089,12 @@ mv video.original video.m4s || exit 46
                 source_url: "https://example.com/?a=1&b=2",
                 studio: Some("Studio"),
                 premiered: Some("2026-05-17"),
+                tvshowtitle: Some("Series & Group"),
+                localfilename: Some("Example.mkv"),
+                attachments: vec![MediaNfoAttachment {
+                    role: "cover",
+                    filename: "封面.jpg".to_string(),
+                }],
             },
         );
 
@@ -41731,6 +42102,97 @@ mv video.original video.m4s || exit 46
         assert!(nfo.contains("<uniqueid type=\"youtube-alt\">alt &amp; id</uniqueid>"));
         assert!(nfo.contains("<plot>x &lt; y</plot>"));
         assert!(nfo.contains("<year>2026</year>"));
+        assert!(nfo.contains("<tvshowtitle>Series &amp; Group</tvshowtitle>"));
+        assert!(nfo.contains("<localfilename>Example.mkv</localfilename>"));
+        assert!(nfo.contains("<tvd_attachment role=\"cover\">封面.jpg</tvd_attachment>"));
+        assert!(nfo.contains("<thumb>封面.jpg</thumb>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_nfo_manifest_uses_only_local_regular_role_compatible_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("bilibili-nfo-attachments");
+        let group = root.join("Group");
+        fs::create_dir_all(&group).expect("group directory should create");
+        let primary = group.join("Film.mkv");
+        let cover = group.join("cover.jpg");
+        fs::write(&primary, b"video").expect("primary video should write");
+        fs::write(&cover, b"local cover").expect("local cover should write");
+        fs::write(group.join("not-cover.mkv"), b"other video").expect("other primary should write");
+        fs::write(group.join("Film.nfo"), b"not a cover").expect("NFO file should write");
+        let outside = temp_test_dir("bilibili-nfo-attachments-outside");
+        let outside_cover = outside.join("cover.jpg");
+        fs::write(&outside_cover, b"outside cover").expect("outside cover should write");
+        symlink(&outside_cover, group.join("linked.jpg")).expect("cover symlink should create");
+
+        let report = BilibiliEntryDownloadReport {
+            index: 1,
+            title: "Film".to_string(),
+            files: vec![
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: cover.clone(),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("linked.jpg"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("not-cover.mkv"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("Film.nfo"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: outside_cover.clone(),
+                },
+            ],
+            mux: None,
+        };
+
+        let attachments = bilibili_nfo_attachments(&root, &primary, &report)
+            .expect("local report attachments should be safely indexed");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].role, "cover");
+        assert_eq!(attachments[0].filename, "cover.jpg");
+        assert!(
+            outside_cover.exists(),
+            "outside file should remain untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn generated_nfo_never_replaces_an_existing_clear_source_id() {
+        let root = temp_test_dir("nfo-create-only-preserves-clear-id");
+        let video = root.join("Film.mkv");
+        let nfo_path = root.join("Film.nfo");
+        let original =
+            b"<movie><uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid></movie>";
+        fs::write(&video, b"video").expect("media should write");
+        fs::write(&nfo_path, original).expect("existing NFO should write");
+        let nfo = MediaNfo {
+            title: Some("New title"),
+            plot: None,
+            unique_id_type: "bilibili",
+            unique_id: "BV7654321",
+            alternate_unique_ids: Vec::new(),
+            source_url: "https://example.test/video",
+            studio: None,
+            premiered: None,
+            tvshowtitle: None,
+            localfilename: Some("Film.mkv"),
+            attachments: Vec::new(),
+        };
+        assert!(write_nfo_for_media(&video, &nfo).is_err());
+        assert_eq!(fs::read(&nfo_path).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -41738,6 +42200,13 @@ mv video.original video.m4s || exit 46
         let root_dir = temp_test_dir("youtube-bound-nfo");
         let video = root_dir.join("Example.mkv");
         fs::write(&video, "video").expect("video should write");
+        fs::write(root_dir.join("Example.jpg"), "cover").expect("cover should write");
+        fs::write(root_dir.join("Example.zh-Hans.srt"), "subtitle").expect("subtitle should write");
+        fs::write(root_dir.join("Example.danmaku.xml"), "danmaku").expect("danmaku should write");
+        fs::write(root_dir.join("Another.mkv"), "another video")
+            .expect("second primary should write");
+        fs::write(root_dir.join("cover.jpg"), "ambiguous bare cover")
+            .expect("bare cover should write");
         let root = RootedFs::new(&root_dir).expect("output root should bind");
         let metadata = YoutubeMetadata {
             id: Some("PHH1wTDF-1M".to_string()),
@@ -41758,6 +42227,15 @@ mv video.original video.m4s || exit 46
         assert!(nfo.contains("<title>Example &amp; title</title>"));
         assert!(nfo.contains("<uniqueid type=\"youtube\" default=\"true\">PHH1wTDF-1M</uniqueid>"));
         assert!(nfo.contains("<premiered>2026-05-17</premiered>"));
+        assert!(nfo.contains("<tvd_attachment role=\"cover\">Example.jpg</tvd_attachment>"));
+        assert!(
+            nfo.contains("<tvd_attachment role=\"subtitle\">Example.zh-Hans.srt</tvd_attachment>")
+        );
+        assert!(
+            nfo.contains("<tvd_attachment role=\"danmaku\">Example.danmaku.xml</tvd_attachment>")
+        );
+        assert!(!nfo.contains("<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>"));
+        assert!(!nfo.contains("<tvd_attachment role=\"cover\">Another.mkv</tvd_attachment>"));
         let _ = fs::remove_dir_all(root_dir);
     }
 

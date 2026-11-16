@@ -44,6 +44,7 @@ import {
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   readJsonBody,
   sha256Hex,
+  validateActionRequest,
   validateSnapshot,
 } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, getDatabaseEpoch, storeSnapshot } from "../src/store";
@@ -544,6 +545,105 @@ describe("inbox sequence preservation after migration", () => {
     expect(savedSequence?.seq).toBe(47);
     const next = await testEnv.DB.prepare("INSERT INTO inbox_probe (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('probe:next', 'hash-next', 'library_scan', '{}', 2) RETURNING seq").first<{ seq: number }>();
     expect(next?.seq).toBeGreaterThan(47);
+  });
+
+  it("preserves danmaku rows and the inbox high-water mark when adding Bilibili auth", async () => {
+    await testEnv.DB.prepare(`CREATE TABLE inbox_probe (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedup_key TEXT NOT NULL UNIQUE,
+      payload_hash TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      acked_at INTEGER
+    )`).run();
+    await testEnv.DB.prepare(`INSERT INTO inbox_probe (seq, dedup_key, payload_hash, kind, payload_json, created_at)
+      VALUES (6, 'probe:6', 'hash-6', 'danmaku_refresh', '{"operation":"preview"}', 1),
+             (47, 'probe:47', 'hash-47', 'library_scan', '{}', 1)`).run();
+
+    for (const name of ["0009_danmaku_refresh_kind", "0010_bilibili_auth_kind"]) {
+      const migration = testEnv.TEST_MIGRATIONS.find((candidate) => candidate.name.includes(name));
+      expect(migration).toBeDefined();
+      for (const query of migration?.queries ?? []) {
+        const probeQuery = query
+          .replaceAll("inbox_with_danmaku_refresh_kind", "inbox_probe_with_danmaku_refresh_kind")
+          .replaceAll("inbox_with_bilibili_auth_kind", "inbox_probe_with_bilibili_auth_kind")
+          .replaceAll("inbox_sequence_backup", "inbox_probe_sequence_backup")
+          .replaceAll("inbox_pending_seq", "inbox_probe_pending_seq")
+          .replace(/\binbox\b/gu, "inbox_probe");
+        await testEnv.DB.prepare(probeQuery).run();
+      }
+    }
+
+    const preserved = await testEnv.DB.prepare("SELECT seq, kind FROM inbox_probe ORDER BY seq").all<{ seq: number; kind: string }>();
+    expect(preserved.results).toEqual([{ seq: 6, kind: "danmaku_refresh" }, { seq: 47, kind: "library_scan" }]);
+    const savedSequence = await testEnv.DB.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'inbox_probe'").first<{ seq: number }>();
+    expect(savedSequence?.seq).toBe(47);
+    const next = await testEnv.DB.prepare("INSERT INTO inbox_probe (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('probe:next', 'hash-next', 'bilibili_auth', '{\"operation\":\"login\",\"mode\":\"web\"}', 2) RETURNING seq").first<{ seq: number }>();
+    expect(next?.seq).toBeGreaterThan(47);
+  });
+});
+
+describe("Bilibili authentication cloud contract", () => {
+  const authState = {
+    phase: "waiting_for_scan",
+    mode: "web",
+    generation: 4,
+    credential_revision: 2,
+    credential_summary: { has_cookie: false, has_access_key: false, has_tv_access_key: false },
+    updated_at_ms: Date.now(),
+    safe_reason: "none",
+  };
+
+  it("accepts login, scoped cancellation, and generation plus credential revision logout payloads", () => {
+    const now = Date.now();
+    const request = (requestId: string, payload: Record<string, unknown>) => validateActionRequest({
+      request_id: requestId,
+      kind: "bilibili_auth",
+      payload,
+      queued_at_ms: now,
+      replay_expires_at_ms: now + ACTION_REPLAY_WINDOW_MS,
+    });
+    expect(request("00000000-0000-4000-8000-000000009901", { operation: "login", mode: "tv" }).payload)
+      .toEqual({ operation: "login", mode: "tv" });
+    expect(request("00000000-0000-4000-8000-000000009902", { operation: "cancel", generation: 4, credential_revision: 2 }).payload)
+      .toEqual({ operation: "cancel", generation: 4, credential_revision: 2 });
+    expect(() => request("00000000-0000-4000-8000-000000009902", { operation: "cancel", generation: 4 }))
+      .toThrow(/invalid shape/u);
+    expect(request("00000000-0000-4000-8000-000000009903", { operation: "logout", generation: 4, credential_revision: 2 }).payload)
+      .toEqual({ operation: "logout", generation: 4, credential_revision: 2 });
+    expect(() => request("00000000-0000-4000-8000-000000009904", { operation: "login", mode: "web", qr_payload: syntheticCredentials.bilibiliAuth.qrPayload.value }))
+      .toThrow(/invalid shape/u);
+  });
+
+  it("accepts old snapshots without auth state but rejects unsafe auth fields and values", () => {
+    const settings = {
+      download_dir: "/Volumes/Main",
+      applied: {
+        revision: "settings-revision-auth",
+        default_library_id: "main",
+        default_category: "Films",
+        libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true }],
+      },
+    };
+    expect(validateSnapshot(localSnapshot({ settings })).settings.applied?.bilibili_auth).toBeUndefined();
+    expect(validateSnapshot(localSnapshot({ settings: { ...settings, applied: { ...settings.applied, bilibili_auth: authState } } }))
+      .settings.applied?.bilibili_auth?.phase).toBe("waiting_for_scan");
+    const invalidQrSnapshot = localSnapshot({ settings: {
+      ...settings,
+      applied: { ...settings.applied, bilibili_auth: { ...authState, qr_payload: syntheticCredentials.bilibiliAuth.qrPayload.value } },
+    } });
+    expect(() => validateSnapshot(invalidQrSnapshot)).toThrow(/authentication field|invalid shape/u);
+    const invalidAccessKeySnapshot = localSnapshot({ settings: {
+      ...settings,
+      applied: { ...settings.applied, bilibili_auth: {
+        ...authState,
+        credential_summary: { ...authState.credential_summary, access_key: syntheticCredentials.bilibiliAuth.accessKey.value },
+      } },
+    } });
+    expect(() => validateSnapshot(invalidAccessKeySnapshot)).toThrow(/authentication field|invalid shape/u);
+    expect(() => validateSnapshot(localSnapshot({ operations: [{ kind: "bilibili_auth", error: syntheticCredentials.bilibiliAuth.cookie.value, qr_ticket: syntheticCredentials.bilibiliAuth.qrPayload.value }], settings })))
+      .toThrow(/authentication field/u);
   });
 });
 
