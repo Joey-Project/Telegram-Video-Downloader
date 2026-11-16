@@ -430,3 +430,413 @@ fn review78_empty_uniqueid_placeholders_receive_requested_source_ids() {
     }
     assert!(!updated.source_ids.iter().any(|found| found == "BV7654321"));
 }
+
+#[test]
+fn review78_extra_nfo_thumb_ownership_survives_multi_primary_organization() {
+    let root = TemporaryRoot::new("review78-extra-nfo-thumb-organization");
+    let destination = root.path().join("Organized");
+    fs::create_dir(&destination).expect("destination directory should create");
+    fs::write(root.path().join("A.mkv"), b"A media").expect("A media should write");
+    fs::write(root.path().join("B.mkv"), b"B media").expect("B media should write");
+    fs::write(root.path().join("A-cover.jpg"), b"A cover").expect("A cover should write");
+    fs::write(destination.join("A-cover.jpg"), b"existing cover")
+        .expect("cover collision should write");
+    fs::write(
+        root.path().join("A.nfo"),
+        concat!(
+            "<movie><title>Old A title</title>",
+            "<localfilename>A.mkv</localfilename>",
+            "<uniqueid type=\"bilibili\">BV1A1234567</uniqueid>",
+            "<futureField owner=\"authoritative\">preserve A</futureField></movie>"
+        ),
+    )
+    .expect("A authoritative NFO should write");
+    fs::write(
+        root.path().join("A.extra.nfo"),
+        concat!(
+            "<movie><title>Secondary A title</title>",
+            "<thumb>A-cover.jpg</thumb>",
+            "<futureField owner=\"secondary\">preserve extra</futureField></movie>"
+        ),
+    )
+    .expect("A secondary NFO should write");
+    fs::write(
+        root.path().join("B.nfo"),
+        "<movie><title>B title</title><localfilename>B.mkv</localfilename></movie>",
+    )
+    .expect("B NFO should write");
+
+    let manager = manager(&root);
+    let snapshot = manager.scan(&[]).expect("source library should scan");
+    let a = item_at(&snapshot, "A.mkv");
+    let b = item_at(&snapshot, "B.mkv");
+    assert_eq!(a.authoritative_nfo_path.as_deref(), Some("A.nfo"));
+    for path in ["A.nfo", "A.extra.nfo"] {
+        assert!(
+            a.attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == "nfo" })
+        );
+    }
+    assert!(a.attachments.iter().any(|attachment| {
+        attachment.relative_path == "A-cover.jpg" && attachment.kind == "cover"
+    }));
+    assert!(b.attachments.iter().all(|attachment| {
+        attachment.relative_path != "A-cover.jpg" && attachment.relative_path != "A.extra.nfo"
+    }));
+
+    let patch = MetadataPatch {
+        item_id: a.id.clone(),
+        title: Some("Confirmed A title".to_string()),
+        source_ids: Vec::new(),
+        collection: None,
+        fill_missing_only: false,
+        organization_status: None,
+    };
+    let preview = manager
+        .preview_with_hints_and_patches(
+            &[a.id.clone(), b.id.clone()],
+            Some("Organized"),
+            false,
+            ConflictPolicy::KeepBoth,
+            &[],
+            &[patch],
+        )
+        .expect("both primaries and A's attached files should be previewable");
+    assert_eq!(preview.items.len(), 2);
+    assert!(
+        preview
+            .items
+            .iter()
+            .all(|item| item.outcome == MoveOutcome::Move)
+    );
+    let target_for = |source_path: &str| {
+        preview
+            .items
+            .iter()
+            .flat_map(|item| item.files.iter())
+            .find(|file| file.source_path == source_path)
+            .unwrap_or_else(|| panic!("preview should include {source_path}"))
+            .target_path
+            .clone()
+    };
+    let a_media_target = target_for("A.mkv");
+    let a_cover_target = target_for("A-cover.jpg");
+    let a_authoritative_target = target_for("A.nfo");
+    let a_extra_target = target_for("A.extra.nfo");
+    let b_media_target = target_for("B.mkv");
+    assert_ne!(a_media_target, "Organized/A.mkv");
+    assert_ne!(a_cover_target, "Organized/A-cover.jpg");
+    assert!(preview.metadata_patches.iter().any(|metadata_patch| {
+        metadata_patch.nfo_path == a_authoritative_target
+            && metadata_patch
+                .changes
+                .iter()
+                .any(|change| change.field == "title" && change.after == "Confirmed A title")
+    }));
+    assert!(
+        preview
+            .metadata_patches
+            .iter()
+            .any(|metadata_patch| metadata_patch.nfo_path == a_extra_target)
+    );
+
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("confirmed multi-primary organization should complete");
+    assert_eq!(result.status, BatchStatus::Complete);
+    let authoritative = fs::read_to_string(root.path().join(&a_authoritative_target))
+        .expect("moved authoritative NFO should read");
+    let extra = fs::read_to_string(root.path().join(&a_extra_target))
+        .expect("moved secondary NFO should read");
+    let cover_filename = Path::new(&a_cover_target)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("cover target basename should be UTF-8");
+    let media_filename = Path::new(&a_media_target)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("media target basename should be UTF-8");
+    assert!(authoritative.contains("<title>Confirmed A title</title>"));
+    assert!(authoritative.contains("<uniqueid type=\"bilibili\">BV1A1234567</uniqueid>"));
+    assert!(authoritative.contains(&format!("<localfilename>{media_filename}</localfilename>")));
+    assert!(
+        authoritative.contains("<futureField owner=\"authoritative\">preserve A</futureField>")
+    );
+    assert!(
+        !authoritative.contains("tvd_attachment") && !authoritative.contains("<thumb>"),
+        "the authoritative NFO had no cover declaration and must not acquire one"
+    );
+    assert!(extra.contains(&format!("<thumb>{cover_filename}</thumb>")));
+    assert!(extra.contains("<futureField owner=\"secondary\">preserve extra</futureField>"));
+
+    let rescanned = manager
+        .scan(&[])
+        .expect("organized multiple-primary library should rescan");
+    let moved_a = item_at(&rescanned, &a_media_target);
+    assert_eq!(
+        moved_a.authoritative_nfo_path.as_deref(),
+        Some(a_authoritative_target.as_str())
+    );
+    for path in [&a_authoritative_target, &a_extra_target] {
+        assert!(
+            moved_a.attachments.iter().any(|attachment| {
+                attachment.relative_path == *path && attachment.kind == "nfo"
+            })
+        );
+    }
+    assert!(moved_a.attachments.iter().any(|attachment| {
+        attachment.relative_path == a_cover_target && attachment.kind == "cover"
+    }));
+    let moved_b = item_at(&rescanned, &b_media_target);
+    assert!(moved_b.attachments.iter().all(|attachment| {
+        attachment.relative_path != a_cover_target && attachment.relative_path != a_extra_target
+    }));
+}
+
+#[test]
+fn review78_conflicting_nfo_claims_stay_unattached_and_normalized_aliases_deduplicate() {
+    let root = TemporaryRoot::new("review78-nfo-conflicting-claims");
+    fs::write(root.path().join("A.mkv"), b"A media").expect("A media should write");
+    fs::write(root.path().join("B.mkv"), b"B media").expect("B media should write");
+    fs::write(root.path().join("same.ass"), b"shared ASS").expect("ASS sidecar should write");
+    fs::write(root.path().join("shared.jpg"), b"shared cover").expect("shared cover should write");
+    fs::write(
+        root.path().join("A.nfo"),
+        concat!(
+            "<movie><tvd_attachment role=\"subtitle\">same.ass</tvd_attachment>",
+            "<tvd_attachment role=\"cover\">shared.jpg</tvd_attachment></movie>"
+        ),
+    )
+    .expect("A authoritative NFO should write");
+    fs::write(
+        root.path().join("A.extra.nfo"),
+        "<movie><tvd_attachment role=\"danmaku\">same.ass</tvd_attachment></movie>",
+    )
+    .expect("A secondary NFO should write");
+    fs::write(
+        root.path().join("B.nfo"),
+        "<movie><tvd_attachment role=\"cover\">shared.jpg</tvd_attachment></movie>",
+    )
+    .expect("B NFO should write");
+
+    let manager = manager(&root);
+    let snapshot = manager
+        .scan(&[])
+        .expect("conflicting declarations should scan safely");
+    let a = item_at(&snapshot, "A.mkv");
+    let b = item_at(&snapshot, "B.mkv");
+    for path in ["A.nfo", "A.extra.nfo"] {
+        assert!(
+            a.attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == "nfo" })
+        );
+    }
+    assert!(
+        b.attachments
+            .iter()
+            .any(|attachment| attachment.relative_path == "B.nfo" && attachment.kind == "nfo")
+    );
+    for item in [a, b] {
+        assert!(item.attachments.iter().all(|attachment| {
+            attachment.relative_path != "same.ass" && attachment.relative_path != "shared.jpg"
+        }));
+    }
+
+    let semantics = TargetNameSemantics {
+        normalization_insensitive: true,
+        case_insensitive: false,
+        hfs_ignorable: false,
+    };
+    let case_fold = |value: &str| Ok(value.to_string());
+    let files = vec![
+        round4_scanned_file("Media/A.mkv", 1),
+        round4_scanned_file("Media/B.mkv", 2),
+        round4_scanned_file("Media/A.nfo", 3),
+        round4_scanned_file("Media/A.extra.nfo", 4),
+        round4_scanned_file("Media/B.nfo", 5),
+        round4_scanned_file("Media/same.ass", 6),
+        round4_scanned_file("Media/shared.jpg", 7),
+        round4_scanned_file("Media/Café.jpg", 8),
+    ];
+    let directory_semantics = round4_semantics_by_parent(&files, semantics);
+    let mut sidecars = SidecarIndex::build_with_case_fold(
+        &files,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &directory_semantics,
+        case_fold,
+    )
+    .expect("modeled filesystem semantics should build the sidecar index");
+    let declarations = HashMap::from([
+        (
+            "Media/A.mkv".to_string(),
+            vec![
+                NfoAttachmentDeclaration {
+                    role: "subtitle".to_string(),
+                    filename: "same.ass".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "danmaku".to_string(),
+                    filename: "same.ass".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "shared.jpg".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "Café.jpg".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "Cafe\u{301}.jpg".to_string(),
+                },
+            ],
+        ),
+        (
+            "Media/B.mkv".to_string(),
+            vec![NfoAttachmentDeclaration {
+                role: "cover".to_string(),
+                filename: "shared.jpg".to_string(),
+            }],
+        ),
+    ]);
+    sidecars
+        .add_declared_attachments_with_case_fold(
+            &files,
+            &declarations,
+            &directory_semantics,
+            case_fold,
+        )
+        .expect("same-owner aliases should deduplicate while ambiguous claims stay rejected");
+    assert_eq!(
+        sidecars.declared_role("Media/A.mkv", "Media/Café.jpg"),
+        Some("cover")
+    );
+    assert_eq!(
+        sidecars
+            .attached_files(&files[0])
+            .iter()
+            .filter(|path| path.as_str() == "Media/Café.jpg")
+            .count(),
+        1,
+        "normalization-equivalent same-role claims should attach the scanned spelling once"
+    );
+    for media in ["Media/A.mkv", "Media/B.mkv"] {
+        assert_eq!(sidecars.declared_role(media, "Media/same.ass"), None);
+        assert_eq!(sidecars.declared_role(media, "Media/shared.jpg"), None);
+    }
+}
+
+#[test]
+fn review78_nfo_declaration_deadline_preserves_prior_rows_and_recovers() {
+    let root = TemporaryRoot::new("review78-nfo-declaration-deadline");
+    fs::write(root.path().join("A.mkv"), b"A media").expect("A media should write");
+    fs::write(root.path().join("B.mkv"), b"B media").expect("B media should write");
+    let manager = manager(&root);
+    let baseline = manager.scan(&[]).expect("baseline library should scan");
+    let prior_a = item_at(&baseline, "A.mkv").clone();
+    let prior_b = item_at(&baseline, "B.mkv").clone();
+
+    fs::write(root.path().join("bonus.jpg"), b"declared bonus")
+        .expect("declared bonus should write");
+    fs::write(
+        root.path().join("A.extra.nfo"),
+        "<movie><thumb>bonus.jpg</thumb></movie>",
+    )
+    .expect("first NFO declaration source should write");
+    fs::write(
+        root.path().join("A.nfo"),
+        "<movie><tvd_attachment role=\"cover\">../bad.jpg</tvd_attachment></movie>",
+    )
+    .expect("malformed second NFO declaration source should write");
+
+    manager.expire_next_scan_during_nfo_declarations_after(1);
+    let partial = manager
+        .scan(&[])
+        .expect("declaration deadline should return a safe partial snapshot");
+    assert!(partial.warnings.iter().any(|warning| {
+        warning.contains("120-second scan budget")
+            && warning.contains("unvisited paths were not marked missing")
+    }));
+    assert!(
+        partial
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("invalid portable attachment declaration in A.nfo")),
+        "the malformed second NFO should remain unread after the one-source cutoff"
+    );
+    let partial_a = item_at(&partial, "A.mkv");
+    assert_eq!(partial_a.id, prior_a.id);
+    assert_eq!(partial_a.presence, Presence::Unavailable);
+    assert_eq!(partial_a.title, prior_a.title);
+    assert_eq!(partial_a.attachments, prior_a.attachments);
+    assert!(
+        partial_a
+            .attachments
+            .iter()
+            .all(|attachment| attachment.relative_path != "bonus.jpg")
+    );
+    let partial_b = item_at(&partial, "B.mkv");
+    assert_eq!(partial_b.id, prior_b.id);
+    assert_eq!(partial_b.presence, Presence::Unavailable);
+    assert_eq!(partial_b.title, prior_b.title);
+
+    manager.expire_next_scan_during_nfo_declarations_after(0);
+    let zero_sources = manager
+        .scan(&[])
+        .expect("zero-source cutoff should also return a safe partial snapshot");
+    assert!(zero_sources.warnings.iter().any(|warning| {
+        warning.contains("120-second scan budget")
+            && warning.contains("unvisited paths were not marked missing")
+    }));
+    assert!(
+        zero_sources
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("invalid portable attachment declaration in A.nfo"))
+    );
+    assert_eq!(
+        item_at(&zero_sources, "A.mkv").presence,
+        Presence::Unavailable
+    );
+    assert_eq!(
+        item_at(&zero_sources, "B.mkv").presence,
+        Presence::Unavailable
+    );
+    assert_eq!(item_at(&zero_sources, "A.mkv").id, prior_a.id);
+    assert_eq!(item_at(&zero_sources, "B.mkv").id, prior_b.id);
+
+    fs::write(
+        root.path().join("A.nfo"),
+        "<movie><title>Recovered A</title></movie>",
+    )
+    .expect("malformed NFO should be repaired before recovery scan");
+    let recovered = manager
+        .scan(&[])
+        .expect("a complete rescan should recover the declared cover");
+    let recovered_a = item_at(&recovered, "A.mkv");
+    assert_eq!(recovered_a.id, prior_a.id);
+    assert_eq!(recovered_a.presence, Presence::Present);
+    assert_eq!(recovered_a.title, "Recovered A");
+    assert!(recovered_a.attachments.iter().any(|attachment| {
+        attachment.relative_path == "bonus.jpg" && attachment.kind == "cover"
+    }));
+    for path in ["A.nfo", "A.extra.nfo"] {
+        assert!(
+            recovered_a
+                .attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == "nfo" })
+        );
+    }
+    assert_eq!(item_at(&recovered, "B.mkv").presence, Presence::Present);
+    assert!(
+        recovered
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("120-second scan budget"))
+    );
+}
