@@ -5,6 +5,8 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +56,10 @@ pub(super) struct TestDanmakuFetcher {
     fetch: Arc<TestDanmakuFetch>,
     #[cfg(test)]
     refresh_duration: Duration,
+    #[cfg(test)]
+    expire_after_successful_publish: Arc<AtomicBool>,
+    #[cfg(test)]
+    between_item_deadline_hits: Arc<AtomicUsize>,
 }
 
 impl TestDanmakuFetcher {
@@ -62,6 +68,8 @@ impl TestDanmakuFetcher {
         Self {
             fetch,
             refresh_duration: MAX_REFRESH_DURATION,
+            expire_after_successful_publish: Arc::new(AtomicBool::new(false)),
+            between_item_deadline_hits: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -75,7 +83,39 @@ impl TestDanmakuFetcher {
         Self {
             fetch,
             refresh_duration,
+            expire_after_successful_publish: Arc::new(AtomicBool::new(false)),
+            between_item_deadline_hits: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn expiring_after_first_successful_publish(fetch: Arc<TestDanmakuFetch>) -> Self {
+        let fetcher = Self::new(fetch);
+        fetcher
+            .expire_after_successful_publish
+            .store(true, Ordering::SeqCst);
+        fetcher
+    }
+
+    #[cfg(test)]
+    pub(super) fn between_item_deadline_hit_count(&self) -> usize {
+        self.between_item_deadline_hits.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn expire_after_successful_publish(&self, budget: &mut FetchBudget) {
+        if self
+            .expire_after_successful_publish
+            .swap(false, Ordering::SeqCst)
+        {
+            budget.deadline = Instant::now();
+        }
+    }
+
+    #[cfg(test)]
+    fn note_between_item_deadline_hit(&self) {
+        self.between_item_deadline_hits
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn refresh_duration(&self) -> Duration {
@@ -761,13 +801,17 @@ async fn execute_inner(
             append_skipped_result(item, &mut summary, &mut results);
             continue;
         }
+        let capture = take_capture(&item, &mut captures)?;
         if fetch_budget.is_expired() {
+            #[cfg(test)]
+            if let Some(fetcher) = fetcher.as_ref() {
+                fetcher.note_between_item_deadline_hit();
+            }
             guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
             append_deferred_result(item, &mut summary, &mut results);
             append_remaining_results(items, &mut captures, &mut summary, &mut results)?;
             break;
         }
-        let capture = take_capture(&item, &mut captures)?;
         guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
         let fetched = match fetch_xml(
             capture.cid,
@@ -865,6 +909,10 @@ async fn execute_inner(
                     reason: None,
                     added_comments: merged.appended_comments,
                 });
+                #[cfg(test)]
+                if let Some(fetcher) = fetcher.as_ref() {
+                    fetcher.expire_after_successful_publish(&mut fetch_budget);
+                }
             }
             Err(PublishFailure::Guard) => bail!(GUARD_STOPPED),
             Err(PublishFailure::Stale) => bail!(REVIEWED_FILES_CHANGED),

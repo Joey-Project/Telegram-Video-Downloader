@@ -59,16 +59,20 @@ superseded_by: ""
   cancel actions, durable reload, results and failure states.
 - Additive D1 migration coverage preserves existing requests and high-water
   sequence values. Existing Rust and Cloud CI commands discover the new tests.
-- The final focused native run passes 49 danmaku cases, including mock Telegram
+- The final focused native run passes 50 danmaku cases, including mock Telegram
   replay, restart, cancellation, deadline deferral and XML-first interruption;
   one opt-in graphical-render test stays ignored. All 38 snapshot budget tests
   pass, including multiple individually valid previews exceeding the shared cap.
+  Deterministic E2E covers expiry between two videos as well as during a fetch,
+  preserving completed results and allowing fresh-preview continuation.
   Native converter workspace coverage passes 27 unit and 8 E2E cases.
 - Cloud validation passes 442 Worker/helper cases, 113 Mini App cases and 4 Widget
   regressions, plus typechecking and a Worker bundle dry run.
 - Formatting, strict workspace Clippy, diff and project-journal checks pass.
   The existing Rust and Cloud CI workflows discover the added tests and retain
   their full workspace, service-helper and test-runtime validation.
+- All nine Mini App notification tests pass with immutable Telegram replay
+  timestamps, keeping duplicate payload hashes stable across clock boundaries.
 
 ## Delivery boundaries
 
