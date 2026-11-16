@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-16
 updated: 2026-11-16
 branch: "codex/settings-login"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/77"
 supersedes: []
 superseded_by: ""
 ---
