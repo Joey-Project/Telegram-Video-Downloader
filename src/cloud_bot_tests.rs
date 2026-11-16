@@ -36,12 +36,125 @@ const TEST_TELEGRAM_TOKEN: &str = "codex_synth_v1_api_key_a";
 // Keep completion waits bounded without treating parallel-suite contention as a deadlock.
 const MIGRATION_TEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[test]
+fn bilibili_auth_cloud_contract_rejects_extra_fields_and_never_echoes_request_ids() {
+    let valid = serde_json::json!({ "operation": "login", "mode": "web" });
+    assert!(bilibili_auth_payload_has_exact_fields(
+        valid.as_object().expect("payload should be an object"),
+        &["operation", "mode"]
+    ));
+
+    let extra = serde_json::json!({
+        "operation": "login",
+        "mode": "web",
+        "qr_payload": "must-not-be-accepted"
+    });
+    assert!(!bilibili_auth_payload_has_exact_fields(
+        extra.as_object().expect("payload should be an object"),
+        &["operation", "mode"]
+    ));
+
+    let valid_cancel = serde_json::json!({
+        "operation": "cancel",
+        "generation": 4,
+        "credential_revision": 12
+    });
+    assert!(bilibili_auth_payload_has_exact_fields(
+        valid_cancel
+            .as_object()
+            .expect("cancel payload should be an object"),
+        &["operation", "generation", "credential_revision"]
+    ));
+    let stale_contract_cancel = serde_json::json!({
+        "operation": "cancel",
+        "generation": 4
+    });
+    assert!(!bilibili_auth_payload_has_exact_fields(
+        stale_contract_cancel
+            .as_object()
+            .expect("cancel payload should be an object"),
+        &["operation", "generation", "credential_revision"]
+    ));
+
+    let outcome = bilibili_auth_action_result(
+        "login",
+        Some("request-1".to_string()),
+        2,
+        0,
+        "accepted",
+        "Authorization flow started.",
+    );
+    let result = outcome.result.expect("action should return a safe receipt");
+    assert_eq!(result["status"], "accepted");
+    assert!(result.get("request_id").is_none());
+    assert_eq!(result.as_object().unwrap().len(), 5);
+}
+
+#[test]
+fn bilibili_auth_operation_history_is_reduced_to_safe_fields() {
+    let mut extra = serde_json::Map::new();
+    extra.insert("request_id".to_string(), serde_json::json!("request-1"));
+    let mut record = InboxRecord {
+        schema_version: 1,
+        request: CloudRequest {
+            seq: 8,
+            kind: "bilibili_auth".to_string(),
+            payload: serde_json::json!({
+                "operation": "login",
+                "mode": "web",
+                "qr_payload": "discard-this-field"
+            }),
+            created_at: 1,
+            extra,
+        },
+        status: InboxStatus::Completed,
+        attempts: 1,
+        received_at: None,
+        updated_at: 1,
+        next_attempt_at: 0,
+        error: Some("discarded error".to_string()),
+        result: Some(serde_json::json!({"raw": "discarded result"})),
+    };
+    sanitize_bilibili_auth_operation_record(&mut record);
+    assert_eq!(
+        record.request.payload,
+        serde_json::json!({"operation":"login", "mode":"web"})
+    );
+    assert!(record.request.extra.is_empty());
+    assert_eq!(record.error, None);
+    let serialized = serde_json::to_string(&record).expect("sanitized receipt should serialize");
+    assert!(!serialized.contains("discard-this-field"));
+    assert!(!serialized.contains("discarded error"));
+    assert!(!serialized.contains("discarded result"));
+    assert!(!serialized.contains("request-1"));
+
+    record.request.payload = serde_json::json!({
+        "operation": "cancel",
+        "generation": 4,
+        "credential_revision": 12,
+        "extra_secret": "discard-this-field"
+    });
+    record.result = Some(serde_json::json!({"raw": "discarded result"}));
+    sanitize_bilibili_auth_operation_record(&mut record);
+    assert_eq!(
+        record.request.payload,
+        serde_json::json!({
+            "operation": "cancel",
+            "generation": 4,
+            "credential_revision": 12
+        })
+    );
+    let serialized = serde_json::to_string(&record).expect("cancel receipt should serialize");
+    assert!(!serialized.contains("discard-this-field"));
+    assert!(!serialized.contains("discarded result"));
+}
+
 pub(super) struct FakeTelegramRequest {
-    method: String,
-    body: serde_json::Value,
-    authorization: Option<String>,
-    database_epoch: Option<String>,
-    snapshot_notify_viewers: Option<String>,
+    pub(super) method: String,
+    pub(super) body: serde_json::Value,
+    pub(super) authorization: Option<String>,
+    pub(super) database_epoch: Option<String>,
+    pub(super) snapshot_notify_viewers: Option<String>,
 }
 
 pub(super) fn take_cloud_test_telegram_requests(
@@ -54,7 +167,7 @@ pub(super) fn take_cloud_test_telegram_requests(
     recorded
 }
 
-struct FakeCloudApiState {
+pub(super) struct FakeCloudApiState {
     pending: StdMutex<Vec<CloudRequest>>,
     database_epoch: StdMutex<String>,
     rotate_epoch_to: StdMutex<Option<String>>,
@@ -68,7 +181,8 @@ struct FakeCloudApiState {
     fail_first_ack: AtomicBool,
     durable_before_ack: AtomicBool,
     inbox_root: PathBuf,
-    state_posts: StdMutex<Vec<serde_json::Value>>,
+    pub(super) state_posts: StdMutex<Vec<serde_json::Value>>,
+    pub(super) state_bodies: StdMutex<Vec<serde_json::Value>>,
     state_post_statuses: StdMutex<Vec<u16>>,
     state_post_response_headers: StdMutex<Vec<Vec<(String, String)>>>,
     state_post_pause: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -319,6 +433,11 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         .unwrap_or("0")
         .parse::<usize>()
         .context("fake HTTP content length was invalid")?;
+    let content_type = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-type")
+            .then_some(value.trim().to_ascii_lowercase())
+    });
     let authorization = headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("authorization")
@@ -346,7 +465,18 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
-    let body = if let Some(hash) = request_path.strip_prefix("/api/local/state/chunks/") {
+    let body = if content_type
+        .as_deref()
+        .is_some_and(|value| value.starts_with("multipart/form-data"))
+    {
+        let body = String::from_utf8_lossy(&bytes[header_end..body_end]);
+        let chat_id = body
+            .split("name=\"chat_id\"\r\n\r\n")
+            .nth(1)
+            .and_then(|part| part.split("\r\n").next())
+            .unwrap_or_default();
+        serde_json::json!({"chat_id": chat_id, "multipart": true})
+    } else if let Some(hash) = request_path.strip_prefix("/api/local/state/chunks/") {
         method = "state_chunk".to_string();
         serde_json::json!({
             "sha256": hash,
@@ -432,7 +562,7 @@ pub(super) async fn stop_fake_telegram_api(
         .expect("fake Telegram API should not fail");
 }
 
-async fn spawn_fake_cloud_api(
+pub(super) async fn spawn_fake_cloud_api(
     inbox_root: PathBuf,
     pending: Vec<CloudRequest>,
 ) -> (
@@ -485,7 +615,7 @@ fn decode_fake_chunked_snapshot(
     Ok(state)
 }
 
-async fn spawn_fake_cloud_api_with_epoch(
+pub(super) async fn spawn_fake_cloud_api_with_epoch(
     inbox_root: PathBuf,
     pending: Vec<CloudRequest>,
     database_epoch: String,
@@ -516,6 +646,7 @@ async fn spawn_fake_cloud_api_with_epoch(
         durable_before_ack: AtomicBool::new(false),
         inbox_root,
         state_posts: StdMutex::new(Vec::new()),
+        state_bodies: StdMutex::new(Vec::new()),
         state_post_statuses: StdMutex::new(Vec::new()),
         state_post_response_headers: StdMutex::new(Vec::new()),
         state_post_pause: StdMutex::new(None),
@@ -828,6 +959,11 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 .context("fake library warnings should serialize")?
                                 .len();
                             let tasks = state_body["tasks"].clone();
+                            task_state
+                                .state_bodies
+                                .lock()
+                                .expect("fake state body lock should not poison")
+                                .push(state_body.clone());
                             let status = {
                                 let mut statuses = task_state.state_post_statuses
                                     .lock()
@@ -981,6 +1117,262 @@ fn fake_http_response(status: u16, payload: &serde_json::Value) -> String {
     fake_http_response_with_headers(status, payload, &[])
 }
 
+async fn read_fake_bilibili_request(stream: &mut TcpStream) -> Result<String> {
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await?;
+        anyhow::ensure!(read > 0, "fake Bilibili request ended before headers");
+        bytes.extend_from_slice(&chunk[..read]);
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        anyhow::ensure!(bytes.len() <= 64 * 1024, "fake Bilibili headers too large");
+    };
+    let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then_some(value.trim())
+        })
+        .unwrap_or("0")
+        .parse::<usize>()?;
+    let body_end = header_end.saturating_add(content_length);
+    while bytes.len() < body_end {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await?;
+        anyhow::ensure!(read > 0, "fake Bilibili request ended before body");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    Ok(headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn fake_bilibili_request_path(request_target: &str) -> &str {
+    request_target
+        .split_once('?')
+        .map_or(request_target, |(path, _)| path)
+}
+
+fn fake_bilibili_query_has_parameter(
+    request_target: &str,
+    parameter: &str,
+    expected_value: Option<&str>,
+) -> bool {
+    request_target.split_once('?').is_some_and(|(_, query)| {
+        query.split('&').any(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            name == parameter && expected_value.is_none_or(|expected| value == expected)
+        })
+    })
+}
+
+#[test]
+fn fake_bilibili_auth_routes_strip_query_and_validate_web_qr_parameters() {
+    let generate = "/x/passport-login/web/qrcode/generate?source=main-fe-header";
+    assert_eq!(
+        fake_bilibili_request_path(generate),
+        "/x/passport-login/web/qrcode/generate"
+    );
+    assert!(fake_bilibili_request_path(generate).ends_with("/qrcode/generate"));
+    assert!(fake_bilibili_query_has_parameter(
+        generate,
+        "source",
+        Some("main-fe-header")
+    ));
+
+    let poll = "/x/passport-login/web/qrcode/poll?qrcode_key=synthetic&source=main-fe-header";
+    assert_eq!(
+        fake_bilibili_request_path(poll),
+        "/x/passport-login/web/qrcode/poll"
+    );
+    assert!(fake_bilibili_request_path(poll).ends_with("/qrcode/poll"));
+    assert!(fake_bilibili_query_has_parameter(poll, "qrcode_key", None));
+    assert!(fake_bilibili_query_has_parameter(
+        poll,
+        "source",
+        Some("main-fe-header")
+    ));
+    assert!(
+        !fake_bilibili_request_path("/other?next=/x/passport-login/web/qrcode/poll")
+            .ends_with("/qrcode/poll")
+    );
+}
+
+pub(super) async fn spawn_fake_bilibili_auth_api(
+    web_poll_responses: Vec<serde_json::Value>,
+    tv_poll_responses: Vec<serde_json::Value>,
+    pause_at_tv_polls: &[usize],
+    pause_at_web_polls: &[usize],
+) -> (
+    String,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedReceiver<String>,
+    mpsc::UnboundedSender<String>,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake Bilibili API should bind localhost");
+    let address = listener
+        .local_addr()
+        .expect("fake Bilibili API should expose its address");
+    let (poll_tx, poll_rx) = mpsc::unbounded_channel();
+    let (poll_response_written_tx, poll_response_written_rx) = mpsc::unbounded_channel();
+    let (release_tx, mut release_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let pause_at_tv_polls = pause_at_tv_polls.iter().copied().collect::<HashSet<_>>();
+    let pause_at_web_polls = pause_at_web_polls.iter().copied().collect::<HashSet<_>>();
+    let server = tokio::spawn(async move {
+        let mut web_poll_index = 0_usize;
+        let mut tv_poll_index = 0_usize;
+        loop {
+            let accepted = tokio::select! {
+                _ = &mut shutdown_rx => return Ok(()),
+                accepted = listener.accept() => accepted.context("fake Bilibili API accept failed")?,
+            };
+            let (mut stream, _) = accepted;
+            let request_target = read_fake_bilibili_request(&mut stream).await?;
+            let path = fake_bilibili_request_path(&request_target);
+            let mut poll_response_written_event = None;
+            let payload = if path.ends_with("/qrcode/auth_code") {
+                let _ = poll_tx.send("tv:ticket".to_string());
+                serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "url": TEST_BILIBILI_QR_SENTINEL,
+                        "auth_code": TEST_BILIBILI_QR_SENTINEL,
+                        "cookie": TEST_BILIBILI_COOKIE_SENTINEL
+                    }
+                })
+            } else if path.ends_with("/qrcode/generate") {
+                let event = if fake_bilibili_query_has_parameter(
+                    &request_target,
+                    "source",
+                    Some("main-fe-header"),
+                ) {
+                    "web:ticket"
+                } else {
+                    "web:ticket:invalid_query"
+                };
+                let _ = poll_tx.send(event.to_string());
+                serde_json::json!({
+                    "code": 0,
+                    "data": {
+                        "url": TEST_BILIBILI_QR_SENTINEL,
+                        "qrcode_key": TEST_BILIBILI_QR_SENTINEL,
+                        "cookie": TEST_BILIBILI_COOKIE_SENTINEL
+                    }
+                })
+            } else if path.ends_with("/qrcode/poll") {
+                if path.contains("/web/") {
+                    web_poll_index = web_poll_index.saturating_add(1);
+                    let event =
+                        if fake_bilibili_query_has_parameter(&request_target, "qrcode_key", None)
+                            && fake_bilibili_query_has_parameter(
+                                &request_target,
+                                "source",
+                                Some("main-fe-header"),
+                            )
+                        {
+                            format!("web:{web_poll_index}")
+                        } else {
+                            format!("web:{web_poll_index}:invalid_query")
+                        };
+                    let _ = poll_tx.send(event.clone());
+                    poll_response_written_event = Some(event.clone());
+                    if pause_at_web_polls.contains(&web_poll_index) {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => return Ok(()),
+                            released = release_rx.recv() => {
+                                anyhow::ensure!(released.as_deref() == Some(event.as_str()), "fake Bilibili poll release did not match its paused request");
+                            }
+                        }
+                    }
+                    web_poll_responses
+                        .get(web_poll_index.saturating_sub(1))
+                        .or_else(|| web_poll_responses.last())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "code": 0,
+                                "data": {"code": 86038, "message": "expired"}
+                            })
+                        })
+                } else {
+                    tv_poll_index = tv_poll_index.saturating_add(1);
+                    let event = format!("tv:{tv_poll_index}");
+                    let _ = poll_tx.send(event.clone());
+                    poll_response_written_event = Some(event.clone());
+                    if pause_at_tv_polls.contains(&tv_poll_index) {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => return Ok(()),
+                            released = release_rx.recv() => {
+                                anyhow::ensure!(released.as_deref() == Some(event.as_str()), "fake Bilibili poll release did not match its paused request");
+                            }
+                        }
+                    }
+                    tv_poll_responses
+                        .get(tv_poll_index.saturating_sub(1))
+                        .or_else(|| tv_poll_responses.last())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "code": 86038,
+                                "message": "expired"
+                            })
+                        })
+                }
+            } else {
+                serde_json::json!({"code": -1, "message": "unsupported fake endpoint"})
+            };
+            let response = fake_http_response(200, &payload);
+            // A cancelled request can close its side before this delayed mock response is released.
+            if stream.write_all(response.as_bytes()).await.is_ok()
+                && let Some(event) = poll_response_written_event
+            {
+                let _ = poll_response_written_tx.send(event);
+            }
+        }
+    });
+    (
+        format!("http://{address}"),
+        poll_rx,
+        poll_response_written_rx,
+        release_tx,
+        shutdown_tx,
+        server,
+    )
+}
+
+pub(super) async fn stop_fake_bilibili_api(
+    shutdown: oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<Result<()>>,
+) {
+    shutdown
+        .send(())
+        .expect("fake Bilibili API shutdown should be accepted");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("fake Bilibili API should stop within timeout")
+        .expect("fake Bilibili API task should not panic")
+        .expect("fake Bilibili API should not fail");
+}
+
+// Synthetic catalog joey-private-v3: access-b (QR ticket), bearer-a (cookie marker),
+// access-a (TV access key), and access-expired (sanitized error marker).
+pub(super) const TEST_BILIBILI_QR_SENTINEL: &str = "codex_synth_v1_access_b";
+pub(super) const TEST_BILIBILI_COOKIE_SENTINEL: &str = "codex_synth_v1_bearer_a";
+pub(super) const TEST_BILIBILI_TV_ACCESS_KEY: &str = "codex_synth_v1_access_a";
+pub(super) const TEST_BILIBILI_ERROR_TOKEN: &str = "codex_synth_v1_access_expired";
+
 fn fake_http_response_with_headers(
     status: u16,
     payload: &serde_json::Value,
@@ -1008,7 +1400,7 @@ fn fake_http_response_with_headers(
     )
 }
 
-async fn stop_fake_cloud_api(
+pub(super) async fn stop_fake_cloud_api(
     shutdown: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<Result<()>>,
 ) {
@@ -1267,7 +1659,7 @@ async fn spawn_fake_cloud_websocket_api(
     )
 }
 
-async fn wait_for_state_posts(
+pub(super) async fn wait_for_state_posts(
     state: &Arc<FakeCloudApiState>,
     count: usize,
 ) -> Vec<serde_json::Value> {

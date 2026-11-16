@@ -46,6 +46,9 @@ mod queue;
 mod redaction;
 mod router;
 mod safe_fs;
+mod settings_auth;
+#[cfg(test)]
+mod settings_auth_e2e_tests;
 mod staging_cleanup;
 mod staging_cleanup_bot;
 #[cfg(test)]
@@ -78,7 +81,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use bbdown_core::{
@@ -147,14 +150,22 @@ static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_REPLY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_AUTH_MUTATION_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static BILIBILI_CREDENTIAL_REVISION: AtomicU64 = AtomicU64::new(0);
+static BILIBILI_SETTINGS_AUTH: OnceLock<Mutex<settings_auth::Snapshot>> = OnceLock::new();
+static BILIBILI_SETTINGS_AUTH_EPOCH: OnceLock<std::sync::Mutex<Option<bilibili_auth::AuthEpoch>>> =
+    OnceLock::new();
+static BILIBILI_AUTH_STATUS_NOTIFY: OnceLock<Notify> = OnceLock::new();
+#[cfg(test)]
+static TEST_AUTH_GENERATION_LOCK: Mutex<()> = Mutex::const_new(());
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
 static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilibiliSelectionJob>>> =
     OnceLock::new();
 static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollectionDetails>>> =
     OnceLock::new();
 const CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BILIBILI_AUTH_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CLOUD_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const CLOUD_STATE_PREVIEW_ENTRY_LIMIT: usize = 100;
 const CLOUD_TASK_SUMMARY_LIMIT: usize = 100;
@@ -2013,11 +2024,15 @@ struct CloudPublicationTrigger {
     idle_expiry: bool,
     refreshes: Vec<SnapshotRefreshRequest>,
     watched_operation: bool,
+    settings_auth_changed: bool,
 }
 
 impl CloudPublicationTrigger {
     fn is_forced(&self) -> bool {
-        self.bootstrap || self.idle_expiry || !self.refreshes.is_empty()
+        self.bootstrap
+            || self.idle_expiry
+            || !self.refreshes.is_empty()
+            || self.settings_auth_changed
     }
 
     fn is_admitted(&self) -> bool {
@@ -2290,6 +2305,10 @@ async fn cloud_state_reporter_with_retry_policy(
                 tokio::select! {
                     _ = runtime.epoch_fatal.notified() => return,
                     _ = runtime.state_notify.notified() => CloudPublicationTrigger::default(),
+                    _ = bilibili_auth_status_notify().notified() => CloudPublicationTrigger {
+                        settings_auth_changed: true,
+                        ..CloudPublicationTrigger::default()
+                    },
                     _ = tokio::time::sleep_until(publication_deadline) => CloudPublicationTrigger {
                         idle_expiry: true,
                         ..CloudPublicationTrigger::default()
@@ -2303,6 +2322,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 }
                 trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
                 trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
+                trigger.settings_auth_changed &= !active_cloud_viewers(&runtime).await.is_empty();
             } else {
                 trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
                 trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
@@ -2444,7 +2464,9 @@ async fn cloud_state_reporter_with_retry_policy(
         let failed_fingerprint = state.fingerprint.clone();
         let failed_version = state.state_version;
         let state_version = state.state_version;
-        let notify_viewers = !state.trigger.refreshes.is_empty() || state.trigger.watched_operation;
+        let notify_viewers = !state.trigger.refreshes.is_empty()
+            || state.trigger.watched_operation
+            || state.trigger.settings_auth_changed;
         let post_result = tokio::select! {
             _ = runtime.epoch_fatal.notified() => return,
             result = state.snapshot.post(&runtime, state_version, notify_viewers) => result,
@@ -2946,8 +2968,20 @@ async fn refresh_snapshot_references(
             }
             SnapshotRefreshScope::Settings => {
                 if settings_refresh.is_none() {
-                    settings_refresh =
-                        Some(media_library_bot::refresh_library_bindings(runtime).await);
+                    let library_refresh =
+                        media_library_bot::refresh_library_bindings(runtime).await;
+                    initialize_bilibili_settings_auth(&runtime.bot.config).await;
+                    let auth_refresh = refresh_bilibili_settings_auth(&runtime.bot.config).await;
+                    settings_refresh = Some(match (library_refresh, auth_refresh) {
+                        (Ok(()), true) => Ok(()),
+                        (Err(error), true) => Err(error),
+                        (Ok(()), false) => Err(anyhow::anyhow!(
+                            "Bilibili credential state could not be verified locally"
+                        )),
+                        (Err(_), false) => Err(anyhow::anyhow!(
+                            "settings and Bilibili credential state could not be verified locally"
+                        )),
+                    });
                 }
                 settings_refresh
                     .as_ref()
@@ -3147,6 +3181,9 @@ async fn build_cloud_state_snapshot(
                 .to_string()
         });
     }
+    for record in &mut records {
+        sanitize_bilibili_auth_operation_record(record);
+    }
     let mut management_records = records
         .iter()
         .filter(|record| record.request.kind != "telegram")
@@ -3157,7 +3194,7 @@ async fn build_cloud_state_snapshot(
         cloud_snapshot_budget::preview_snapshots(&management_records, omitted_preview_count);
     let config = Arc::clone(&runtime.bot.config);
     let queue = Arc::clone(&runtime.bot.queue);
-    let (tasks, settings_applied) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let (tasks, mut settings_applied) = tokio::task::spawn_blocking(move || -> Result<_> {
         Ok((
             cloud_task_summaries(&config, &queue)?,
             media_library_bot::applied_settings(&queue)?,
@@ -3165,6 +3202,8 @@ async fn build_cloud_state_snapshot(
     })
     .await
     .context("cloud task summary worker failed")??;
+    initialize_bilibili_settings_auth(&runtime.bot.config).await;
+    settings_applied["bilibili_auth"] = bilibili_settings_auth_snapshot().await;
     let (revision, mut library_value) = match library {
         Some(library) => (
             library.revision.clone(),
@@ -3266,6 +3305,365 @@ async fn build_cloud_state_snapshot(
         download_dir,
         settings_applied,
     }))
+}
+
+fn sanitize_bilibili_auth_operation_record(record: &mut InboxRecord) {
+    if record.request.kind != "bilibili_auth" {
+        return;
+    }
+    let original = record.request.payload.as_object().cloned();
+    let operation = original
+        .as_ref()
+        .and_then(|payload| payload.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|operation| matches!(*operation, "login" | "cancel" | "logout"))
+        .unwrap_or("invalid")
+        .to_string();
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "operation".to_string(),
+        serde_json::Value::String(operation.clone()),
+    );
+    if let Some(original) = original.as_ref() {
+        match operation.as_str() {
+            "login" => {
+                if let Some(mode @ ("web" | "tv" | "access_key")) =
+                    original.get("mode").and_then(serde_json::Value::as_str)
+                {
+                    payload.insert("mode".to_string(), serde_json::Value::String(mode.into()));
+                }
+            }
+            "cancel" | "logout" => {
+                if let Some(generation) = original
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|generation| *generation <= MAX_BILIBILI_AUTH_SAFE_INTEGER)
+                {
+                    payload.insert("generation".to_string(), serde_json::json!(generation));
+                }
+                if let Some(revision) = original
+                    .get("credential_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|revision| *revision <= MAX_BILIBILI_AUTH_SAFE_INTEGER)
+                {
+                    payload.insert(
+                        "credential_revision".to_string(),
+                        serde_json::json!(revision),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    record.request.payload = serde_json::Value::Object(payload);
+    record.request.extra.clear();
+    let status = match record.status {
+        InboxStatus::Completed => "completed",
+        InboxStatus::Failed => "failed",
+        InboxStatus::Cancelled => "cancelled",
+        InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable => "pending",
+        InboxStatus::AwaitingConfirmation | InboxStatus::Uncertain | InboxStatus::Stale => "failed",
+    };
+    record.result = Some(serde_json::json!({
+        "operation": operation,
+        "status": status,
+        "safe_message": "Bilibili authorization activity is available in Settings.",
+    }));
+    record.error = None;
+}
+
+fn bilibili_settings_auth_state() -> &'static Mutex<settings_auth::Snapshot> {
+    BILIBILI_SETTINGS_AUTH.get_or_init(|| Mutex::new(settings_auth::Snapshot::default()))
+}
+
+fn bilibili_auth_status_notify() -> &'static Notify {
+    BILIBILI_AUTH_STATUS_NOTIFY.get_or_init(Notify::new)
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
+async fn bilibili_settings_auth_snapshot() -> serde_json::Value {
+    let mut snapshot = bilibili_settings_auth_state().lock().await.clone();
+    snapshot.generation = snapshot
+        .generation
+        .max(BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst));
+    snapshot.credential_revision = snapshot
+        .credential_revision
+        .max(BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst));
+    if !settings_auth::reason_is_safe(snapshot.safe_reason) {
+        snapshot.safe_reason = "none";
+    }
+    serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({
+        "phase": "signed_out",
+        "mode": null,
+        "generation": 0,
+        "credential_revision": 0,
+        "credential_summary": {"has_cookie": false, "has_access_key": false, "has_tv_access_key": false},
+        "updated_at_ms": 0,
+        "safe_reason": "none"
+    }))
+}
+
+async fn initialize_bilibili_settings_auth(config: &AppConfig) {
+    #[cfg(test)]
+    if uses_default_test_bilibili_auth_paths(config) {
+        return;
+    }
+    {
+        let state = bilibili_settings_auth_state().lock().await;
+        if state.updated_at_ms != 0 || state.generation != 0 {
+            return;
+        }
+    }
+    let _state_guard = bbdown_auth_state_lock().lock().await;
+    {
+        let state = bilibili_settings_auth_state().lock().await;
+        if state.updated_at_ms != 0 || state.generation != 0 {
+            return;
+        }
+    }
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        bilibili_auth::with_auth_mutation_transaction(
+            &state_path,
+            &credential_file,
+            |transaction| {
+                let summary = bilibili_core::CredentialRuntime::from_credential_file(
+                    transaction.credential_file()?,
+                    credential_profile.as_deref(),
+                )?
+                .load()?
+                .redacted_summary();
+                Ok(summary)
+            },
+        )
+    })
+    .await;
+    let (phase, reason, summary, revision, auth_epoch) = match loaded {
+        Ok(Ok((summary, auth_epoch))) if auth_epoch.value() <= MAX_BILIBILI_AUTH_SAFE_INTEGER => (
+            if summary.has_cookie || summary.has_access_key || summary.has_tv_access_key {
+                settings_auth::Phase::Connected
+            } else {
+                settings_auth::Phase::SignedOut
+            },
+            "none",
+            settings_auth::CredentialSummary {
+                has_cookie: summary.has_cookie,
+                has_access_key: summary.has_access_key,
+                has_tv_access_key: summary.has_tv_access_key,
+            },
+            auth_epoch.value(),
+            Some(auth_epoch),
+        ),
+        _ => (
+            settings_auth::Phase::Failed,
+            "login_failed",
+            settings_auth::CredentialSummary::default(),
+            BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+            None,
+        ),
+    };
+    let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+    BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(auth_epoch);
+    let mut state = bilibili_settings_auth_state().lock().await;
+    if state.updated_at_ms == 0 && state.generation <= generation {
+        state.phase = phase;
+        state.safe_reason = reason;
+        state.generation = generation;
+        state.credential_revision = revision;
+        state.credential_summary = summary;
+        state.updated_at_ms = unix_time_millis();
+    }
+}
+
+fn read_bilibili_settings_credentials_with_epoch(
+    config: &AppConfig,
+) -> Result<(
+    bilibili_auth::BbdownCredentialSummary,
+    bilibili_auth::AuthEpoch,
+)> {
+    let file_lock = bilibili_auth::acquire_auth_reply_file_lock(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+    )?;
+    let auth_epoch = file_lock.current_epoch()?;
+    let summary = bilibili_core::CredentialRuntime::from_credential_file(
+        config.bilibili.auth.credential_file.clone(),
+        config.bilibili.auth.credential_profile.as_deref(),
+    )?
+    .load()?
+    .redacted_summary();
+    Ok((
+        bilibili_auth::BbdownCredentialSummary {
+            has_cookie: summary.has_cookie,
+            has_access_key: summary.has_access_key,
+            has_tv_access_key: summary.has_tv_access_key,
+        },
+        auth_epoch,
+    ))
+}
+
+async fn refresh_bilibili_settings_auth(config: &AppConfig) -> bool {
+    #[cfg(test)]
+    if uses_default_test_bilibili_auth_paths(config) {
+        return false;
+    }
+    let _state_guard = bbdown_auth_state_lock().lock().await;
+    let config = config.clone();
+    let loaded =
+        tokio::task::spawn_blocking(move || read_bilibili_settings_credentials_with_epoch(&config))
+            .await;
+    let Ok(Ok((summary, auth_epoch))) = loaded else {
+        mark_bilibili_settings_auth_unavailable().await;
+        return false;
+    };
+    let revision = auth_epoch.value();
+    if revision > MAX_BILIBILI_AUTH_SAFE_INTEGER {
+        mark_bilibili_settings_auth_unavailable().await;
+        return false;
+    }
+    set_bilibili_settings_auth_epoch(Some(auth_epoch));
+    let credentials = settings_auth::CredentialSummary {
+        has_cookie: summary.has_cookie,
+        has_access_key: summary.has_access_key,
+        has_tv_access_key: summary.has_tv_access_key,
+    };
+    let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+    let phase =
+        if credentials.has_cookie || credentials.has_access_key || credentials.has_tv_access_key {
+            settings_auth::Phase::Connected
+        } else {
+            settings_auth::Phase::SignedOut
+        };
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    let changed =
+        snapshot.credential_revision != revision || snapshot.credential_summary != credentials;
+    if !changed {
+        BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
+        return true;
+    }
+    BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
+    snapshot.credential_revision = revision;
+    snapshot.credential_summary = credentials;
+    snapshot.mode = None;
+    snapshot.transition(generation, phase, "none", unix_time_millis());
+    bilibili_auth_status_notify().notify_one();
+    true
+}
+
+async fn mark_bilibili_settings_auth_unavailable() {
+    BILIBILI_CREDENTIAL_REVISION.store(0, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(None);
+    let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    let generation = generation.max(snapshot.generation);
+    let empty_credentials = settings_auth::CredentialSummary::default();
+    let changed = snapshot.transition(
+        generation,
+        settings_auth::Phase::Failed,
+        "login_failed",
+        unix_time_millis(),
+    ) || snapshot.credential_summary != empty_credentials
+        || snapshot.credential_revision != 0
+        || snapshot.mode.is_some();
+    snapshot.generation = generation;
+    snapshot.credential_revision = 0;
+    snapshot.credential_summary = empty_credentials;
+    snapshot.mode = None;
+    if changed {
+        bilibili_auth_status_notify().notify_one();
+    }
+}
+
+fn bilibili_settings_auth_epoch() -> &'static std::sync::Mutex<Option<bilibili_auth::AuthEpoch>> {
+    BILIBILI_SETTINGS_AUTH_EPOCH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_bilibili_settings_auth_epoch(epoch: Option<bilibili_auth::AuthEpoch>) {
+    if let Ok(mut stored) = bilibili_settings_auth_epoch().lock() {
+        *stored = epoch;
+    }
+}
+
+fn get_bilibili_settings_auth_epoch() -> Option<bilibili_auth::AuthEpoch> {
+    bilibili_settings_auth_epoch()
+        .lock()
+        .ok()
+        .and_then(|stored| *stored)
+}
+
+#[cfg(test)]
+fn uses_default_test_bilibili_auth_paths(config: &AppConfig) -> bool {
+    let defaults = AppConfig::for_test();
+    config.bilibili.auth.state_path == defaults.bilibili.auth.state_path
+        || config.bilibili.auth.credential_file == defaults.bilibili.auth.credential_file
+}
+
+async fn set_bilibili_settings_auth_phase(
+    generation: u64,
+    phase: settings_auth::Phase,
+    reason: &'static str,
+) -> bool {
+    if !settings_auth::reason_is_safe(reason) {
+        return false;
+    }
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    if snapshot.generation > generation
+        || (snapshot.generation == generation
+            && snapshot.phase == phase
+            && snapshot.safe_reason == reason)
+    {
+        return false;
+    }
+    let changed = snapshot.transition(generation, phase, reason, unix_time_millis());
+    if changed {
+        bilibili_auth_status_notify().notify_one();
+    }
+    changed
+}
+
+async fn set_bilibili_settings_auth_mode(generation: u64, mode: BilibiliAuthLoginMode) {
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    if snapshot.generation <= generation {
+        let mode = match mode {
+            BilibiliAuthLoginMode::Web => settings_auth::Mode::Web,
+            BilibiliAuthLoginMode::Tv => settings_auth::Mode::Tv,
+            BilibiliAuthLoginMode::AccessKey => settings_auth::Mode::AccessKey,
+        };
+        if snapshot.generation == generation && snapshot.mode == Some(mode) {
+            return;
+        }
+        snapshot.generation = generation;
+        snapshot.set_mode(mode);
+        snapshot.updated_at_ms = unix_time_millis();
+    }
+}
+
+async fn set_bilibili_settings_auth_credentials(saved: &SavedBilibiliLogin) {
+    let summary = settings_auth::CredentialSummary {
+        has_cookie: saved.summary.has_cookie,
+        has_access_key: saved.summary.has_access_key,
+        has_tv_access_key: saved.summary.has_tv_access_key,
+    };
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    if snapshot.set_credentials(
+        saved.auth_generation,
+        saved.credential_revision,
+        summary,
+        unix_time_millis(),
+    ) {
+        snapshot.phase = settings_auth::Phase::Connected;
+        snapshot.safe_reason = "none";
+        bilibili_auth_status_notify().notify_one();
+    }
 }
 
 fn cloud_task_summaries(
@@ -4634,6 +5032,9 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
+    if request.kind == "bilibili_auth" {
+        return dispatch_cloud_bilibili_auth(runtime, request).await;
+    }
     if request.kind == "danmaku_refresh" && request.bound_preview_operation() == Some("cancel") {
         return danmaku_refresh_bot::dispatch_cancel(runtime, request).await;
     }
@@ -5199,6 +5600,498 @@ async fn dispatch_cloud_management(
             "unsupported cloud request kind: {}",
             request.kind
         ))),
+    }
+}
+
+async fn dispatch_cloud_bilibili_auth(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    let request_id = cloud_action_request_id(request).map(str::to_string);
+    let Some(payload) = request.payload.as_object() else {
+        return Ok(cloud_dispatch_failure("invalid Bilibili auth request"));
+    };
+    let operation = payload.get("operation").and_then(serde_json::Value::as_str);
+    let Some(owner_chat) = configured_cloud_management_chat_id(&runtime.bot.config) else {
+        return Ok(cloud_dispatch_failure(
+            "Bilibili auth requires one configured private cloud owner",
+        ));
+    };
+    initialize_bilibili_settings_auth(&runtime.bot.config).await;
+    if !refresh_bilibili_settings_auth(&runtime.bot.config).await {
+        return Ok(cloud_dispatch_failure(
+            "Bilibili credential state could not be verified locally",
+        ));
+    }
+    match operation {
+        Some("login") => {
+            if !bilibili_auth_payload_has_exact_fields(payload, &["operation", "mode"]) {
+                return Ok(cloud_dispatch_failure(
+                    "invalid Bilibili auth request fields",
+                ));
+            }
+            let mode = match payload.get("mode").and_then(serde_json::Value::as_str) {
+                Some("web") => BilibiliAuthLoginMode::Web,
+                Some("tv") => BilibiliAuthLoginMode::Tv,
+                Some("access_key") => BilibiliAuthLoginMode::AccessKey,
+                _ => return Ok(cloud_dispatch_failure("invalid Bilibili login mode")),
+            };
+            if request_id.as_deref().is_none_or(|id| id.is_empty()) {
+                return Ok(cloud_dispatch_failure(
+                    "Bilibili login request is missing its request identity",
+                ));
+            }
+            if has_pending_bilibili_access_key_login().await {
+                return Ok(bilibili_auth_action_result(
+                    "login",
+                    request_id,
+                    BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+                    BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+                    "conflict",
+                    "An authorization flow is already active.",
+                ));
+            }
+            let lock = BILIBILI_LOGIN_LOCK.get_or_init(|| Mutex::new(()));
+            let guard = match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Ok(bilibili_auth_action_result(
+                        "login",
+                        request_id,
+                        BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+                        BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+                        "conflict",
+                        "An authorization flow is already active.",
+                    ));
+                }
+            };
+            let generation = match allocate_bilibili_auth_generation() {
+                Some(generation) => generation,
+                None => {
+                    return Ok(cloud_dispatch_failure(
+                        "Bilibili auth state is changing; retry later",
+                    ));
+                }
+            };
+            set_bilibili_settings_auth_mode(generation, mode).await;
+            set_bilibili_settings_auth_phase(
+                generation,
+                settings_auth::Phase::WaitingForScan,
+                "none",
+            )
+            .await;
+            let telegram = runtime.bot.telegram.clone();
+            let config = Arc::clone(&runtime.bot.config);
+            tokio::spawn(async move {
+                let _guard = guard;
+                run_bbdown_login(telegram, config, owner_chat, generation, mode).await;
+            });
+            Ok(bilibili_auth_action_result(
+                "login",
+                request_id,
+                generation,
+                BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+                "accepted",
+                "Authorization flow started; check the owner Telegram chat for the QR code.",
+            ))
+        }
+        Some("cancel") => {
+            if !bilibili_auth_payload_has_exact_fields(
+                payload,
+                &["operation", "generation", "credential_revision"],
+            ) {
+                return Ok(cloud_dispatch_failure(
+                    "invalid Bilibili auth request fields",
+                ));
+            }
+            let Some(generation) = payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Ok(cloud_dispatch_failure("invalid Bilibili auth generation"));
+            };
+            let Some(credential_revision) = payload
+                .get("credential_revision")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Ok(cloud_dispatch_failure(
+                    "invalid Bilibili credential revision",
+                ));
+            };
+            if generation > MAX_BILIBILI_AUTH_SAFE_INTEGER
+                || credential_revision > MAX_BILIBILI_AUTH_SAFE_INTEGER
+            {
+                return Ok(cloud_dispatch_failure("invalid Bilibili auth fence"));
+            }
+            if !cancel_bilibili_auth_generation(
+                generation,
+                credential_revision,
+                &runtime.bot.config,
+            )
+            .await
+            {
+                return Ok(bilibili_auth_action_result(
+                    "cancel",
+                    request_id,
+                    generation,
+                    BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+                    "conflict",
+                    "The authorization generation is no longer active.",
+                ));
+            }
+            Ok(bilibili_auth_action_result(
+                "cancel",
+                request_id,
+                generation.saturating_add(2),
+                BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+                "completed",
+                "Authorization flow cancelled.",
+            ))
+        }
+        Some("logout") => {
+            if !bilibili_auth_payload_has_exact_fields(
+                payload,
+                &["operation", "generation", "credential_revision"],
+            ) {
+                return Ok(cloud_dispatch_failure(
+                    "invalid Bilibili auth request fields",
+                ));
+            }
+            let Some(generation) = payload
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Ok(cloud_dispatch_failure("invalid Bilibili auth generation"));
+            };
+            let Some(credential_revision) = payload
+                .get("credential_revision")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Ok(cloud_dispatch_failure(
+                    "invalid Bilibili credential revision",
+                ));
+            };
+            if generation > MAX_BILIBILI_AUTH_SAFE_INTEGER
+                || credential_revision > MAX_BILIBILI_AUTH_SAFE_INTEGER
+            {
+                return Ok(cloud_dispatch_failure("invalid Bilibili auth fence"));
+            }
+            match settings_bilibili_logout(&runtime.bot.config, generation, credential_revision)
+                .await
+            {
+                Ok((next_generation, next_revision)) => Ok(bilibili_auth_action_result(
+                    "logout",
+                    request_id,
+                    next_generation,
+                    next_revision,
+                    "completed",
+                    "Bilibili credentials removed from this computer.",
+                )),
+                Err(reason) => Ok(bilibili_auth_action_result(
+                    "logout",
+                    request_id,
+                    generation,
+                    credential_revision,
+                    "conflict",
+                    reason,
+                )),
+            }
+        }
+        _ => Ok(cloud_dispatch_failure(
+            "unsupported Bilibili auth operation",
+        )),
+    }
+}
+
+fn bilibili_auth_payload_has_exact_fields(
+    payload: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> bool {
+    payload.len() == allowed.len()
+        && allowed
+            .iter()
+            .all(|required_key| payload.contains_key(*required_key))
+}
+
+fn allocate_bilibili_auth_generation() -> Option<u64> {
+    loop {
+        let current = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        if !current.is_multiple_of(2) {
+            return None;
+        }
+        let next = current.checked_add(2)?;
+        if next > MAX_BILIBILI_AUTH_SAFE_INTEGER {
+            return None;
+        }
+        if BILIBILI_AUTH_GENERATION
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(next);
+        }
+    }
+}
+
+async fn cancel_bilibili_auth_generation(
+    expected_generation: u64,
+    expected_credential_revision: u64,
+    config: &AppConfig,
+) -> bool {
+    cancel_bilibili_auth_generation_with_lock_hook(
+        expected_generation,
+        expected_credential_revision,
+        config,
+        || async {},
+    )
+    .await
+}
+
+async fn cancel_bilibili_auth_generation_with_lock_hook<F, Fut>(
+    expected_generation: u64,
+    expected_credential_revision: u64,
+    config: &AppConfig,
+    after_auth_state_lock: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let _operation_guard = BILIBILI_AUTH_MUTATION_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    if !expected_generation.is_multiple_of(2)
+        || expected_generation.saturating_add(2) > MAX_BILIBILI_AUTH_SAFE_INTEGER
+        || expected_credential_revision > MAX_BILIBILI_AUTH_SAFE_INTEGER
+    {
+        return false;
+    }
+    let state_guard = bbdown_auth_state_lock().lock().await;
+    after_auth_state_lock().await;
+    if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != expected_generation
+        || BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst) != expected_credential_revision
+    {
+        return false;
+    }
+    let Some(expected_epoch) = get_bilibili_settings_auth_epoch()
+        .filter(|epoch| epoch.value() == expected_credential_revision)
+    else {
+        drop(state_guard);
+        refresh_bilibili_settings_auth(config).await;
+        return false;
+    };
+    let auth_file_lock = match acquire_bbdown_auth_reply_file_lock(config).await {
+        Ok(lock) => lock,
+        Err(_) => {
+            drop(state_guard);
+            refresh_bilibili_settings_auth(config).await;
+            return false;
+        }
+    };
+    if !matches!(auth_file_lock.current_epoch(), Ok(current_epoch) if current_epoch == expected_epoch)
+    {
+        drop(auth_file_lock);
+        drop(state_guard);
+        refresh_bilibili_settings_auth(config).await;
+        return false;
+    }
+    if BILIBILI_AUTH_GENERATION
+        .compare_exchange(
+            expected_generation,
+            expected_generation.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    drop(auth_file_lock);
+    bbdown_login_cancel_notify().notify_waiters();
+    pending_bilibili_access_key_logins()
+        .lock()
+        .await
+        .retain(|_, login| login.auth_generation != expected_generation);
+    BILIBILI_AUTH_GENERATION.store(expected_generation.saturating_add(2), Ordering::SeqCst);
+    set_bilibili_settings_auth_phase(
+        expected_generation.saturating_add(2),
+        settings_auth::Phase::Cancelled,
+        "login_cancelled",
+    )
+    .await;
+    drop(state_guard);
+    true
+}
+
+async fn settings_bilibili_logout(
+    config: &AppConfig,
+    expected_generation: u64,
+    expected_credential_revision: u64,
+) -> std::result::Result<(u64, u64), &'static str> {
+    let _operation_guard = BILIBILI_AUTH_MUTATION_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != expected_generation {
+        return Err("The authorization generation changed; refresh Settings and try again.");
+    }
+    if BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst) != expected_credential_revision {
+        return Err("The credential state changed; refresh Settings and try again.");
+    }
+    if !expected_generation.is_multiple_of(2)
+        || expected_generation.saturating_add(2) > MAX_BILIBILI_AUTH_SAFE_INTEGER
+        || expected_credential_revision.saturating_add(1) > MAX_BILIBILI_AUTH_SAFE_INTEGER
+    {
+        return Err("The authorization state is changing; refresh Settings and try again.");
+    }
+
+    let Some(expected_epoch) = get_bilibili_settings_auth_epoch()
+        .filter(|epoch| epoch.value() == expected_credential_revision)
+    else {
+        refresh_bilibili_settings_auth(config).await;
+        return Err("The credential state changed; refresh Settings and try again.");
+    };
+    let live_epoch = match current_bbdown_auth_epoch(config).await {
+        Ok(epoch) => epoch,
+        Err(_) => {
+            return Err(
+                "The credential state could not be verified; refresh Settings and try again.",
+            );
+        }
+    };
+    if live_epoch != expected_epoch {
+        refresh_bilibili_settings_auth(config).await;
+        return Err("The credential state changed; refresh Settings and try again.");
+    }
+
+    let state_guard = bbdown_auth_state_lock().lock().await;
+    if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != expected_generation {
+        return Err("The authorization generation changed; refresh Settings and try again.");
+    }
+    if BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst) != expected_credential_revision
+        || get_bilibili_settings_auth_epoch() != Some(expected_epoch)
+    {
+        drop(state_guard);
+        refresh_bilibili_settings_auth(config).await;
+        return Err("The credential state changed; refresh Settings and try again.");
+    }
+    if BILIBILI_AUTH_GENERATION
+        .compare_exchange(
+            expected_generation,
+            expected_generation.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err("The authorization state is changing; refresh Settings and try again.");
+    }
+    bbdown_login_cancel_notify().notify_waiters();
+    pending_bilibili_access_key_logins().lock().await.clear();
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
+    let cleanup = tokio::task::spawn_blocking(move || {
+        bilibili_auth::logout_bbdown_auth_if_epoch(
+            &state_path,
+            &credential_file,
+            credential_profile.as_deref(),
+            expected_epoch,
+        )
+    })
+    .await;
+    let next_generation = expected_generation.saturating_add(2);
+    BILIBILI_AUTH_GENERATION.store(next_generation, Ordering::SeqCst);
+    match cleanup {
+        Ok(Ok(((Ok(_), Ok(())), auth_epoch))) => {
+            let next_revision = auth_epoch.value();
+            BILIBILI_CREDENTIAL_REVISION.store(next_revision, Ordering::SeqCst);
+            set_bilibili_settings_auth_epoch(Some(auth_epoch));
+            let mut snapshot = bilibili_settings_auth_state().lock().await;
+            let changed = snapshot.transition(
+                next_generation,
+                settings_auth::Phase::SignedOut,
+                "credentials_removed",
+                unix_time_millis(),
+            );
+            snapshot.mode = None;
+            snapshot.credential_revision = next_revision;
+            snapshot.credential_summary = settings_auth::CredentialSummary::default();
+            if changed {
+                bilibili_auth_status_notify().notify_one();
+            }
+            Ok((next_generation, next_revision))
+        }
+        Ok(Ok(((legacy_state, credential_state), auth_epoch))) => {
+            let next_revision = auth_epoch.value();
+            BILIBILI_CREDENTIAL_REVISION.store(next_revision, Ordering::SeqCst);
+            set_bilibili_settings_auth_epoch(Some(auth_epoch));
+            let mut snapshot = bilibili_settings_auth_state().lock().await;
+            let changed = snapshot.transition(
+                next_generation,
+                settings_auth::Phase::Failed,
+                "logout_failed",
+                unix_time_millis(),
+            );
+            snapshot.credential_revision = next_revision;
+            if changed {
+                bilibili_auth_status_notify().notify_one();
+            }
+            let _ = (legacy_state, credential_state);
+            Err("Bilibili credentials could not be removed. Check local status before retrying.")
+        }
+        _ => {
+            let latest_epoch = current_bbdown_auth_epoch(config).await.ok();
+            let stale_epoch = latest_epoch.is_some_and(|epoch| epoch != expected_epoch);
+            if let Some(epoch) =
+                latest_epoch.filter(|epoch| epoch.value() <= MAX_BILIBILI_AUTH_SAFE_INTEGER)
+            {
+                BILIBILI_CREDENTIAL_REVISION.store(epoch.value(), Ordering::SeqCst);
+                set_bilibili_settings_auth_epoch(Some(epoch));
+            }
+            if stale_epoch {
+                drop(state_guard);
+                refresh_bilibili_settings_auth(config).await;
+                return Err("The credential state changed; refresh Settings and try again.");
+            }
+            let mut snapshot = bilibili_settings_auth_state().lock().await;
+            if snapshot.transition(
+                next_generation,
+                settings_auth::Phase::Failed,
+                "logout_failed",
+                unix_time_millis(),
+            ) {
+                bilibili_auth_status_notify().notify_one();
+            }
+            Err("Bilibili credentials could not be removed. Check local status before retrying.")
+        }
+    }
+}
+
+fn bilibili_auth_action_result(
+    operation: &str,
+    _request_id: Option<String>,
+    generation: u64,
+    credential_revision: u64,
+    status: &str,
+    safe_message: &str,
+) -> CloudDispatchOutcome {
+    let result = serde_json::json!({
+        "operation": operation,
+        "generation": generation,
+        "credential_revision": credential_revision,
+        "status": status,
+        "safe_message": safe_message,
+    });
+    CloudDispatchOutcome {
+        status: if status == "conflict" {
+            InboxStatus::Failed
+        } else {
+            InboxStatus::Completed
+        },
+        result: Some(result),
+        error: None,
+        related_preview: None,
     }
 }
 
@@ -9206,7 +10099,36 @@ async fn handle_bilibili_auth_command(
                     return;
                 }
             };
-            let auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            initialize_bilibili_settings_auth(&config).await;
+            if !refresh_bilibili_settings_auth(&config).await {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    "The local Bilibili credential state could not be verified. Refresh Settings before starting a new login.".to_string(),
+                )
+                .await;
+                return;
+            }
+            let auth_generation = match allocate_bilibili_auth_generation() {
+                Some(generation) => generation,
+                None => {
+                    send_or_log(
+                        &telegram,
+                        chat_id,
+                        "Bilibili authorization state is changing. Try again in a moment."
+                            .to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            set_bilibili_settings_auth_mode(auth_generation, mode).await;
+            set_bilibili_settings_auth_phase(
+                auth_generation,
+                settings_auth::Phase::WaitingForScan,
+                "none",
+            )
+            .await;
             tokio::spawn(async move {
                 let _guard = guard;
                 run_bbdown_login(telegram, config, chat_id, auth_generation, mode).await;
@@ -9230,6 +10152,13 @@ async fn run_bbdown_login(
     auth_generation: u64,
     mode: BilibiliAuthLoginMode,
 ) {
+    set_bilibili_settings_auth_mode(auth_generation, mode).await;
+    set_bilibili_settings_auth_phase(
+        auth_generation,
+        settings_auth::Phase::WaitingForScan,
+        "none",
+    )
+    .await;
     let auth_epoch = match current_bbdown_auth_epoch(&config).await {
         Ok(epoch) => epoch,
         Err(err) => {
@@ -9272,6 +10201,7 @@ async fn run_bbdown_login(
 
     match result {
         Ok(BbdownLoginOutcome::Saved(saved)) => {
+            set_bilibili_settings_auth_credentials(&saved).await;
             send_current_bbdown_login_success(
                 &telegram,
                 &config,
@@ -9287,6 +10217,16 @@ async fn run_bbdown_login(
         }
         Ok(BbdownLoginOutcome::PendingAccessKey) => {}
         Err(err) => {
+            let (phase, reason) = if err.to_string().to_ascii_lowercase().contains("expir")
+                || err.to_string().to_ascii_lowercase().contains("timed out")
+            {
+                (settings_auth::Phase::Expired, "login_expired")
+            } else if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
+                (settings_auth::Phase::Cancelled, "login_cancelled")
+            } else {
+                (settings_auth::Phase::Failed, "login_failed")
+            };
+            set_bilibili_settings_auth_phase(auth_generation, phase, reason).await;
             send_or_log(
                 &telegram,
                 chat_id,
@@ -9375,6 +10315,12 @@ async fn run_bbdown_qr_login(
                         last_waiting_state = Some("waiting_for_scan");
                     }
                     QrLoginState::WaitingForConfirm => {
+                        set_bilibili_settings_auth_phase(
+                            auth_generation,
+                            settings_auth::Phase::WaitingForConfirmation,
+                            "none",
+                        )
+                        .await;
                         if last_waiting_state != Some("waiting_for_confirm") {
                             await_bbdown_login_active(
                                 auth_generation,
@@ -9435,6 +10381,13 @@ async fn start_bbdown_access_key_login(
         created_at: Instant::now(),
         in_progress: true,
     };
+    set_bilibili_settings_auth_mode(auth_generation, BilibiliAuthLoginMode::AccessKey).await;
+    set_bilibili_settings_auth_phase(
+        auth_generation,
+        settings_auth::Phase::WaitingForScan,
+        "none",
+    )
+    .await;
     {
         let mut logins =
             await_bbdown_login_active(auth_generation, pending_bilibili_access_key_logins().lock())
@@ -9484,6 +10437,7 @@ async fn finish_bbdown_access_key_qr_login(
         .await;
     match result {
         Ok(saved) => {
+            set_bilibili_settings_auth_credentials(&saved).await;
             send_current_bbdown_login_success(
                 &telegram,
                 &config,
@@ -9497,6 +10451,16 @@ async fn finish_bbdown_access_key_qr_login(
             .await;
         }
         Err(err) => {
+            let (phase, reason) = if err.to_string().to_ascii_lowercase().contains("expir")
+                || err.to_string().to_ascii_lowercase().contains("timed out")
+            {
+                (settings_auth::Phase::Expired, "login_expired")
+            } else if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != pending.auth_generation {
+                (settings_auth::Phase::Cancelled, "login_cancelled")
+            } else {
+                (settings_auth::Phase::Failed, "login_failed")
+            };
+            set_bilibili_settings_auth_phase(pending.auth_generation, phase, reason).await;
             if ensure_bbdown_login_active(pending.auth_generation).is_ok() {
                 send_or_log(
                     &telegram,
@@ -9548,6 +10512,12 @@ async fn run_bbdown_access_key_qr_login(
                         last_waiting_state = Some("waiting_for_scan");
                     }
                     QrLoginState::WaitingForConfirm => {
+                        set_bilibili_settings_auth_phase(
+                            auth_generation,
+                            settings_auth::Phase::WaitingForConfirmation,
+                            "none",
+                        )
+                        .await;
                         if last_waiting_state != Some("waiting_for_confirm") {
                             await_bbdown_login_active(
                                 auth_generation,
@@ -9627,6 +10597,7 @@ async fn complete_bbdown_access_key_login(
     .await;
     match complete_bbdown_access_key_login_inner(&config, &pending, &input).await {
         Ok(saved) => {
+            set_bilibili_settings_auth_credentials(&saved).await;
             clear_pending_bilibili_access_key_login(
                 chat_id,
                 pending.auth_generation,
@@ -9646,6 +10617,16 @@ async fn complete_bbdown_access_key_login(
             .await;
         }
         Err(err) => {
+            let (phase, reason) = if err.to_string().to_ascii_lowercase().contains("expir")
+                || err.to_string().to_ascii_lowercase().contains("timed out")
+            {
+                (settings_auth::Phase::Expired, "login_expired")
+            } else if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != pending.auth_generation {
+                (settings_auth::Phase::Cancelled, "login_cancelled")
+            } else {
+                (settings_auth::Phase::Failed, "login_failed")
+            };
+            set_bilibili_settings_auth_phase(pending.auth_generation, phase, reason).await;
             let retryable = release_pending_bilibili_access_key_login(
                 &config,
                 chat_id,
@@ -9717,8 +10698,33 @@ async fn save_bbdown_login_credentials_with_sync<F>(
 where
     F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()> + Send + 'static,
 {
+    save_bbdown_login_credentials_with_sync_and_lock_hook(
+        config,
+        auth_generation,
+        auth_epoch,
+        credentials,
+        sync_legacy,
+        || async {},
+    )
+    .await
+}
+
+async fn save_bbdown_login_credentials_with_sync_and_lock_hook<F, H, Fut>(
+    config: &AppConfig,
+    auth_generation: u64,
+    auth_epoch: bilibili_auth::AuthEpoch,
+    credentials: bbdown_core::Credentials,
+    sync_legacy: F,
+    after_auth_state_lock: H,
+) -> Result<SavedBilibiliLogin>
+where
+    F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()> + Send + 'static,
+    H: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let _state_guard = bbdown_auth_state_lock().lock().await;
     ensure_bbdown_login_active(auth_generation)?;
+    after_auth_state_lock().await;
     let credential_profile = config.bilibili.auth.credential_profile.clone();
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();
@@ -9728,6 +10734,9 @@ where
             &credential_file,
             auth_epoch,
             |transaction| {
+                if transaction.epoch().value() > MAX_BILIBILI_AUTH_SAFE_INTEGER {
+                    bail!("BBDown credential epoch exceeds the safe Settings revision range");
+                }
                 ensure_bbdown_login_active(auth_generation)?;
                 sync_legacy(transaction)?;
                 ensure_bbdown_login_active(auth_generation)?;
@@ -9752,9 +10761,9 @@ where
     .await
     .context("BBDown credential save task failed")??;
     ensure_bbdown_login_active(auth_generation)?;
-    let credential_revision = BILIBILI_CREDENTIAL_REVISION
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
+    let credential_revision = auth_epoch.value();
+    BILIBILI_CREDENTIAL_REVISION.store(credential_revision, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(Some(auth_epoch));
     Ok(SavedBilibiliLogin {
         summary,
         auth_generation,
@@ -10291,6 +11300,10 @@ fn bbdown_login_cancel_notify() -> &'static Notify {
 }
 
 async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
+    let _operation_guard = BILIBILI_AUTH_MUTATION_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
     // Odd generations mark an in-progress credential mutation. This also cancels active logins
     // before local credential cleanup waits on any other async work.
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -10314,35 +11327,83 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
         // Return to a stable even generation and invalidate status checks that started after
         // logout was requested but before the credential files were cleared.
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
-        BILIBILI_CREDENTIAL_REVISION.fetch_add(1, Ordering::SeqCst);
         cleanup
     };
     let (message, auth_epoch) = match cleanup {
-        Ok(((Ok(_), Ok(())), auth_epoch)) => (
-            "BBDown credential state cleared.".to_string(),
-            Some(auth_epoch),
-        ),
-        Ok(((Ok(_), Err(err)), auth_epoch)) => (
-            format!(
-                "Failed to clear BBDown credential state:\n{}",
-                summarize_bbdown_auth_error(&err)
-            ),
-            Some(auth_epoch),
-        ),
-        Ok(((Err(err), _), auth_epoch)) => (
-            format!(
-                "Failed to clear legacy BBDown login state:\n{}",
-                truncate(&err.to_string())
-            ),
-            Some(auth_epoch),
-        ),
-        Err(err) => (
-            format!(
-                "Failed to lock BBDown credential state for logout:\n{}",
-                truncate(&err.to_string())
-            ),
-            None,
-        ),
+        Ok(((Ok(_), Ok(())), auth_epoch)) => {
+            let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            let revision = auth_epoch.value();
+            BILIBILI_CREDENTIAL_REVISION.store(revision, Ordering::SeqCst);
+            set_bilibili_settings_auth_epoch(Some(auth_epoch));
+            let mut snapshot = bilibili_settings_auth_state().lock().await;
+            if snapshot.transition(
+                generation,
+                settings_auth::Phase::SignedOut,
+                "credentials_removed",
+                unix_time_millis(),
+            ) {
+                snapshot.mode = None;
+                snapshot.credential_revision = revision;
+                snapshot.credential_summary = settings_auth::CredentialSummary::default();
+                bilibili_auth_status_notify().notify_one();
+            }
+            (
+                "BBDown credential state cleared.".to_string(),
+                Some(auth_epoch),
+            )
+        }
+        Ok(((Ok(_), Err(err)), auth_epoch)) => {
+            let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            BILIBILI_CREDENTIAL_REVISION.store(auth_epoch.value(), Ordering::SeqCst);
+            set_bilibili_settings_auth_epoch(Some(auth_epoch));
+            set_bilibili_settings_auth_phase(
+                generation,
+                settings_auth::Phase::Failed,
+                "logout_failed",
+            )
+            .await;
+            (
+                format!(
+                    "Failed to clear BBDown credential state:\n{}",
+                    summarize_bbdown_auth_error(&err)
+                ),
+                Some(auth_epoch),
+            )
+        }
+        Ok(((Err(err), _), auth_epoch)) => {
+            let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            BILIBILI_CREDENTIAL_REVISION.store(auth_epoch.value(), Ordering::SeqCst);
+            set_bilibili_settings_auth_epoch(Some(auth_epoch));
+            set_bilibili_settings_auth_phase(
+                generation,
+                settings_auth::Phase::Failed,
+                "logout_failed",
+            )
+            .await;
+            (
+                format!(
+                    "Failed to clear legacy BBDown login state:\n{}",
+                    truncate(&err.to_string())
+                ),
+                Some(auth_epoch),
+            )
+        }
+        Err(err) => {
+            let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            set_bilibili_settings_auth_phase(
+                generation,
+                settings_auth::Phase::Failed,
+                "logout_failed",
+            )
+            .await;
+            (
+                format!(
+                    "Failed to lock BBDown credential state for logout:\n{}",
+                    truncate(&err.to_string())
+                ),
+                None,
+            )
+        }
     };
     let _reply_guard = bbdown_auth_reply_lock().lock().await;
     send_bbdown_auth_reply(&telegram, &config, chat_id, move |current_epoch| {
@@ -16474,8 +17535,6 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
-
-    static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn youtube_queue_source_hint_keeps_its_platform_prefix() {

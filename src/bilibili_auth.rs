@@ -2915,13 +2915,44 @@ pub fn logout_bbdown_auth_with_epoch(
     })
 }
 
+pub fn logout_bbdown_auth_if_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    expected_epoch: AuthEpoch,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    logout_bbdown_auth_with_epoch_and_hook_at_epoch(
+        state_path,
+        credential_file,
+        credential_profile,
+        Some(expected_epoch),
+        || Ok(()),
+    )
+}
+
 fn logout_bbdown_auth_with_epoch_and_hook(
     state_path: &Path,
     credential_file: &Path,
     credential_profile: Option<&str>,
     after_legacy_state_cleanup: impl FnOnce() -> Result<()>,
 ) -> Result<(AuthCleanupResult, AuthEpoch)> {
-    with_auth_mutation_transaction(state_path, credential_file, |transaction| {
+    logout_bbdown_auth_with_epoch_and_hook_at_epoch(
+        state_path,
+        credential_file,
+        credential_profile,
+        None,
+        after_legacy_state_cleanup,
+    )
+}
+
+fn logout_bbdown_auth_with_epoch_and_hook_at_epoch(
+    state_path: &Path,
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+    expected_epoch: Option<AuthEpoch>,
+    after_legacy_state_cleanup: impl FnOnce() -> Result<()>,
+) -> Result<(AuthCleanupResult, AuthEpoch)> {
+    let operation = |transaction: &LockedAuthMutation<'_>| {
         let intent = transaction.persist_logout_intent(credential_profile)?;
         let legacy_state = transaction.delete_legacy_state();
         let credential_state = if legacy_state.is_ok() {
@@ -2941,7 +2972,16 @@ fn logout_bbdown_auth_with_epoch_and_hook(
             credential_state
         };
         Ok((legacy_state, credential_state))
-    })
+    };
+    match expected_epoch {
+        Some(expected_epoch) => with_auth_mutation_transaction_at_epoch(
+            state_path,
+            credential_file,
+            expected_epoch,
+            operation,
+        ),
+        None => with_auth_mutation_transaction(state_path, credential_file, operation),
+    }
 }
 
 #[cfg(test)]

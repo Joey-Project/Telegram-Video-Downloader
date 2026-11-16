@@ -48,6 +48,21 @@
             <span id="sync-badge" class="badge">Not synced</span>
           </section>
 
+          <section id="bilibili-auth-card" class="settings-section auth-settings-card" aria-live="polite">
+            <div class="panel-heading"><div><p class="eyebrow">BILIBILI ACCOUNT</p><h2>Login status</h2><p id="bilibili-auth-detail">Status is unavailable until the desktop publishes a settings snapshot.</p></div></div>
+            <article class="stack-card" role="status">
+              <div class="stack-card-head"><div><h3 id="bilibili-auth-phase">Status unavailable</h3><p id="bilibili-auth-updated">Refresh settings to check the desktop.</p></div><span id="bilibili-auth-badge" class="state-pill pending">Unavailable</span></div>
+              <p id="bilibili-auth-account" class="field-hint">Account details are not available in this status view.</p>
+              <div class="auth-login-actions">
+                <button class="primary-button" type="button" data-bilibili-login="web">Login with web QR</button>
+                <button class="secondary-button" type="button" data-bilibili-login="tv">Login with TV QR</button>
+                <button class="secondary-button" type="button" data-bilibili-login="access_key">Continue access-key login in Telegram</button>
+              </div>
+              <p class="field-hint">QR codes and access-key prompts are sent only to the bot owner’s private Telegram chat. This page never receives login material.</p>
+              <div class="auth-session-actions"><button id="bilibili-auth-cancel" class="small-button" type="button" disabled>Cancel this login</button><button id="bilibili-auth-logout" class="small-button" type="button" disabled>Log out</button></div>
+            </article>
+          </section>
+
           <section class="settings-section">
             <div class="panel-heading"><div><p class="eyebrow">REGISTERED LOCATIONS</p><h2>Your libraries</h2><p>Settings shown here are the last values applied on the desktop. Requests remain pending until that computer applies them.</p></div></div>
             <div id="library-list" class="settings-library-list" aria-live="polite"></div>
