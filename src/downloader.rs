@@ -32156,6 +32156,7 @@ mod tests {
             main_episode_count: 203,
             areas: Vec::new(),
             tags: Vec::new(),
+            episode_groups: Vec::new(),
             episodes: vec![first.clone(), latest.clone()],
         };
         let metadata = ResolvedContent::Season(bbdown_core::SeasonResolution {
@@ -34569,6 +34570,7 @@ mod tests {
                 main_episode_count: 1,
                 areas: Vec::new(),
                 tags: Vec::new(),
+                episode_groups: Vec::new(),
                 episodes: vec![episode.clone()],
             },
             selected_episodes: vec![episode],
@@ -35440,6 +35442,7 @@ mod tests {
             main_episode_count: 57,
             areas: Vec::new(),
             tags: Vec::new(),
+            episode_groups: Vec::new(),
             episodes: vec![episode.clone()],
         };
         let mut selected = episode.clone();

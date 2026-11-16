@@ -190,7 +190,7 @@ async function readJson<T>(response: Response): Promise<T> {
   return await response.json() as T;
 }
 
-async function webhook(updateId: number): Promise<Response> {
+async function webhook(updateId: number, messageDate: number): Promise<Response> {
   return SELF.fetch(new Request(`${workerUrl}/webhook`, {
     method: "POST",
     headers: {
@@ -201,7 +201,7 @@ async function webhook(updateId: number): Promise<Response> {
       update_id: updateId,
       message: {
         message_id: updateId,
-        date: Math.floor(Date.now() / 1000),
+        date: messageDate,
         from: { id: ownerId, is_bot: false, first_name: "Owner" },
         chat: { id: ownerId, type: "private", first_name: "Owner" },
         text: "/scan",
@@ -472,13 +472,15 @@ describe("Mini App update capabilities", () => {
 
     const firstEnqueue = collector.waitFor((event) => event.type === "invalidate" && event.reason === "inbox", collector.messages.length);
     const localEnqueue = localCollector.waitFor((event) => "payload" in event && "request_id" in event, localCollector.messages.length);
-    expect((await webhook(701)).status).toBe(200);
+    const messageDate = Math.floor(Date.now() / 1000);
+    expect((await webhook(701, messageDate)).status).toBe(200);
     expect(await firstEnqueue).toMatchObject({ type: "invalidate", reason: "inbox", database_epoch: testDatabaseEpoch });
     expect(await localEnqueue).toMatchObject({ kind: "telegram", request_id: "tg:701" });
 
     const duplicateEnqueue = collector.waitFor((event) => event.type === "invalidate" && event.reason === "inbox", collector.messages.length);
     const localDuplicate = localCollector.waitFor((event) => "payload" in event && "request_id" in event, localCollector.messages.length);
-    expect((await webhook(701)).status).toBe(200);
+    // A Telegram redelivery preserves the original timestamp and payload hash.
+    expect((await webhook(701, messageDate)).status).toBe(200);
     expect(await duplicateEnqueue).toMatchObject({ type: "invalidate", reason: "inbox" });
     expect(await localDuplicate).toMatchObject({ kind: "telegram", request_id: "tg:701" });
     expect(collector.messages.some((event) => "payload" in event || "request_id" in event)).toBe(false);
@@ -504,7 +506,7 @@ describe("Mini App update capabilities", () => {
     expect(await acked).toMatchObject({ reason: "inbox", database_epoch: testDatabaseEpoch });
 
     const secondEnqueue = collector.waitFor((event) => event.type === "invalidate" && event.reason === "inbox", collector.messages.length);
-    expect((await webhook(702)).status).toBe(200);
+    expect((await webhook(702, messageDate)).status).toBe(200);
     await secondEnqueue;
     const rotationRow = await testEnv.DB.prepare(
       "SELECT seq, dedup_key, payload_hash, kind, created_at FROM inbox WHERE dedup_key = ?",

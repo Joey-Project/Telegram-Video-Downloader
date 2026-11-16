@@ -1547,6 +1547,7 @@ pub(super) fn make_runtime(
         cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         test_file_provider: None,
         test_metadata_recovery_resolver: None,
+        test_danmaku_fetcher: None,
         test_library_refresh_failure: Arc::new(StdMutex::new(None)),
         test_cloud_ready_marker_emissions: Arc::new(AtomicUsize::new(0)),
     }
@@ -9473,6 +9474,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
 }
 #[path = "bulk_selection_e2e_tests.rs"]
 mod bulk_selection_e2e_tests;
+#[path = "danmaku_refresh_e2e_tests.rs"]
+mod danmaku_refresh_e2e_tests;
 #[path = "media_library_e2e_tests.rs"]
 mod media_library_e2e_tests;
 #[path = "media_library_snapshot_e2e_tests.rs"]

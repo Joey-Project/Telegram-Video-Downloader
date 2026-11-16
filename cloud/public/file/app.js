@@ -31,6 +31,7 @@ import { createFileQueuedAction, fileActionRequestBody } from "./file-action-dis
 import { buildFilePreviewPayloadFromRenderedOption, buildLegacyMetadataPreviewPayloadFromRenderedOption, buildSelectedFilePreviewPayloadFromRenderedOption, clearFileIdentityScopedStateOnSnapshot, fileOperationIdentityMatches, fileOperationLibraryIdentity } from "./file-preview-identity.js";
 import { PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, PREVIEW_CANCELLATION_STORAGE_KEY, readPreviewCancellationDismissals, readPreviewCancellations, writePreviewCancellationDismissals, writePreviewCancellations } from "./preview-cancellation-state.js";
 import { createTorrentView } from "./torrent-view.js";
+import { danmakuRefreshItemSample, danmakuRefreshOperationName, danmakuRefreshPreviewEntries, isIncompleteBoundPreview } from "./danmaku-refresh.js";
 
 const API = "/api";
 const loadOwnerSnapshot = createOwnerSnapshotLoader();
@@ -39,7 +40,7 @@ const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const actionReceiptCallbacks = new Map();
 const MAX_LEGACY_BYTES = 256 * 1024;
 const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
-const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import", "staging_cleanup"]);
+const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import", "staging_cleanup", "danmaku_refresh"]);
 const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "retryable"]);
 
 const telegram = window.Telegram?.WebApp;
@@ -1194,7 +1195,7 @@ function restoreAwaitingOperationResults() {
     }
   }
   for (const action of queue) {
-    if (!["library_scan", "legacy_import", "staging_cleanup", "torrent_action"].includes(action.kind)
+    if (!["library_scan", "legacy_import", "staging_cleanup", "danmaku_refresh", "torrent_action"].includes(action.kind)
         || state.quarantinedActionIds.has(action.request_id)
         || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
         || actionReplayStatus(action).status !== "valid"
@@ -1205,7 +1206,7 @@ function restoreAwaitingOperationResults() {
 
 function awaitingOperationResultTracker(action, seq = null) {
   const tracker = { kind: action?.kind, seq };
-  if (action?.kind !== "staging_cleanup") return tracker;
+  if (action?.kind !== "staging_cleanup" && action?.kind !== "danmaku_refresh") return tracker;
   const payload = action.payload && typeof action.payload === "object" ? action.payload : {};
   tracker.operation = payload.operation;
   tracker.library_id = payload.library_id;
@@ -1239,7 +1240,7 @@ function reconcileAwaitingOperationResults(snapshot) {
     const operation = operations.find((entry) => entry?.kind === tracker.kind
       && (entry?.seq === tracker.seq || entry?.request_id === requestId || entry?.request_id === `action:${requestId}`));
     const operationStatus = String(operation?.status ?? "").toLowerCase();
-    const stagingPreviewReadyForReview = tracker.kind === "staging_cleanup"
+    const stagingPreviewReadyForReview = ["staging_cleanup", "danmaku_refresh"].includes(tracker.kind)
       && operation?.operation === "preview"
       && operationStatus === "awaiting_confirmation";
     if (!operation || (!SETTLED_OPERATION_STATUSES.has(operationStatus) && !stagingPreviewReadyForReview)) continue;
@@ -2203,12 +2204,43 @@ async function submitAction(kind, payload, { onQueued, onReceipt, requestId: sup
       return false;
     }
   }
+  if (kind === "danmaku_refresh") {
+    const libraryId = String(payload?.library_id ?? "");
+    const library = registeredMediaLibrary(state.snapshot, libraryId);
+    const currentRevision = resolveMediaLibrary(state.snapshot, libraryId).snapshot?.revision;
+    if (!isValidLibraryRootBinding(payload?.root_binding)
+        || payload?.operation !== "cancel" && (!library || library.root_binding !== payload.root_binding)) {
+      showToast("This refresh request no longer matches a verified media library. Refresh the library and try again.");
+      return false;
+    }
+    if (payload?.operation === "preview") {
+      const selected = payload.scope === "selected";
+      const ids = selected ? payload.item_ids : null;
+      if (payload.expected_revision !== currentRevision
+          || selected && (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_SELECTED_ITEMS
+            || new Set(ids).size !== ids.length
+            || ids.some((id) => !Array.isArray(resolveMediaLibrary(state.snapshot, libraryId).snapshot?.items)
+              || !resolveMediaLibrary(state.snapshot, libraryId).snapshot.items.some((item) => String(item.id) === id && isPresentMedia(item))))) {
+        showToast("The selected library items changed. Refresh the library and choose the videos again.");
+        return false;
+      }
+    }
+    if (["confirm", "cancel"].includes(payload?.operation)
+        && !danmakuRefreshPreviewEntries(state.snapshot).some((entry) => entry.seq === payload.preview_seq
+          && entry.id === payload.preview_id && entry.revision === payload.revision
+          && entry.library_id === libraryId && entry.root_binding === payload.root_binding
+          && isReviewablePreviewStatus(entry.status))) {
+      showToast("This danmaku preview is no longer awaiting review. Refresh Requests before continuing.");
+      return false;
+    }
+  }
   const unavailableLibraryAction = (() => {
     if (["file_preview", "legacy_import", "metadata_recover"].includes(kind)) {
       return !libraryCanOperate(String(payload?.library_id ?? ""));
     }
     if (kind === "download_submit") return !libraryCanOperate(String(payload?.library_id ?? ""));
     if (kind === "staging_cleanup") return payload?.operation !== "cancel" && !libraryCanOperate(String(payload?.library_id ?? ""));
+    if (kind === "danmaku_refresh") return payload?.operation !== "cancel" && !libraryCanOperate(String(payload?.library_id ?? ""));
     if (kind === "library_migration_preview") {
       return !libraryCanOperate(String(payload?.source_library_id ?? ""))
         || !libraryCanOperate(String(payload?.target_library_id ?? ""));
@@ -2240,7 +2272,8 @@ async function submitAction(kind, payload, { onQueued, onReceipt, requestId: sup
     showToast("This library is offline or showing a saved scan. Reconnect it and refresh before changing files.");
     return false;
   }
-  if (kind === "file_preview" || kind === "staging_cleanup" && payload?.operation === "preview") {
+  if (kind === "file_preview" || kind === "staging_cleanup" && payload?.operation === "preview"
+      || kind === "danmaku_refresh" && payload?.operation === "preview" && payload?.scope === "selected") {
     for (const field of ["item_ids", "metadata_patches"]) {
       if (Array.isArray(payload?.[field]) && payload[field].length > MAX_SELECTED_ITEMS) {
         showToast(`Choose at most ${MAX_SELECTED_ITEMS} ${field === "item_ids" ? "videos" : "metadata matches"} per request.`);
@@ -2256,14 +2289,14 @@ async function submitAction(kind, payload, { onQueued, onReceipt, requestId: sup
     onQueued: (queuedAction) => {
       onQueued?.(queuedAction);
       if (typeof onReceipt === "function") actionReceiptCallbacks.set(queuedAction.request_id, onReceipt);
-      if (["library_scan", "legacy_import", "torrent_action"].includes(kind)) {
+      if (["library_scan", "legacy_import", "torrent_action", "danmaku_refresh"].includes(kind)) {
         state.awaitingOperationResults.set(queuedAction.request_id, awaitingOperationResultTracker(queuedAction));
       }
       if (kind === "staging_cleanup") {
         state.awaitingOperationResults.set(queuedAction.request_id, awaitingOperationResultTracker(queuedAction));
       }
       if ((["file_preview", "library_migration_preview"].includes(kind)
-          || kind === "staging_cleanup" && payload?.operation === "preview") && state.view !== "waiting") {
+          || ["staging_cleanup", "danmaku_refresh"].includes(kind) && payload?.operation === "preview") && state.view !== "waiting") {
         state.view = "waiting";
         render();
       }
@@ -2543,6 +2576,8 @@ function renderLibrary() {
   byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
   byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
   byId("recover-selected").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
+  byId("refresh-selected-danmaku").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
+  byId("refresh-library-danmaku").disabled = !canOperate || typeof activeLibrarySnapshot()?.revision !== "string";
   renderMetadataRecovery();
 }
 
@@ -2690,6 +2725,13 @@ function renderMetadataRecovery() {
 }
 
 function operationTitle(operation) {
+  if (operation?.kind === "danmaku_refresh") {
+    return {
+      preview: "Danmaku refresh preview",
+      confirm: "Danmaku refresh",
+      cancel: "Danmaku preview cancellation",
+    }[danmakuRefreshOperationName(operation)] ?? "Danmaku refresh";
+  }
   if (operation?.kind === "staging_cleanup") {
     return {
       scan: "Video staging scan",
@@ -2735,7 +2777,52 @@ function allReviewEntries() {
     })),
     ...stagingCleanupPreviewEntries().filter((entry) => isReviewablePreviewStatus(entry.status))
       .map((entry) => ({ kind: "staging_cleanup", entry, libraryId: entry.library_id ?? "" })),
+    ...danmakuRefreshPreviewEntries(state.snapshot).filter((entry) => isReviewablePreviewStatus(entry.status))
+      .map((entry) => ({ kind: "danmaku_refresh", entry, libraryId: entry.library_id ?? "" })),
   ];
+}
+
+function danmakuRefreshActionPending(operation, preview) {
+  const samePreview = (entry) => entry?.kind === "danmaku_refresh"
+    && Number(entry.preview_seq ?? entry.seq) === preview.seq
+    && String(entry.preview_id ?? entry.result?.preview_id ?? "") === preview.id
+    && String(entry.revision ?? entry.result?.revision ?? "") === preview.revision
+    && String(entry.library_id ?? entry.result?.library_id ?? "") === preview.library_id;
+  const cloudPending = (Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [])
+    .some((entry) => entry.operation === operation && samePreview(entry));
+  const localPending = (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
+    .some((entry) => danmakuRefreshOperationName(entry) === operation && samePreview(entry)
+      && ["pending", "processing", "retryable"].includes(String(entry.status ?? "").toLowerCase()));
+  return cloudPending || localPending;
+}
+
+function danmakuRefreshPreviewCard(entry) {
+  const preview = entry.preview;
+  const libraryId = String(entry.library_id ?? preview.library_id ?? "");
+  const binding = String(entry.root_binding ?? preview.root_binding ?? "");
+  const library = registeredMediaLibrary(state.snapshot, libraryId);
+  const bindingMatches = Boolean(library && library.root_binding === binding && isValidLibraryRootBinding(binding));
+  const ready = Number.isSafeInteger(preview.ready) ? preview.ready : 0;
+  const skipped = Number.isSafeInteger(preview.skipped) ? preview.skipped : 0;
+  const total = Number.isSafeInteger(preview.total) ? preview.total : ready + skipped;
+  const pending = danmakuRefreshActionPending("confirm", entry) || danmakuRefreshActionPending("cancel", entry);
+  const incomplete = isIncompleteBoundPreview(entry);
+  const canConfirm = bindingMatches && libraryCanOperate(libraryId) && ready > 0 && !pending && !incomplete;
+  const scope = preview.scope === "library" ? "the current library" : `${total.toLocaleString()} selected videos`;
+  const rows = danmakuRefreshItemSample(preview, escapeHtml);
+  const staleNotice = bindingMatches ? "" : `<p class="field-hint">The original library registration is unavailable. This saved preview can only be cancelled.</p>`;
+  const pendingNotice = pending ? `<p class="field-hint" role="status">A confirmation or cancellation request is waiting for your computer.</p>` : "";
+  const warning = incomplete
+    ? "Some preview details were omitted from this snapshot. Cancel unused previews, then refresh to review this one. Confirmation is disabled until its details are available."
+    : "This appends comments to the selected sidecars and retains their existing comments. Video files are not downloaded.";
+  return `<article class="stack-card danmaku-refresh-preview" id="${previewCardId("danmaku_refresh", entry)}" tabindex="-1"><div class="stack-card-head"><div><h3>Refresh danmaku for ${escapeHtml(scope)}</h3><p>${escapeHtml(library?.name ?? libraryLabel(libraryId))} · preview requested ${escapeHtml(timeAgo(entry.created_at, "seconds"))}</p></div><span class="state-pill pending">Review needed</span></div><p class="warning-text">${warning}</p><p class="field-hint">${ready.toLocaleString()} ready · ${skipped.toLocaleString()} skipped · ${total.toLocaleString()} total.</p><div class="preview-table">${rows || `<p class="field-hint">No item examples were retained in the public preview.</p>`}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-danmaku-refresh-confirm="${escapeHtml(entry.id)}" data-danmaku-refresh-seq="${escapeHtml(entry.seq)}" data-danmaku-refresh-revision="${escapeHtml(entry.revision)}" data-danmaku-refresh-library="${escapeHtml(libraryId)}" data-danmaku-refresh-binding="${escapeHtml(binding)}" ${canConfirm ? "" : "disabled"}>Append comments to ${ready.toLocaleString()} videos</button><button class="quiet-button" type="button" data-danmaku-refresh-cancel="${escapeHtml(entry.id)}" data-danmaku-refresh-seq="${escapeHtml(entry.seq)}" data-danmaku-refresh-revision="${escapeHtml(entry.revision)}" data-danmaku-refresh-library="${escapeHtml(libraryId)}" data-danmaku-refresh-binding="${escapeHtml(binding)}" ${pending ? "disabled" : ""}>Cancel preview</button>${staleNotice}${pendingNotice}</div></article>`;
+}
+
+function danmakuRefreshCancelButton(entry) {
+  const busy = danmakuRefreshActionPending("confirm", entry) || danmakuRefreshActionPending("cancel", entry);
+  const libraryId = String(entry.library_id ?? "");
+  const binding = String(entry.root_binding ?? "");
+  return `<button class="quiet-button" type="button" data-danmaku-refresh-cancel="${escapeHtml(entry.id)}" data-danmaku-refresh-seq="${escapeHtml(entry.seq)}" data-danmaku-refresh-revision="${escapeHtml(entry.revision)}" data-danmaku-refresh-library="${escapeHtml(libraryId)}" data-danmaku-refresh-binding="${escapeHtml(binding)}" ${busy ? "disabled" : ""}>Cancel preview</button>`;
 }
 
 function stagingCleanupOperationName(entry) {
@@ -2772,7 +2859,9 @@ function stagingCleanupPreviewEntries() {
     const previousIsTerminal = previous && !isReviewablePreviewStatus(previous.status);
     if (!previous || incomingIsTerminal && !previousIsTerminal
         || !incomingIsTerminal && !previousIsTerminal
-          && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items)) {
+          && (!isIncompleteBoundPreview(normalized) && isIncompleteBoundPreview(previous)
+            || isIncompleteBoundPreview(normalized) === isIncompleteBoundPreview(previous)
+              && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items))) {
       entries.set(key, normalized);
     }
   }
@@ -2948,10 +3037,11 @@ function stagingCleanupPreviewCard(entry) {
   const totalBytes = Number.isSafeInteger(preview.total_bytes) && preview.total_bytes >= 0 ? formatBytes(preview.total_bytes) : "Size unavailable";
   const library = registeredMediaLibrary(state.snapshot, entry.library_id);
   const bindingMatches = Boolean(library && library.root_binding === entry.root_binding && isValidLibraryRootBinding(entry.root_binding));
-  const canConfirm = bindingMatches && libraryCanOperate(entry.library_id) && count > 0;
+  const canConfirm = bindingMatches && libraryCanOperate(entry.library_id) && count > 0 && !isIncompleteBoundPreview(entry);
   const busy = stagingCleanupActionPending("confirm", null, entry) || stagingCleanupActionPending("cancel", null, entry);
   const disabled = busy;
-  const warning = "Confirming permanently removes the selected video staging data from disk. This cannot be undone. Finished media, active writers, PDF downloads, Music originals or playback dependencies, and unknown or unowned directories are outside this cleanup.";
+  const warning = (isIncompleteBoundPreview(entry) ? "Some preview details were omitted. Cancel unused previews, then refresh before confirming. " : "")
+    + "Confirming permanently removes the selected video staging data from disk. This cannot be undone. Finished media, active writers, PDF downloads, Music originals or playback dependencies, and unknown or unowned directories are outside this cleanup.";
   return `<article class="stack-card staging-cleanup-preview" id="staging-cleanup-preview-${escapeHtml(entry.seq ?? entry.id)}"><div class="stack-card-head"><div><h3>${count.toLocaleString()} video staging entries selected</h3><p>${escapeHtml(library?.name ?? libraryLabel(entry.library_id))} · preview requested ${escapeHtml(timeAgo(entry.created_at, "seconds"))}</p></div><span class="state-pill pending">Review needed</span></div><p class="warning-text">${warning}</p><p class="field-hint">Estimated staging bytes: ${escapeHtml(totalBytes)}. The local confirmation rechecks the exact selected entries and active-writer state.</p><div class="preview-table">${sample}${items.length === 0 ? `<p class="field-hint">No item examples were retained in the public preview.</p>` : ""}${omitted ? `<p class="field-hint">${omitted.toLocaleString()} selected entries are omitted from this bounded preview summary.</p>` : ""}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-staging-cleanup-confirm="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${!canConfirm || disabled ? "disabled" : ""}>Permanently clean ${count.toLocaleString()} selected entries</button><button class="quiet-button" type="button" data-staging-cleanup-cancel="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${disabled ? "disabled" : ""}>Cancel preview</button>${!bindingMatches ? `<p class="field-hint">The original library registration is unavailable. Cleanup cannot be confirmed from this snapshot.</p>` : ""}${busy ? `<p class="field-hint" role="status">A confirmation or cancellation request is already waiting for your computer.</p>` : ""}</div></article>`;
 }
 
@@ -3669,11 +3759,13 @@ function renderReviewNavigation() {
         : cancelState?.status === "failed" ? `Cancellation failed: ${cancelState.error || "The computer could not cancel this preview."}`
           : "";
     const title = kind === "file_preview" ? "File changes need review"
-      : kind === "library_migration_preview" ? "Library migration needs review" : "Video staging cleanup needs review";
+      : kind === "library_migration_preview" ? "Library migration needs review"
+        : kind === "danmaku_refresh" ? "Danmaku refresh needs review" : "Video staging cleanup needs review";
     const reviewButton = canReview
       ? `<button class="secondary-button" type="button" data-review-library="${escapeHtml(libraryId)}" data-review-preview-kind="${escapeHtml(kind)}" data-review-preview-seq="${escapeHtml(sequence)}" data-review-preview-id="${escapeHtml(id)}" data-review-preview-revision="${escapeHtml(revision)}">Review</button>`
       : `<p class="field-hint">${kind === "staging_cleanup" ? "The original library registration is unavailable. Cleanup confirmation is disabled; the saved preview remains available below." : "This library is no longer registered. You can still cancel this saved preview by its exact identity."}</p>`;
-    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(libraryLabel(libraryId))} · request ${sequence ? `#${sequence}` : "details unavailable"}</p>${cancelMessage ? `<p class="field-hint">${escapeHtml(cancelMessage)}</p>` : ""}</div><span class="state-pill pending">Review needed</span></div><div class="stack-actions">${reviewButton}${previewCancellationMarkup(kind, entry)}</div></article>`);
+    const danmakuCancel = kind === "danmaku_refresh" ? danmakuRefreshCancelButton(entry) : "";
+    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(libraryLabel(libraryId))} · request ${sequence ? `#${sequence}` : "details unavailable"}</p>${cancelMessage ? `<p class="field-hint">${escapeHtml(cancelMessage)}</p>` : ""}</div><span class="state-pill pending">Review needed</span></div><div class="stack-actions">${reviewButton}${kind === "danmaku_refresh" ? danmakuCancel : previewCancellationMarkup(kind, entry)}</div></article>`);
   }
   for (const [key, tracker] of state.previewCancellations) {
     const hasAcceptedSequence = Number.isSafeInteger(tracker?.seq) && tracker.seq > 0;
@@ -3807,6 +3899,11 @@ function renderPreviews() {
     return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(destination)} · Conflict: ${escapeHtml(conflict)}</p>${offlineMessage}</div><span class="state-pill pending">${compactSummary ? "Compact review" : "Review needed"}</span></div><div class="preview-table">${details}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>${escapeHtml(confirmLabel)}</button>${cancel}</div></article>`;
   }).join("");
   if (!requestCard && !omittedNotice && !pending.length) byId("preview-list").innerHTML = "";
+  const danmakuEntries = danmakuRefreshPreviewEntries(state.snapshot)
+    .filter((entry) => entry.library_id === activeLibraryId() && isReviewablePreviewStatus(entry.status));
+  if (danmakuEntries.length) {
+    byId("preview-list").insertAdjacentHTML("beforeend", danmakuEntries.map(danmakuRefreshPreviewCard).join(""));
+  }
 }
 
 function renderLegacyMappings() {
@@ -3971,12 +4068,101 @@ function stagingCleanupHistoryDetails(entry) {
     : "";
 }
 
+function danmakuRefreshHistorySummary(entry) {
+  const result = entry?.result && typeof entry.result === "object" ? entry.result : {};
+  const operation = danmakuRefreshOperationName(entry);
+  if (operation === "preview") {
+    const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
+    return `Danmaku preview: ${Number(preview.ready ?? 0).toLocaleString()} ready, ${Number(preview.skipped ?? 0).toLocaleString()} skipped.`;
+  }
+  if (operation === "confirm") {
+    const summary = result.summary;
+    if (!summary || typeof summary !== "object" || Array.isArray(summary)
+        || ["updated", "unchanged", "skipped", "failed", "added_comments"]
+          .some((field) => !Number.isSafeInteger(summary[field]) || summary[field] < 0)) {
+      return "Refresh counts are unavailable in this snapshot.";
+    }
+    return `${summary.updated.toLocaleString()} updated · ${summary.unchanged.toLocaleString()} unchanged · ${summary.skipped.toLocaleString()} skipped · ${summary.failed.toLocaleString()} failed · ${summary.added_comments.toLocaleString()} comments appended.`;
+  }
+  if (operation === "cancel") return result.cancelled === true
+    ? "Danmaku preview cancelled. No comments were changed."
+    : "Danmaku preview cancellation completed.";
+  return "Danmaku refresh request recorded.";
+}
+
+function danmakuRefreshHistoryDetails(entry) {
+  const result = entry?.result && typeof entry.result === "object" ? entry.result : {};
+  const operation = danmakuRefreshOperationName(entry);
+  const preview = result.preview && typeof result.preview === "object" ? result.preview : null;
+  const data = operation === "preview" ? preview : result;
+  if (!data || !Array.isArray(data.items)) {
+    return operation === "confirm" && Number(result.summary?.failed ?? 0) > 0
+      ? `<p class="field-hint">Saved per-video details are unavailable.</p><div class="stack-actions"><button class="quiet-button" type="button" data-danmaku-remaining="${escapeHtml(entry?.seq ?? "")}">Preview remaining videos</button></div>`
+      : "";
+  }
+  const rows = operation === "preview"
+    ? danmakuRefreshItemSample(data, escapeHtml)
+    : data.items.slice(0, 24).map((item) => {
+      const title = String(item?.title ?? item?.item_id ?? "Selected video");
+      const path = String(item?.relative_path ?? "Path unavailable");
+      const added = Number.isSafeInteger(item?.added_comments) ? ` · ${item.added_comments.toLocaleString()} comments appended` : "";
+      const reason = typeof item?.reason === "string" ? `<br><span class="preview-reason">${escapeHtml(item.reason)}</span>` : "";
+      const status = String(item?.status ?? "completed").replaceAll("_", " ");
+      return `<div class="preview-line"><span>${escapeHtml(title)}<br><span class="field-hint">${escapeHtml(path)}${escapeHtml(added)}</span>${reason}</span><strong class="${item?.status === "failed" ? "skip" : "move"}">${escapeHtml(status)}</strong></div>`;
+    }).join("");
+  const omitted = Math.max(0, data.items.length - 24);
+  const summary = result.summary && typeof result.summary === "object" ? result.summary : {};
+  const retryable = operation === "confirm" && (Number(summary.failed ?? 0) > 0 || data.items.some((item) => item?.deferred === true));
+  const continuation = retryable
+    ? `<div class="stack-actions"><button class="quiet-button" type="button" data-danmaku-remaining="${escapeHtml(entry?.seq ?? "")}">Preview remaining videos</button></div>`
+    : "";
+  return `<p class="field-hint">${escapeHtml(data.media_files_changed === false ? "Video files were not changed." : "Existing comments are retained; new comments append to sidecars.")}</p><div class="preview-table">${rows}${omitted ? `<p class="field-hint">${omitted.toLocaleString()} additional item results are in the saved local report.</p>` : ""}</div>${continuation}`;
+}
+
+function danmakuRemainingPreviewPayload(entry) {
+  const result = entry?.result && typeof entry.result === "object" ? entry.result : {};
+  const summary = result.summary && typeof result.summary === "object" ? result.summary : {};
+  const items = Array.isArray(result.items) ? result.items : null;
+  const counts = [summary.updated, summary.unchanged, summary.skipped, summary.failed];
+  const total = counts.every((count) => Number.isSafeInteger(count) && count >= 0)
+    ? counts.reduce((sum, count) => sum + count, 0)
+    : -1;
+  if (entry?.kind !== "danmaku_refresh" || danmakuRefreshOperationName(entry) !== "confirm"
+      || String(entry.status ?? "").toLowerCase() !== "completed" || !items || total < 0 || total !== items.length) {
+    return null;
+  }
+  const retryItems = items.filter((item) => item?.status === "failed" || item?.deferred === true);
+  const itemIds = retryItems.map((item) => item?.item_id);
+  if (itemIds.length === 0 || itemIds.length > MAX_SELECTED_ITEMS
+      || itemIds.some((id) => typeof id !== "string" || id.length === 0)
+      || new Set(itemIds).size !== itemIds.length) return null;
+  const libraryId = String(result.library_id ?? entry.library_id ?? "");
+  const rootBinding = String(result.root_binding ?? entry.root_binding ?? "");
+  const currentLibrary = registeredMediaLibrary(state.snapshot, libraryId);
+  const current = resolveMediaLibrary(state.snapshot, libraryId).snapshot;
+  if (!libraryId || !isValidLibraryRootBinding(rootBinding) || !currentLibrary
+      || currentLibrary.root_binding !== rootBinding || !Array.isArray(current?.items)
+      || typeof current.revision !== "string" || !current.revision
+      || !libraryCanOperate(libraryId) || itemIds.some((id) => !current.items.some((item) => String(item.id) === id && isPresentMedia(item)))) {
+    return null;
+  }
+  return {
+    operation: "preview",
+    library_id: libraryId,
+    root_binding: rootBinding,
+    scope: "selected",
+    expected_revision: current.revision,
+    item_ids: itemIds,
+  };
+}
+
 function renderOperations() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
   const history = operationHistoryEntries(operations).filter((entry) =>
     SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()) && historySearchMatches(entry));
   const active = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
     && !(entry?.kind === "staging_cleanup" && stagingCleanupOperationName(entry) === "preview")
+    && !(entry?.kind === "danmaku_refresh" && danmakuRefreshOperationName(entry) === "preview")
     && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
   const renderEntries = (entries) => entries.slice().reverse().map((entry) => {
     const result = entry.result && typeof entry.result === "object" ? entry.result : {};
@@ -3996,7 +4182,9 @@ function renderOperations() {
     const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
     const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
     const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
-    const summary = entry.kind === "staging_cleanup"
+    const summary = entry.kind === "danmaku_refresh"
+      ? danmakuRefreshHistorySummary(entry)
+      : entry.kind === "staging_cleanup"
       ? stagingCleanupHistorySummary(entry)
       : fileConfirmSummary?.detailsAvailable
       ? `${statusText(fileConfirmSummary.status)} · ${fileConfirmSummary.selectedCount.toLocaleString()} item results · ${fileConfirmSummary.movedFileCount.toLocaleString()}/${fileConfirmSummary.fileCount.toLocaleString()} related files moved`
@@ -4020,7 +4208,7 @@ function renderOperations() {
       ...(entry.kind === "staging_cleanup" && Array.isArray(result.scan?.warnings) ? result.scan.warnings : []),
     ];
     const telegramWarning = result.telegram_progress_warning ?? outcome.telegram_progress_warning;
-    const itemResults = items.map((item) => {
+    const itemResults = entry.kind === "danmaku_refresh" ? "" : items.map((item) => {
       const libraryItem = libraryItems().find((candidate) => String(candidate.id) === String(item.item_id));
       const label = libraryItem?.title || libraryItem?.relative_path || item.source_path || item.item_id || "Selected item";
       const fileProgress = Number.isSafeInteger(item.total_files) ? `${Number(item.moved_files ?? 0)}/${item.total_files} files moved` : "No files moved";
@@ -4035,7 +4223,9 @@ function renderOperations() {
       ? `${libraryLabel(sourceLibraryId)} → ${libraryLabel(targetLibraryId)}`
       : operationLibraryId(entry) ? libraryLabel(operationLibraryId(entry)) : "";
     const contextLabel = libraryContext ? `<p class="field-hint">${escapeHtml(libraryContext)}</p>` : "";
-    const previewDetails = entry.kind === "staging_cleanup"
+    const previewDetails = entry.kind === "danmaku_refresh"
+      ? danmakuRefreshHistoryDetails(entry)
+      : entry.kind === "staging_cleanup"
       ? stagingCleanupHistoryDetails(entry)
       : preview ? `<div class="preview-table">${describePreview(preview)}</div>` : "";
     const fileConfirmDetails = fileConfirmSummary ? renderFileConfirmSummary(fileConfirmSummary) : "";
@@ -4086,6 +4276,7 @@ function renderTabCounts() {
 
   const activeOperations = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
     && !(entry?.kind === "staging_cleanup" && stagingCleanupOperationName(entry) === "preview")
+    && !(entry?.kind === "danmaku_refresh" && danmakuRefreshOperationName(entry) === "preview")
     && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
   const retained = retainedMigrationState();
   const activeMigrations = retained.migrations.filter((migration) =>
@@ -4326,9 +4517,45 @@ function openMovedTarget(button) {
   showToast(destinationMessage);
 }
 
+function requestDanmakuRefreshPreview(scope) {
+  const libraryId = activeLibraryId();
+  const library = registeredMediaLibrary(state.snapshot, libraryId);
+  const rootBinding = library?.root_binding;
+  const expectedRevision = activeLibrarySnapshot()?.revision;
+  if (!libraryId || !isValidLibraryRootBinding(rootBinding) || typeof expectedRevision !== "string"
+      || !expectedRevision || !libraryCanOperate(libraryId)) {
+    showToast("Refresh the current library scan before preparing a danmaku preview.");
+    return;
+  }
+  const identity = { library_id: libraryId, root_binding: rootBinding };
+  if (scope === "library") {
+    void submitAction("danmaku_refresh", {
+      operation: "preview", ...identity, scope: "library", expected_revision: expectedRevision,
+    });
+    return;
+  }
+  const itemIds = [...state.selected].filter((id) => {
+    const item = libraryItems().find((candidate) => String(candidate.id) === id);
+    return isPresentMedia(item);
+  });
+  if (itemIds.length === 0) {
+    showToast("Select at least one present video in the current library.");
+    return;
+  }
+  if (itemIds.length > MAX_SELECTED_ITEMS) {
+    showToast(`Choose at most ${MAX_SELECTED_ITEMS.toLocaleString()} videos per preview.`);
+    return;
+  }
+  void submitAction("danmaku_refresh", {
+    operation: "preview", ...identity, scope: "selected", expected_revision: expectedRevision, item_ids: itemIds,
+  });
+}
+
 function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
   byId("scan-button").addEventListener("click", () => submitAction("library_scan", { library_id: activeLibraryId() }));
+  byId("refresh-library-danmaku").addEventListener("click", () => requestDanmakuRefreshPreview("library"));
+  byId("refresh-selected-danmaku").addEventListener("click", () => requestDanmakuRefreshPreview("selected"));
   byId("staging-scan").addEventListener("click", () => {
     const identity = activeStagingLibraryIdentity();
     if (!identity || !libraryCanOperate(identity.library_id)) return showToast("Reconnect this registered library and refresh before scanning its video staging entries.");
@@ -4694,6 +4921,52 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const remainingButton = event.target.closest("[data-danmaku-remaining]");
+    if (remainingButton) {
+      const seq = Number(remainingButton.dataset.danmakuRemaining);
+      const entry = (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
+        .find((candidate) => candidate.seq === seq);
+      const payload = danmakuRemainingPreviewPayload(entry);
+      if (!payload) {
+        showToast("Saved result rows are missing, incomplete, or stale. Refresh Requests and select the remaining videos manually.");
+        return;
+      }
+      void submitAction("danmaku_refresh", payload);
+      return;
+    }
+    const danmakuConfirm = event.target.closest("[data-danmaku-refresh-confirm]");
+    const danmakuCancel = event.target.closest("[data-danmaku-refresh-cancel]");
+    const danmakuAction = danmakuConfirm ?? danmakuCancel;
+    if (danmakuAction) {
+      const operation = danmakuConfirm ? "confirm" : "cancel";
+      const preview = danmakuRefreshPreviewEntries(state.snapshot).find((entry) => entry.seq === Number(danmakuAction.dataset.danmakuRefreshSeq)
+        && entry.id === danmakuAction.dataset[danmakuConfirm ? "danmakuRefreshConfirm" : "danmakuRefreshCancel"]
+        && entry.revision === danmakuAction.dataset.danmakuRefreshRevision
+        && entry.library_id === danmakuAction.dataset.danmakuRefreshLibrary
+        && entry.root_binding === danmakuAction.dataset.danmakuRefreshBinding);
+      if (!preview || !isReviewablePreviewStatus(preview.status)
+          || danmakuRefreshActionPending("confirm", preview) || danmakuRefreshActionPending("cancel", preview)) {
+        showToast("This danmaku preview is no longer awaiting review, or an action is already pending.");
+        renderPreviewReviewCards();
+        return;
+      }
+      if (operation === "confirm" && (!libraryCanOperate(preview.library_id)
+          || registeredMediaLibrary(state.snapshot, preview.library_id)?.root_binding !== preview.root_binding)) {
+        showToast("Reconnect the original library and refresh before confirming the danmaku refresh.");
+        renderPreviewReviewCards();
+        return;
+      }
+      danmakuAction.disabled = true;
+      void submitAction("danmaku_refresh", {
+        operation,
+        library_id: preview.library_id,
+        root_binding: preview.root_binding,
+        preview_seq: preview.seq,
+        preview_id: preview.id,
+        revision: preview.revision,
+      });
+      return;
+    }
     const stagingConfirm = event.target.closest("[data-staging-cleanup-confirm]");
     const stagingCancel = event.target.closest("[data-staging-cleanup-cancel]");
     const stagingAction = stagingConfirm ?? stagingCancel;

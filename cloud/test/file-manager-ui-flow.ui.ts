@@ -1159,6 +1159,324 @@ describe("file manager UI flow", () => {
     expect(fixture.actions.filter((action) => action.kind === "torrent_action")).toHaveLength(1);
   });
 
+  it("previews, confirms, cancels, and records append-only danmaku refreshes", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    let currentSnapshot: Record<string, any> = {
+      ...ownerSnapshot,
+      state_version: 1,
+      pending_requests: [],
+      operations: [],
+      previews: [],
+    };
+    let previewCount = 0;
+    const fixture = await mountFileManagerFixture(currentSnapshot, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("danmaku_refresh");
+      const payload = action.payload as Record<string, any>;
+      const operations = [...currentSnapshot.operations];
+      if (payload.operation === "preview") {
+        previewCount += 1;
+        const previewId = `danmaku-preview-${previewCount}`;
+        const revision = `danmaku-r${previewCount}`;
+        const ids = payload.scope === "selected" ? payload.item_ids : ["item-alpha", "item-beta"];
+        const items = ids.map((itemId: string, index: number) => ({
+          item_id: itemId,
+          title: itemId === "item-alpha" ? "Alpha video" : "Beta video",
+          relative_path: itemId === "item-alpha" ? "Films/Alpha.mkv" : "Films/Beta.mkv",
+          status: index === 0 ? "ready" : "skipped",
+          ...(index === 0 ? {} : { reason: "No Bilibili identity was found." }),
+        }));
+        const preview = {
+          id: previewId,
+          revision,
+          scope: payload.scope,
+          items,
+          ready: items.filter((item: Record<string, any>) => item.status === "ready").length,
+          skipped: items.filter((item: Record<string, any>) => item.status === "skipped").length,
+          total: items.length,
+          truncated: false,
+        };
+        operations.push({
+          seq,
+          request_id: action.request_id,
+          kind: "danmaku_refresh",
+          operation: "preview",
+          status: "awaiting_confirmation",
+          created_at: Math.floor(Date.now() / 1000),
+          preview_id: previewId,
+          revision,
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
+          result: { operation: "preview", library_id: LIBRARY_ID, root_binding: ROOT_BINDING, preview_id: previewId, revision, preview },
+        });
+        currentSnapshot = { ...currentSnapshot, state_version: currentSnapshot.state_version + 1, operations, pending_requests: [] };
+      } else {
+        const previewSeq = payload.preview_seq;
+        const previewOperation = operations.find((entry: Record<string, any>) => entry.seq === previewSeq);
+        if (previewOperation) previewOperation.status = payload.operation === "confirm" ? "confirmed" : "cancelled";
+        operations.push({
+          seq,
+          request_id: action.request_id,
+          kind: "danmaku_refresh",
+          operation: payload.operation,
+          status: "completed",
+          created_at: Math.floor(Date.now() / 1000),
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
+          preview_seq: previewSeq,
+          preview_id: payload.preview_id,
+          revision: payload.revision,
+          result: payload.operation === "confirm"
+            ? {
+              operation: "confirm", library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+              preview_id: payload.preview_id, revision: payload.revision,
+              summary: { updated: 1, unchanged: 0, skipped: 0, failed: 0, added_comments: 12 },
+              items: [{ item_id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", status: "updated", added_comments: 12 }],
+              media_files_changed: false,
+            }
+            : { operation: "cancel", cancelled: true, media_files_changed: false },
+        });
+        currentSnapshot = { ...currentSnapshot, state_version: currentSnapshot.state_version + 1, operations, pending_requests: [] };
+      }
+      await publishSnapshot(currentSnapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLInputElement>('[data-select-item="item-alpha"]').click();
+    element<HTMLButtonElement>("#refresh-selected-danmaku").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    expect(fixture.actions[0]?.payload).toMatchObject({
+      operation: "preview", scope: "selected", library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      expected_revision: ownerSnapshot.library.revision, item_ids: ["item-alpha"],
+    });
+    await vi.waitFor(() => expect(document.querySelector(".danmaku-refresh-preview")?.textContent).toContain("Ready to append"));
+    expect(document.querySelector(".danmaku-refresh-preview")?.textContent).toContain("Video files are not downloaded");
+    document.querySelector<HTMLButtonElement>("[data-danmaku-refresh-confirm]")!.click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(2));
+    expect(fixture.actions[1]?.payload).toMatchObject({ operation: "confirm", preview_seq: 901, preview_id: "danmaku-preview-1", revision: "danmaku-r1" });
+    await vi.waitFor(() => expect(element<HTMLElement>("#operation-list").textContent).toContain("12 comments appended"));
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Video files were not changed");
+
+    element<HTMLButtonElement>('[data-view="library"]').click();
+    element<HTMLButtonElement>("#refresh-library-danmaku").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(3));
+    expect(fixture.actions[2]?.payload).toMatchObject({
+      operation: "preview", scope: "library", library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      expected_revision: ownerSnapshot.library.revision,
+    });
+    expect(fixture.actions[2]?.payload).not.toHaveProperty("item_ids");
+    await vi.waitFor(() => expect(document.querySelectorAll(".danmaku-refresh-preview")).toHaveLength(1));
+    document.querySelector<HTMLButtonElement>("[data-danmaku-refresh-cancel]")!.click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(4));
+    expect(fixture.actions[3]?.payload).toMatchObject({ operation: "cancel", preview_seq: 903, preview_id: "danmaku-preview-2", revision: "danmaku-r2" });
+    await vi.waitFor(() => expect(element<HTMLElement>("#operation-list").textContent).toContain("Danmaku preview cancelled"));
+  });
+
+  it.each([
+    { name: "missing", summary: undefined, available: false },
+    { name: "partial", summary: { updated: 3 }, available: false },
+    { name: "malformed", summary: { updated: "3", unchanged: 0, skipped: 0, failed: 0, added_comments: 0 }, available: false },
+    { name: "negative", summary: { updated: 0, unchanged: 0, skipped: 0, failed: -1, added_comments: 0 }, available: false },
+    { name: "zero", summary: { updated: 0, unchanged: 0, skipped: 0, failed: 0, added_comments: 0 }, available: true },
+    { name: "retained", summary: { updated: 3, unchanged: 2, skipped: 1, failed: 4, added_comments: 12 }, available: true },
+  ])("keeps $name compact danmaku counts distinct from omitted results", async ({ name, summary, available }) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    await mountFileManagerFixture({
+      ...ownerSnapshot,
+      pending_requests: [], previews: [],
+      operations: [{
+        seq: 989, kind: "danmaku_refresh", operation: "confirm", status: "completed",
+        library_id: LIBRARY_ID, root_binding: ROOT_BINDING, details_incomplete: true,
+        result_truncated: true, created_at: Math.floor(Date.now() / 1000),
+        result: { operation: "confirm", incomplete: true, ...(summary ? { summary } : {}) },
+      }],
+    }, makeMemoryStorage());
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    const history = element<HTMLElement>("#operation-list");
+    if (available) {
+      const expected = name === "zero"
+        ? "0 updated · 0 unchanged · 0 skipped · 0 failed · 0 comments appended."
+        : "3 updated · 2 unchanged · 1 skipped · 4 failed · 12 comments appended.";
+      await vi.waitFor(() => expect(history.textContent).toContain(expected));
+      expect(history.textContent).not.toContain("Refresh counts are unavailable");
+    } else {
+      await vi.waitFor(() => expect(history.textContent).toContain("Refresh counts are unavailable"));
+      expect(history.textContent).not.toContain("0 updated");
+      expect(history.textContent).not.toContain("0 comments appended");
+    }
+  });
+
+  it("keeps compact danmaku previews cancellable and restores review from complete details", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const preview = {
+      id: "dmr-budget-preview", revision: "dmr-budget-r1", scope: "selected",
+      library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      ready: 2, skipped: 0, total: 2, truncated: false,
+      items: [{ item_id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", status: "ready" }],
+    };
+    const compact = {
+      seq: 880, kind: "danmaku_refresh", operation: "preview", status: "awaiting_confirmation",
+      preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      preview, preview_incomplete: true, incomplete: true, reload_required: true,
+    };
+    const oldOperation = { ...compact, result: { operation: "preview", preview } };
+    const initial = { ...ownerSnapshot, state_version: 1, pending_requests: [], operations: [oldOperation], previews: [compact] };
+    const fixture = await mountFileManagerFixture(initial, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("danmaku_refresh");
+      expect(action.payload).toEqual({ operation: "cancel", preview_seq: 880,
+        preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING });
+      await publishSnapshot({ ...initial, state_version: 4, previews: [], operations: [{
+        seq, request_id: action.request_id, kind: "danmaku_refresh", operation: "cancel", status: "completed",
+        library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+        result: { operation: "cancel", preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING },
+      }] });
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(true);
+    expect(element<HTMLButtonElement>("[data-danmaku-refresh-cancel]").disabled).toBe(false);
+    expect(document.querySelector(".danmaku-refresh-preview")?.textContent).toContain("Cancel unused previews");
+
+    const full = { ...compact, preview_incomplete: false, incomplete: false, reload_required: false,
+      preview: { ...preview, items: [...preview.items, { item_id: "item-beta", title: "Beta video", relative_path: "Films/Beta.mkv", status: "ready" }] } };
+    await fixture.publishSnapshot({ ...initial, state_version: 2, previews: [full] });
+    publishMockSnapshot(2);
+    await vi.waitFor(() => expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(false));
+    await fixture.publishSnapshot({ ...initial, state_version: 3 });
+    publishMockSnapshot(3);
+    await vi.waitFor(() => expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(true));
+    element<HTMLButtonElement>("[data-danmaku-refresh-cancel]").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+  });
+
+  it("previews failed and deferred danmaku rows while preserving the selection draft", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const priorResult = {
+      operation: "confirm",
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      summary: { updated: 0, unchanged: 0, skipped: 1, failed: 1, added_comments: 0 },
+      items: [
+        { item_id: "item-alpha", title: "Alpha video", status: "failed", reason: "The comment endpoint timed out." },
+        { item_id: "item-beta", title: "Beta video", status: "skipped", deferred: true, reason: "Deferred by the preview inspection budget." },
+      ],
+      media_files_changed: false,
+    };
+    let currentSnapshot: Record<string, any> = {
+      ...ownerSnapshot,
+      state_version: 1,
+      pending_requests: [],
+      operations: [{
+        seq: 880,
+        kind: "danmaku_refresh",
+        operation: "confirm",
+        status: "completed",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        created_at: Math.floor(Date.now() / 1000),
+        result: priorResult,
+      }],
+      previews: [],
+    };
+    const fixture = await mountFileManagerFixture(currentSnapshot, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("danmaku_refresh");
+      expect(action.payload).toEqual({
+        operation: "preview",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        scope: "selected",
+        expected_revision: ownerSnapshot.library.revision,
+        item_ids: ["item-alpha", "item-beta"],
+      });
+      currentSnapshot = {
+        ...currentSnapshot,
+        state_version: currentSnapshot.state_version + 1,
+        operations: [...currentSnapshot.operations, {
+          seq,
+          request_id: action.request_id,
+          kind: "danmaku_refresh",
+          operation: "preview",
+          status: "awaiting_confirmation",
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
+          preview_id: "remaining-preview",
+          revision: "remaining-preview-r1",
+          result: {
+            operation: "preview", library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+            preview_id: "remaining-preview", revision: "remaining-preview-r1",
+            preview: { id: "remaining-preview", revision: "remaining-preview-r1", scope: "selected", items: [], ready: 0, skipped: 0, total: 0, truncated: false },
+          },
+        }],
+        pending_requests: [],
+      };
+      await publishSnapshot(currentSnapshot);
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLInputElement>('[data-select-item="series-a-1"]').click();
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    const retry = element<HTMLButtonElement>('[data-danmaku-remaining="880"]');
+    expect(retry.textContent).toBe("Preview remaining videos");
+    retry.click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    expect(fixture.actions[0]?.payload).toEqual({
+      operation: "preview",
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      scope: "selected",
+      expected_revision: ownerSnapshot.library.revision,
+      item_ids: ["item-alpha", "item-beta"],
+    });
+    element<HTMLButtonElement>('[data-view="library"]').click();
+    expect(element<HTMLInputElement>('[data-select-item="series-a-1"]').checked).toBe(true);
+  });
+
+  it.each(["stale binding", "missing rows"] as const)(
+    "does not preview danmaku continuation when saved rows have %s",
+    async (problem) => {
+      vi.useFakeTimers();
+      vi.stubGlobal("crypto", webcrypto);
+      const rootBinding = problem === "stale binding" ? `v1:${"b".repeat(64)}` : ROOT_BINDING;
+      const snapshot = {
+        ...ownerSnapshot,
+        state_version: 1,
+        settings: {
+          ...ownerSnapshot.settings,
+          applied: {
+            ...ownerSnapshot.settings.applied,
+            libraries: ownerSnapshot.settings.applied.libraries.map((library) => ({ ...library, root_binding: rootBinding })),
+          },
+        },
+        pending_requests: [],
+        operations: [{
+          seq: 881,
+          kind: "danmaku_refresh",
+          operation: "confirm",
+          status: "completed",
+          library_id: LIBRARY_ID,
+          root_binding: ROOT_BINDING,
+          result: {
+            operation: "confirm",
+            library_id: LIBRARY_ID,
+            root_binding: ROOT_BINDING,
+            summary: { updated: 0, unchanged: 0, skipped: 0, failed: 1, added_comments: 0 },
+            ...(problem === "missing rows" ? {} : { items: [{ item_id: "item-alpha", status: "failed" }] }),
+            media_files_changed: false,
+          },
+        }],
+        previews: [],
+      };
+      const fixture = await mountFileManagerFixture(snapshot, makeMemoryStorage());
+      element<HTMLButtonElement>('[data-view="history"]').click();
+      element<HTMLButtonElement>('[data-danmaku-remaining="881"]').click();
+      expect(fixture.actions).toHaveLength(0);
+      expect(element<HTMLElement>("#toast").textContent).toContain("Refresh Requests");
+    },
+  );
+
   it("keeps the catalog title while detail loads and restores its original row title on back", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

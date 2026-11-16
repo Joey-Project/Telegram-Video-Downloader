@@ -50,7 +50,7 @@ function itemIds(count: number): string[] {
   return Array.from({ length: count }, (_, index) => `copy-${index.toString(16).padStart(24, "0")}`);
 }
 
-type BulkActionKind = "file_preview" | "library_migration_preview" | "staging_cleanup";
+type BulkActionKind = "file_preview" | "library_migration_preview" | "staging_cleanup" | "danmaku_refresh";
 
 function payloadFor(kind: BulkActionKind, ids: string[]) {
   if (kind === "file_preview") {
@@ -68,6 +68,16 @@ function payloadFor(kind: BulkActionKind, ids: string[]) {
       operation: "preview",
       library_id: "library-test",
       root_binding: rootBinding,
+      item_ids: ids,
+    };
+  }
+  if (kind === "danmaku_refresh") {
+    return {
+      operation: "preview",
+      library_id: "library-test",
+      root_binding: rootBinding,
+      scope: "selected",
+      expected_revision: "library-r1",
       item_ids: ids,
     };
   }
@@ -137,7 +147,7 @@ describe("5,000-item batch selection", () => {
     expect(capped.omittedCount).toBe(1);
   });
 
-  it.each(["file_preview", "library_migration_preview", "staging_cleanup"] as const)(
+  it.each(["file_preview", "library_migration_preview", "staging_cleanup", "danmaku_refresh"] as const)(
     "persists exactly 5,000 %s item IDs and rejects 5,001",
     async (kind) => {
       const initData = await signOwnerInitData();
@@ -145,12 +155,16 @@ describe("5,000-item batch selection", () => {
         ? "00000000-0000-4000-8000-000000000501"
         : kind === "library_migration_preview"
           ? "00000000-0000-4000-8000-000000000502"
-          : "00000000-0000-4000-8000-000000000505";
+          : kind === "staging_cleanup"
+            ? "00000000-0000-4000-8000-000000000505"
+            : "00000000-0000-4000-8000-000000000507";
       const rejectedId = kind === "file_preview"
         ? "00000000-0000-4000-8000-000000000503"
         : kind === "library_migration_preview"
           ? "00000000-0000-4000-8000-000000000504"
-          : "00000000-0000-4000-8000-000000000506";
+          : kind === "staging_cleanup"
+            ? "00000000-0000-4000-8000-000000000506"
+            : "00000000-0000-4000-8000-000000000508";
 
       const accepted = await submitAction(initData, kind, itemIds(MAX_SELECTED_ITEMS), acceptedId);
       expect(accepted.response.status).toBe(202);
@@ -203,6 +217,59 @@ describe("5,000-item batch selection", () => {
       const row = await testEnv.DB.prepare(
         "SELECT seq FROM inbox WHERE dedup_key = ?",
       ).bind(`action:${requestId}`).first<{ seq: number }>();
+      expect(row).toBeNull();
+    }
+  });
+
+  it("validates danmaku refresh scope and preview lifecycle before durable inbox writes", async () => {
+    const initData = await signOwnerInitData();
+    const identity = { library_id: "library-test", root_binding: rootBinding };
+    const selected = {
+      operation: "preview",
+      ...identity,
+      scope: "selected",
+      expected_revision: "library-r7",
+      item_ids: ["video-a", "video-b"],
+    };
+    const library = {
+      operation: "preview",
+      ...identity,
+      scope: "library",
+      expected_revision: "library-r8",
+    };
+    const confirmed = {
+      operation: "confirm",
+      ...identity,
+      preview_seq: 42,
+      preview_id: "danmaku-preview-42",
+      revision: "danmaku-r1",
+    };
+    for (const [index, payload] of [selected, library, confirmed].entries()) {
+      const requestId = `00000000-0000-4000-8000-00000000053${index}`;
+      const accepted = await submitPayload(initData, "danmaku_refresh", payload, requestId);
+      expect(accepted.response.status).toBe(202);
+      const stored = await testEnv.DB.prepare(
+        "SELECT kind, payload_json FROM inbox WHERE dedup_key = ?",
+      ).bind(`action:${requestId}`).first<{ kind: string; payload_json: string }>();
+      expect(stored?.kind).toBe("danmaku_refresh");
+      expect(JSON.parse(stored?.payload_json ?? "{}")).toEqual(payload);
+    }
+
+    const invalidPayloads = [
+      { ...selected, item_ids: [] },
+      { ...selected, item_ids: ["same", "same"] },
+      { ...library, item_ids: ["unexpected"] },
+      { ...confirmed, preview_seq: 0 },
+      { ...selected, danmaku_preview: { private: true } },
+      { ...selected, operation: "scan" },
+    ];
+    for (const [index, payload] of invalidPayloads.entries()) {
+      const requestId = `00000000-0000-4000-8000-00000000054${index}`;
+      const rejected = await submitPayload(initData, "danmaku_refresh", payload, requestId);
+      expect(rejected.response.status).toBe(400);
+      const row = await testEnv.DB.prepare(
+        "SELECT seq FROM inbox WHERE dedup_key = ?",
+      ).bind(`action:${requestId}`).first();
       expect(row).toBeNull();
     }
   });

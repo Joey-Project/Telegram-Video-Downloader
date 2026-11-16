@@ -189,6 +189,21 @@ pub struct CloudRequest {
 }
 
 impl CloudRequest {
+    /// Explicit local-library previews share sequence, expiry and confirmation rules.
+    pub(crate) fn bound_preview_operation(&self) -> Option<&str> {
+        matches!(self.kind.as_str(), "staging_cleanup" | "danmaku_refresh")
+            .then(|| self.payload.get("operation").and_then(Value::as_str))
+            .flatten()
+    }
+
+    pub(crate) fn is_bound_preview(&self) -> bool {
+        self.bound_preview_operation() == Some("preview")
+    }
+
+    pub(crate) fn is_bound_preview_confirmation(&self) -> bool {
+        self.bound_preview_operation() == Some("confirm")
+    }
+
     pub(crate) fn staging_cleanup_operation(&self) -> Option<&str> {
         (self.kind == "staging_cleanup")
             .then(|| self.payload.get("operation").and_then(Value::as_str))
@@ -1490,7 +1505,7 @@ impl InboxStateIndex {
                 .get("preview_id")
                 .and_then(Value::as_str)
                 .filter(|id| preview_identifier_is_indexable(id))
-            && (record.request.staging_cleanup_operation() != Some("confirm")
+            && (!record.request.is_bound_preview_confirmation()
                 || record
                     .request
                     .payload
@@ -1783,7 +1798,7 @@ fn inbox_preview_id(record: &InboxRecord) -> Option<&str> {
                 .get("id")
                 .and_then(Value::as_str)
                 .or_else(|| result.get("preview_id").and_then(Value::as_str)),
-            "staging_cleanup" if record.request.is_staging_cleanup_preview() => result
+            "staging_cleanup" | "danmaku_refresh" if record.request.is_bound_preview() => result
                 .get("preview_id")
                 .and_then(Value::as_str)
                 .or_else(|| {
@@ -1800,7 +1815,7 @@ fn is_preview_request(request: &CloudRequest) -> bool {
     matches!(
         request.kind.as_str(),
         "file_preview" | "library_migration_preview"
-    ) || request.is_staging_cleanup_preview()
+    ) || request.is_bound_preview()
 }
 
 fn preview_kind_for_confirmation(request: &CloudRequest) -> Option<&'static str> {
@@ -1808,6 +1823,7 @@ fn preview_kind_for_confirmation(request: &CloudRequest) -> Option<&'static str>
         "file_confirm" => Some("file_preview"),
         "library_migration_confirm" => Some("library_migration_preview"),
         "staging_cleanup" if request.is_staging_cleanup_confirmation() => Some("staging_cleanup"),
+        "danmaku_refresh" if request.is_bound_preview_confirmation() => Some("danmaku_refresh"),
         _ => None,
     }
 }
@@ -2579,7 +2595,7 @@ impl CloudInbox {
         {
             return Ok(None);
         }
-        let requested_sequence = if confirmation.request.is_staging_cleanup_confirmation() {
+        let requested_sequence = if confirmation.request.is_bound_preview_confirmation() {
             let Some(sequence) = confirmation
                 .request
                 .payload
@@ -2610,7 +2626,7 @@ impl CloudInbox {
             }
             bail!("indexed cloud preview request {sequence} is missing");
         };
-        if confirmation.request.is_staging_cleanup_confirmation() {
+        if confirmation.request.is_bound_preview_confirmation() {
             let confirmation_payload = &confirmation.request.payload;
             let preview_result = record.result.as_ref();
             let expected_library_id = confirmation_payload
@@ -2621,7 +2637,7 @@ impl CloudInbox {
                 .and_then(Value::as_str);
             if record.request.seq != requested_sequence.unwrap_or_default()
                 || record.request.kind != preview_kind
-                || !record.request.is_staging_cleanup_preview()
+                || !record.request.is_bound_preview()
                 || record.status != InboxStatus::AwaitingConfirmation
                 || inbox_preview_id(&record) != Some(preview_id)
                 || inbox_preview_revision(&record)
@@ -2676,7 +2692,7 @@ impl CloudInbox {
     ) -> Result<Option<InboxRecord>> {
         if !matches!(
             preview_kind,
-            "file_preview" | "library_migration_preview" | "staging_cleanup"
+            "file_preview" | "library_migration_preview" | "staging_cleanup" | "danmaku_refresh"
         ) || preview_seq == 0
             || preview_seq > MAX_JS_SAFE_INTEGER
             || !valid_preview_cancel_scalar(preview_id, MAX_PREVIEW_CANCEL_ID_BYTES)
@@ -5978,6 +5994,75 @@ mod tests {
 
         drop(inbox);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn danmaku_preview_confirmation_and_cancellation_keep_exact_kind_and_root() {
+        let root = temp_root("danmaku-preview-lifecycle");
+        fs::create_dir_all(&root).unwrap();
+        let inbox = CloudInbox::open(&root).unwrap();
+        finish_initial_recovery(&inbox);
+        let mut preview = request(1, "danmaku preview");
+        preview.kind = "danmaku_refresh".into();
+        preview.payload =
+            json!({"operation":"preview", "library_id":"library-one", "root_binding":"root-one"});
+        inbox.persist(preview).unwrap();
+        inbox.update(1, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(json!({"operation":"preview", "preview_id":"danmaku-one", "revision":"revision-one",
+                "library_id":"library-one", "root_binding":"root-one"}));
+        }).unwrap();
+        for (seq, root_binding) in [(2, "root-one"), (3, "root-replaced")] {
+            let mut confirmation = request(seq, "danmaku confirmation");
+            confirmation.kind = "danmaku_refresh".into();
+            confirmation.payload = json!({"operation":"confirm", "preview_seq":1,
+                "preview_id":"danmaku-one", "revision":"revision-one",
+                "library_id":"library-one", "root_binding":root_binding});
+            inbox.persist(confirmation).unwrap();
+            let found = inbox
+                .awaiting_confirmation_record("danmaku-one", seq)
+                .unwrap();
+            assert_eq!(found.is_some(), seq == 2);
+            inbox
+                .update(seq, |record| record.status = InboxStatus::Failed)
+                .unwrap();
+        }
+        // A failed confirmation makes that reviewed plan stale. Cancellation is
+        // tested against a fresh preview, rather than reviving the failed one.
+        let mut fresh = request(4, "fresh danmaku preview");
+        fresh.kind = "danmaku_refresh".into();
+        fresh.payload =
+            json!({"operation":"preview", "library_id":"library-one", "root_binding":"root-one"});
+        inbox.persist(fresh).unwrap();
+        inbox.update(4, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(json!({"operation":"preview", "preview_id":"danmaku-cancel", "revision":"revision-two",
+                "library_id":"library-one", "root_binding":"root-one"}));
+        }).unwrap();
+        assert!(
+            inbox
+                .cancel_awaiting_preview("staging_cleanup", 4, "danmaku-cancel", "revision-two")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            inbox
+                .cancel_awaiting_preview("danmaku_refresh", 4, "danmaku-cancel", "revision-two")
+                .unwrap()
+                .unwrap()
+                .status,
+            InboxStatus::Cancelled
+        );
+        assert!(
+            inbox
+                .state_index
+                .lock()
+                .unwrap()
+                .awaiting_preview_sequence_for_kind("danmaku-cancel", "danmaku_refresh")
+                .is_none()
+        );
+        drop(inbox);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -61,7 +61,7 @@ enum Motion {
 
 /// This is an adapter for bbdown-core 0a94b071's generated ASS, not a general ASS editor.
 /// Reject an unfamiliar layout instead of silently publishing partially styled comments.
-fn restyle_ass(input: &str, settings: &BilibiliDanmakuConfig) -> Result<Option<String>> {
+pub(crate) fn restyle_ass(input: &str, settings: &BilibiliDanmakuConfig) -> Result<Option<String>> {
     settings.validate()?;
     let marker = format!(
         "{MARKER}font_scale={};opacity={};display_area={}",
