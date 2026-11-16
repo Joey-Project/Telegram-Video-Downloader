@@ -44,6 +44,11 @@ superseded_by: ""
   by [BBDown-rust #125](https://github.com/Joey-Project/BBDown-rust/pull/125).
 - Preserve the configured ASS presentation and support repairing an interrupted
   XML-first publication. Unknown extra ASS comments remain protected.
+- Preserve per-video results when the batch time budget ends. Cancel an in-flight
+  fetch at its remaining deadline and defer unprocessed videos for a new preview.
+- Reserve bounded identities, counts and samples for pending previews before
+  restoring complete details within the shared snapshot budget. Omitted details
+  keep cancellation available; confirmation waits for the complete preview.
 
 ## Validation
 
@@ -54,10 +59,12 @@ superseded_by: ""
   cancel actions, durable reload, results and failure states.
 - Additive D1 migration coverage preserves existing requests and high-water
   sequence values. Existing Rust and Cloud CI commands discover the new tests.
-- The focused native suite passes all 42 cases, including mock Telegram replay,
-  restart, cancellation, stale content and real XML-first interruption/retry.
+- The final focused native run passes 49 danmaku cases, including mock Telegram
+  replay, restart, cancellation, deadline deferral and XML-first interruption;
+  one opt-in graphical-render test stays ignored. All 38 snapshot budget tests
+  pass, including multiple individually valid previews exceeding the shared cap.
   Native converter workspace coverage passes 27 unit and 8 E2E cases.
-- Cloud validation passes 442 Worker/helper cases, 112 Mini App cases and 4 Widget
+- Cloud validation passes 442 Worker/helper cases, 113 Mini App cases and 4 Widget
   regressions, plus typechecking and a Worker bundle dry run.
 - Formatting, strict workspace Clippy, diff and project-journal checks pass.
   The existing Rust and Cloud CI workflows discover the added tests and retain

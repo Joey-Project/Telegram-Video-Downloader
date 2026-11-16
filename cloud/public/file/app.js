@@ -31,7 +31,7 @@ import { createFileQueuedAction, fileActionRequestBody } from "./file-action-dis
 import { buildFilePreviewPayloadFromRenderedOption, buildLegacyMetadataPreviewPayloadFromRenderedOption, buildSelectedFilePreviewPayloadFromRenderedOption, clearFileIdentityScopedStateOnSnapshot, fileOperationIdentityMatches, fileOperationLibraryIdentity } from "./file-preview-identity.js";
 import { PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, PREVIEW_CANCELLATION_STORAGE_KEY, readPreviewCancellationDismissals, readPreviewCancellations, writePreviewCancellationDismissals, writePreviewCancellations } from "./preview-cancellation-state.js";
 import { createTorrentView } from "./torrent-view.js";
-import { danmakuRefreshItemSample, danmakuRefreshOperationName, danmakuRefreshPreviewEntries } from "./danmaku-refresh.js";
+import { danmakuRefreshItemSample, danmakuRefreshOperationName, danmakuRefreshPreviewEntries, isIncompleteBoundPreview } from "./danmaku-refresh.js";
 
 const API = "/api";
 const loadOwnerSnapshot = createOwnerSnapshotLoader();
@@ -2806,12 +2806,15 @@ function danmakuRefreshPreviewCard(entry) {
   const skipped = Number.isSafeInteger(preview.skipped) ? preview.skipped : 0;
   const total = Number.isSafeInteger(preview.total) ? preview.total : ready + skipped;
   const pending = danmakuRefreshActionPending("confirm", entry) || danmakuRefreshActionPending("cancel", entry);
-  const canConfirm = bindingMatches && libraryCanOperate(libraryId) && ready > 0 && !pending;
+  const incomplete = isIncompleteBoundPreview(entry);
+  const canConfirm = bindingMatches && libraryCanOperate(libraryId) && ready > 0 && !pending && !incomplete;
   const scope = preview.scope === "library" ? "the current library" : `${total.toLocaleString()} selected videos`;
   const rows = danmakuRefreshItemSample(preview, escapeHtml);
   const staleNotice = bindingMatches ? "" : `<p class="field-hint">The original library registration is unavailable. This saved preview can only be cancelled.</p>`;
   const pendingNotice = pending ? `<p class="field-hint" role="status">A confirmation or cancellation request is waiting for your computer.</p>` : "";
-  const warning = "This appends comments to the selected sidecars and retains their existing comments. Video files are not downloaded.";
+  const warning = incomplete
+    ? "Some preview details were omitted from this snapshot. Cancel unused previews, then refresh to review this one. Confirmation is disabled until its details are available."
+    : "This appends comments to the selected sidecars and retains their existing comments. Video files are not downloaded.";
   return `<article class="stack-card danmaku-refresh-preview" id="${previewCardId("danmaku_refresh", entry)}" tabindex="-1"><div class="stack-card-head"><div><h3>Refresh danmaku for ${escapeHtml(scope)}</h3><p>${escapeHtml(library?.name ?? libraryLabel(libraryId))} · preview requested ${escapeHtml(timeAgo(entry.created_at, "seconds"))}</p></div><span class="state-pill pending">Review needed</span></div><p class="warning-text">${warning}</p><p class="field-hint">${ready.toLocaleString()} ready · ${skipped.toLocaleString()} skipped · ${total.toLocaleString()} total.</p><div class="preview-table">${rows || `<p class="field-hint">No item examples were retained in the public preview.</p>`}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-danmaku-refresh-confirm="${escapeHtml(entry.id)}" data-danmaku-refresh-seq="${escapeHtml(entry.seq)}" data-danmaku-refresh-revision="${escapeHtml(entry.revision)}" data-danmaku-refresh-library="${escapeHtml(libraryId)}" data-danmaku-refresh-binding="${escapeHtml(binding)}" ${canConfirm ? "" : "disabled"}>Append comments to ${ready.toLocaleString()} videos</button><button class="quiet-button" type="button" data-danmaku-refresh-cancel="${escapeHtml(entry.id)}" data-danmaku-refresh-seq="${escapeHtml(entry.seq)}" data-danmaku-refresh-revision="${escapeHtml(entry.revision)}" data-danmaku-refresh-library="${escapeHtml(libraryId)}" data-danmaku-refresh-binding="${escapeHtml(binding)}" ${pending ? "disabled" : ""}>Cancel preview</button>${staleNotice}${pendingNotice}</div></article>`;
 }
 
@@ -2856,7 +2859,9 @@ function stagingCleanupPreviewEntries() {
     const previousIsTerminal = previous && !isReviewablePreviewStatus(previous.status);
     if (!previous || incomingIsTerminal && !previousIsTerminal
         || !incomingIsTerminal && !previousIsTerminal
-          && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items)) {
+          && (!isIncompleteBoundPreview(normalized) && isIncompleteBoundPreview(previous)
+            || isIncompleteBoundPreview(normalized) === isIncompleteBoundPreview(previous)
+              && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items))) {
       entries.set(key, normalized);
     }
   }
@@ -3032,10 +3037,11 @@ function stagingCleanupPreviewCard(entry) {
   const totalBytes = Number.isSafeInteger(preview.total_bytes) && preview.total_bytes >= 0 ? formatBytes(preview.total_bytes) : "Size unavailable";
   const library = registeredMediaLibrary(state.snapshot, entry.library_id);
   const bindingMatches = Boolean(library && library.root_binding === entry.root_binding && isValidLibraryRootBinding(entry.root_binding));
-  const canConfirm = bindingMatches && libraryCanOperate(entry.library_id) && count > 0;
+  const canConfirm = bindingMatches && libraryCanOperate(entry.library_id) && count > 0 && !isIncompleteBoundPreview(entry);
   const busy = stagingCleanupActionPending("confirm", null, entry) || stagingCleanupActionPending("cancel", null, entry);
   const disabled = busy;
-  const warning = "Confirming permanently removes the selected video staging data from disk. This cannot be undone. Finished media, active writers, PDF downloads, Music originals or playback dependencies, and unknown or unowned directories are outside this cleanup.";
+  const warning = (isIncompleteBoundPreview(entry) ? "Some preview details were omitted. Cancel unused previews, then refresh before confirming. " : "")
+    + "Confirming permanently removes the selected video staging data from disk. This cannot be undone. Finished media, active writers, PDF downloads, Music originals or playback dependencies, and unknown or unowned directories are outside this cleanup.";
   return `<article class="stack-card staging-cleanup-preview" id="staging-cleanup-preview-${escapeHtml(entry.seq ?? entry.id)}"><div class="stack-card-head"><div><h3>${count.toLocaleString()} video staging entries selected</h3><p>${escapeHtml(library?.name ?? libraryLabel(entry.library_id))} · preview requested ${escapeHtml(timeAgo(entry.created_at, "seconds"))}</p></div><span class="state-pill pending">Review needed</span></div><p class="warning-text">${warning}</p><p class="field-hint">Estimated staging bytes: ${escapeHtml(totalBytes)}. The local confirmation rechecks the exact selected entries and active-writer state.</p><div class="preview-table">${sample}${items.length === 0 ? `<p class="field-hint">No item examples were retained in the public preview.</p>` : ""}${omitted ? `<p class="field-hint">${omitted.toLocaleString()} selected entries are omitted from this bounded preview summary.</p>` : ""}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-staging-cleanup-confirm="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${!canConfirm || disabled ? "disabled" : ""}>Permanently clean ${count.toLocaleString()} selected entries</button><button class="quiet-button" type="button" data-staging-cleanup-cancel="${escapeHtml(entry.id)}" data-staging-cleanup-seq="${escapeHtml(entry.seq)}" data-staging-cleanup-revision="${escapeHtml(entry.revision)}" data-staging-cleanup-library="${escapeHtml(entry.library_id)}" data-staging-cleanup-binding="${escapeHtml(entry.root_binding)}" ${disabled ? "disabled" : ""}>Cancel preview</button>${!bindingMatches ? `<p class="field-hint">The original library registration is unavailable. Cleanup cannot be confirmed from this snapshot.</p>` : ""}${busy ? `<p class="field-hint" role="status">A confirmation or cancellation request is already waiting for your computer.</p>` : ""}</div></article>`;
 }
 
