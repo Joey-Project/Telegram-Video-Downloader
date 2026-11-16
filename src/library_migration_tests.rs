@@ -2942,6 +2942,193 @@ fn migration_preserves_portable_attachment_references_when_group_names_stay_stab
 }
 
 #[test]
+fn migration_preserves_declared_cjk_cover_and_russian_subtitle_basenames() {
+    let source_root = TestRoot::new("declared-unicode-attachments-source");
+    let target_root = TestRoot::new("declared-unicode-attachments-target");
+    fs::write(source_root.path().join("Episode.mkv"), MEDIA_BYTES)
+        .expect("source media should write");
+    fs::write(source_root.path().join("封面.jpg"), b"synthetic cover")
+        .expect("CJK cover should write");
+    fs::write(
+        source_root.path().join("Русский.srt"),
+        b"synthetic subtitle",
+    )
+    .expect("Russian subtitle should write");
+    let nfo = concat!(
+        "<movie><localfilename>Episode.mkv</localfilename>",
+        "<tvd_attachment role=\"cover\">封面.jpg</tvd_attachment>",
+        "<tvd_attachment role=\"subtitle\">Русский.srt</tvd_attachment>",
+        "<futureField keep=\"yes\">preserve</futureField></movie>"
+    );
+    fs::write(source_root.path().join("Episode.nfo"), nfo).expect("authoritative NFO should write");
+
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine.source.migration_scan().expect("source should scan");
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Episode.mkv" && item.presence == Presence::Present)
+        .expect("source media should index");
+    assert!(item.attachments.iter().any(|attachment| {
+        attachment.relative_path == "封面.jpg" && attachment.kind == "cover"
+    }));
+    assert!(item.attachments.iter().any(|attachment| {
+        attachment.relative_path == "Русский.srt" && attachment.kind == "subtitle"
+    }));
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item.id.clone()],
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("validated custom attachment names should remain migratable");
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Copying);
+    for basename in ["封面.jpg", "Русский.srt"] {
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| { file.source_path == basename && file.target_path == basename })
+        );
+    }
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("migration should confirm");
+    let mut completed = false;
+    for _ in 0..64 {
+        let status = engine
+            .status(&preview.id)
+            .expect("migration status should read")
+            .expect("migration status should exist");
+        if status.status == MigrationRunStatus::Completed {
+            completed = true;
+            break;
+        }
+        assert!(
+            !matches!(
+                status.status,
+                MigrationRunStatus::Partial | MigrationRunStatus::Failed
+            ),
+            "declared custom attachments should not fail migration: {status:?}"
+        );
+        engine
+            .step(&preview.id)
+            .expect("migration step should complete");
+    }
+    assert!(completed, "migration should reach a completed state");
+    assert_eq!(
+        fs::read_to_string(target_root.path().join("Episode.nfo"))
+            .expect("migrated NFO should read"),
+        nfo,
+        "stable group names preserve custom references and unknown NFO fields exactly"
+    );
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("target should rescan migrated files");
+    let migrated = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Episode.mkv")
+        .expect("migrated primary should index");
+    assert!(migrated.attachments.iter().any(|attachment| {
+        attachment.relative_path == "封面.jpg" && attachment.kind == "cover"
+    }));
+    assert!(migrated.attachments.iter().any(|attachment| {
+        attachment.relative_path == "Русский.srt" && attachment.kind == "subtitle"
+    }));
+}
+
+#[test]
+fn migration_keep_both_still_skips_unicode_manifest_references_that_need_rewrite() {
+    let source_root = TestRoot::new("declared-unicode-keep-both-source");
+    let target_root = TestRoot::new("declared-unicode-keep-both-target");
+    fs::write(source_root.path().join("Episode.mkv"), MEDIA_BYTES)
+        .expect("source media should write");
+    fs::write(source_root.path().join("封面.jpg"), b"synthetic cover")
+        .expect("CJK cover should write");
+    fs::write(
+        source_root.path().join("Русский.srt"),
+        b"synthetic subtitle",
+    )
+    .expect("Russian subtitle should write");
+    let nfo = concat!(
+        "<movie><localfilename>Episode.mkv</localfilename>",
+        "<tvd_attachment role=\"cover\">封面.jpg</tvd_attachment>",
+        "<tvd_attachment role=\"subtitle\">Русский.srt</tvd_attachment></movie>"
+    );
+    fs::write(source_root.path().join("Episode.nfo"), nfo).expect("authoritative NFO should write");
+    fs::write(target_root.path().join("Episode.mkv"), b"existing target")
+        .expect("conflicting target media should write");
+
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine.source.migration_scan().expect("source should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Episode.mkv" && item.presence == Presence::Present)
+        .expect("source media should index")
+        .id
+        .clone();
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: ConflictPolicy::KeepBoth,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("Keep Both should retain a reviewable skip when NFO rewrite is unavailable");
+    assert!(preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Skipped);
+    assert_eq!(
+        fs::read(source_root.path().join("Episode.nfo")).unwrap(),
+        nfo.as_bytes(),
+        "Keep Both must preserve the source NFO when it cannot safely rewrite the references"
+    );
+    assert!(!target_root.path().join("Episode (2).mkv").exists());
+}
+
+#[test]
 fn migration_keep_both_skips_when_nfo_localfilename_would_become_stale() {
     let source_root = TestRoot::new("portable-attachment-keep-both-source");
     let target_root = TestRoot::new("portable-attachment-keep-both-target");
