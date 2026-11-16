@@ -74,8 +74,11 @@ superseded_by: ""
   replay, restart, cancellation, deadline deferral and XML-first interruption;
   one opt-in graphical-render test stays ignored. All 40 snapshot budget tests
   pass, including multiple individually valid previews exceeding the shared cap.
-  Deterministic E2E covers expiry between two videos as well as during a fetch,
+  Separate E2Es cover expiry between two videos and during a pending fetch,
   preserving completed results and allowing fresh-preview continuation.
+  Restart acceptance waits for the old inbox owner lock to become available;
+  aborting a dispatcher can leave its blocking inbox read running briefly.
+  Production worker leases and timeout values remain unchanged.
   Native converter workspace coverage passes 27 unit and 8 E2E cases.
 - Cloud validation passes 442 Worker/helper cases, 119 Mini App cases and 4 Widget
   regressions, plus typechecking and a Worker bundle dry run.
