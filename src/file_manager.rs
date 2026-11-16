@@ -9327,6 +9327,14 @@ fn nfo_attachment_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclara
     Ok(declarations)
 }
 
+pub(crate) fn nfo_danmaku_attachment_filenames(content: &str) -> Result<Vec<String>> {
+    Ok(nfo_attachment_declarations(content)?
+        .into_iter()
+        .filter(|declaration| declaration.role == "danmaku")
+        .map(|declaration| declaration.filename)
+        .collect())
+}
+
 fn nfo_local_thumb_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclaration>> {
     if content.len() > SIDE_CAR_LIMIT {
         bail!("NFO exceeds the {SIDE_CAR_LIMIT}-byte thumb parsing limit");
