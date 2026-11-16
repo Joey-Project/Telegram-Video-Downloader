@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::{Result, bail};
+use anyhow::{Error, Result, bail};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -33,6 +33,12 @@ impl Drop for FetchCancellationProbe {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
+}
+
+fn is_live_local_inbox_owner_error(error: &Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "cloud inbox already has a live local owner")
 }
 
 impl DanmakuRefreshHarness {
@@ -111,21 +117,43 @@ impl DanmakuRefreshHarness {
             let _ = dispatcher.await;
         }
         self.drain_dispatch().await;
-        let (config, telegram, queue, fetcher) = {
+        let (config, telegram, queue, fetcher, inbox_weak) = {
             let runtime = self.runtime.as_ref().expect("runtime should be open");
             (
                 (*runtime.bot.config).clone(),
                 runtime.bot.telegram.clone(),
                 Arc::clone(&runtime.bot.queue),
                 runtime.test_danmaku_fetcher.clone(),
+                Arc::downgrade(&runtime.inbox),
             )
         };
         drop(self.runtime.take());
-
-        let inbox = Arc::new(
-            open_runtime_test_inbox(&self.fixture.video_root)
-                .expect("same-epoch inbox should reopen after refresh result persisted"),
-        );
+        // Aborting the dispatcher cannot cancel a pending spawn_blocking inbox read.
+        let inbox = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while inbox_weak.strong_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Weak reaches zero as Drop begins; retry only until its owner-lock field releases.
+            loop {
+                match open_runtime_test_inbox(&self.fixture.video_root) {
+                    Ok(inbox) => break inbox,
+                    Err(error) if is_live_local_inbox_owner_error(&error) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!(
+                        "same-epoch inbox should reopen after refresh result persisted: {error:#}"
+                    ),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "same-epoch inbox owner remained live after dispatch drain ({} runtime Arc owner(s))",
+                inbox_weak.strong_count()
+            )
+        });
+        let inbox = Arc::new(inbox);
         let persisted = inbox
             .record(durable_seq)
             .expect("durable refresh receipt should load")
