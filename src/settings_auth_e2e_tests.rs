@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::cloud::{
     CloudRequest, CloudViewerInterest, CloudViewerSurface, InboxRecord, InboxStatus,
-    TEST_DATABASE_EPOCH, now_millis,
+    SnapshotRefreshReason, SnapshotRefreshRequest, SnapshotRefreshScope, TEST_DATABASE_EPOCH,
+    now_millis,
 };
 use crate::cloud_bot_tests::{
     FakeCloudApiState, FakeTelegramRequest, TEST_BILIBILI_COOKIE_SENTINEL,
@@ -190,6 +191,132 @@ async fn wait_for_cloud_auth_publication(
     .expect("existing cloud reporter should publish the Bilibili auth state")
 }
 
+async fn request_user_settings_snapshot_refresh(
+    runtime: &CloudBotRuntime,
+    results: &mut tokio::sync::mpsc::Receiver<Value>,
+    request_number: u64,
+) -> Value {
+    let expires_at = now_millis().saturating_add(60_000);
+    runtime.viewer_interests.lock().await.insert(
+        SETTINGS_VIEWER_ID.to_string(),
+        CloudViewerInterest {
+            viewer_id: SETTINGS_VIEWER_ID.to_string(),
+            surface: CloudViewerSurface::Settings,
+            watch: false,
+            expires_at,
+        },
+    );
+    let request = SnapshotRefreshRequest {
+        viewer_id: SETTINGS_VIEWER_ID.to_string(),
+        request_id: format!("a11a0000-0000-4000-8000-{request_number:012x}"),
+        database_epoch: TEST_DATABASE_EPOCH.to_string(),
+        reason: SnapshotRefreshReason::Manual,
+        scope: SnapshotRefreshScope::Settings,
+        library_id: None,
+        expires_at,
+    };
+    enqueue_snapshot_refresh(runtime, request.clone())
+        .await
+        .expect("user Settings refresh request should queue");
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            if let Some(result) = results.recv().await
+                && result["request_id"] == request.request_id
+            {
+                return result;
+            }
+        }
+    })
+    .await
+    .expect("user Settings refresh should receive a result")
+}
+
+async fn externally_save_test_tv_credential(config: &AppConfig) -> bilibili_auth::AuthEpoch {
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
+    let ((), auth_epoch) = tokio::task::spawn_blocking(move || {
+        bilibili_auth::with_auth_mutation_transaction(
+            &state_path,
+            &credential_file,
+            |transaction| {
+                bilibili_core::CredentialRuntime::from_credential_file(
+                    transaction.credential_file()?,
+                    credential_profile.as_deref(),
+                )?
+                .save_merged(
+                    bbdown_core::Credentials::default()
+                        .with_tv_access_key(TEST_BILIBILI_TV_ACCESS_KEY),
+                )?;
+                Ok(())
+            },
+        )
+    })
+    .await
+    .expect("external synthetic save worker should complete")
+    .expect("external synthetic save should use the credential transaction");
+    auth_epoch
+}
+
+async fn externally_delete_test_credentials(config: &AppConfig) -> bilibili_auth::AuthEpoch {
+    let state_path = config.bilibili.auth.state_path.clone();
+    let credential_file = config.bilibili.auth.credential_file.clone();
+    let credential_profile = config.bilibili.auth.credential_profile.clone();
+    let ((legacy_state, credential_state), auth_epoch) = tokio::task::spawn_blocking(move || {
+        bilibili_auth::logout_bbdown_auth_with_epoch(
+            &state_path,
+            &credential_file,
+            credential_profile.as_deref(),
+        )
+    })
+    .await
+    .expect("external synthetic delete worker should complete")
+    .expect("external synthetic delete should use the shared auth transaction");
+    legacy_state.expect("external delete should clean legacy state");
+    credential_state.expect("external delete should clean selected credentials");
+    auth_epoch
+}
+
+async fn seed_auth_save_race_state(
+    config: &AppConfig,
+    generation: u64,
+) -> bilibili_auth::AuthEpoch {
+    let auth_epoch = externally_save_test_tv_credential(config).await;
+    BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+    BILIBILI_CREDENTIAL_REVISION.store(auth_epoch.value(), Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(Some(auth_epoch));
+    let mut snapshot = settings_auth::Snapshot::default();
+    snapshot.transition(
+        generation,
+        settings_auth::Phase::WaitingForScan,
+        "none",
+        now_millis(),
+    );
+    snapshot.mode = Some(settings_auth::Mode::Tv);
+    snapshot.credential_revision = auth_epoch.value();
+    snapshot.credential_summary.has_tv_access_key = true;
+    *bilibili_settings_auth_state().lock().await = snapshot;
+    auth_epoch
+}
+
+fn telegram_login_command(config: &AppConfig) -> BilibiliAuthCommand {
+    match crate::router::route_message("/bbdown login tv", &config.pdf.auto_domains) {
+        RouteResult::BilibiliAuth(command) => command,
+        route => panic!("Telegram login text should route to BBDown auth, got {route:?}"),
+    }
+}
+
+async fn handle_test_telegram_login(runtime: &CloudBotRuntime) {
+    handle_bilibili_auth_command(
+        runtime.bot.telegram.clone(),
+        Arc::clone(&runtime.bot.config),
+        OWNER_CHAT_ID,
+        true,
+        telegram_login_command(&runtime.bot.config),
+    )
+    .await;
+}
+
 async fn public_auth_projection(runtime: &CloudBotRuntime) -> Value {
     let snapshot = build_cloud_state_snapshot(runtime)
         .await
@@ -263,6 +390,387 @@ fn tv_succeeded() -> Value {
             "access_token": TEST_BILIBILI_TV_ACCESS_KEY,
         }
     })
+}
+
+#[tokio::test]
+async fn bbdown_cancel_and_credential_save_share_one_auth_state_order() {
+    let _auth_generation_guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+    let original_snapshot = bilibili_settings_auth_state().lock().await.clone();
+    let _restore = AuthGlobalsRestore {
+        generation: BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+        credential_revision: BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+        snapshot: original_snapshot,
+        auth_epoch: get_bilibili_settings_auth_epoch(),
+    };
+    BILIBILI_AUTH_GENERATION.store(0, Ordering::SeqCst);
+    BILIBILI_CREDENTIAL_REVISION.store(0, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(None);
+    *bilibili_settings_auth_state().lock().await = settings_auth::Snapshot::default();
+
+    let save_first_root = temp_cloud_bot_dir("settings-auth-cancel-save-first");
+    let save_first_auth_dir = save_first_root.join("private-auth");
+    fs::create_dir_all(&save_first_auth_dir).expect("private auth fixture should create");
+    #[cfg(unix)]
+    fs::set_permissions(&save_first_auth_dir, fs::Permissions::from_mode(0o700))
+        .expect("private auth fixture should remain private");
+    let mut save_first_config = AppConfig::for_test();
+    save_first_config.bilibili.auth.credential_file = save_first_auth_dir.join("credentials.json");
+    save_first_config.bilibili.auth.state_path = save_first_auth_dir.join("legacy-state.json");
+    save_first_config
+        .ensure_runtime_dirs()
+        .expect("save-first test directories should create");
+    let save_first_epoch = seed_auth_save_race_state(&save_first_config, 2).await;
+
+    let (save_entered_tx, save_entered_rx) = tokio::sync::oneshot::channel();
+    let (resume_save_tx, resume_save_rx) = tokio::sync::oneshot::channel();
+    let save_config = save_first_config.clone();
+    let save_task = tokio::spawn(async move {
+        let saved = save_bbdown_login_credentials_with_sync_and_lock_hook(
+            &save_config,
+            2,
+            save_first_epoch,
+            bbdown_core::Credentials::default().with_tv_access_key(TEST_BILIBILI_COOKIE_SENTINEL),
+            |_transaction| Ok(()),
+            move || async move {
+                let _ = save_entered_tx.send(());
+                let _ = resume_save_rx.await;
+            },
+        )
+        .await?;
+        set_bilibili_settings_auth_credentials(&saved).await;
+        Ok::<_, anyhow::Error>(saved)
+    });
+    save_entered_rx
+        .await
+        .expect("credential save should reach its lock barrier");
+    let (cancel_started_tx, cancel_started_rx) = tokio::sync::oneshot::channel();
+    let cancel_config = save_first_config.clone();
+    let cancel_task = tokio::spawn(async move {
+        let _ = cancel_started_tx.send(());
+        cancel_bilibili_auth_generation(2, save_first_epoch.value(), &cancel_config).await
+    });
+    cancel_started_rx
+        .await
+        .expect("cancel task should start before the save barrier releases");
+    tokio::task::yield_now().await;
+    assert!(
+        !cancel_task.is_finished(),
+        "cancel must wait while a credential save owns the shared auth-state lock"
+    );
+    resume_save_tx
+        .send(())
+        .expect("save barrier should release after cancel waits");
+    let saved = save_task
+        .await
+        .expect("save task should not panic")
+        .expect("credential save should complete before cancel checks the new revision");
+    assert!(
+        !cancel_task.await.expect("cancel task should not panic"),
+        "cancel must reject the generation after the credential save advances its revision"
+    );
+    assert_eq!(
+        bilibili_core::CredentialRuntime::from_credential_file(
+            save_first_config.bilibili.auth.credential_file.clone(),
+            save_first_config
+                .bilibili
+                .auth
+                .credential_profile
+                .as_deref(),
+        )
+        .expect("saved fixture should remain readable")
+        .load()
+        .expect("saved fixture should parse")
+        .tv_access_key
+        .as_deref(),
+        Some(TEST_BILIBILI_COOKIE_SENTINEL),
+        "cancel after save must preserve the successfully written credential"
+    );
+    assert_eq!(
+        BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+        saved.credential_revision
+    );
+    assert_eq!(
+        bilibili_settings_auth_snapshot().await["phase"],
+        "connected"
+    );
+
+    let cancel_first_root = temp_cloud_bot_dir("settings-auth-cancel-first");
+    let cancel_first_auth_dir = cancel_first_root.join("private-auth");
+    fs::create_dir_all(&cancel_first_auth_dir).expect("private auth fixture should create");
+    #[cfg(unix)]
+    fs::set_permissions(&cancel_first_auth_dir, fs::Permissions::from_mode(0o700))
+        .expect("private auth fixture should remain private");
+    let mut cancel_first_config = AppConfig::for_test();
+    cancel_first_config.bilibili.auth.credential_file =
+        cancel_first_auth_dir.join("credentials.json");
+    cancel_first_config.bilibili.auth.state_path = cancel_first_auth_dir.join("legacy-state.json");
+    cancel_first_config
+        .ensure_runtime_dirs()
+        .expect("cancel-first test directories should create");
+    let cancel_first_epoch = seed_auth_save_race_state(&cancel_first_config, 2).await;
+
+    let (cancel_lock_tx, cancel_lock_rx) = tokio::sync::oneshot::channel();
+    let (resume_cancel_tx, resume_cancel_rx) = tokio::sync::oneshot::channel();
+    let cancel_config = cancel_first_config.clone();
+    let cancel_task = tokio::spawn(async move {
+        cancel_bilibili_auth_generation_with_lock_hook(
+            2,
+            cancel_first_epoch.value(),
+            &cancel_config,
+            move || async move {
+                let _ = cancel_lock_tx.send(());
+                let _ = resume_cancel_rx.await;
+            },
+        )
+        .await
+    });
+    cancel_lock_rx
+        .await
+        .expect("cancel should pause after taking the auth-state lock");
+    let (save_started_tx, save_started_rx) = tokio::sync::oneshot::channel();
+    let save_config = cancel_first_config.clone();
+    let save_task = tokio::spawn(async move {
+        let _ = save_started_tx.send(());
+        save_bbdown_login_credentials_with_sync(
+            &save_config,
+            2,
+            cancel_first_epoch,
+            bbdown_core::Credentials::default().with_tv_access_key(TEST_BILIBILI_COOKIE_SENTINEL),
+            |_transaction| Ok(()),
+        )
+        .await
+    });
+    save_started_rx
+        .await
+        .expect("stale credential save should start behind the cancel lock");
+    tokio::task::yield_now().await;
+    assert!(
+        !save_task.is_finished(),
+        "credential save must wait while cancel owns the shared auth-state lock"
+    );
+    resume_cancel_tx
+        .send(())
+        .expect("cancel barrier should release after the save waits");
+    assert!(
+        cancel_task.await.expect("cancel task should not panic"),
+        "cancel that obtains the shared lock first should complete"
+    );
+    assert!(
+        save_task
+            .await
+            .expect("save task should not panic")
+            .is_err(),
+        "save for the cancelled generation should fail before mutation"
+    );
+    assert_eq!(
+        bilibili_core::CredentialRuntime::from_credential_file(
+            cancel_first_config.bilibili.auth.credential_file.clone(),
+            cancel_first_config
+                .bilibili
+                .auth
+                .credential_profile
+                .as_deref(),
+        )
+        .expect("cancel-first fixture should remain readable")
+        .load()
+        .expect("cancel-first fixture should parse")
+        .tv_access_key
+        .as_deref(),
+        Some(TEST_BILIBILI_TV_ACCESS_KEY),
+        "stale save must not replace the credential that existed before cancellation"
+    );
+    assert_eq!(BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        bilibili_settings_auth_snapshot().await["phase"],
+        "cancelled"
+    );
+
+    let _ = fs::remove_dir_all(save_first_root);
+    let _ = fs::remove_dir_all(cancel_first_root);
+}
+
+#[tokio::test]
+async fn telegram_bbdown_login_generations_are_fresh_and_settings_cancel_is_scoped() {
+    let _auth_generation_guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+    let original_snapshot = bilibili_settings_auth_state().lock().await.clone();
+    let _restore = AuthGlobalsRestore {
+        generation: BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst),
+        credential_revision: BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst),
+        snapshot: original_snapshot,
+        auth_epoch: get_bilibili_settings_auth_epoch(),
+    };
+    BILIBILI_AUTH_GENERATION.store(0, Ordering::SeqCst);
+    BILIBILI_CREDENTIAL_REVISION.store(0, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(None);
+    *bilibili_settings_auth_state().lock().await = settings_auth::Snapshot::default();
+
+    let root = temp_cloud_bot_dir("telegram-settings-auth-generation-e2e");
+    let auth_dir = root.join("private-auth");
+    fs::create_dir_all(&auth_dir).expect("private auth fixture should create");
+    #[cfg(unix)]
+    fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700))
+        .expect("private auth fixture should remain private");
+    let (bilibili_base_url, mut polls, release_poll, bilibili_shutdown, bilibili_server) =
+        spawn_fake_bilibili_auth_api(Vec::new(), vec![tv_succeeded(), tv_succeeded()], &[1, 2])
+            .await;
+
+    let mut config = AppConfig::for_test();
+    config.telegram.allowed_chat_ids = vec![OWNER_CHAT_ID];
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.bilibili.auth.credential_file = auth_dir.join("credentials.json");
+    config.bilibili.auth.state_path = auth_dir.join("legacy-state.json");
+    config.bilibili.auth.login_timeout_seconds = 20;
+    config.bilibili.auth.poll_interval_seconds = 1;
+    config.bilibili.global_args = vec![
+        "--passport-base".to_string(),
+        bilibili_base_url.clone(),
+        "--tv-passport-base".to_string(),
+        bilibili_base_url.clone(),
+        "--tv-passport-poll-base".to_string(),
+        bilibili_base_url.clone(),
+    ];
+    config
+        .ensure_runtime_dirs()
+        .expect("private runtime fixture roots should create");
+
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let queue = Arc::new(QueueManager::open(&config).expect("fixture queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir)
+            .expect("fixture cloud inbox should open"),
+    );
+    let runtime = make_runtime(telegram, config, queue, Arc::clone(&inbox));
+    let (cloud_base_url, _cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api_with_epoch(
+            runtime.bot.config.downloads.video_dir.clone(),
+            Vec::new(),
+            TEST_DATABASE_EPOCH.to_string(),
+        )
+        .await;
+    let mut runtime = runtime;
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("auth dispatcher should use the loopback Cloud API");
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    handle_test_telegram_login(&runtime).await;
+    wait_for_bilibili_poll(&mut polls, "tv:1", "first Telegram login attempt").await;
+    let first = bilibili_settings_auth_snapshot().await;
+    let first_generation = first["generation"]
+        .as_u64()
+        .expect("first Telegram QR snapshot should carry a generation");
+    let first_revision = first["credential_revision"]
+        .as_u64()
+        .expect("first Telegram QR snapshot should carry a credential revision");
+    assert!(first_generation > 0);
+    assert_eq!(first_generation % 2, 0);
+    assert_eq!(first["phase"], "waiting_for_scan");
+    let first_cancel = dispatch_auth_request(
+        &runtime,
+        1,
+        json!({
+            "operation": "cancel",
+            "generation": first_generation,
+            "credential_revision": first_revision,
+        }),
+    )
+    .await;
+    assert_eq!(first_cancel.result.as_ref().unwrap()["status"], "completed");
+    let first_cancelled_generation = first_cancel.result.as_ref().unwrap()["generation"]
+        .as_u64()
+        .expect("first MiniApp cancellation should carry the settled generation");
+    release_poll
+        .send("tv:1".to_string())
+        .expect("first Telegram QR poll should be released after cancellation");
+    wait_for_login_lock_idle().await;
+    assert_eq!(
+        wait_for_auth_phase("cancelled", first_cancelled_generation).await["phase"],
+        "cancelled"
+    );
+
+    handle_test_telegram_login(&runtime).await;
+    wait_for_bilibili_poll(&mut polls, "tv:2", "second Telegram login attempt").await;
+    let second = bilibili_settings_auth_snapshot().await;
+    let second_generation = second["generation"]
+        .as_u64()
+        .expect("second Telegram QR snapshot should carry a generation");
+    let second_revision = second["credential_revision"]
+        .as_u64()
+        .expect("second Telegram QR snapshot should carry a credential revision");
+    assert!(second_generation > first_generation);
+    assert_eq!(second["phase"], "waiting_for_scan");
+
+    let stale_cancel = dispatch_auth_request(
+        &runtime,
+        2,
+        json!({
+            "operation": "cancel",
+            "generation": first_generation,
+            "credential_revision": first_revision,
+        }),
+    )
+    .await;
+    assert_eq!(stale_cancel.status, InboxStatus::Failed);
+    assert_eq!(stale_cancel.result.as_ref().unwrap()["status"], "conflict");
+    let after_stale_cancel = bilibili_settings_auth_snapshot().await;
+    assert_eq!(after_stale_cancel["generation"], second_generation);
+    assert_eq!(after_stale_cancel["phase"], "waiting_for_scan");
+
+    let second_cancel = dispatch_auth_request(
+        &runtime,
+        3,
+        json!({
+            "operation": "cancel",
+            "generation": second_generation,
+            "credential_revision": second_revision,
+        }),
+    )
+    .await;
+    assert_eq!(
+        second_cancel.result.as_ref().unwrap()["status"],
+        "completed"
+    );
+    let second_cancelled_generation = second_cancel.result.as_ref().unwrap()["generation"]
+        .as_u64()
+        .expect("current MiniApp cancellation should settle the second generation");
+    release_poll
+        .send("tv:2".to_string())
+        .expect("second Telegram QR poll should be released after cancellation");
+    wait_for_login_lock_idle().await;
+    assert_eq!(
+        wait_for_auth_phase("cancelled", second_cancelled_generation).await["phase"],
+        "cancelled"
+    );
+
+    let telegram_requests = take_cloud_test_telegram_requests(&mut telegram_requests);
+    let photos = telegram_requests
+        .iter()
+        .filter(|request| request.method == "sendPhoto")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        photos.len(),
+        2,
+        "each Telegram login should send one QR photo"
+    );
+    for request in &telegram_requests {
+        if request.method == "sendPhoto" || request.method == "sendMessage" {
+            let chat_id = request.body["chat_id"].as_i64().or_else(|| {
+                request.body["chat_id"]
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+            });
+            assert_eq!(chat_id, Some(OWNER_CHAT_ID));
+        }
+        assert_no_bilibili_secrets(&request.body.to_string());
+    }
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    stop_fake_bilibili_api(bilibili_shutdown, bilibili_server).await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -516,32 +1024,35 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     .expect("stale restart logout should leave credentials readable");
     assert!(empty_after_stale_restart_logout.tv_access_key.is_none());
 
-    let external_state_path = config.bilibili.auth.state_path.clone();
-    let external_credential_file = config.bilibili.auth.credential_file.clone();
-    let external_profile = config.bilibili.auth.credential_profile.clone();
-    let ((), external_epoch) = tokio::task::spawn_blocking(move || {
-        bilibili_auth::with_auth_mutation_transaction(
-            &external_state_path,
-            &external_credential_file,
-            |transaction| {
-                bilibili_core::CredentialRuntime::from_credential_file(
-                    transaction.credential_file()?,
-                    external_profile.as_deref(),
-                )?
-                .save_merged(
-                    bbdown_core::Credentials::default()
-                        .with_tv_access_key(TEST_BILIBILI_TV_ACCESS_KEY),
-                )?;
-                Ok(())
-            },
-        )
-    })
-    .await
-    .expect("external synthetic save worker should complete")
-    .expect("external synthetic save should use the credential transaction");
+    let external_epoch = externally_save_test_tv_credential(&config).await;
     assert!(
         external_epoch.value() > restart_revision,
         "an external credential save should advance the persistent epoch"
+    );
+    let cached_after_external_save = bilibili_settings_auth_snapshot().await;
+    assert_eq!(
+        cached_after_external_save["credential_revision"].as_u64(),
+        Some(restart_revision),
+        "ordinary auth snapshots must not silently rescan an external credential write"
+    );
+    assert_ne!(
+        cached_after_external_save["phase"], "connected",
+        "external credential state becomes current through an explicit Settings refresh"
+    );
+    let (refresh_result_sender, mut refresh_results) = tokio::sync::mpsc::channel(16);
+    *runtime.websocket_writer.lock().await = Some(refresh_result_sender);
+    let external_save_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 1).await;
+    assert_eq!(external_save_refresh["status"], "published");
+    let refreshed_external_snapshot = bilibili_settings_auth_snapshot().await;
+    assert_eq!(refreshed_external_snapshot["phase"], "connected");
+    assert_eq!(
+        refreshed_external_snapshot["credential_revision"].as_u64(),
+        Some(external_epoch.value())
+    );
+    assert_eq!(
+        refreshed_external_snapshot["credential_summary"]["has_tv_access_key"],
+        true
     );
     let stale_after_external_save = dispatch_auth_request(
         &runtime,
@@ -570,16 +1081,6 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         external_credentials.tv_access_key.as_deref(),
         Some(TEST_BILIBILI_TV_ACCESS_KEY),
         "a stale snapshot must not delete credentials saved by another writer"
-    );
-    let refreshed_external_snapshot = bilibili_settings_auth_snapshot().await;
-    assert_eq!(refreshed_external_snapshot["phase"], "connected");
-    assert_eq!(
-        refreshed_external_snapshot["credential_revision"].as_u64(),
-        Some(external_epoch.value())
-    );
-    assert_eq!(
-        refreshed_external_snapshot["credential_summary"]["has_tv_access_key"],
-        true
     );
     let fresh_external_revision = refreshed_external_snapshot["credential_revision"]
         .as_u64()
@@ -616,6 +1117,100 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         .is_none(),
         "a fresh snapshot revision should allow the user to remove the newly saved credential"
     );
+
+    let reconnected_epoch = externally_save_test_tv_credential(&config).await;
+    let external_reconnect_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 2).await;
+    assert_eq!(external_reconnect_refresh["status"], "published");
+    let reconnected_snapshot = bilibili_settings_auth_snapshot().await;
+    assert_eq!(reconnected_snapshot["phase"], "connected");
+    assert_eq!(
+        reconnected_snapshot["credential_revision"].as_u64(),
+        Some(reconnected_epoch.value())
+    );
+
+    let deleted_epoch = externally_delete_test_credentials(&config).await;
+    assert!(deleted_epoch.value() > reconnected_epoch.value());
+    assert_eq!(
+        bilibili_settings_auth_snapshot().await["phase"],
+        "connected",
+        "a shared-protocol delete remains last-known state until Settings explicitly refreshes"
+    );
+    let external_delete_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 3).await;
+    assert_eq!(external_delete_refresh["status"], "published");
+    let externally_deleted_snapshot = bilibili_settings_auth_snapshot().await;
+    assert_eq!(externally_deleted_snapshot["phase"], "signed_out");
+    assert_eq!(
+        externally_deleted_snapshot["credential_revision"].as_u64(),
+        Some(deleted_epoch.value())
+    );
+    assert_eq!(
+        externally_deleted_snapshot["credential_summary"]["has_tv_access_key"],
+        false
+    );
+
+    fs::write(
+        &config.bilibili.auth.credential_file,
+        b"{invalid credentials",
+    )
+    .expect("credential fixture should become unreadable");
+    let unavailable_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 4).await;
+    assert_eq!(unavailable_refresh["status"], "failed");
+    assert_eq!(
+        unavailable_refresh["error_code"],
+        "reference_refresh_failed"
+    );
+    let unavailable_snapshot = bilibili_settings_auth_snapshot().await;
+    assert_eq!(unavailable_snapshot["phase"], "failed");
+    assert_eq!(unavailable_snapshot["safe_reason"], "login_failed");
+    assert_eq!(unavailable_snapshot["credential_revision"], 0);
+    assert_eq!(
+        unavailable_snapshot["credential_summary"],
+        json!({"has_cookie": false, "has_access_key": false, "has_tv_access_key": false}),
+        "unreadable credential state must not publish its cached summary as current"
+    );
+    let unavailable_logout = dispatch_auth_request(
+        &runtime,
+        96,
+        json!({
+            "operation": "logout",
+            "generation": unavailable_snapshot["generation"],
+            "credential_revision": deleted_epoch.value(),
+        }),
+    )
+    .await;
+    assert_eq!(unavailable_logout.status, InboxStatus::Failed);
+    assert_eq!(
+        unavailable_logout.error.as_deref(),
+        Some("Bilibili credential state could not be verified locally")
+    );
+    assert_eq!(
+        fs::read(&config.bilibili.auth.credential_file)
+            .expect("unreadable fixture should remain present"),
+        b"{invalid credentials",
+        "unverified cached state must not authorize a credential mutation"
+    );
+    fs::remove_file(&config.bilibili.auth.credential_file)
+        .expect("test should repair the unreadable fixture before later login cases");
+    let repaired_epoch = externally_delete_test_credentials(&config).await;
+    let repaired_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 5).await;
+    assert_eq!(repaired_refresh["status"], "published");
+    let repaired_snapshot = bilibili_settings_auth_snapshot().await;
+    assert_eq!(repaired_snapshot["phase"], "signed_out");
+    assert_eq!(
+        repaired_snapshot["credential_revision"].as_u64(),
+        Some(repaired_epoch.value()),
+        "a later successful refresh should reconcile the repaired credential store"
+    );
+    runtime.viewer_interests.lock().await.clear();
+    let posts_before_closed_auth = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake cloud post lock should not poison")
+        .len();
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
         cloud_state
@@ -623,7 +1218,7 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
             .lock()
             .expect("fake cloud post lock should not poison")
             .len(),
-        1,
+        posts_before_closed_auth,
         "credential refreshes while Settings is closed should keep idle throttling"
     );
 
@@ -901,7 +1496,9 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
 
     let history = public_auth_projection(&runtime).await;
     assert_no_bilibili_secrets(&history.to_string());
-    for seq in [1, 2, 3, 4, 5, 6, 7, 8, 79, 80, 81, 82, 83, 84, 90, 91, 92] {
+    for seq in [
+        1, 2, 3, 4, 5, 6, 7, 8, 79, 80, 81, 82, 83, 84, 90, 91, 92, 96,
+    ] {
         let record = inbox
             .record(seq)
             .expect("durable auth history should load")
@@ -915,6 +1512,11 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
                 assert_eq!(
                     record.error.as_deref(),
                     Some("invalid Bilibili auth request fields")
+                );
+            } else if seq == 96 {
+                assert_eq!(
+                    record.error.as_deref(),
+                    Some("Bilibili credential state could not be verified locally")
                 );
             } else {
                 assert!(record.error.is_none());
