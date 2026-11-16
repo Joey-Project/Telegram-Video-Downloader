@@ -12,7 +12,7 @@ test-runtime = []
 
 [dependencies]
 anyhow = "1"
-bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "3ef20552d7e81aa8e3816a4dd6f006391319ef9c", package = "bbdown-core" }
+bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "afd39a25ed32421bfb6f5c51bb7733153e3db915", package = "bbdown-core" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2"
 qrcode = "0.14.1"

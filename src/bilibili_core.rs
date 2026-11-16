@@ -185,9 +185,19 @@ pub async fn resolve_video_collection_membership(
         _ => return Ok(None),
     };
     client
-        .resolve_video_collection_membership(&bvid)
+        .resolve_video_collection_membership_with_options(&bvid, &ugc_metadata_resolve_options())
         .await
         .context("failed to resolve Bilibili UGC collection membership")
+}
+
+pub(crate) fn ugc_metadata_resolve_options() -> bbdown_core::UgcCollectionResolveOptions {
+    bbdown_core::UgcCollectionResolveOptions {
+        max_response_bytes: 1024 * 1024,
+        max_requests: 64,
+        max_raw_archives: crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES,
+        max_expanded_pages: crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES,
+        max_result_bytes: 4 * 1024 * 1024,
+    }
 }
 
 pub async fn resolve_video_page_info(
@@ -210,7 +220,7 @@ pub async fn resolve_video_page_info(
         .or(parsed_bvid.as_deref())
         .context("resolved Bilibili video did not include a BV identifier")?;
     let collection = client
-        .resolve_video_collection_membership(bvid)
+        .resolve_video_collection_membership_with_options(bvid, &ugc_metadata_resolve_options())
         .await
         .context("failed to resolve Bilibili UGC collection membership")?;
     Ok((page_count, collection))
@@ -1031,6 +1041,74 @@ mod tests {
             Some("SESSDATA=selected")
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn ugc_metadata_resolve_options_match_recovery_limits() {
+        let options = ugc_metadata_resolve_options();
+        assert_eq!(options.max_response_bytes, 1024 * 1024);
+        assert_eq!(options.max_requests, 64);
+        assert_eq!(
+            options.max_raw_archives,
+            crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+        );
+        assert_eq!(
+            options.max_expanded_pages,
+            crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+        );
+        assert_eq!(options.max_result_bytes, 4 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn bounded_membership_rejects_oversized_body_before_json_parsing() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let directory = tempfile::tempdir()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let declared_bytes = ugc_metadata_resolve_options().max_response_bytes + 1;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await?;
+                anyhow::ensure!(
+                    read != 0 && request.len() < 16 * 1024,
+                    "invalid mock request"
+                );
+                request.extend_from_slice(&buffer[..read]);
+            }
+            // No JSON body is sent: the declared size must be rejected first.
+            stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {declared_bytes}\r\nconnection: close\r\n\r\n").as_bytes()).await?;
+            let mut closed = [0_u8; 1];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut closed))
+                    .await;
+            Ok::<_, anyhow::Error>(String::from_utf8(request)?)
+        });
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.auth.credential_file = directory.path().join("credentials.json");
+        config.bilibili.auth.state_path = directory.path().join("legacy-auth.json");
+        config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resolve_video_collection_membership(
+                &config,
+                "https://www.bilibili.com/video/BV17x411w7KC",
+            ),
+        )
+        .await?
+        .expect_err("oversized membership must be refused");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+        assert!(request.contains("GET /x/web-interface/view?bvid=BV17x411w7KC HTTP/1.1"));
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<bbdown_core::Error>(),
+                Some(bbdown_core::Error::InvalidInput(_))
+            )),
+            "limit must precede body/JSON errors: {error:#}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
