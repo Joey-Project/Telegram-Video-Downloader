@@ -1343,6 +1343,12 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         "local credential store should contain the mock TV access key"
     );
 
+    let waiting_for_scan_min_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake cloud post lock should not poison")
+        .len()
+        + 1;
     let start_web =
         dispatch_auth_request(&runtime, 3, json!({"operation": "login", "mode": "web"})).await;
     assert_eq!(start_web.result.as_ref().unwrap()["status"], "accepted");
@@ -1351,12 +1357,6 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         .expect("web start should include a safe generation");
     wait_for_bilibili_poll(&mut polls, "web:1", "web QR confirmation lifecycle").await;
     wait_for_auth_phase("waiting_for_scan", web_generation).await;
-    let waiting_for_scan_min_posts = cloud_state
-        .state_posts
-        .lock()
-        .expect("fake cloud post lock should not poison")
-        .len()
-        + 1;
     let (waiting_for_scan_publication, _) = wait_for_cloud_auth_publication(
         &cloud_state,
         "waiting_for_scan",
@@ -1364,6 +1364,12 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     )
     .await;
     assert_no_bilibili_secrets(&waiting_for_scan_publication.to_string());
+    let confirming_min_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake cloud post lock should not poison")
+        .len()
+        + 1;
     release_poll
         .send("web:1".to_string())
         .expect("web QR scan response should be released after its publication is acknowledged");
@@ -1375,12 +1381,6 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     .await;
     let confirming = wait_for_auth_phase("waiting_for_confirmation", web_generation).await;
     let confirming_updated_at = confirming["updated_at_ms"].as_u64();
-    let confirming_min_posts = cloud_state
-        .state_posts
-        .lock()
-        .expect("fake cloud post lock should not poison")
-        .len()
-        + 1;
     let (confirming_publication, confirming_post) = wait_for_cloud_auth_publication(
         &cloud_state,
         "waiting_for_confirmation",
