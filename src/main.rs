@@ -2968,8 +2968,20 @@ async fn refresh_snapshot_references(
             }
             SnapshotRefreshScope::Settings => {
                 if settings_refresh.is_none() {
-                    settings_refresh =
-                        Some(media_library_bot::refresh_library_bindings(runtime).await);
+                    let library_refresh =
+                        media_library_bot::refresh_library_bindings(runtime).await;
+                    initialize_bilibili_settings_auth(&runtime.bot.config).await;
+                    let auth_refresh = refresh_bilibili_settings_auth(&runtime.bot.config).await;
+                    settings_refresh = Some(match (library_refresh, auth_refresh) {
+                        (Ok(()), true) => Ok(()),
+                        (Err(error), true) => Err(error),
+                        (Ok(()), false) => Err(anyhow::anyhow!(
+                            "Bilibili credential state could not be verified locally"
+                        )),
+                        (Err(_), false) => Err(anyhow::anyhow!(
+                            "settings and Bilibili credential state could not be verified locally"
+                        )),
+                    });
                 }
                 settings_refresh
                     .as_ref()
@@ -3510,10 +3522,12 @@ async fn refresh_bilibili_settings_auth(config: &AppConfig) -> bool {
         tokio::task::spawn_blocking(move || read_bilibili_settings_credentials_with_epoch(&config))
             .await;
     let Ok(Ok((summary, auth_epoch))) = loaded else {
+        mark_bilibili_settings_auth_unavailable().await;
         return false;
     };
     let revision = auth_epoch.value();
     if revision > MAX_BILIBILI_AUTH_SAFE_INTEGER {
+        mark_bilibili_settings_auth_unavailable().await;
         return false;
     }
     set_bilibili_settings_auth_epoch(Some(auth_epoch));
@@ -3543,6 +3557,30 @@ async fn refresh_bilibili_settings_auth(config: &AppConfig) -> bool {
     snapshot.transition(generation, phase, "none", unix_time_millis());
     bilibili_auth_status_notify().notify_one();
     true
+}
+
+async fn mark_bilibili_settings_auth_unavailable() {
+    BILIBILI_CREDENTIAL_REVISION.store(0, Ordering::SeqCst);
+    set_bilibili_settings_auth_epoch(None);
+    let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+    let mut snapshot = bilibili_settings_auth_state().lock().await;
+    let generation = generation.max(snapshot.generation);
+    let empty_credentials = settings_auth::CredentialSummary::default();
+    let changed = snapshot.transition(
+        generation,
+        settings_auth::Phase::Failed,
+        "login_failed",
+        unix_time_millis(),
+    ) || snapshot.credential_summary != empty_credentials
+        || snapshot.credential_revision != 0
+        || snapshot.mode.is_some();
+    snapshot.generation = generation;
+    snapshot.credential_revision = 0;
+    snapshot.credential_summary = empty_credentials;
+    snapshot.mode = None;
+    if changed {
+        bilibili_auth_status_notify().notify_one();
+    }
 }
 
 fn bilibili_settings_auth_epoch() -> &'static std::sync::Mutex<Option<bilibili_auth::AuthEpoch>> {
@@ -5799,13 +5837,38 @@ async fn cancel_bilibili_auth_generation(
     expected_credential_revision: u64,
     config: &AppConfig,
 ) -> bool {
+    cancel_bilibili_auth_generation_with_lock_hook(
+        expected_generation,
+        expected_credential_revision,
+        config,
+        || async {},
+    )
+    .await
+}
+
+async fn cancel_bilibili_auth_generation_with_lock_hook<F, Fut>(
+    expected_generation: u64,
+    expected_credential_revision: u64,
+    config: &AppConfig,
+    after_auth_state_lock: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let _operation_guard = BILIBILI_AUTH_MUTATION_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .await;
     if !expected_generation.is_multiple_of(2)
         || expected_generation.saturating_add(2) > MAX_BILIBILI_AUTH_SAFE_INTEGER
-        || BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != expected_generation
+        || expected_credential_revision > MAX_BILIBILI_AUTH_SAFE_INTEGER
+    {
+        return false;
+    }
+    let state_guard = bbdown_auth_state_lock().lock().await;
+    after_auth_state_lock().await;
+    if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != expected_generation
         || BILIBILI_CREDENTIAL_REVISION.load(Ordering::SeqCst) != expected_credential_revision
     {
         return false;
@@ -5813,13 +5876,22 @@ async fn cancel_bilibili_auth_generation(
     let Some(expected_epoch) = get_bilibili_settings_auth_epoch()
         .filter(|epoch| epoch.value() == expected_credential_revision)
     else {
+        drop(state_guard);
         refresh_bilibili_settings_auth(config).await;
         return false;
     };
-    if !matches!(
-        current_bbdown_auth_epoch(config).await,
-        Ok(current_epoch) if current_epoch == expected_epoch
-    ) {
+    let auth_file_lock = match acquire_bbdown_auth_reply_file_lock(config).await {
+        Ok(lock) => lock,
+        Err(_) => {
+            drop(state_guard);
+            refresh_bilibili_settings_auth(config).await;
+            return false;
+        }
+    };
+    if !matches!(auth_file_lock.current_epoch(), Ok(current_epoch) if current_epoch == expected_epoch)
+    {
+        drop(auth_file_lock);
+        drop(state_guard);
         refresh_bilibili_settings_auth(config).await;
         return false;
     }
@@ -5834,12 +5906,12 @@ async fn cancel_bilibili_auth_generation(
     {
         return false;
     }
+    drop(auth_file_lock);
     bbdown_login_cancel_notify().notify_waiters();
     pending_bilibili_access_key_logins()
         .lock()
         .await
         .retain(|_, login| login.auth_generation != expected_generation);
-    let _state_guard = bbdown_auth_state_lock().lock().await;
     BILIBILI_AUTH_GENERATION.store(expected_generation.saturating_add(2), Ordering::SeqCst);
     set_bilibili_settings_auth_phase(
         expected_generation.saturating_add(2),
@@ -5847,6 +5919,7 @@ async fn cancel_bilibili_auth_generation(
         "login_cancelled",
     )
     .await;
+    drop(state_guard);
     true
 }
 
@@ -10026,7 +10099,36 @@ async fn handle_bilibili_auth_command(
                     return;
                 }
             };
-            let auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            initialize_bilibili_settings_auth(&config).await;
+            if !refresh_bilibili_settings_auth(&config).await {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    "The local Bilibili credential state could not be verified. Refresh Settings before starting a new login.".to_string(),
+                )
+                .await;
+                return;
+            }
+            let auth_generation = match allocate_bilibili_auth_generation() {
+                Some(generation) => generation,
+                None => {
+                    send_or_log(
+                        &telegram,
+                        chat_id,
+                        "Bilibili authorization state is changing. Try again in a moment."
+                            .to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            set_bilibili_settings_auth_mode(auth_generation, mode).await;
+            set_bilibili_settings_auth_phase(
+                auth_generation,
+                settings_auth::Phase::WaitingForScan,
+                "none",
+            )
+            .await;
             tokio::spawn(async move {
                 let _guard = guard;
                 run_bbdown_login(telegram, config, chat_id, auth_generation, mode).await;
@@ -10596,8 +10698,33 @@ async fn save_bbdown_login_credentials_with_sync<F>(
 where
     F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()> + Send + 'static,
 {
+    save_bbdown_login_credentials_with_sync_and_lock_hook(
+        config,
+        auth_generation,
+        auth_epoch,
+        credentials,
+        sync_legacy,
+        || async {},
+    )
+    .await
+}
+
+async fn save_bbdown_login_credentials_with_sync_and_lock_hook<F, H, Fut>(
+    config: &AppConfig,
+    auth_generation: u64,
+    auth_epoch: bilibili_auth::AuthEpoch,
+    credentials: bbdown_core::Credentials,
+    sync_legacy: F,
+    after_auth_state_lock: H,
+) -> Result<SavedBilibiliLogin>
+where
+    F: for<'a> FnOnce(&bilibili_auth::LockedAuthMutation<'a>) -> Result<()> + Send + 'static,
+    H: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let _state_guard = bbdown_auth_state_lock().lock().await;
     ensure_bbdown_login_active(auth_generation)?;
+    after_auth_state_lock().await;
     let credential_profile = config.bilibili.auth.credential_profile.clone();
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();

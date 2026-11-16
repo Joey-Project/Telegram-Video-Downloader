@@ -343,13 +343,6 @@ impl MockBackend {
         })
     }
 
-    pub(crate) fn set_archive_states(&self, states: impl IntoIterator<Item = ArchiveState>) {
-        *self
-            .archive_states
-            .lock()
-            .expect("archive state queue should not be poisoned") = states.into_iter().collect();
-    }
-
     pub(crate) fn set_archive_default(&self, state: ArchiveState) {
         *self
             .archive_default
@@ -1161,7 +1154,7 @@ pub(crate) async fn open_manager(
 }
 
 async fn wait_for_stage(manager: &MusicManager, job_id: &str, stage: JobStage) -> StoredJob {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(job) = manager.store.job(job_id).expect("job should read")
                 && job.stage == stage
@@ -1171,8 +1164,14 @@ async fn wait_for_stage(manager: &MusicManager, job_id: &str, stage: JobStage) -
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("job did not reach expected stage")
+    .await;
+    result.unwrap_or_else(|_| {
+        let last_stage = manager
+            .store
+            .job(job_id)
+            .map(|job| job.map(|job| (job.stage, job.attempt)));
+        panic!("job did not reach {stage:?}; last stage and attempt: {last_stage:?}")
+    })
 }
 
 async fn wait_for_complete(manager: &MusicManager, job_id: &str) -> StoredJob {
@@ -2377,7 +2376,8 @@ async fn archive_upload_and_conflict_gates_precede_eviction() {
         conflicts: true,
         local_bytes: true,
     };
-    backend.set_archive_states([pending.clone(), conflicted, stable]);
+    // Keep each cloud condition stable until the test has observed its gate.
+    backend.set_archive_default(pending);
     let manager = open_manager(
         fixture.settings(),
         &server,
@@ -2390,8 +2390,10 @@ async fn archive_upload_and_conflict_gates_precede_eviction() {
     let admission = manager.enqueue(upload(70, "unique-70")).await.unwrap();
     wait_for_stage(&manager, &admission.job_id, JobStage::WaitingArchiveCloud).await;
     assert_eq!(backend.evictions.load(Ordering::Relaxed), 0);
+    backend.set_archive_default(conflicted);
     wait_for_stage(&manager, &admission.job_id, JobStage::Failed).await;
     assert_eq!(backend.evictions.load(Ordering::Relaxed), 0);
+    backend.set_archive_default(stable);
     manager.retry(42, &admission.job_id).await.unwrap();
     wait_for_complete(&manager, &admission.job_id).await;
     assert_eq!(backend.evictions.load(Ordering::Relaxed), 1);
