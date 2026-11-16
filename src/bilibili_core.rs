@@ -220,7 +220,7 @@ pub async fn resolve_video_page_info(
         .or(parsed_bvid.as_deref())
         .context("resolved Bilibili video did not include a BV identifier")?;
     let collection = client
-        .resolve_video_collection_membership_with_options(bvid, &ugc_metadata_resolve_options())
+        .resolve_video_collection_membership(bvid)
         .await
         .context("failed to resolve Bilibili UGC collection membership")?;
     Ok((page_count, collection))
@@ -1107,6 +1107,130 @@ mod tests {
                 Some(bbdown_core::Error::InvalidInput(_))
             )),
             "limit must precede body/JSON errors: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn page_info_keeps_valid_membership_from_response_over_recovery_limit()
+    -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let directory = tempfile::tempdir()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let initial_view_body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "aid": 170_001,
+                "bvid": "BV17x411w7KC",
+                "title": "Multi-page video",
+                "owner": {"mid": 210_798, "name": "Satori"},
+                "pages": [
+                    {"page": 1, "cid": 9_988, "part": "Page 1"},
+                    {"page": 2, "cid": 9_989, "part": "Page 2"},
+                    {"page": 3, "cid": 9_990, "part": "Page 3"}
+                ]
+            }
+        })
+        .to_string();
+        let oversized_membership_body = serde_json::json!({
+            "code": 0,
+            "data": {
+                "aid": 170_001,
+                "bvid": "BV17x411w7KC",
+                "title": "Multi-page video",
+                "desc": "x".repeat(1024 * 1024 + 1),
+                "owner": {"mid": 210_798, "name": "Satori"},
+                "pages": [
+                    {"page": 1, "cid": 9_988, "part": "Page 1"},
+                    {"page": 2, "cid": 9_989, "part": "Page 2"},
+                    {"page": 3, "cid": 9_990, "part": "Page 3"}
+                ],
+                "ugc_season": {
+                    "id": 167_822,
+                    "title": "Verified oversized collection",
+                    "cover": "https://example.invalid/season.jpg",
+                    "mid": 210_798,
+                    "intro": "Membership remains valid above the optional recovery limit.",
+                    "ep_count": 37,
+                    "season_type": 1
+                }
+            }
+        })
+        .to_string();
+        assert!(oversized_membership_body.len() > 1024 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut view_responses = 0;
+            let mut request_lines = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await?;
+                    anyhow::ensure!(
+                        read != 0 && request.len() < 16 * 1024,
+                        "invalid mock request"
+                    );
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8(request)?;
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                let body = if request_line.starts_with("GET /x/tag/archive/tags?") {
+                    r#"{"code":0,"data":[]}"#.to_string()
+                } else if request_line.starts_with("GET /x/web-interface/view?bvid=BV17x411w7KC ") {
+                    view_responses += 1;
+                    if view_responses == 1 {
+                        initial_view_body.clone()
+                    } else {
+                        oversized_membership_body.clone()
+                    }
+                } else {
+                    anyhow::bail!("unexpected mock request: {request_line}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await?;
+                request_lines.push(request_line);
+            }
+            Ok::<_, anyhow::Error>((request_lines, view_responses))
+        });
+
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.auth.credential_file = directory.path().join("credentials.json");
+        config.bilibili.auth.state_path = directory.path().join("legacy-auth.json");
+        config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+
+        let (page_count, collection) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            resolve_video_page_info(&config, "https://www.bilibili.com/video/BV17x411w7KC"),
+        )
+        .await??;
+        let (request_lines, view_responses) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+
+        assert_eq!(page_count, 3);
+        let collection = collection.expect("oversized valid membership should be preserved");
+        assert_eq!(collection.kind, UgcCollectionKind::Collection);
+        assert_eq!(collection.id, 167_822);
+        assert_eq!(collection.owner_mid, 210_798);
+        assert_eq!(collection.title, "Verified oversized collection");
+        assert_eq!(view_responses, 2);
+        assert_eq!(
+            request_lines
+                .iter()
+                .filter(|line| line.starts_with("GET /x/web-interface/view?bvid=BV17x411w7KC "))
+                .count(),
+            2
+        );
+        assert!(
+            request_lines
+                .iter()
+                .any(|line| line.starts_with("GET /x/tag/archive/tags?aid=170001 "))
         );
         Ok(())
     }
