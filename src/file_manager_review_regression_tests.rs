@@ -1337,3 +1337,296 @@ fn review5629_foreign_claim_does_not_preserve_a_stem_inferred_cover_owner() {
     );
     assert!(root.path().join("B.mkv").exists());
 }
+
+#[test]
+fn review3f9_keep_both_budgets_custom_cover_names_for_ascii_and_unicode() {
+    let root = TemporaryRoot::new("review3f9-custom-cover-component-budget");
+    let destination = root.path().join("Organized");
+    fs::create_dir_all(&destination).expect("destination directory should create");
+
+    let cases = [
+        ("ascii", "a".repeat(251)),
+        ("cjk", format!("{}xy", "界".repeat(83))),
+        ("emoji", format!("{}abc", "😀".repeat(62))),
+    ];
+    for (label, cover_stem) in &cases {
+        assert_eq!(
+            cover_stem.len(),
+            251,
+            "{label} stem should approach the limit"
+        );
+        let source_directory = root.path().join("Source").join(label);
+        fs::create_dir_all(&source_directory).expect("source directory should create");
+
+        let media_filename = format!("{label}.mkv");
+        let nfo_filename = format!("{label}.nfo");
+        let cover_filename = format!("{cover_stem}.jpg");
+        assert_eq!(cover_filename.len(), MAX_FILENAME_COMPONENT_BYTES);
+        let media_bytes = format!("source media for {label}").into_bytes();
+        let cover_bytes = format!("custom cover for {label}").into_bytes();
+        let original_nfo = format!(
+            "<movie><title>{label}</title><tvd_attachment role=\"cover\">{cover_filename}</tvd_attachment><thumb>{cover_filename}</thumb></movie>"
+        );
+
+        fs::write(source_directory.join(&media_filename), &media_bytes)
+            .expect("source media should write");
+        fs::write(source_directory.join(&nfo_filename), &original_nfo)
+            .expect("source NFO should write");
+        fs::write(source_directory.join(&cover_filename), &cover_bytes)
+            .expect("maximum-length custom cover should write");
+        fs::write(
+            destination.join(&media_filename),
+            format!("existing target media for {label}"),
+        )
+        .expect("media-only target conflict should write");
+        assert!(
+            !destination.join(&cover_filename).exists(),
+            "the destination must not contain a cover-name conflict"
+        );
+    }
+
+    let manager = manager(&root);
+    for (label, cover_stem) in &cases {
+        let media_filename = format!("{label}.mkv");
+        let nfo_filename = format!("{label}.nfo");
+        let cover_filename = format!("{cover_stem}.jpg");
+        let media_source = format!("Source/{label}/{media_filename}");
+        let nfo_source = format!("Source/{label}/{nfo_filename}");
+        let cover_source = format!("Source/{label}/{cover_filename}");
+        let old_target_bytes = format!("existing target media for {label}").into_bytes();
+        let media_bytes = format!("source media for {label}").into_bytes();
+        let cover_bytes = format!("custom cover for {label}").into_bytes();
+        let original_nfo = format!(
+            "<movie><title>{label}</title><tvd_attachment role=\"cover\">{cover_filename}</tvd_attachment><thumb>{cover_filename}</thumb></movie>"
+        );
+
+        let snapshot = manager.scan(&[]).expect("source library should scan");
+        let item = item_at(&snapshot, &media_source);
+        assert!(item.attachments.iter().any(|attachment| {
+            attachment.relative_path == cover_source && attachment.kind == "cover"
+        }));
+
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&item.id),
+                "Organized",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("KeepBoth should fit a declared near-limit custom cover");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+        let target_for = |source: &str| {
+            preview.items[0]
+                .files
+                .iter()
+                .find(|file| file.source_path == source)
+                .unwrap_or_else(|| panic!("preview should include {source}"))
+                .target_path
+                .clone()
+        };
+        let media_target = target_for(&media_source);
+        let nfo_target = target_for(&nfo_source);
+        let cover_target = target_for(&cover_source);
+        assert_eq!(media_target, format!("Organized/{label} (2).mkv"));
+        assert!(
+            preview
+                .metadata_patches
+                .iter()
+                .any(|patch| { patch.nfo_path == nfo_target })
+        );
+        let cover_target_filename = Path::new(&cover_target)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("rewritten cover target should remain valid UTF-8");
+        assert!(cover_target_filename.ends_with(" (2).jpg"));
+        assert!(cover_target_filename.len() <= MAX_FILENAME_COMPONENT_BYTES);
+        assert!(
+            !destination.join(cover_target_filename).exists(),
+            "only the media target should conflict before confirmation"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(&nfo_source)).unwrap(),
+            original_nfo,
+            "preview must not rewrite the NFO before confirmation"
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed custom-cover KeepBoth organization should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        assert_eq!(
+            fs::read(root.path().join(&media_target)).unwrap(),
+            media_bytes
+        );
+        assert_eq!(
+            fs::read(root.path().join(&cover_target)).unwrap(),
+            cover_bytes
+        );
+        assert_eq!(
+            fs::read(destination.join(&media_filename)).unwrap(),
+            old_target_bytes,
+            "KeepBoth must leave the pre-existing target media unchanged"
+        );
+
+        let rewritten_nfo =
+            fs::read_to_string(root.path().join(&nfo_target)).expect("published NFO should read");
+        assert!(rewritten_nfo.contains(&format!(
+            "<tvd_attachment role=\"cover\">{cover_target_filename}</tvd_attachment>"
+        )));
+        assert!(rewritten_nfo.contains(&format!("<thumb>{cover_target_filename}</thumb>")));
+
+        let rescanned = manager.scan(&[]).expect("KeepBoth result should rescan");
+        let moved = item_at(&rescanned, &media_target);
+        assert_eq!(
+            moved.authoritative_nfo_path.as_deref(),
+            Some(nfo_target.as_str())
+        );
+        assert!(moved.attachments.iter().any(|attachment| {
+            attachment.relative_path == cover_target && attachment.kind == "cover"
+        }));
+    }
+}
+
+#[test]
+fn review3f9_keep_both_disambiguates_custom_covers_with_trimmed_tails() {
+    let root = TemporaryRoot::new("review3f9-custom-cover-trimmed-tail-disambiguation");
+    let destination = root.path().join("Organized");
+    fs::create_dir_all(&destination).expect("destination directory should create");
+    let source_directory = root.path().join("Source");
+    fs::create_dir_all(&source_directory).expect("source directory should create");
+
+    let shared_prefix = "p".repeat(247);
+    let cover_a_stem = format!("{shared_prefix}a");
+    let cover_b_stem = format!("{shared_prefix}b");
+    assert_eq!(cover_a_stem.len(), 248);
+    assert_eq!(cover_b_stem.len(), 248);
+    let cover_a_filename = format!("{cover_a_stem}.jpg");
+    let cover_b_filename = format!("{cover_b_stem}.jpg");
+    let media_bytes = b"source media";
+    let cover_a_bytes = b"first custom cover";
+    let cover_b_bytes = b"second custom cover";
+    let original_nfo = format!(
+        "<movie><title>Film</title><tvd_attachment role=\"cover\">{cover_a_filename}</tvd_attachment><tvd_attachment role=\"cover\">{cover_b_filename}</tvd_attachment><thumb>{cover_a_filename}</thumb><thumb>{cover_b_filename}</thumb></movie>"
+    );
+
+    fs::write(source_directory.join("Film.mkv"), media_bytes).expect("source media should write");
+    fs::write(source_directory.join("Film.nfo"), &original_nfo)
+        .expect("NFO with both custom cover references should write");
+    fs::write(source_directory.join(&cover_a_filename), cover_a_bytes)
+        .expect("first custom cover should write");
+    fs::write(source_directory.join(&cover_b_filename), cover_b_bytes)
+        .expect("second custom cover should write");
+    fs::write(destination.join("Film.mkv"), b"existing target media")
+        .expect("media-only target conflict should write");
+
+    let manager = manager(&root);
+    let snapshot = manager.scan(&[]).expect("source library should scan");
+    let film = item_at(&snapshot, "Source/Film.mkv");
+    for filename in [&cover_a_filename, &cover_b_filename] {
+        let source = format!("Source/{filename}");
+        assert!(film.attachments.iter().any(|attachment| {
+            attachment.relative_path == source && attachment.kind == "cover"
+        }));
+    }
+
+    let preview = manager
+        .preview(
+            std::slice::from_ref(&film.id),
+            "Organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("KeepBoth should preserve both near-limit declared covers");
+    assert_eq!(preview.items.len(), 1);
+    assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+    let target_for = |source: &str| {
+        preview.items[0]
+            .files
+            .iter()
+            .find(|file| file.source_path == source)
+            .unwrap_or_else(|| panic!("preview should include {source}"))
+            .target_path
+            .clone()
+    };
+    let media_target = target_for("Source/Film.mkv");
+    let nfo_target = target_for("Source/Film.nfo");
+    let cover_a_target = target_for(&format!("Source/{cover_a_filename}"));
+    let cover_b_target = target_for(&format!("Source/{cover_b_filename}"));
+    assert_eq!(media_target, "Organized/Film (2).mkv");
+    assert_ne!(
+        cover_a_target, cover_b_target,
+        "names differing only in the truncated tail need stable discriminators"
+    );
+    for target in [&cover_a_target, &cover_b_target] {
+        let filename = Path::new(target)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("custom cover target should remain valid UTF-8");
+        assert!(filename.len() <= MAX_FILENAME_COMPONENT_BYTES);
+        assert!(filename.ends_with(" (2).jpg"));
+    }
+    assert!(
+        preview
+            .metadata_patches
+            .iter()
+            .any(|patch| patch.nfo_path == nfo_target)
+    );
+    assert_eq!(
+        fs::read_to_string(source_directory.join("Film.nfo")).unwrap(),
+        original_nfo,
+        "preview must not rewrite either reference before confirmation"
+    );
+    assert_eq!(
+        fs::read(destination.join("Film.mkv")).unwrap(),
+        b"existing target media"
+    );
+
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("confirmed custom-cover KeepBoth organization should complete");
+    assert_eq!(result.status, BatchStatus::Complete);
+    assert_eq!(
+        fs::read(root.path().join(&media_target)).unwrap(),
+        media_bytes
+    );
+    assert_eq!(
+        fs::read(root.path().join(&cover_a_target)).unwrap(),
+        cover_a_bytes,
+        "first cover must retain its own bytes"
+    );
+    assert_eq!(
+        fs::read(root.path().join(&cover_b_target)).unwrap(),
+        cover_b_bytes,
+        "second cover must retain its own bytes"
+    );
+    assert_eq!(
+        fs::read(destination.join("Film.mkv")).unwrap(),
+        b"existing target media",
+        "KeepBoth must leave the pre-existing target media unchanged"
+    );
+
+    let nfo = fs::read_to_string(root.path().join(&nfo_target)).unwrap();
+    for target in [&cover_a_target, &cover_b_target] {
+        let filename = Path::new(target)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("published cover filename should remain UTF-8");
+        assert!(nfo.contains(&format!(
+            "<tvd_attachment role=\"cover\">{filename}</tvd_attachment>"
+        )));
+        assert!(nfo.contains(&format!("<thumb>{filename}</thumb>")));
+    }
+
+    let rescanned = manager.scan(&[]).expect("KeepBoth result should rescan");
+    let moved = item_at(&rescanned, &media_target);
+    assert_eq!(
+        moved.authoritative_nfo_path.as_deref(),
+        Some(nfo_target.as_str())
+    );
+    for target in [&cover_a_target, &cover_b_target] {
+        assert!(moved.attachments.iter().any(|attachment| {
+            attachment.relative_path == *target && attachment.kind == "cover"
+        }));
+    }
+}

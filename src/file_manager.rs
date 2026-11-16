@@ -4147,15 +4147,7 @@ impl LibraryManager {
                         let target_name = if let Some(suffix) = suffix {
                             file_name_with_stem(source_abs, target_primary_stem, suffix)?
                         } else if let Some(keep_both_suffix) = keep_both_suffix {
-                            let source_stem = source_abs
-                                .file_stem()
-                                .and_then(OsStr::to_str)
-                                .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
-                            file_name_with_stem(
-                                source_abs,
-                                &format!("{source_stem}{keep_both_suffix}"),
-                                "",
-                            )?
+                            keep_both_custom_attachment_name(source_abs, keep_both_suffix)?
                         } else {
                             source_abs
                                 .file_name()
@@ -7939,6 +7931,40 @@ fn file_name_with_stem(source: &Path, stem: &str, suffix: &str) -> Result<String
         );
     }
     Ok(file_name)
+}
+
+fn keep_both_custom_attachment_name(source: &Path, keep_both_suffix: &str) -> Result<String> {
+    let source_stem = source
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
+    let extension_bytes = filename_tail_bytes(source, "")?;
+    let reserved_bytes = extension_bytes
+        .checked_add(keep_both_suffix.len())
+        .ok_or_else(|| anyhow!("filename component length overflowed"))?;
+    let stem_budget = MAX_FILENAME_COMPONENT_BYTES
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| {
+            anyhow!(
+                "attachment extension and KeepBoth suffix exceed the {MAX_FILENAME_COMPONENT_BYTES}-byte filename component limit"
+            )
+        })?;
+
+    // Keep the historical spelling for short custom names, including trailing
+    // spaces or dots. Only names that need truncation receive a stable
+    // discriminator so truncation alone does not collapse distinct names.
+    if source_stem.len() <= stem_budget {
+        return file_name_with_stem(source, &format!("{source_stem}{keep_both_suffix}"), "");
+    }
+
+    let source_name = source
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
+    let digest = sha256_bytes(source_name.as_bytes());
+    let distinct_suffix = format!("~{}{}", &digest[..16], keep_both_suffix);
+    let stem = budgeted_group_stem(source_stem, extension_bytes, &distinct_suffix, true)?;
+    file_name_with_stem(source, &stem, "")
 }
 
 fn with_extension(path: &Path, extension: &str) -> PathBuf {
