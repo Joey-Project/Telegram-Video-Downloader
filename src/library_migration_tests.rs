@@ -3471,3 +3471,331 @@ fn migration_preserves_secondary_nfo_references_when_group_names_stay_stable() {
         );
     }
 }
+
+const LEGACY_COVER_MIGRATION_FILM_BYTES: &[u8] = b"legacy cover migration film bytes";
+const LEGACY_COVER_MIGRATION_COVER_BYTES: &[u8] = b"legacy cover migration cover bytes";
+const EXPLICIT_BARE_COVER_MIGRATION_NFO: &str = concat!(
+    "<movie><title>Film title</title>",
+    "<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>",
+    "<thumb>cover.jpg</thumb></movie>"
+);
+
+fn cover_owner_migration_fixture(
+    label: &str,
+    existing_other_media: Option<&[u8]>,
+    nfo: Option<&str>,
+) -> (TestRoot, TestRoot, MigrationEngine) {
+    let source_root = TestRoot::new(&format!("{label}-source"));
+    let target_root = TestRoot::new(&format!("{label}-target"));
+    fs::write(
+        source_root.path().join("Film.mkv"),
+        LEGACY_COVER_MIGRATION_FILM_BYTES,
+    )
+    .expect("source film should write");
+    fs::write(
+        source_root.path().join("cover.jpg"),
+        LEGACY_COVER_MIGRATION_COVER_BYTES,
+    )
+    .expect("unqualified legacy cover should write");
+    if let Some(nfo) = nfo {
+        fs::write(source_root.path().join("Film.nfo"), nfo).expect("portable NFO should write");
+    }
+    if let Some(bytes) = existing_other_media {
+        fs::write(target_root.path().join("Other.mkv"), bytes)
+            .expect("unrelated target media should write");
+    }
+
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    (source_root, target_root, engine)
+}
+
+fn cover_owner_migration_preview(
+    engine: &MigrationEngine,
+    conflict: ConflictPolicy,
+    expected_authoritative_nfo: Option<&str>,
+) -> MigrationPreview {
+    let snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source library should scan");
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("source film should be indexed");
+    assert_eq!(
+        item.authoritative_nfo_path.as_deref(),
+        expected_authoritative_nfo
+    );
+    if let Some(nfo_path) = expected_authoritative_nfo {
+        assert!(
+            item.attachments
+                .iter()
+                .any(|attachment| attachment.relative_path == nfo_path && attachment.kind == "nfo")
+        );
+    }
+    assert!(item.attachments.iter().any(|attachment| {
+        attachment.relative_path == "cover.jpg" && attachment.kind == "cover"
+    }));
+
+    engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item.id.clone()],
+            conflict,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("legacy cover migration should produce a preview")
+}
+
+#[test]
+fn migration_skips_legacy_cover_when_target_would_make_owner_ambiguous() {
+    const OTHER_MEDIA_BYTES: &[u8] = b"existing unrelated target media";
+    let (source_root, target_root, engine) = cover_owner_migration_fixture(
+        "legacy-cover-multi-primary-target-skip",
+        Some(OTHER_MEDIA_BYTES),
+        None,
+    );
+    let preview = cover_owner_migration_preview(&engine, ConflictPolicy::KeepBoth, None);
+    assert_eq!(preview.items.len(), 1);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Skipped);
+    assert_eq!(preview.file_count, 2);
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .any(|file| { file.source_path == "Film.mkv" && file.target_path == "Film.mkv" })
+    );
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .any(|file| { file.source_path == "cover.jpg" && file.target_path == "cover.jpg" })
+    );
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("unsafe shared-target migration should remain confirmable as a skip");
+    let status = drive_migration_to_completed(&engine, &preview.id);
+    assert_eq!(status.status, MigrationRunStatus::Completed);
+    assert_eq!(status.success_count, 0);
+    assert_eq!(status.skipped_count, 1);
+    assert_eq!(status.items[0].status, MigrationItemPhase::Skipped);
+    assert!(
+        status.items[0]
+            .files
+            .iter()
+            .all(|file| file.status == MigrationItemPhase::Skipped)
+    );
+
+    assert_eq!(
+        fs::read(source_root.path().join("Film.mkv")).unwrap(),
+        LEGACY_COVER_MIGRATION_FILM_BYTES,
+        "a skipped group must preserve the source media bytes"
+    );
+    assert_eq!(
+        fs::read(source_root.path().join("cover.jpg")).unwrap(),
+        LEGACY_COVER_MIGRATION_COVER_BYTES,
+        "a skipped group must preserve the legacy cover bytes"
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Other.mkv")).unwrap(),
+        OTHER_MEDIA_BYTES,
+        "the unrelated existing target must remain unchanged"
+    );
+    assert!(!target_root.path().join("Film.mkv").exists());
+    assert!(!target_root.path().join("cover.jpg").exists());
+    assert!(
+        fs::read_dir(target_root.path())
+            .expect("target directory should list after a skipped migration")
+            .filter_map(std::result::Result::ok)
+            .all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with("Film") && !name.starts_with("cover")
+            }),
+        "a skipped group must not leave any allocated or partial output files"
+    );
+
+    let source_snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source should rescan after the completed skip");
+    let source_film = source_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("skipped source film should remain indexed");
+    assert!(source_film.attachments.iter().any(|attachment| {
+        attachment.relative_path == "cover.jpg" && attachment.kind == "cover"
+    }));
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("unmodified target should rescan");
+    assert!(
+        target_snapshot
+            .items
+            .iter()
+            .all(|item| item.relative_path != "Film.mkv")
+    );
+    let other = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Other.mkv" && item.presence == Presence::Present)
+        .expect("unrelated target media should remain indexed");
+    assert!(
+        other
+            .attachments
+            .iter()
+            .all(|attachment| attachment.relative_path != "cover.jpg")
+    );
+}
+
+#[test]
+fn migration_preserves_legacy_cover_owner_in_unique_leaf_target() {
+    let (source_root, target_root, engine) =
+        cover_owner_migration_fixture("legacy-cover-unique-leaf-target", None, None);
+    let preview = cover_owner_migration_preview(&engine, ConflictPolicy::KeepBoth, None);
+    assert_eq!(preview.items.len(), 1);
+    assert!(!preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Copying);
+    assert_eq!(preview.file_count, 2);
+    for path in ["Film.mkv", "cover.jpg"] {
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.source_path == path && file.target_path == path)
+        );
+    }
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("unique-leaf legacy cover migration should confirm");
+    let status = drive_migration_to_completed(&engine, &preview.id);
+    assert_eq!(status.status, MigrationRunStatus::Completed);
+    assert_eq!(status.success_count, 1);
+    assert_eq!(status.skipped_count, 0);
+    assert_eq!(
+        fs::read(target_root.path().join("Film.mkv")).unwrap(),
+        LEGACY_COVER_MIGRATION_FILM_BYTES
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("cover.jpg")).unwrap(),
+        LEGACY_COVER_MIGRATION_COVER_BYTES
+    );
+    assert!(!source_root.path().join("Film.mkv").exists());
+    assert!(!source_root.path().join("cover.jpg").exists());
+
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("unique-leaf target should rescan the migrated files");
+    let migrated_film = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("migrated film should be indexed");
+    assert!(migrated_film.attachments.iter().any(|attachment| {
+        attachment.relative_path == "cover.jpg" && attachment.kind == "cover"
+    }));
+}
+
+#[test]
+fn migration_preserves_explicit_cover_owner_in_multi_primary_target() {
+    const OTHER_MEDIA_BYTES: &[u8] = b"existing unrelated target media";
+    let (source_root, target_root, engine) = cover_owner_migration_fixture(
+        "explicit-cover-multi-primary-target",
+        Some(OTHER_MEDIA_BYTES),
+        Some(EXPLICIT_BARE_COVER_MIGRATION_NFO),
+    );
+    let preview =
+        cover_owner_migration_preview(&engine, ConflictPolicy::KeepBoth, Some("Film.nfo"));
+    assert_eq!(preview.items.len(), 1);
+    assert!(!preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Copying);
+    assert_eq!(preview.file_count, 3);
+    for path in ["Film.mkv", "Film.nfo", "cover.jpg"] {
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.source_path == path && file.target_path == path)
+        );
+    }
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("explicitly declared cover migration should confirm");
+    let status = drive_migration_to_completed(&engine, &preview.id);
+    assert_eq!(status.status, MigrationRunStatus::Completed);
+    assert_eq!(status.success_count, 1);
+    assert_eq!(status.skipped_count, 0);
+    assert_eq!(
+        fs::read(target_root.path().join("Other.mkv")).unwrap(),
+        OTHER_MEDIA_BYTES
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Film.mkv")).unwrap(),
+        LEGACY_COVER_MIGRATION_FILM_BYTES
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Film.nfo")).unwrap(),
+        EXPLICIT_BARE_COVER_MIGRATION_NFO.as_bytes()
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("cover.jpg")).unwrap(),
+        LEGACY_COVER_MIGRATION_COVER_BYTES
+    );
+    for path in ["Film.mkv", "Film.nfo", "cover.jpg"] {
+        assert!(!source_root.path().join(path).exists());
+    }
+
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("multi-primary target should rescan after migration");
+    let migrated_film = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("migrated film should be indexed");
+    assert_eq!(
+        migrated_film.authoritative_nfo_path.as_deref(),
+        Some("Film.nfo")
+    );
+    assert!(migrated_film.attachments.iter().any(|attachment| {
+        attachment.relative_path == "cover.jpg" && attachment.kind == "cover"
+    }));
+    let other = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Other.mkv" && item.presence == Presence::Present)
+        .expect("pre-existing target film should remain indexed");
+    assert!(
+        other
+            .attachments
+            .iter()
+            .all(|attachment| attachment.relative_path != "cover.jpg")
+    );
+}
