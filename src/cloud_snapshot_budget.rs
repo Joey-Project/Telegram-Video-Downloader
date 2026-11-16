@@ -189,14 +189,14 @@ fn validated_file_preview_summary<'a>(
     let metadata_patch_count = summary.get("metadata_patch_count")?.as_u64()? as usize;
     let changed_patch_count = summary.get("changed_metadata_patch_count")?.as_u64()? as usize;
     let requested_patch_count = requested_metadata_patch_count(record)?;
-    // A confirmed file move may synthesize one NFO patch per moved media item to preserve
-    // localfilename and portable attachment references. Metadata-only previews still contain
-    // exactly the requested patches; move summaries may include only the bounded generated
-    // patches above the request. Confirmation resolves the full saved plan by ID and revision.
+    // A move may patch each bounded NFO declaration source so local references remain valid.
+    // The total is bounded by the actual selected move-file count, which includes NFO files;
+    // metadata-only previews still contain exactly the requested patches. Confirmation resolves
+    // the full saved plan by ID and revision.
     let max_patch_count = if metadata_only {
         requested_patch_count
     } else {
-        requested_patch_count.saturating_add(moves)
+        requested_patch_count.saturating_add(file_count)
     };
     if metadata_patch_count > MAX_FILE_PREVIEW_METADATA_PATCHES
         || changed_patch_count > metadata_patch_count
@@ -226,7 +226,8 @@ fn validated_file_preview_summary<'a>(
 }
 
 const MAX_FILE_PREVIEW_SELECTION_ITEMS: usize = 5_000;
-const MAX_FILE_PREVIEW_METADATA_PATCHES: usize = MAX_FILE_PREVIEW_SELECTION_ITEMS * 2;
+const MAX_FILE_PREVIEW_METADATA_PATCHES: usize = MAX_FILE_PREVIEW_SELECTION_ITEMS
+    * (crate::file_manager::NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA + 1);
 
 fn file_preview_request_identity(record: &InboxRecord) -> Option<(&str, &str)> {
     let payload_library_id = record.request.payload.get("library_id")?.as_str()?;
@@ -4273,12 +4274,25 @@ mod tests {
         assert!(is_valid_compact_file_preview_result(&compact_receipt));
 
         let summary = compact_receipt.result.as_mut().unwrap();
-        summary["preview"]["metadata_patch_count"] = json!(2);
-        summary["preview"]["omitted_metadata_patch_count"] = json!(1);
+        summary["preview"]["metadata_patch_count"] = json!(5);
+        summary["preview"]["omitted_metadata_patch_count"] = json!(4);
         assert!(
             !is_valid_compact_file_preview_result(&compact_receipt),
-            "move summaries cannot claim more generated patches than moved media items"
+            "move summaries cannot claim more patches than the bounded move-file count"
         );
+
+        let mut multiple_nfo_patches = generated_file_preview_record(508, 1);
+        multiple_nfo_patches.result.as_mut().unwrap()["preview"]["metadata_patches"] = json!([
+            { "item_id": "item-0000", "nfo_path": "target/item-0000.nfo", "changed": true, "added_source_ids": [], "changes": [] },
+            { "item_id": "item-0000", "nfo_path": "target/item-0000.extra.nfo", "changed": true, "added_source_ids": [], "changes": [] },
+            { "item_id": "item-0000", "nfo_path": "target/item-0000.notes.nfo", "changed": true, "added_source_ids": [], "changes": [] },
+            { "item_id": "item-0000", "nfo_path": "target/item-0000.poster.nfo", "changed": true, "added_source_ids": [], "changes": [] },
+        ]);
+        let compact = compact_file_preview_receipt_result(&multiple_nfo_patches)
+            .expect("a move may patch multiple bounded NFO declaration sources");
+        let mut compact_receipt = multiple_nfo_patches;
+        compact_receipt.result = Some(compact);
+        assert!(is_valid_compact_file_preview_result(&compact_receipt));
 
         let metadata_only = generated_metadata_only_preview_record(507, 1);
         let compact = compact_file_preview_receipt_result(&metadata_only)

@@ -1209,8 +1209,10 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
     web_poll_responses: Vec<serde_json::Value>,
     tv_poll_responses: Vec<serde_json::Value>,
     pause_at_tv_polls: &[usize],
+    pause_at_web_polls: &[usize],
 ) -> (
     String,
+    mpsc::UnboundedReceiver<String>,
     mpsc::UnboundedReceiver<String>,
     mpsc::UnboundedSender<String>,
     oneshot::Sender<()>,
@@ -1223,9 +1225,11 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
         .local_addr()
         .expect("fake Bilibili API should expose its address");
     let (poll_tx, poll_rx) = mpsc::unbounded_channel();
+    let (poll_response_written_tx, poll_response_written_rx) = mpsc::unbounded_channel();
     let (release_tx, mut release_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let pause_at_tv_polls = pause_at_tv_polls.iter().copied().collect::<HashSet<_>>();
+    let pause_at_web_polls = pause_at_web_polls.iter().copied().collect::<HashSet<_>>();
     let server = tokio::spawn(async move {
         let mut web_poll_index = 0_usize;
         let mut tv_poll_index = 0_usize;
@@ -1237,6 +1241,7 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
             let (mut stream, _) = accepted;
             let request_target = read_fake_bilibili_request(&mut stream).await?;
             let path = fake_bilibili_request_path(&request_target);
+            let mut poll_response_written_event = None;
             let payload = if path.ends_with("/qrcode/auth_code") {
                 let _ = poll_tx.send("tv:ticket".to_string());
                 serde_json::json!({
@@ -1281,7 +1286,16 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
                         } else {
                             format!("web:{web_poll_index}:invalid_query")
                         };
-                    let _ = poll_tx.send(event);
+                    let _ = poll_tx.send(event.clone());
+                    poll_response_written_event = Some(event.clone());
+                    if pause_at_web_polls.contains(&web_poll_index) {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => return Ok(()),
+                            released = release_rx.recv() => {
+                                anyhow::ensure!(released.as_deref() == Some(event.as_str()), "fake Bilibili poll release did not match its paused request");
+                            }
+                        }
+                    }
                     web_poll_responses
                         .get(web_poll_index.saturating_sub(1))
                         .or_else(|| web_poll_responses.last())
@@ -1296,6 +1310,7 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
                     tv_poll_index = tv_poll_index.saturating_add(1);
                     let event = format!("tv:{tv_poll_index}");
                     let _ = poll_tx.send(event.clone());
+                    poll_response_written_event = Some(event.clone());
                     if pause_at_tv_polls.contains(&tv_poll_index) {
                         tokio::select! {
                             _ = &mut shutdown_rx => return Ok(()),
@@ -1320,12 +1335,17 @@ pub(super) async fn spawn_fake_bilibili_auth_api(
             };
             let response = fake_http_response(200, &payload);
             // A cancelled request can close its side before this delayed mock response is released.
-            let _ = stream.write_all(response.as_bytes()).await;
+            if stream.write_all(response.as_bytes()).await.is_ok()
+                && let Some(event) = poll_response_written_event
+            {
+                let _ = poll_response_written_tx.send(event);
+            }
         }
     });
     (
         format!("http://{address}"),
         poll_rx,
+        poll_response_written_rx,
         release_tx,
         shutdown_tx,
         server,

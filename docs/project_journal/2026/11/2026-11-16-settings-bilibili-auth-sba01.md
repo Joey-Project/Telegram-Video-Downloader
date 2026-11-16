@@ -64,5 +64,15 @@ superseded_by: ""
 - The archive eviction mock holds pending, conflict and stable conditions until
   each expected gate is observed; its targeted regression passes without relying
   on a transient stage or changing production Music behavior.
+- The authentication lifecycle mock separates request receipt from response
+  completion and pauses each relevant poll. Publication acknowledgements precede
+  the confirmation baseline; unchanged polls preserve both the auth timestamp
+  and publication count, while expiration adds one state update. The revised
+  lifecycle E2E passed three consecutive isolated runs after capturing each
+  count threshold before its triggering action, and the shared-helper generation
+  E2E passed (`p2-auth-barrier-1-1794851737791488000.log`,
+  `p2-auth-barrier-2-1794851797849651000.log`,
+  `p2-auth-barrier-3-1794851814509394000.log`,
+  `p2-auth-helper-final-1794851832473322000.log`).
 - Strict workspace/all-target Clippy passes with warnings denied. Production
   credentials, real login sessions and services are outside automated acceptance.
