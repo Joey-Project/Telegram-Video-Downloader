@@ -28,17 +28,18 @@ superseded_by: ""
 - Metadata recovery tests cover optional membership and collection failures, timeouts, oversized groups, verified-membership fallback, and exact order mapping.
 
 ## Validation
-- The SDK repin was tested on top of integration source `1e5c7e51c4f3a100c1db01810d6e3702be60613e`: the patched manifest and lockfile selected `f0cb37ce9821f28a7fb8fb2a238553ed9c0265cf`, and the SDK dependency compiled from that exact revision. Compared with the earlier `afd39a25` pin, the merged SDK changes only its project journal; SDK Rust sources and manifests are identical.
-- A fresh test binary, `rust-cache/bounded/build/debug/deps/telegram_video_downloader-80b2f68028bfa173` (SHA-256 `62f55584f9b3de19aed78dca05a7fce11af370396b896b2110991d17c7fefe86`), passed the 20 Bilibili-core contract tests, 25 metadata-recovery tests, and 10 flat-collection publication E2Es (55 tests total, 0 failed, 0 ignored). The broader `flat_collection` filter also passed 12 tests, including those 10 E2Es.
-- Strict workspace/all-target Clippy with `-D warnings` and `cargo fmt --all -- --check` passed after the repin.
+- Integration source `f166c810a425d5e56b91bd5542eba9b53d1b4513` includes the parent's custom-name KeepBoth repair and pins both manifest and lockfile to `f0cb37ce9821f28a7fb8fb2a238553ed9c0265cf`. Compared with the earlier `afd39a25` pin, the merged SDK changes only its project journal; SDK Rust sources and manifests are identical.
+- One fresh test binary, `rust-cache/bounded/build/debug/deps/telegram_video_downloader-80b2f68028bfa173` (SHA-256 `46fe027241b2af3455cf852c5871dcc790655f991b8770bee1d2769dafb356e1`), passed both new KeepBoth regressions, all 193 file-manager cases, 20 Bilibili-core contract tests, 25 metadata-recovery tests and 10 flat-collection publication E2Es. Each filter had zero failures and zero ignored tests; overlapping filters are not counted as unique tests.
+- Strict workspace/all-target Clippy with `-D warnings` and `cargo fmt --all -- --check` passed on that combined source.
 - The project journal validator and `git diff --check` passed after this journal update.
 - Tests used local mocks and temporary fixtures; no live Bilibili, Telegram, or Music service was called.
 
 ## Evidence
 - Integration points: `src/bilibili_core.rs` and `src/downloader.rs`.
 - SDK pin-update log: `bot4-pin-update-1794867862320431000.log`.
-- Bilibili-core log: `bot4-newcore20-1794867882728242000.log`.
-- Metadata-recovery log: `bot4-new-meta25-1794868121236492000.log`.
-- Broad and exact collection/publication logs: `bot4-new-collection10-1794868148512931000.log`, `bot4-new-flatpub10-1794868173871722000.log`.
-- Strict Clippy log: `bot4-strict-clippy-1794868193231830000.log`.
-- Formatting log: `bot4-fmt-check-1794868308423669000.log`.
+- New KeepBoth and file-manager logs: `p4-review3f9-1794870073636520000.log`, `p4-file-manager193-1794870154639312000.log`.
+- Bilibili-core log: `p4-bilibili20-1794870209765384000.log`.
+- Metadata-recovery log: `p4-metadata25-1794870216762598000.log`.
+- Collection/publication log: `p4-flat-collection10-1794870245288633000.log`.
+- Strict Clippy log: `p4-strict-clippy-1794870254032890000.log`.
+- Formatting log: `p4-fmt-check-1794870298415808000.log`.
