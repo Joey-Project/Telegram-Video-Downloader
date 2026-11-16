@@ -83,6 +83,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "staging_cleanup",
   "danmaku_refresh",
   "torrent_action",
+  "bilibili_auth",
 ]);
 
 function isRequestKind(value: unknown): value is RequestKind {

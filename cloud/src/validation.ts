@@ -743,7 +743,7 @@ function validateMigrationDiscoveryWarnings(library: Record<string, unknown>): v
 }
 
 function validateAppliedSettings(value: unknown): void {
-  if (!isRecord(value) || !onlyKeys(value, ["revision", "default_library_id", "default_category", "libraries"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["revision", "default_library_id", "default_category", "libraries", "bilibili_auth"])) {
     throw new HttpError(400, "settings.applied has an invalid shape");
   }
   boundedString(value.revision, "settings.applied.revision", 256);
@@ -782,6 +782,7 @@ function validateAppliedSettings(value: unknown): void {
   if (value.libraries.length > 0 && (defaults !== 1 || !ids.has(defaultLibraryId))) {
     throw new HttpError(400, "settings.applied must identify exactly one registered default library");
   }
+  if (value.bilibili_auth !== undefined) validateBilibiliAuthSnapshot(value.bilibili_auth);
 }
 
 function validateLibraryDescriptors(library: Record<string, unknown>): void {
@@ -904,6 +905,80 @@ function parseDanmakuRefreshPayload(value: Record<string, unknown>): DanmakuRefr
   return { operation, ...identity, preview_seq: value.preview_seq as number, preview_id: previewId, revision };
 }
 
+const BILIBILI_AUTH_REASONS = new Set([
+  "none", "duplicate_start", "login_expired", "login_cancelled", "login_failed",
+  "credentials_removed", "stale_generation", "stale_credentials", "logout_failed", "invalid_request",
+]);
+
+function parseBilibiliAuthPayload(value: Record<string, unknown>): Record<string, unknown> {
+  const operation = value.operation;
+  if (operation === "login") {
+    if (!onlyKeys(value, ["operation", "mode"]) || !["web", "tv", "access_key"].includes(String(value.mode))) {
+      throw new HttpError(400, "bilibili_auth login payload has an invalid shape");
+    }
+    return { operation, mode: value.mode };
+  }
+  if (operation === "cancel") {
+    if (!onlyKeys(value, ["operation", "generation", "credential_revision"])
+        || !Number.isSafeInteger(value.generation) || (value.generation as number) <= 0
+        || !Number.isSafeInteger(value.credential_revision) || (value.credential_revision as number) < 0) {
+      throw new HttpError(400, "bilibili_auth cancellation payload has an invalid shape");
+    }
+    return { operation, generation: value.generation, credential_revision: value.credential_revision };
+  }
+  if (operation === "logout") {
+    if (!onlyKeys(value, ["operation", "generation", "credential_revision"])
+        || !Number.isSafeInteger(value.generation) || (value.generation as number) < 0
+        || !Number.isSafeInteger(value.credential_revision) || (value.credential_revision as number) < 0) {
+      throw new HttpError(400, "bilibili_auth logout payload has an invalid shape");
+    }
+    return { operation, generation: value.generation, credential_revision: value.credential_revision };
+  }
+  throw new HttpError(400, "bilibili_auth operation is not supported");
+}
+
+function validateBilibiliAuthSnapshot(value: unknown): void {
+  if (!isRecord(value) || !onlyKeys(value, ["phase", "mode", "generation", "credential_revision", "credential_summary", "updated_at_ms", "safe_reason"])) {
+    throw new HttpError(400, "settings.applied.bilibili_auth has an invalid shape");
+  }
+  const phases = ["signed_out", "waiting_for_scan", "waiting_for_confirmation", "connected", "expired", "cancelled", "failed"];
+  if (!phases.includes(String(value.phase))
+      || !(value.mode === null || value.mode === "web" || value.mode === "tv" || value.mode === "access_key")
+      || !Number.isSafeInteger(value.generation) || (value.generation as number) < 0
+      || !Number.isSafeInteger(value.credential_revision) || (value.credential_revision as number) < 0
+      || !Number.isSafeInteger(value.updated_at_ms) || (value.updated_at_ms as number) <= 0
+      || !(value.safe_reason === null || typeof value.safe_reason === "string" && BILIBILI_AUTH_REASONS.has(value.safe_reason))) {
+    throw new HttpError(400, "settings.applied.bilibili_auth contains an unsupported value");
+  }
+  const summary = value.credential_summary;
+  if (!isRecord(summary) || !onlyKeys(summary, ["has_cookie", "has_access_key", "has_tv_access_key"])) {
+    throw new HttpError(400, "settings.applied.bilibili_auth credential summary is invalid");
+  }
+  if (!["has_cookie", "has_access_key", "has_tv_access_key"].every((key) => typeof summary[key] === "boolean")) {
+    throw new HttpError(400, "settings.applied.bilibili_auth credential summary is invalid");
+  }
+}
+
+function rejectCredentialAndQrFields(value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const entry of value) rejectCredentialAndQrFields(entry);
+    return;
+  }
+  if (!isRecord(value)) return;
+  const safeCredentialFlags = new Set(["has_cookie", "has_access_key", "has_tv_access_key"]);
+  for (const [key, entry] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replaceAll("-", "_");
+    if (!safeCredentialFlags.has(normalized)
+        && (normalized.includes("qr") || normalized === "cookie" || normalized === "cookies"
+          || normalized.includes("access_key") || normalized.includes("refresh_token")
+          || normalized.includes("polling_token") || normalized.includes("ticket_url")
+          || normalized === "ticket" || normalized.includes("login_response"))) {
+      throw new HttpError(400, "Snapshot contains a disallowed authentication field");
+    }
+    rejectCredentialAndQrFields(entry);
+  }
+}
+
 export function validateActionRequest(value: unknown): ActionRequest {
   if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload", "queued_at_ms", "replay_expires_at_ms"])) {
     throw new HttpError(400, "Action request has an invalid shape");
@@ -916,7 +991,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
   const supportedKinds = [
     "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
     "metadata_recover", "file_preview", "file_confirm", "preview_cancel", "legacy_import", "download_submit", "library_migration_preview",
-    "library_migration_confirm", "library_migration_control", "staging_cleanup", "danmaku_refresh", "torrent_action",
+    "library_migration_confirm", "library_migration_control", "staging_cleanup", "danmaku_refresh", "torrent_action", "bilibili_auth",
   ];
   if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
     throw new HttpError(400, "kind is not supported");
@@ -928,6 +1003,9 @@ export function validateActionRequest(value: unknown): ActionRequest {
   switch (kind) {
     case "torrent_action":
       payload = validateTorrentActionPayload(value.payload);
+      break;
+    case "bilibili_auth":
+      payload = parseBilibiliAuthPayload(value.payload);
       break;
     case "library_scan":
       if (!onlyKeys(value.payload, ["library_id"])) throw new HttpError(400, "library_scan payload has an invalid shape");
@@ -1099,6 +1177,7 @@ export function isOwnerPrivateTelegramUpdate(
 
 export function validateSnapshot(value: unknown): LocalSnapshot {
   if (!isRecord(value)) throw new HttpError(400, "Snapshot must be an object");
+  rejectCredentialAndQrFields(value);
   if (value.revision !== undefined && typeof value.revision !== "string") {
     throw new HttpError(400, "revision must be a string when provided");
   }
