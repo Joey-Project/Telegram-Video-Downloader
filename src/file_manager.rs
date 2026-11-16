@@ -989,6 +989,7 @@ struct ScanTestHooks {
     scope_unknown: bool,
     expire_after_built_item: bool,
     expire_after_attachment_count: Option<usize>,
+    expire_after_nfo_declaration_count: Option<usize>,
     index_budget: Option<usize>,
     identity_reconciliation_steps: Option<Arc<AtomicUsize>>,
 }
@@ -2978,6 +2979,14 @@ impl LibraryManager {
             .lock()
             .expect("scan test-hook lock should remain healthy")
             .expire_after_attachment_count = Some(count.max(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_next_scan_during_nfo_declarations_after(&self, source_count: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .expire_after_nfo_declaration_count = Some(source_count);
     }
 
     #[cfg(test)]
@@ -5465,6 +5474,8 @@ impl LibraryManager {
         let index_budget = test_hooks.index_budget.unwrap_or(INDEX_LIMIT);
         #[cfg(test)]
         let mut expire_after_attachment_count = test_hooks.expire_after_attachment_count;
+        #[cfg(test)]
+        let mut expire_after_nfo_declaration_count = test_hooks.expire_after_nfo_declaration_count;
         #[cfg(not(test))]
         let index_budget = INDEX_LIMIT;
         #[cfg(not(test))]
@@ -5508,27 +5519,80 @@ impl LibraryManager {
             &walk.leaf_directories,
             &walk.directory_name_semantics,
         )?;
-        let mut declarations_by_media = HashMap::new();
-        for media in walk
+        let primary_file_indices = walk
             .files
             .iter()
-            .filter(|file| is_primary_media(&file.relative_path))
-        {
+            .enumerate()
+            .filter_map(|(index, file)| is_primary_media(&file.relative_path).then_some(index))
+            .collect::<Vec<_>>();
+        let mut declarations_by_media = HashMap::new();
+        'declarations: for (media_index, file_index) in primary_file_indices.iter().enumerate() {
+            if walk.timed_out || walk.started_at.elapsed() >= SCAN_TIMEOUT || {
+                #[cfg(test)]
+                {
+                    expire_after_nfo_declaration_count == Some(0)
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            } {
+                stop_scan_for_nfo_deadline(
+                    &mut walk.timed_out,
+                    &mut walk.warnings,
+                    &mut walk.migration_incomplete_paths,
+                    &walk.files,
+                    &primary_file_indices[media_index..],
+                );
+                break 'declarations;
+            }
+            let media_relative_path = walk.files[*file_index].relative_path.clone();
             let nfo_paths = sidecars
-                .attached_files(media)
+                .attached_files(&walk.files[*file_index])
                 .into_iter()
                 .filter(|path| attachment_kind(path) == "nfo")
                 .collect::<Vec<_>>();
             if nfo_paths.len() > NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA {
                 walk.warnings.push(format!(
                     "portable attachment declarations were ignored because {NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA} NFO sources is the per-media limit: {}",
-                    media.relative_path
+                    media_relative_path
                 ));
                 continue;
             }
             for nfo_path in nfo_paths {
+                if walk.timed_out || walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
                 let absolute = self.absolute_path(&nfo_path)?;
-                match self.read_file(&absolute, SIDE_CAR_LIMIT) {
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+                let read_result = self.read_file(&absolute, SIDE_CAR_LIMIT);
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+                match read_result {
                     Ok(Some(contents)) => {
                         let Ok(text) = String::from_utf8(contents) else {
                             continue;
@@ -5586,7 +5650,7 @@ impl LibraryManager {
                         }
                         if !declarations.is_empty() {
                             declarations_by_media
-                                .entry(media.relative_path.clone())
+                                .entry(media_relative_path.clone())
                                 .or_insert_with(Vec::new)
                                 .extend(declarations);
                         }
@@ -5601,7 +5665,42 @@ impl LibraryManager {
                         ));
                     }
                 }
+                #[cfg(test)]
+                if let Some(remaining) = expire_after_nfo_declaration_count.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                    }
+                    if *remaining == 0 {
+                        stop_scan_for_nfo_deadline(
+                            &mut walk.timed_out,
+                            &mut walk.warnings,
+                            &mut walk.migration_incomplete_paths,
+                            &walk.files,
+                            &primary_file_indices[media_index..],
+                        );
+                        break 'declarations;
+                    }
+                }
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
             }
+        }
+        if !walk.timed_out && walk.started_at.elapsed() >= SCAN_TIMEOUT {
+            stop_scan_for_nfo_deadline(
+                &mut walk.timed_out,
+                &mut walk.warnings,
+                &mut walk.migration_incomplete_paths,
+                &walk.files,
+                &primary_file_indices,
+            );
         }
         let rejected_declarations = sidecars.add_declared_attachments(
             &walk.files,
@@ -9089,7 +9188,9 @@ impl SidecarIndex {
         let mut claims = HashMap::<String, Vec<(String, String, String)>>::new();
         let mut rejected = 0usize;
         for (media, declarations) in declarations_by_media {
-            if declarations.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+            if declarations.len()
+                > NFO_ATTACHMENT_DECLARATION_LIMIT * NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA
+            {
                 rejected = rejected.saturating_add(declarations.len());
                 continue;
             }
@@ -9105,11 +9206,23 @@ impl SidecarIndex {
                 })?;
                 normalized.entry(key).or_default().push(declaration);
             }
+            if normalized.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+                rejected = rejected.saturating_add(declarations.len());
+                continue;
+            }
             for (name_key, declarations) in normalized {
-                if declarations.len() != 1 {
+                let roles = declarations
+                    .iter()
+                    .map(|declaration| declaration.role.as_str())
+                    .collect::<HashSet<_>>();
+                if roles.len() != 1 {
                     rejected = rejected.saturating_add(declarations.len());
                     continue;
                 }
+                // Several attached NFOs may repeat the same declaration for one media item.
+                // Treat same-role claims as one logical owner, but keep conflicting roles
+                // ambiguous. The source NFO paths remain in LibraryItem.attachments and are
+                // still independently rewritten by the organizer.
                 let declaration = declarations[0];
                 let mut matches = Vec::new();
                 for file in files_by_parent.get(&parent).into_iter().flatten() {
@@ -9992,6 +10105,23 @@ fn push_scan_timeout_warning(warnings: &mut Vec<String>) {
                 .to_string(),
         );
     }
+}
+
+fn stop_scan_for_nfo_deadline(
+    timed_out: &mut bool,
+    warnings: &mut Vec<String>,
+    migration_incomplete_paths: &mut BTreeSet<String>,
+    files: &[ScannedFile],
+    pending_primary_indices: &[usize],
+) {
+    *timed_out = true;
+    push_scan_timeout_warning(warnings);
+    let incomplete_paths = pending_primary_indices
+        .iter()
+        .filter_map(|index| files.get(*index))
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<_>>();
+    migration_incomplete_paths.extend(incomplete_paths);
 }
 
 fn snapshot_revision(items: &[LibraryItem]) -> Result<String> {
@@ -20968,7 +21098,7 @@ mod tests {
     }
 
     #[test]
-    fn round6_multiple_nfo_claims_for_one_attachment_are_ambiguous() {
+    fn round6_same_owner_nfo_claims_for_one_attachment_are_deduplicated() {
         let root = TemporaryRoot::new("multiple-nfo-claims-one-attachment");
         fs::write(root.path().join("A.mkv"), b"fixture video").expect("primary media should write");
         fs::write(root.path().join("bonus.jpg"), b"fixture image")
@@ -20987,17 +21117,28 @@ mod tests {
 
         let snapshot = manager(&root).scan(&[]).expect("library should scan");
         let item = item_at(&snapshot, "A.mkv");
-        assert!(
+        assert_eq!(
             item.attachments
                 .iter()
-                .all(|attachment| attachment.relative_path != "bonus.jpg"),
-            "two attached NFOs claiming one file leave it unattached"
+                .filter(|attachment| attachment.relative_path == "bonus.jpg")
+                .count(),
+            1,
+            "equivalent same-owner declarations should yield one logical attachment"
         );
         assert!(
-            snapshot
+            item.attachments.iter().any(|attachment| {
+                attachment.relative_path == "A.nfo" && attachment.kind == "nfo"
+            })
+        );
+        assert!(item.attachments.iter().any(|attachment| {
+            attachment.relative_path == "A.extra.nfo" && attachment.kind == "nfo"
+        }));
+        assert!(
+            !snapshot
                 .warnings
                 .iter()
-                .any(|warning| { warning.contains("declaration(s) were left unattached") })
+                .any(|warning| { warning.contains("declaration(s) were left unattached") }),
+            "same-owner duplicate declarations are not ambiguous claims"
         );
     }
 

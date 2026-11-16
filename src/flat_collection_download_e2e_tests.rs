@@ -118,7 +118,7 @@ fn flat_collection_keep_both_publishes_one_coherent_sidecar_group() {
                 progress: None,
             }),
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: false,
+            rewrite_local_nfo_references: false,
         },
         &staging_dir,
         &output_root,
@@ -359,7 +359,7 @@ fn sdk_entry_output_flattens_then_publishes_flat_collection_sidecars_together() 
                 progress: None,
             }),
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &output_dir,
         &output_root,
@@ -571,7 +571,7 @@ fn direct_collection_mapper_and_publication_keep_multiple_videos_flat() {
             staging: Some(&staging),
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: false,
+            rewrite_local_nfo_references: false,
         },
         &output_dir,
         &output_root,
@@ -939,7 +939,7 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
         .and_then(|name| name.to_str())
         .unwrap();
     let flat_parent_relative = rooted_relative_directory(&root, &staged_collection_dir).unwrap();
-    let (_, second_flatten_rewrite, _) = read_bilibili_nfo_rewrite(
+    let (_, second_flatten_rewrite, _) = read_nfo_local_reference_rewrite(
         &root,
         &flat_nfo,
         None,
@@ -974,7 +974,7 @@ async fn sdk_unmuxed_segments_keep_report_order_and_bound_sidecars_through_publi
                 progress: None,
             }),
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &output_dir,
         &output_root,
@@ -1470,7 +1470,7 @@ fn duplicate_sdk_basenames_keep_nfo_references_with_their_flattened_and_publishe
             staging: Some(&staging),
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &staging_dir,
         &output_root,
@@ -1619,6 +1619,198 @@ fn duplicate_sdk_basenames_keep_nfo_references_with_their_flattened_and_publishe
 
 #[cfg(unix)]
 #[test]
+fn youtube_keep_both_publication_remaps_generated_nfo_and_rescans_owner_attachments() {
+    let output_root = temp_root("youtube-keep-both-nfo-remap");
+    let _cleanup = TestDirectory(output_root.clone());
+    fs::create_dir_all(&output_root).expect("output root should be created");
+    let existing_media = output_root.join("Film.mkv");
+    let existing_cover = output_root.join("cover.jpg");
+    write_fixture(&existing_media, b"existing YouTube media");
+    write_fixture(&existing_cover, b"existing unqualified cover");
+
+    let root = RootedFs::new(&output_root).expect("library root should bind");
+    let staging = create_video_staging_dir(&root).expect("private staging should be created");
+    let staging_dir = staging.path().to_path_buf();
+    let staged_media = staging_dir.join("Film.mkv");
+    let staged_cover = staging_dir.join("cover.jpg");
+    let staged_subtitle = staging_dir.join("Film.zh-Hans.srt");
+    let staged_danmaku = staging_dir.join("Film.danmaku.xml");
+    write_fixture(&staged_media, b"new YouTube media");
+    write_fixture(&staged_cover, b"YouTube cover");
+    write_fixture(&staged_subtitle, b"YouTube subtitle");
+    write_fixture(&staged_danmaku, b"YouTube danmaku");
+
+    let metadata = YoutubeMetadata {
+        id: Some("abcdefghijk".to_string()),
+        title: Some("Saved YouTube title".to_string()),
+        description: Some("Saved YouTube description".to_string()),
+        webpage_url: Some("https://www.youtube.com/watch?v=abcdefghijk".to_string()),
+        ..YoutubeMetadata::default()
+    };
+    let nfo_path = write_youtube_nfo_bound(
+        &root,
+        &staged_media,
+        "https://youtu.be/abcdefghijk",
+        &metadata,
+    )
+    .expect("production YouTube NFO writer should create the staged NFO");
+    let generated_text = fs::read_to_string(&nfo_path).expect("generated NFO should be readable");
+    let user_extended_text = generated_text.replacen(
+        "</movie>",
+        "  <unknown-field>preserve-user-note</unknown-field>\n</movie>",
+        1,
+    );
+    assert_ne!(user_extended_text, generated_text);
+    write_fixture(&nfo_path, user_extended_text.as_bytes());
+    let original_nfo = fs::read(&nfo_path).expect("original staged NFO should be captured");
+    let original_nfo_identity = root
+        .entry_identity(&nfo_path)
+        .expect("staged NFO identity should be readable")
+        .expect("staged NFO should exist");
+    for reference in [
+        "<localfilename>Film.mkv</localfilename>",
+        "<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>",
+        "<thumb>cover.jpg</thumb>",
+        "<tvd_attachment role=\"subtitle\">Film.zh-Hans.srt</tvd_attachment>",
+        "<tvd_attachment role=\"danmaku\">Film.danmaku.xml</tvd_attachment>",
+    ] {
+        assert!(
+            user_extended_text.contains(reference),
+            "generated NFO missing {reference}"
+        );
+    }
+
+    let staged_files = vec![
+        staged_media.clone(),
+        staged_cover.clone(),
+        staged_subtitle.clone(),
+        staged_danmaku.clone(),
+        nfo_path.clone(),
+    ];
+    let duplicate = VideoDuplicate {
+        identity: VideoIdentity {
+            provider: VideoProvider::Youtube,
+            id: "abcdefghijk".to_string(),
+        },
+        existing_videos: vec![existing_media.clone()],
+        skip_summary: None,
+        overwrite_confirmation: None,
+    };
+    let publication = move_staged_video_files_with_root_and_sources(
+        MoveExecutionContext {
+            root: &root,
+            staging: Some(&staging),
+            bilibili_group_receipt: None,
+            bilibili_collection_destination: None,
+            rewrite_local_nfo_references: true,
+        },
+        &staging_dir,
+        &output_root,
+        &staged_files,
+        VideoDuplicateAction::KeepBoth,
+        &duplicate,
+        StagedPrimaryMediaKind::Video,
+    )
+    .expect("KeepBoth should publish the media and a private remapped NFO copy");
+
+    let published_media = output_root.join("Film (2).mkv");
+    let published_cover = output_root.join("cover (2).jpg");
+    let published_subtitle = output_root.join("Film (2).zh-Hans.srt");
+    let published_danmaku = output_root.join("Film (2).danmaku.xml");
+    let published_nfo = output_root.join("Film (2).nfo");
+    assert_eq!(
+        publication.primary_destinations,
+        vec![published_media.clone()]
+    );
+    assert_eq!(
+        publication.logical_source_destinations.get(&nfo_path),
+        Some(&published_nfo),
+        "the generated NFO should keep its logical source mapping"
+    );
+    assert_eq!(
+        fs::read(&existing_media).unwrap(),
+        b"existing YouTube media"
+    );
+    assert_eq!(
+        fs::read(&existing_cover).unwrap(),
+        b"existing unqualified cover"
+    );
+    assert_eq!(fs::read(&published_media).unwrap(), b"new YouTube media");
+    assert_eq!(fs::read(&published_cover).unwrap(), b"YouTube cover");
+    assert_eq!(fs::read(&published_subtitle).unwrap(), b"YouTube subtitle");
+    assert_eq!(fs::read(&published_danmaku).unwrap(), b"YouTube danmaku");
+
+    let published_text = fs::read_to_string(&published_nfo).unwrap();
+    for field in [
+        "<title>Saved YouTube title</title>",
+        "<uniqueid type=\"youtube\" default=\"true\">abcdefghijk</uniqueid>",
+        "<unknown-field>preserve-user-note</unknown-field>",
+        "<localfilename>Film (2).mkv</localfilename>",
+        "<tvd_attachment role=\"cover\">cover (2).jpg</tvd_attachment>",
+        "<thumb>cover (2).jpg</thumb>",
+        "<tvd_attachment role=\"subtitle\">Film (2).zh-Hans.srt</tvd_attachment>",
+        "<tvd_attachment role=\"danmaku\">Film (2).danmaku.xml</tvd_attachment>",
+    ] {
+        assert!(
+            published_text.contains(field),
+            "published NFO missing {field}"
+        );
+    }
+    assert!(!published_text.contains("<localfilename>Film.mkv</localfilename>"));
+    assert!(!published_text.contains("<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>"));
+    assert!(!published_text.contains("<thumb>cover.jpg</thumb>"));
+    assert_eq!(
+        root.entry_identity(&nfo_path).unwrap(),
+        Some(original_nfo_identity),
+        "publication should not replace the generated retry-source identity"
+    );
+    assert_eq!(
+        fs::read(&nfo_path).unwrap(),
+        original_nfo,
+        "publication should keep the generated retry source unchanged"
+    );
+
+    staging
+        .finish()
+        .expect("owned staging should be cleaned up");
+    let library = LibraryManager::open(&output_root).expect("library manager should open");
+    let snapshot = library
+        .scan(&[])
+        .expect("library should rescan published media");
+    let relative_media = "Film (2).mkv";
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == relative_media)
+        .expect("rescan should find the KeepBoth media");
+    assert_eq!(item.title, "Saved YouTube title");
+    assert!(
+        item.source_ids
+            .iter()
+            .any(|id| id.as_str() == "youtube:abcdefghijk")
+    );
+    for (filename, kind) in [
+        ("cover (2).jpg", "cover"),
+        ("Film (2).zh-Hans.srt", "subtitle"),
+        ("Film (2).danmaku.xml", "danmaku"),
+    ] {
+        assert!(
+            item.attachments.iter().any(|attachment| {
+                attachment.relative_path == filename && attachment.kind == kind
+            }),
+            "rescan should assign {filename} to {relative_media} as {kind}"
+        );
+    }
+    let old_item = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv")
+        .expect("rescan should retain the pre-existing media");
+    assert!(old_item.attachments.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn publication_nfo_copy_refreshes_before_manifest_when_keep_both_name_changes() {
     let output_root = temp_root("publication-nfo-premanifest-reallocation");
     let _cleanup = TestDirectory(output_root.clone());
@@ -1671,7 +1863,7 @@ fn publication_nfo_copy_refreshes_before_manifest_when_keep_both_name_changes() 
         first_primary.file_name().and_then(|name| name.to_str()),
         Some("Episode (2).mkv")
     );
-    rewrite_bilibili_publication_nfo_copies(
+    rewrite_publication_nfo_copies(
         &root,
         &staging_dir,
         &mut first_plan,
@@ -1707,7 +1899,7 @@ fn publication_nfo_copy_refreshes_before_manifest_when_keep_both_name_changes() 
             staging: Some(&staging),
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &staging_dir,
         &output_root,
@@ -1833,7 +2025,7 @@ async fn pending_manifest_recovery_keeps_the_rewritten_nfo_copy_identity() {
             staging: Some(&staging),
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &staging_dir,
         &output_root,
@@ -1894,7 +2086,7 @@ async fn pending_manifest_recovery_keeps_the_rewritten_nfo_copy_identity() {
             staging: Some(&staging),
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: true,
+            rewrite_local_nfo_references: true,
         },
         &staging_dir,
         &output_root,
@@ -2233,7 +2425,7 @@ fn generic_artifact_only_groups_flatten_and_publish_without_primary_media() {
                     staging: Some(&staging),
                     bilibili_group_receipt: None,
                     bilibili_collection_destination: Some(destination_context),
-                    rewrite_bilibili_nfo_references: false,
+                    rewrite_local_nfo_references: false,
                 },
                 &output_dir,
                 &output_root,
@@ -2583,7 +2775,7 @@ async fn collection_group_driver_publishes_two_mock_sdk_children_with_page_stems
                         progress: None,
                     }),
                     bilibili_collection_destination: None,
-                    rewrite_bilibili_nfo_references: false,
+                    rewrite_local_nfo_references: false,
                 },
                 &output_dir,
                 &output_root,

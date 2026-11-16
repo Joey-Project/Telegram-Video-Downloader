@@ -99,7 +99,7 @@ const VIDEO_STAGING_RETENTION_FILE_NAME: &str = ".retained.json";
 const VIDEO_STAGING_RETENTION_VERSION: u32 = 1;
 const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME: &str = ".publication-nfo";
-const BILIBILI_NFO_REWRITE_LIMIT: usize = 1024 * 1024;
+const NFO_LOCAL_REFERENCE_REWRITE_LIMIT: usize = 1024 * 1024;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
 const VIDEO_STAGING_TASK_RETRY_RETENTION_REASON: &str =
@@ -10956,7 +10956,7 @@ fn flatten_bilibili_collection_staging_output(
                     .file_name()
                     .and_then(|name| name.to_str())
                     .context("Bilibili flat primary filename is not UTF-8")?;
-                let (nfo_identity, rewritten, original_sha256) = read_bilibili_nfo_rewrite(
+                let (nfo_identity, rewritten, original_sha256) = read_nfo_local_reference_rewrite(
                     root,
                     &nfo_path,
                     Some(source_identity),
@@ -13346,7 +13346,7 @@ fn rooted_relative_directory(root: &RootedFs, directory: &Path) -> Result<PathBu
     Ok(relative.to_path_buf())
 }
 
-fn read_bilibili_nfo_rewrite(
+fn read_nfo_local_reference_rewrite(
     root: &RootedFs,
     path: &Path,
     expected_identity: Option<EntryIdentity>,
@@ -13358,14 +13358,14 @@ fn read_bilibili_nfo_rewrite(
     let entry = root.bind_entry(path, false)?;
     let identity = root
         .bound_entry_identity(&entry)?
-        .with_context(|| format!("Bilibili NFO disappeared: {}", path.display()))?;
+        .with_context(|| format!("NFO disappeared: {}", path.display()))?;
     if expected_identity.is_some_and(|expected| expected != identity) {
-        bail!("Bilibili NFO identity changed before local-reference remapping");
+        bail!("NFO identity changed before local-reference remapping");
     }
     let file = root.open_bound_file_if_identity(&entry, identity)?;
-    let original = file.read_limited(BILIBILI_NFO_REWRITE_LIMIT)?;
+    let original = file.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
     let original_sha256: [u8; 32] = Sha256::digest(&original).into();
-    let text = std::str::from_utf8(&original).context("Bilibili NFO is not valid UTF-8")?;
+    let text = std::str::from_utf8(&original).context("NFO is not valid UTF-8")?;
     let rewritten = rewrite_nfo_local_references(
         text,
         renamed_files,
@@ -13374,8 +13374,8 @@ fn read_bilibili_nfo_rewrite(
         root,
         source_parent_relative,
     )?;
-    if rewritten.len() > BILIBILI_NFO_REWRITE_LIMIT {
-        bail!("rewritten Bilibili NFO exceeds its bounded size");
+    if rewritten.len() > NFO_LOCAL_REFERENCE_REWRITE_LIMIT {
+        bail!("rewritten NFO exceeds its bounded size");
     }
     let contents = (rewritten.as_bytes() != original.as_slice()).then(|| rewritten.into_bytes());
     Ok((identity, contents, original_sha256))
@@ -13407,31 +13407,31 @@ fn replace_bilibili_nfo_atomically(
         &temp_path,
         contents,
         mode,
-        BILIBILI_NFO_REWRITE_LIMIT,
+        NFO_LOCAL_REFERENCE_REWRITE_LIMIT,
         &mut |staged_entry, staged_file, staged_identity| {
             let current = root.open_bound_file_if_identity(&entry, expected_identity)?;
-            let current_contents = current.read_limited(BILIBILI_NFO_REWRITE_LIMIT)?;
+            let current_contents = current.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
             let current_sha256: [u8; 32] = Sha256::digest(&current_contents).into();
             if current_sha256 != original_sha256 {
-                bail!("Bilibili NFO content changed during local-reference remapping");
+                bail!("NFO content changed during local-reference remapping");
             }
             if staged_file.identity() != staged_identity
                 || root.bound_entry_identity(staged_entry)? != Some(staged_identity)
-                || staged_file.read_limited(BILIBILI_NFO_REWRITE_LIMIT)? != contents
+                || staged_file.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents
             {
-                bail!("staged Bilibili NFO contents changed during local-reference remapping");
+                bail!("staged NFO contents changed during local-reference remapping");
             }
             Ok(())
         },
     )?;
     let saved = root.open_bound_file_if_identity(&entry, new_identity)?;
-    if saved.read_limited(BILIBILI_NFO_REWRITE_LIMIT)? != contents {
-        bail!("Bilibili NFO contents changed after atomic local-reference rewrite");
+    if saved.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents {
+        bail!("NFO contents changed after atomic local-reference rewrite");
     }
     Ok(new_identity)
 }
 
-fn rewrite_bilibili_publication_nfo_copies(
+fn rewrite_publication_nfo_copies(
     root: &RootedFs,
     staging_dir: &Path,
     plan: &mut [MoveStep],
@@ -13458,21 +13458,21 @@ fn rewrite_bilibili_publication_nfo_copies(
             .entry_identity(&staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME))?
             .is_some()
     {
-        bail!("cannot rewrite Bilibili NFO copies while staged publication recovery is pending");
+        bail!("cannot rewrite NFO copies while staged publication recovery is pending");
     }
     for nfo_index in nfo_indices {
         let nfo_source = plan[nfo_index].source.clone();
-        let Some(owner_index) = bilibili_sidecar_owner_index(&nfo_source, &primaries) else {
+        let Some(owner_index) = staged_video_sidecar_owner_index(&nfo_source, &primaries) else {
             continue;
         };
         let (_, primary_source, primary_destination) = primaries
             .iter()
             .find(|(index, _, _)| *index == owner_index)
-            .context("Bilibili NFO lost its staged primary owner")?;
+            .context("NFO lost its staged primary owner")?;
         let mut renamed_files = Vec::new();
         for (index, step) in plan.iter().enumerate() {
             if index == nfo_index
-                || bilibili_sidecar_owner_index(&step.source, &primaries) != Some(owner_index)
+                || staged_video_sidecar_owner_index(&step.source, &primaries) != Some(owner_index)
             {
                 continue;
             }
@@ -13480,28 +13480,28 @@ fn rewrite_bilibili_publication_nfo_copies(
                 step.source
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .context("Bilibili staged filename is not UTF-8")?
+                    .context("staged filename is not UTF-8")?
                     .to_string(),
                 step.destination
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .context("Bilibili publication filename is not UTF-8")?
+                    .context("publication filename is not UTF-8")?
                     .to_string(),
             ));
         }
         let old_primary_filename = primary_source
             .file_name()
             .and_then(|name| name.to_str())
-            .context("Bilibili staged primary filename is not UTF-8")?;
+            .context("staged primary filename is not UTF-8")?;
         let new_primary_filename = primary_destination
             .file_name()
             .and_then(|name| name.to_str())
-            .context("Bilibili publication primary filename is not UTF-8")?;
+            .context("publication primary filename is not UTF-8")?;
         let source_parent = nfo_source
             .parent()
-            .context("Bilibili NFO has no staged source parent")?;
+            .context("NFO has no staged source parent")?;
         let source_parent_relative = rooted_relative_directory(root, source_parent)?;
-        let (identity, rewritten, original_sha256) = read_bilibili_nfo_rewrite(
+        let (identity, rewritten, original_sha256) = read_nfo_local_reference_rewrite(
             root,
             &nfo_source,
             None,
@@ -13513,26 +13513,25 @@ fn rewrite_bilibili_publication_nfo_copies(
         let Some(contents) = rewritten else {
             continue;
         };
-        let copy =
-            persist_bilibili_publication_nfo_copy(root, staging_dir, &nfo_source, &contents)?;
+        let copy = persist_publication_nfo_copy(root, staging_dir, &nfo_source, &contents)?;
         let source_entry = root.bind_entry(&nfo_source, false)?;
         let source = root.open_bound_file_if_identity(&source_entry, identity)?;
-        let source_contents = source.read_limited(BILIBILI_NFO_REWRITE_LIMIT)?;
+        let source_contents = source.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
         let source_sha256: [u8; 32] = Sha256::digest(&source_contents).into();
         if source_sha256 != original_sha256 {
-            bail!("Bilibili NFO source contents changed while its publication copy was prepared");
+            bail!("NFO source contents changed while its publication copy was prepared");
         }
         plan[nfo_index].logical_source = Some(nfo_source);
         plan[nfo_index].source = copy;
         if plan[nfo_index].expected_identity.is_some() {
-            bail!("Bilibili NFO source identity was captured before remapping");
+            bail!("NFO source identity was captured before remapping");
         }
         // The retry source remains unchanged; only the private publication copy is remapped.
     }
     Ok(())
 }
 
-fn persist_bilibili_publication_nfo_copy(
+fn persist_publication_nfo_copy(
     root: &RootedFs,
     staging_dir: &Path,
     original_nfo: &Path,
@@ -13540,16 +13539,14 @@ fn persist_bilibili_publication_nfo_copy(
 ) -> Result<PathBuf> {
     let relative = original_nfo
         .strip_prefix(staging_dir)
-        .context("Bilibili NFO source is outside its owned staging directory")?;
-    let relative = relative
-        .to_str()
-        .context("Bilibili NFO source path is not UTF-8")?;
+        .context("NFO source is outside its owned staging directory")?;
+    let relative = relative.to_str().context("NFO source path is not UTF-8")?;
     let cache_directory = staging_dir.join(VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME);
     root.create_dir(&cache_directory, 0o700)?;
     let cache_entry = root.bind_entry(&cache_directory, false)?;
     let cache_identity = root
         .bound_entry_identity(&cache_entry)?
-        .context("Bilibili NFO publication cache directory disappeared")?;
+        .context("NFO publication cache directory disappeared")?;
     root.validate_private_bound_directory(&cache_entry, cache_identity, 0o700)?;
 
     let cache_name = format!("{:x}.nfo", Sha256::digest(relative.as_bytes()));
@@ -13564,14 +13561,14 @@ fn persist_bilibili_publication_nfo_copy(
     let saved_entry = root.bind_entry(&cache_path, false)?;
     let saved = root.open_bound_file_if_identity(&saved_entry, identity)?;
     saved.validate_private_single_link(0o600)?;
-    if saved.read_limited(BILIBILI_NFO_REWRITE_LIMIT)? != contents {
-        bail!("Bilibili NFO publication copy changed after creation");
+    if saved.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents {
+        bail!("NFO publication copy changed after creation");
     }
     root.validate_private_bound_directory(&cache_entry, cache_identity, 0o700)?;
     Ok(cache_path)
 }
 
-fn bilibili_sidecar_owner_index(
+fn staged_video_sidecar_owner_index(
     source: &Path,
     primaries: &[(usize, PathBuf, PathBuf)],
 ) -> Option<usize> {
@@ -13589,7 +13586,12 @@ fn bilibili_sidecar_owner_index(
     if matched.is_some() {
         return matched;
     }
-    unbound_bilibili_sidecar_suffix(source)?;
+    let filename = source.file_name()?.to_str()?;
+    if unbound_bilibili_sidecar_suffix(source).is_none()
+        && !youtube_is_conventional_unqualified_sidecar(filename)
+    {
+        return None;
+    }
     let mut matching = primaries
         .iter()
         .filter(|(_, primary, _)| primary.parent() == source.parent());
@@ -14564,7 +14566,10 @@ async fn run_staged_video_job(
         staging: Some(&staging),
         bilibili_group_receipt: group_receipt_context,
         bilibili_collection_destination: None,
-        rewrite_bilibili_nfo_references: matches!(job, JobRequest::Bilibili { .. }),
+        rewrite_local_nfo_references: matches!(
+            job,
+            JobRequest::Bilibili { .. } | JobRequest::Youtube { .. }
+        ),
     };
     send_bilibili_worker_entry_stage(
         progress.as_ref(),
@@ -22615,7 +22620,7 @@ struct MoveExecutionContext<'a> {
     staging: Option<&'a BoundStagingDir>,
     bilibili_group_receipt: Option<BilibiliGroupReceiptWriteContext<'a>>,
     bilibili_collection_destination: Option<BilibiliCollectionDestinationContext<'a>>,
-    rewrite_bilibili_nfo_references: bool,
+    rewrite_local_nfo_references: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -24085,7 +24090,7 @@ fn move_staged_video_files(
             staging: None,
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: false,
+            rewrite_local_nfo_references: false,
         },
         staging_dir,
         final_dir,
@@ -24248,16 +24253,11 @@ where
         overwrite_target,
         primary_media_kind,
     )?;
-    if context.rewrite_bilibili_nfo_references {
+    if context.rewrite_local_nfo_references {
         let staging = context
             .staging
-            .context("Bilibili NFO publication remapping requires owned staging")?;
-        rewrite_bilibili_publication_nfo_copies(
-            root,
-            staging.path(),
-            &mut plan,
-            primary_media_kind,
-        )?;
+            .context("NFO publication remapping requires owned staging")?;
+        rewrite_publication_nfo_copies(root, staging.path(), &mut plan, primary_media_kind)?;
     }
     let bilibili_group_receipt = if let Some(receipt_context) = context.bilibili_group_receipt {
         let media_moves = plan
@@ -24472,7 +24472,7 @@ fn move_staged_artifact_files(
             staging: None,
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
-            rewrite_bilibili_nfo_references: false,
+            rewrite_local_nfo_references: false,
         },
         staging_dir,
         final_dir,
@@ -29002,7 +29002,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -29178,7 +29178,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -29286,7 +29286,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &direct_staging_dir,
             &category_root,
@@ -29414,7 +29414,7 @@ mod tests {
                         progress: None,
                     }),
                     bilibili_collection_destination: None,
-                    rewrite_bilibili_nfo_references: false,
+                    rewrite_local_nfo_references: false,
                 },
                 &staging_dir,
                 &collection_dir,
@@ -29507,7 +29507,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -36488,7 +36488,7 @@ mod tests {
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
@@ -37330,7 +37330,7 @@ mod tests {
                 staging: None,
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
@@ -39782,7 +39782,7 @@ mod tests {
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
-                rewrite_bilibili_nfo_references: false,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
