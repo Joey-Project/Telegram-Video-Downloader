@@ -62,6 +62,8 @@ const MAX_OPERATION_STATE_FILES_PER_PASS: usize = 32;
 const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 2 * MANIFEST_LIMIT;
 const MAX_OPERATION_STATE_CLEANUP_ROOTS: usize = 8;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
+const NFO_ATTACHMENT_DECLARATION_LIMIT: usize = 128;
+pub(crate) const NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA: usize = 8;
 const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
 pub(crate) const MAX_METADATA_TITLE_CHARS: usize = 500;
 const MAX_METADATA_TITLE_BYTES: usize = 4096;
@@ -212,6 +214,14 @@ struct PreviewFileBuildContext<'a> {
     preview_anchors: &'a mut PreviewAnchorCollector,
 }
 
+struct PreviewFileBuildRequest<'a> {
+    item: &'a LibraryItem,
+    target_dir: &'a Path,
+    rename: bool,
+    conflict: ConflictPolicy,
+    synthesized_nfo_target: bool,
+}
+
 struct PreviewAnchorEntry {
     revision: String,
     anchors: HashMap<String, BoundFile>,
@@ -241,7 +251,7 @@ struct ResolvedTargetParent {
 
 // These keys only prevent preview-time collisions; they are not persisted as filesystem identity.
 // Unknown or unsupported name-comparison rules fail closed instead of being guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TargetNameSemantics {
     normalization_insensitive: bool,
     case_insensitive: bool,
@@ -421,6 +431,29 @@ fn open_validated_target_directory(
     Ok(directory)
 }
 
+fn rooted_directory_name_semantics(
+    root: &RootedFs,
+    relative_directory: &Path,
+) -> Result<TargetNameSemantics> {
+    let relative = if relative_directory.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        safe_relative_path(&path_to_relative_string(relative_directory)?, true)?
+    };
+    let absolute = root.logical_root_path().join(&relative);
+    let identity = if relative.as_os_str().is_empty() {
+        root.root_identity()
+    } else {
+        root.entry_identity(&absolute)?
+            .ok_or_else(|| anyhow!("name-semantics directory disappeared"))?
+    };
+    if !identity.is_dir() {
+        bail!("name-semantics parent is not a directory");
+    }
+    let directory = open_validated_target_directory(root, &relative, identity)?;
+    target_name_semantics(&directory)
+}
+
 fn target_component_key_with<F>(
     name: &str,
     semantics: TargetNameSemantics,
@@ -448,6 +481,58 @@ where
         key.retain(|character| !is_hfs_ignorable(character));
     }
     Ok(key)
+}
+
+/// Resolve a safe NFO basename only against scanned paths under its bound parent.
+/// Unavailable semantics or invalid paths return an error; no or multiple matches return `Ok(None)`.
+pub(crate) fn resolve_nfo_attachment_relative_path(
+    root: &RootedFs,
+    parent_relative: &Path,
+    declared_basename: &str,
+    actual_attachment_paths: &[String],
+) -> Result<Option<String>> {
+    let parent = if parent_relative.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        safe_relative_path(&path_to_relative_string(parent_relative)?, true)?
+    };
+    let semantics = target_name_semantics_for_directory(root, &parent)?;
+    resolve_nfo_attachment_relative_path_with_semantics(
+        &parent,
+        declared_basename,
+        actual_attachment_paths,
+        semantics,
+    )
+}
+
+fn resolve_nfo_attachment_relative_path_with_semantics(
+    parent: &Path,
+    declared_basename: &str,
+    actual_attachment_paths: &[String],
+    semantics: TargetNameSemantics,
+) -> Result<Option<String>> {
+    let declared_basename = canonical_nfo_attachment_basename(declared_basename)?;
+    let declared_key =
+        target_component_key_with(&declared_basename, semantics, platform_case_fold)?;
+    let mut matches = HashSet::new();
+    for candidate in actual_attachment_paths {
+        let candidate = safe_relative_path(candidate, false)?;
+        if candidate.parent().unwrap_or_else(|| Path::new("")) != parent {
+            continue;
+        }
+        let basename = candidate
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("scanned attachment has a non-UTF-8 basename"))?;
+        let candidate_key = target_component_key_with(basename, semantics, platform_case_fold)?;
+        if candidate_key == declared_key {
+            matches.insert(path_to_relative_string(&candidate)?);
+        }
+    }
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+    Ok(matches.into_iter().next())
 }
 
 fn is_private_downloader_component_with<F>(
@@ -956,6 +1041,7 @@ struct ScanTestHooks {
     scope_unknown: bool,
     expire_after_built_item: bool,
     expire_after_attachment_count: Option<usize>,
+    expire_after_nfo_declaration_count: Option<usize>,
     index_budget: Option<usize>,
     identity_reconciliation_steps: Option<Arc<AtomicUsize>>,
 }
@@ -1023,6 +1109,24 @@ struct PreparedNfoPatch {
     state: ManifestPatchState,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AttachmentNfoUpdate {
+    additions: Vec<NfoAttachmentDeclaration>,
+    renamed_files: Vec<(String, String)>,
+    old_primary_filename: String,
+    new_primary_filename: String,
+    name_semantics: TargetNameSemantics,
+}
+
+struct NfoAttachmentReferenceUpdate<'a> {
+    additions: &'a [NfoAttachmentDeclaration],
+    renamed_files: &'a [(String, String)],
+    old_primary_filename: &'a str,
+    new_primary_filename: &'a str,
+    add_localfilename_when_missing: bool,
+    semantics: TargetNameSemantics,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NfoReplacementCheckpoint {
     staged_path: String,
@@ -1063,8 +1167,15 @@ struct ScannedFile {
 #[derive(Debug, Default)]
 struct SidecarIndex {
     by_media: HashMap<String, Vec<String>>,
+    declared_roles_by_media: HashMap<String, HashMap<String, String>>,
     authoritative_nfo_by_media: HashMap<String, String>,
     ambiguous_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NfoAttachmentDeclaration {
+    role: String,
+    filename: String,
 }
 
 #[derive(Debug)]
@@ -1104,6 +1215,7 @@ struct ScanWalk {
     files: Vec<ScannedFile>,
     complete_directories: BTreeSet<String>,
     incomplete_directories: BTreeSet<String>,
+    leaf_directories: BTreeSet<String>,
     root_categories: BTreeSet<String>,
     directory_name_semantics: HashMap<String, TargetNameSemantics>,
     warnings: Vec<String>,
@@ -1122,6 +1234,7 @@ impl Default for ScanWalk {
             files: Vec::new(),
             complete_directories: BTreeSet::new(),
             incomplete_directories: BTreeSet::new(),
+            leaf_directories: BTreeSet::new(),
             root_categories: BTreeSet::new(),
             directory_name_semantics: HashMap::new(),
             warnings: Vec::new(),
@@ -1639,6 +1752,7 @@ impl LibraryManager {
             ..TargetReservationSet::default()
         };
         let mut seen_sources = HashSet::new();
+        let mut legacy_fallback_item_ids = HashSet::new();
         let mut groups = Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
             let conflict = item_conflicts.get(item_id).copied().unwrap_or(conflict);
@@ -1708,20 +1822,31 @@ impl LibraryManager {
                     .and_then(OsStr::to_str)
                     .ok_or_else(|| anyhow!("migration attachment has a non-UTF-8 filename"))?;
                 let suffix = if source_relative == &item.relative_path {
-                    String::new()
+                    Some(String::new())
                 } else {
-                    matching_sidecar_suffix_with(
+                    let matching_suffix = matching_sidecar_suffix_with(
                         source_stem,
                         primary_stem,
                         source_name_semantics,
                         platform_case_fold,
-                    )?
-                    .ok_or_else(|| {
-                        anyhow!("sidecar association changed during migration planning")
-                    })?
+                    )?;
+                    if matching_suffix.is_some() {
+                        matching_suffix
+                    } else if is_unqualified_legacy_sidecar(source_relative)
+                        || item.attachments.iter().any(|attachment| {
+                            attachment.relative_path == *source_relative
+                                && supported_nfo_attachment_role(&attachment.kind).is_some()
+                        })
+                    {
+                        None
+                    } else {
+                        bail!("sidecar association changed during migration planning")
+                    }
                 };
-                longest_filename_tail =
-                    longest_filename_tail.max(filename_tail_bytes(&source_absolute, &suffix)?);
+                if let Some(suffix) = suffix.as_deref() {
+                    longest_filename_tail =
+                        longest_filename_tail.max(filename_tail_bytes(&source_absolute, suffix)?);
+                }
                 planned_sources.push((source_relative.clone(), source_absolute, suffix));
             }
 
@@ -1738,8 +1863,17 @@ impl LibraryManager {
                 let targets = planned_sources
                     .iter()
                     .map(|(_, source_absolute, suffix)| {
-                        let name =
-                            file_name_with_stem(source_absolute, target_primary_stem, suffix)?;
+                        let name = if let Some(suffix) = suffix {
+                            file_name_with_stem(source_absolute, target_primary_stem, suffix)?
+                        } else {
+                            source_absolute
+                                .file_name()
+                                .and_then(OsStr::to_str)
+                                .ok_or_else(|| {
+                                    anyhow!("migration attachment has a non-UTF-8 filename")
+                                })?
+                                .to_string()
+                        };
                         path_to_relative_string(&target_parent.join(name))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1749,6 +1883,78 @@ impl LibraryManager {
             let (mut target_path, mut target_paths) = candidate_for_stem("")?;
             let has_conflict = migration_targets_conflict(target, &target_paths, &mut reserved)?;
             let mut skip_group = has_conflict && conflict == ConflictPolicy::Skip;
+            let mut checked_nfo_content_digests = HashMap::new();
+
+            let mut nfo_sources = item
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.kind == "nfo")
+                .map(|attachment| attachment.relative_path.clone())
+                .collect::<Vec<_>>();
+            if let Some(authoritative) = &item.authoritative_nfo_path {
+                nfo_sources.push(authoritative.clone());
+            }
+            nfo_sources.sort();
+            nfo_sources.dedup();
+
+            let legacy_paths = planned_sources
+                .iter()
+                .filter(|(source, _, suffix)| {
+                    source != &item.relative_path
+                        && suffix.is_none()
+                        && is_unqualified_legacy_sidecar(source)
+                })
+                .map(|(source, _, _)| source.as_str())
+                .collect::<Vec<_>>();
+            let mut loaded_nfo_contents = HashMap::<String, Vec<u8>>::new();
+            if !legacy_paths.is_empty() {
+                if nfo_sources.len() <= NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA {
+                    for nfo_relative in &nfo_sources {
+                        let nfo_path = self.absolute_path(nfo_relative)?;
+                        let contents =
+                            self.read_file(&nfo_path, SIDE_CAR_LIMIT)?.ok_or_else(|| {
+                                if item.authoritative_nfo_path.as_deref()
+                                    == Some(nfo_relative.as_str())
+                                {
+                                    anyhow!("authoritative migration NFO disappeared")
+                                } else {
+                                    anyhow!("attached migration NFO disappeared")
+                                }
+                            })?;
+                        checked_nfo_content_digests
+                            .insert(nfo_relative.clone(), sha256_bytes(&contents));
+                        loaded_nfo_contents.insert(nfo_relative.clone(), contents);
+                    }
+                }
+
+                let actual_attachment_paths = item
+                    .attachments
+                    .iter()
+                    .map(|attachment| attachment.relative_path.clone())
+                    .collect::<Vec<_>>();
+                let nfo_contents = loaded_nfo_contents.values().cloned().collect::<Vec<_>>();
+                let all_nfos_read = nfo_sources.len() <= NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA
+                    && loaded_nfo_contents.len() == nfo_sources.len();
+                let mut all_legacy_paths_proven = all_nfos_read;
+                if all_legacy_paths_proven {
+                    for attachment_path in &legacy_paths {
+                        if !migration_nfo_proves_attachment(
+                            &item.relative_path,
+                            attachment_path,
+                            &actual_attachment_paths,
+                            &nfo_contents,
+                            source_name_semantics,
+                        )? {
+                            all_legacy_paths_proven = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_legacy_paths_proven {
+                    legacy_fallback_item_ids.insert(item_id.clone());
+                }
+            }
+
             if has_conflict && conflict == ConflictPolicy::KeepBoth {
                 let mut found = false;
                 for number in 2..=10_000 {
@@ -1762,14 +1968,82 @@ impl LibraryManager {
                     }
                 }
                 if !found {
-                    bail!("could not find a free keep-both migration filename");
+                    if planned_sources
+                        .iter()
+                        .any(|(_, _, suffix)| suffix.is_none())
+                    {
+                        skip_group = true;
+                    } else {
+                        bail!("could not find a free keep-both migration filename");
+                    }
+                } else {
+                    let references_need_rewrite = if nfo_sources.len()
+                        > NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA
+                    {
+                        true
+                    } else {
+                        let source_primary_filename = Path::new(&item.relative_path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default();
+                        let target_primary_filename = Path::new(&target_path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default();
+                        let mut needs_rewrite = false;
+                        for nfo_relative in nfo_sources {
+                            let contents =
+                                if let Some(contents) = loaded_nfo_contents.get(&nfo_relative) {
+                                    contents.clone()
+                                } else {
+                                    let nfo_path = self.absolute_path(&nfo_relative)?;
+                                    self.read_file(&nfo_path, SIDE_CAR_LIMIT)?.ok_or_else(|| {
+                                        if item.authoritative_nfo_path.as_deref()
+                                            == Some(nfo_relative.as_str())
+                                        {
+                                            anyhow!("authoritative migration NFO disappeared")
+                                        } else {
+                                            anyhow!("attached migration NFO disappeared")
+                                        }
+                                    })?
+                                };
+                            checked_nfo_content_digests
+                                .insert(nfo_relative.clone(), sha256_bytes(&contents));
+                            let Ok(content) = String::from_utf8(contents) else {
+                                needs_rewrite = true;
+                                continue;
+                            };
+                            needs_rewrite |= migration_nfo_references_need_rewrite(
+                                &content,
+                                source_primary_filename,
+                                target_primary_filename,
+                                &planned_sources,
+                                &target_paths,
+                                source_name_semantics,
+                            );
+                        }
+                        needs_rewrite
+                    };
+                    if references_need_rewrite {
+                        // Migration has no NFO rewrite transaction. A KeepBoth rename that would
+                        // invalidate a relative manifest or localfilename must remain untouched.
+                        skip_group = true;
+                    }
                 }
-                skip_group = false;
+                if found && !skip_group {
+                    skip_group = false;
+                }
             }
 
             let mut files = Vec::with_capacity(planned_sources.len());
             for ((source_path, _, _), target_path) in planned_sources.iter().zip(&target_paths) {
                 let proof = self.migration_file_proof(source_path)?;
+                if checked_nfo_content_digests
+                    .get(source_path)
+                    .is_some_and(|digest| digest != &proof.sha256)
+                {
+                    skip_group = true;
+                }
                 files.push(MigrationPlannedFile {
                     source_path: source_path.clone(),
                     target_path: target_path.clone(),
@@ -1793,6 +2067,67 @@ impl LibraryManager {
                 conflict: has_conflict,
                 files,
             });
+        }
+
+        if !legacy_fallback_item_ids.is_empty() {
+            let mut target_directory_keys = Vec::with_capacity(groups.len());
+            for group in &groups {
+                let parent = Path::new(&group.target_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""));
+                target_directory_keys
+                    .push(migration_target_directory_reservation_key(target, parent)?);
+            }
+
+            let layout_deadline = Instant::now() + SCAN_TIMEOUT;
+            let mut layouts = HashMap::new();
+            for (group, key) in groups.iter().zip(&target_directory_keys) {
+                if group.outcome != MigrationPlanOutcome::Move
+                    || !legacy_fallback_item_ids.contains(&group.item_id)
+                    || layouts.contains_key(key)
+                {
+                    continue;
+                }
+                let parent = Path::new(&group.target_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""));
+                layouts.insert(
+                    key.clone(),
+                    migration_target_directory_layout(target, parent, layout_deadline)?,
+                );
+            }
+
+            let incoming_move_keys = groups
+                .iter()
+                .zip(&target_directory_keys)
+                .filter(|(group, _)| group.outcome == MigrationPlanOutcome::Move)
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            for (index, group) in groups.iter_mut().enumerate() {
+                if group.outcome != MigrationPlanOutcome::Move
+                    || !legacy_fallback_item_ids.contains(&group.item_id)
+                {
+                    continue;
+                }
+                let key = &target_directory_keys[index];
+                let layout = layouts.get(key).copied().unwrap_or_default();
+                let incoming_primaries = incoming_move_keys
+                    .iter()
+                    .filter(|candidate| *candidate == key)
+                    .count();
+                let incoming_child_directory = incoming_move_keys.iter().any(|candidate| {
+                    migration_target_directory_is_strict_descendant(key, candidate)
+                });
+                if layout
+                    .existing_primary_count
+                    .saturating_add(incoming_primaries)
+                    != 1
+                    || layout.has_visible_child_directory
+                    || incoming_child_directory
+                {
+                    group.outcome = MigrationPlanOutcome::Skip;
+                }
+            }
         }
         Ok(groups)
     }
@@ -2855,6 +3190,14 @@ impl LibraryManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn expire_next_scan_during_nfo_declarations_after(&self, source_count: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .expire_after_nfo_declaration_count = Some(source_count);
+    }
+
+    #[cfg(test)]
     fn limit_next_scan_index_to(&self, bytes: usize) {
         self.scan_test_hooks
             .lock()
@@ -3238,10 +3581,17 @@ impl LibraryManager {
                     preview_anchors: &mut preview_anchors,
                 };
                 self.preview_files_for_item(
-                    item,
-                    &item_target_dir,
-                    rename,
-                    conflict,
+                    PreviewFileBuildRequest {
+                        item,
+                        target_dir: &item_target_dir,
+                        rename,
+                        conflict,
+                        synthesized_nfo_target: item.authoritative_nfo_path.is_none()
+                            && (patches.iter().any(|patch| patch.item_id == item.id)
+                                || item.attachments.iter().any(|attachment| {
+                                    is_unqualified_legacy_sidecar(&attachment.relative_path)
+                                })),
+                    },
                     &mut context,
                     target_device_for_path,
                 )?
@@ -3268,6 +3618,16 @@ impl LibraryManager {
                 for file in &files {
                     reserved_targets.insert(&self.root, &file.target_path)?;
                 }
+                if item.authoritative_nfo_path.is_none()
+                    && (patches.iter().any(|patch| patch.item_id == item.id)
+                        || item.attachments.iter().any(|attachment| {
+                            is_unqualified_legacy_sidecar(&attachment.relative_path)
+                        }))
+                {
+                    let synthesized_nfo = with_extension(Path::new(&main_target), "nfo");
+                    reserved_targets
+                        .insert(&self.root, &path_to_relative_string(&synthesized_nfo)?)?;
+                }
             }
             move_items.push(MovePreviewItem {
                 item_id: item.id.clone(),
@@ -3277,6 +3637,41 @@ impl LibraryManager {
                 files,
                 reason,
             });
+        }
+
+        let mut operation_patches = patches.to_vec();
+        let mut attachment_only_patch_ids = HashSet::new();
+        let mut explicit_patch_ids = operation_patches
+            .iter()
+            .map(|patch| patch.item_id.clone())
+            .collect::<HashSet<_>>();
+        for move_item in move_items
+            .iter()
+            .filter(|move_item| move_item.outcome == MoveOutcome::Move)
+        {
+            if explicit_patch_ids.contains(move_item.item_id.as_str()) {
+                continue;
+            }
+            let Some(item) = items_by_id.get(move_item.item_id.as_str()) else {
+                continue;
+            };
+            let needs_attachment_patch = item.authoritative_nfo_path.is_some()
+                || item
+                    .attachments
+                    .iter()
+                    .any(|attachment| is_unqualified_legacy_sidecar(&attachment.relative_path));
+            if needs_attachment_patch {
+                operation_patches.push(MetadataPatch {
+                    item_id: item.id.clone(),
+                    title: None,
+                    source_ids: Vec::new(),
+                    collection: None,
+                    fill_missing_only: true,
+                    organization_status: None,
+                });
+                attachment_only_patch_ids.insert(item.id.clone());
+                explicit_patch_ids.insert(move_item.item_id.clone());
+            }
         }
 
         let mut patch_ids = HashSet::new();
@@ -3300,37 +3695,35 @@ impl LibraryManager {
             }
         }
         let mut source_nfo_owners: HashMap<TargetReservationKey, Vec<&str>> = HashMap::new();
-        if !patches.is_empty() {
-            for source_item in &snapshot.items {
-                let source_media = self.absolute_path(&source_item.relative_path)?;
-                let canonical_nfo = with_extension(&source_media, "nfo");
-                let mut source_nfo_paths = vec![path_to_relative_string(
-                    canonical_nfo.strip_prefix(self.root.logical_root_path())?,
-                )?];
-                source_nfo_paths.extend(
-                    source_item
-                        .attachments
-                        .iter()
-                        .filter(|attachment| attachment.kind == "nfo")
-                        .map(|attachment| attachment.relative_path.clone()),
-                );
-                if let Some(authoritative) = &source_item.authoritative_nfo_path {
-                    source_nfo_paths.push(authoritative.clone());
-                }
-                source_nfo_paths.sort();
-                source_nfo_paths.dedup();
-                for source_nfo_relative in source_nfo_paths {
-                    let key = reserved_targets.key_for(&self.root, &source_nfo_relative)?;
-                    source_nfo_owners
-                        .entry(key)
-                        .or_default()
-                        .push(source_item.id.as_str());
-                }
+        for source_item in &snapshot.items {
+            let source_media = self.absolute_path(&source_item.relative_path)?;
+            let canonical_nfo = with_extension(&source_media, "nfo");
+            let mut source_nfo_paths = vec![path_to_relative_string(
+                canonical_nfo.strip_prefix(self.root.logical_root_path())?,
+            )?];
+            source_nfo_paths.extend(
+                source_item
+                    .attachments
+                    .iter()
+                    .filter(|attachment| attachment.kind == "nfo")
+                    .map(|attachment| attachment.relative_path.clone()),
+            );
+            if let Some(authoritative) = &source_item.authoritative_nfo_path {
+                source_nfo_paths.push(authoritative.clone());
+            }
+            source_nfo_paths.sort();
+            source_nfo_paths.dedup();
+            for source_nfo_relative in source_nfo_paths {
+                let key = reserved_targets.key_for(&self.root, &source_nfo_relative)?;
+                source_nfo_owners
+                    .entry(key)
+                    .or_default()
+                    .push(source_item.id.as_str());
             }
         }
         let mut patch_target_owners: HashMap<TargetReservationKey, &str> = HashMap::new();
         let mut patch_previews = Vec::new();
-        for patch in patches {
+        for patch in &operation_patches {
             if !patch_ids.insert(patch.item_id.as_str()) {
                 bail!("a media item has more than one metadata patch");
             }
@@ -3343,7 +3736,9 @@ impl LibraryManager {
                     item.relative_path
                 );
             }
-            validate_metadata_patch(patch)?;
+            if !attachment_only_patch_ids.contains(patch.item_id.as_str()) {
+                validate_metadata_patch(patch)?;
+            }
             if patch.fill_missing_only
                 && item.collection.as_ref().is_some_and(|stored| {
                     patch.collection.as_ref().is_some_and(|requested| {
@@ -3375,144 +3770,256 @@ impl LibraryManager {
             let target_media = move_target
                 .map(|entry| entry.target_path.as_str())
                 .unwrap_or(&item.relative_path);
-            let source_nfo_relative = match &item.authoritative_nfo_path {
-                Some(path) => path.clone(),
-                None => {
-                    let source_nfo = with_extension(&source_media, "nfo");
-                    path_to_relative_string(
-                        source_nfo.strip_prefix(self.root.logical_root_path())?,
-                    )?
+            let nfo_attachment_update = if let Some(move_item) = move_target {
+                let source_parent = Path::new(&item.relative_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""));
+                let name_semantics = self.name_semantics_for_relative_directory(source_parent)?;
+                attachment_nfo_update_for_move(item, move_item, name_semantics)?
+            } else {
+                AttachmentNfoUpdate {
+                    old_primary_filename: Path::new(&item.relative_path)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    new_primary_filename: Path::new(target_media)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    ..AttachmentNfoUpdate::default()
                 }
             };
-            let target_nfo_relative = match (&item.authoritative_nfo_path, move_target) {
-                (Some(source_nfo), Some(move_item)) => move_item
-                    .files
+            let mut source_nfo_paths = if move_target.is_some() {
+                let mut attached = item
+                    .attachments
                     .iter()
-                    .find(|file| file.source_path == *source_nfo)
-                    .map(|file| file.target_path.clone())
-                    .ok_or_else(|| anyhow!("authoritative NFO was omitted from the move plan"))?,
-                (Some(source_nfo), None) => source_nfo.clone(),
-                (None, _) => {
+                    .filter(|attachment| attachment.kind == "nfo")
+                    .map(|attachment| attachment.relative_path.clone())
+                    .collect::<Vec<_>>();
+                attached.sort();
+                attached.dedup();
+                if attached.len() > NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA {
+                    item.authoritative_nfo_path.iter().cloned().collect()
+                } else {
+                    attached
+                }
+            } else {
+                item.authoritative_nfo_path.iter().cloned().collect()
+            };
+            source_nfo_paths.sort();
+            source_nfo_paths.dedup();
+            if item.authoritative_nfo_path.is_none() && !source_nfo_paths.is_empty() {
+                bail!("attached NFO sources have no authoritative selection");
+            }
+            if let Some(authoritative) = &item.authoritative_nfo_path
+                && !source_nfo_paths.contains(authoritative)
+            {
+                bail!("selected authoritative NFO is not attached to the scanned media item");
+            }
+            let synthesize_nfo = source_nfo_paths.is_empty();
+            if synthesize_nfo {
+                let source_nfo = with_extension(&source_media, "nfo");
+                source_nfo_paths.push(path_to_relative_string(
+                    source_nfo.strip_prefix(self.root.logical_root_path())?,
+                )?);
+            }
+            for source_nfo_relative in source_nfo_paths {
+                let is_authoritative_nfo = synthesize_nfo
+                    || item.authoritative_nfo_path.as_deref() == Some(&source_nfo_relative);
+                let target_nfo_relative = if synthesize_nfo {
                     let target_nfo = with_extension(&self.absolute_path(target_media)?, "nfo");
                     path_to_relative_string(
                         target_nfo.strip_prefix(self.root.logical_root_path())?,
                     )?
-                }
-            };
-            let source_nfo = self.absolute_path(&source_nfo_relative)?;
-            let target_nfo_key = reserved_targets.key_for(&self.root, &target_nfo_relative)?;
-            if source_nfo_owners
-                .get(&target_nfo_key)
-                .is_some_and(|owners| owners.iter().any(|owner| *owner != item.id.as_str()))
-            {
-                bail!(
-                    "metadata patch destination is also a source sidecar candidate for another media item: {target_nfo_relative}"
-                );
-            }
-            if move_file_owners
-                .get(&target_nfo_key)
-                .is_some_and(|owner| *owner != item.id.as_str())
-            {
-                bail!(
-                    "metadata patch destination conflicts with another media item's move target: {target_nfo_relative}"
-                );
-            }
-            if patch_target_owners
-                .insert(target_nfo_key, item.id.as_str())
-                .is_some()
-            {
-                bail!(
-                    "multiple metadata patches resolve to the same NFO target: {target_nfo_relative}"
-                );
-            }
-            let existing =
-                self.read_file_with_token_and_handle(&source_nfo, Some(SIDE_CAR_LIMIT))?;
-            let (expected_identity, expected_sha256, expected_mode, original) = match existing {
-                Some(BoundFileRead {
-                    token,
-                    digest: sha,
-                    contents: bytes,
-                    file,
-                }) => {
-                    let decoded = decode_identity_token(&token)?;
-                    preview_anchors.retain(token.clone(), file)?;
-                    (
-                        Some(token),
-                        Some(sha),
-                        Some((decoded.mode & 0o777) as u16),
-                        Some(bytes),
-                    )
-                }
-                None if item.authoritative_nfo_path.is_some() => {
-                    bail!("authoritative NFO disappeared before metadata preview")
-                }
-                None => (None, None, None, None),
-            };
-            let new_contents = match original.as_deref() {
-                Some(original) => {
-                    let source = std::str::from_utf8(original)
-                        .context("selected NFO is not UTF-8; no metadata patch was prepared")?;
-                    if patch.organization_status == Some(OrganizationStatus::Standalone)
-                        && (item.collection.is_some() || nfo_has_collection_metadata(source))
-                    {
-                        bail!("a media item with collection metadata cannot be marked standalone");
-                    }
-                    append_metadata_patch(source, patch)?.into_bytes()
-                }
-                None => {
-                    if patch.organization_status == Some(OrganizationStatus::Standalone)
-                        && item.collection.is_some()
-                    {
-                        bail!("a media item with collection metadata cannot be marked standalone");
-                    }
-                    new_nfo(patch.title.as_deref().unwrap_or(&item.title), patch).into_bytes()
-                }
-            };
-            let after_sha256 = sha256_bytes(&new_contents);
-            let after_text =
-                std::str::from_utf8(&new_contents).context("prepared NFO patch is not UTF-8")?;
-            let before_text = original
-                .as_deref()
-                .map(|bytes| std::str::from_utf8(bytes).context("selected NFO is not UTF-8"))
-                .transpose()?;
-            let changes = metadata_field_changes(before_text, after_text);
-            let changed = expected_sha256.as_deref() != Some(after_sha256.as_str());
-            if changed && let Some(expected_identity) = expected_identity.as_deref() {
-                let token = decode_identity_token(expected_identity)?;
-                if token.uid != unsafe { libc::geteuid() as u32 }
-                    || token.gid != unsafe { libc::getegid() as u32 }
-                    || token.mode & 0o7000 != 0
+                } else if let Some(move_item) = move_target {
+                    move_item
+                        .files
+                        .iter()
+                        .find(|file| file.source_path == source_nfo_relative)
+                        .map(|file| file.target_path.clone())
+                        .ok_or_else(|| anyhow!("attached NFO was omitted from the move plan"))?
+                } else {
+                    source_nfo_relative.clone()
+                };
+                let target_nfo_key = reserved_targets.key_for(&self.root, &target_nfo_relative)?;
+                if source_nfo_owners
+                    .get(&target_nfo_key)
+                    .is_some_and(|owners| owners.iter().any(|owner| *owner != item.id.as_str()))
                 {
                     bail!(
-                        "existing NFO ownership or special permissions cannot be preserved safely"
+                        "metadata patch destination is also a source sidecar candidate for another media item: {target_nfo_relative}"
                     );
                 }
+                if move_file_owners
+                    .get(&target_nfo_key)
+                    .is_some_and(|owner| *owner != item.id.as_str())
+                {
+                    bail!(
+                        "metadata patch destination conflicts with another media item's move target: {target_nfo_relative}"
+                    );
+                }
+                if patch_target_owners
+                    .insert(target_nfo_key, item.id.as_str())
+                    .is_some()
+                {
+                    bail!(
+                        "multiple metadata patches resolve to the same NFO target: {target_nfo_relative}"
+                    );
+                }
+                let source_nfo = self.absolute_path(&source_nfo_relative)?;
+                let existing =
+                    self.read_file_with_token_and_handle(&source_nfo, Some(SIDE_CAR_LIMIT))?;
+                let (expected_identity, expected_sha256, expected_mode, original) = match existing {
+                    Some(BoundFileRead {
+                        token,
+                        digest: sha,
+                        contents: bytes,
+                        file,
+                    }) => {
+                        let decoded = decode_identity_token(&token)?;
+                        preview_anchors.retain(token.clone(), file)?;
+                        (
+                            Some(token),
+                            Some(sha),
+                            Some((decoded.mode & 0o777) as u16),
+                            Some(bytes),
+                        )
+                    }
+                    None if item.authoritative_nfo_path.as_deref()
+                        == Some(source_nfo_relative.as_str()) =>
+                    {
+                        bail!("authoritative NFO disappeared before metadata preview")
+                    }
+                    None if !synthesize_nfo => {
+                        bail!("attached NFO disappeared before metadata preview")
+                    }
+                    None => (None, None, None, None),
+                };
+                if synthesize_nfo && original.is_some() {
+                    bail!("unassociated source NFO exists at the synthesized metadata path");
+                }
+                let neutral_patch = MetadataPatch {
+                    item_id: item.id.clone(),
+                    title: None,
+                    source_ids: Vec::new(),
+                    collection: None,
+                    fill_missing_only: true,
+                    organization_status: None,
+                };
+                let patch_for_nfo = if is_authoritative_nfo {
+                    patch
+                } else {
+                    &neutral_patch
+                };
+                let new_contents = if is_authoritative_nfo {
+                    match original.as_deref() {
+                        Some(original) => {
+                            let source = std::str::from_utf8(original).context(
+                                "selected NFO is not UTF-8; no metadata patch was prepared",
+                            )?;
+                            if patch.organization_status == Some(OrganizationStatus::Standalone)
+                                && (item.collection.is_some()
+                                    || nfo_has_collection_metadata(source))
+                            {
+                                bail!(
+                                    "a media item with collection metadata cannot be marked standalone"
+                                );
+                            }
+                            append_metadata_patch(source, patch)?.into_bytes()
+                        }
+                        None => {
+                            if patch.organization_status == Some(OrganizationStatus::Standalone)
+                                && item.collection.is_some()
+                            {
+                                bail!(
+                                    "a media item with collection metadata cannot be marked standalone"
+                                );
+                            }
+                            new_nfo(patch.title.as_deref().unwrap_or(&item.title), patch)
+                                .into_bytes()
+                        }
+                    }
+                } else {
+                    original
+                        .clone()
+                        .ok_or_else(|| anyhow!("secondary NFO disappeared before rewrite"))?
+                };
+                let additions = if is_authoritative_nfo {
+                    nfo_attachment_update.additions.as_slice()
+                } else {
+                    &[]
+                };
+                let new_contents = update_nfo_attachment_references(
+                    std::str::from_utf8(&new_contents)
+                        .context("prepared NFO patch is not UTF-8")?,
+                    NfoAttachmentReferenceUpdate {
+                        additions,
+                        renamed_files: &nfo_attachment_update.renamed_files,
+                        old_primary_filename: &nfo_attachment_update.old_primary_filename,
+                        new_primary_filename: &nfo_attachment_update.new_primary_filename,
+                        add_localfilename_when_missing: is_authoritative_nfo,
+                        semantics: nfo_attachment_update.name_semantics,
+                    },
+                )?
+                .into_bytes();
+                let after_sha256 = sha256_bytes(&new_contents);
+                if !is_authoritative_nfo
+                    && expected_sha256.as_deref() == Some(after_sha256.as_str())
+                {
+                    continue;
+                }
+                let after_text = std::str::from_utf8(&new_contents)
+                    .context("prepared NFO patch is not UTF-8")?;
+                let before_text = original
+                    .as_deref()
+                    .map(|bytes| std::str::from_utf8(bytes).context("selected NFO is not UTF-8"))
+                    .transpose()?;
+                let changed = expected_sha256.as_deref() != Some(after_sha256.as_str());
+                if changed && let Some(expected_identity) = expected_identity.as_deref() {
+                    let token = decode_identity_token(expected_identity)?;
+                    if token.uid != unsafe { libc::geteuid() as u32 }
+                        || token.gid != unsafe { libc::getegid() as u32 }
+                        || token.mode & 0o7000 != 0
+                    {
+                        bail!(
+                            "existing NFO ownership or special permissions cannot be preserved safely"
+                        );
+                    }
+                }
+                let changes = metadata_field_changes(before_text, after_text);
+                let added_source_ids = if is_authoritative_nfo {
+                    let existing_nfo = original
+                        .as_deref()
+                        .map(std::str::from_utf8)
+                        .transpose()
+                        .context("selected NFO is not UTF-8; no metadata patch was prepared")?;
+                    accepted_patch_source_ids(existing_nfo, &patch.source_ids)?
+                } else {
+                    Vec::new()
+                };
+                patch_previews.push(MetadataPatchPreview {
+                    item_id: item.id.clone(),
+                    nfo_path: target_nfo_relative.clone(),
+                    changed,
+                    added_source_ids,
+                    changes,
+                });
+                prepared_patches.push(PreparedNfoPatch {
+                    patch: patch_for_nfo.clone(),
+                    target_path: target_nfo_relative,
+                    media_target_path: target_media.to_string(),
+                    media_identity: media_identity.clone(),
+                    expected_identity,
+                    expected_sha256,
+                    expected_mode,
+                    after_sha256,
+                    replacement: new_contents,
+                    replacement_checkpoint: None,
+                    state: ManifestPatchState::Pending,
+                });
             }
-            let existing_ids = original
-                .as_deref()
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .map(nfo_source_ids)
-                .unwrap_or_default();
-            patch_previews.push(MetadataPatchPreview {
-                item_id: item.id.clone(),
-                nfo_path: target_nfo_relative.clone(),
-                changed,
-                added_source_ids: missing_patch_source_ids(existing_ids, &patch.source_ids),
-                changes,
-            });
-            prepared_patches.push(PreparedNfoPatch {
-                patch: patch.clone(),
-                target_path: target_nfo_relative,
-                media_target_path: target_media.to_string(),
-                media_identity,
-                expected_identity,
-                expected_sha256,
-                expected_mode,
-                after_sha256,
-                replacement: new_contents,
-                replacement_checkpoint: None,
-                state: ManifestPatchState::Pending,
-            });
         }
 
         let id = new_operation_id("preview");
@@ -3546,13 +4053,17 @@ impl LibraryManager {
 
     fn preview_files_for_item(
         &self,
-        item: &LibraryItem,
-        target_dir: &Path,
-        rename: bool,
-        conflict: ConflictPolicy,
+        request: PreviewFileBuildRequest<'_>,
         context: &mut PreviewFileBuildContext<'_>,
         target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
     ) -> Result<Vec<FileMovePreview>> {
+        let PreviewFileBuildRequest {
+            item,
+            target_dir,
+            rename,
+            conflict,
+            synthesized_nfo_target,
+        } = request;
         let primary = self.absolute_path(&item.relative_path)?;
         let mut source_paths = vec![item.relative_path.clone()];
         source_paths.extend(
@@ -3607,7 +4118,7 @@ impl LibraryManager {
                 .and_then(OsStr::to_str)
                 .ok_or_else(|| anyhow!("attached media has a non-UTF-8 filename"))?;
             let suffix = if source_rel == &item.relative_path {
-                String::new()
+                Some(String::new())
             } else {
                 matching_sidecar_suffix_with(
                     source_stem,
@@ -3615,31 +4126,68 @@ impl LibraryManager {
                     name_semantics,
                     platform_case_fold,
                 )?
-                .unwrap_or_default()
             };
-            let tail_bytes = filename_tail_bytes(&source_abs, &suffix)?;
-            longest_filename_tail = longest_filename_tail.max(tail_bytes);
+            if let Some(suffix) = suffix.as_deref() {
+                let tail_bytes = filename_tail_bytes(&source_abs, suffix)?;
+                longest_filename_tail = longest_filename_tail.max(tail_bytes);
+            }
             planned_sources.push((source_abs, suffix));
         }
         let target_stem = budgeted_group_stem(&requested_stem, longest_filename_tail, "", rename)?;
         let base_target = target_dir.join(file_name_with_stem(&primary, &target_stem, "")?);
-        let targets_for = |primary_target: &Path| -> Result<Vec<String>> {
-            let target_primary_stem = primary_target
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .ok_or_else(|| anyhow!("target media filename is invalid"))?;
-            planned_sources
-                .iter()
-                .map(|(source_abs, suffix)| {
-                    let target_name = file_name_with_stem(source_abs, target_primary_stem, suffix)?;
-                    path_to_relative_string(&target_dir.join(target_name))
-                })
-                .collect()
+        let targets_for =
+            |primary_target: &Path, keep_both_suffix: Option<&str>| -> Result<Vec<String>> {
+                let target_primary_stem = primary_target
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| anyhow!("target media filename is invalid"))?;
+                planned_sources
+                    .iter()
+                    .map(|(source_abs, suffix)| {
+                        let target_name = if let Some(suffix) = suffix {
+                            file_name_with_stem(source_abs, target_primary_stem, suffix)?
+                        } else if let Some(keep_both_suffix) = keep_both_suffix {
+                            keep_both_custom_attachment_name(source_abs, keep_both_suffix)?
+                        } else {
+                            source_abs
+                                .file_name()
+                                .and_then(OsStr::to_str)
+                                .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?
+                                .to_string()
+                        };
+                        path_to_relative_string(&target_dir.join(target_name))
+                    })
+                    .collect()
+            };
+        let nfo_target_for = |primary_target: &Path| -> Result<Option<String>> {
+            synthesized_nfo_target
+                .then(|| path_to_relative_string(&with_extension(primary_target, "nfo")))
+                .transpose()
+        };
+        let has_candidate_conflict = |primary_target: &Path,
+                                      targets: &[String],
+                                      reserved_targets: &mut TargetReservationSet|
+         -> Result<bool> {
+            if self.has_move_conflicts(&source_paths, targets, reserved_targets)? {
+                return Ok(true);
+            }
+            let Some(nfo_target) = nfo_target_for(primary_target)? else {
+                return Ok(false);
+            };
+            let nfo_key = reserved_targets.key_for(&self.root, &nfo_target)?;
+            for target in targets {
+                if reserved_targets.key_for(&self.root, target)? == nfo_key {
+                    return Ok(true);
+                }
+            }
+            if reserved_targets.contains(&self.root, &nfo_target)? {
+                return Ok(true);
+            }
+            Ok(safe_entry_identity(&self.root, &self.absolute_path(&nfo_target)?)?.is_some())
         };
         let mut candidate = base_target.clone();
-        let mut targets = targets_for(&candidate)?;
-        let conflicts =
-            self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)?;
+        let mut targets = targets_for(&candidate, None)?;
+        let conflicts = has_candidate_conflict(&candidate, &targets, context.reserved_targets)?;
         if conflicts && conflict == ConflictPolicy::KeepBoth {
             let parent = base_target.parent().unwrap_or_else(|| Path::new(""));
             let mut found = false;
@@ -3653,8 +4201,8 @@ impl LibraryManager {
                 )?;
                 let name = file_name_with_stem(&primary, &candidate_stem, "")?;
                 candidate = parent.join(name);
-                targets = targets_for(&candidate)?;
-                if !self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)? {
+                targets = targets_for(&candidate, Some(&keep_both_suffix))?;
+                if !has_candidate_conflict(&candidate, &targets, context.reserved_targets)? {
                     found = true;
                     break;
                 }
@@ -3664,7 +4212,7 @@ impl LibraryManager {
             }
         }
         let final_conflicts =
-            self.has_move_conflicts(&source_paths, &targets, context.reserved_targets)?;
+            has_candidate_conflict(&candidate, &targets, context.reserved_targets)?;
         let mut files = Vec::new();
         let mut source_devices = Vec::new();
         for (source_rel, target_rel) in source_paths.iter().zip(targets) {
@@ -3874,9 +4422,20 @@ impl LibraryManager {
             let mut failed = false;
             for file_index in item_files {
                 if manifest.files[file_index].state == ManifestFileState::Moved {
-                    match self
-                        .validate_moved_file(&manifest.preview.id, &manifest.files[file_index])
-                    {
+                    let checkpoint_identity = self.checkpointed_moved_nfo_identity(
+                        &manifest.files[file_index],
+                        &manifest.patches,
+                    );
+                    let validation = match checkpoint_identity {
+                        Ok(Some(identity)) => {
+                            manifest.files[file_index].identity = identity;
+                            Ok(())
+                        }
+                        Ok(None) => self
+                            .validate_moved_file(&manifest.preview.id, &manifest.files[file_index]),
+                        Err(error) => Err(error),
+                    };
+                    match validation {
                         Ok(()) => {
                             manifest.files[file_index].error = None;
                             manifest.items[item_index].moved_files += 1;
@@ -3939,6 +4498,23 @@ impl LibraryManager {
             );
             match patch_result {
                 Ok(()) => {
+                    if let (Some(expected_identity), Some(checkpoint)) = (
+                        manifest.patches[patch_index].expected_identity.as_deref(),
+                        manifest.patches[patch_index]
+                            .replacement_checkpoint
+                            .as_ref(),
+                    ) && let Some(file) = manifest.files.iter_mut().find(|file| {
+                        file.item_id == item_id && file.target_path == patch.target_path
+                    }) {
+                        if file.identity != expected_identity
+                            && file.identity != checkpoint.after_identity
+                        {
+                            bail!(
+                                "moved NFO identity does not match its prepared replacement checkpoint"
+                            );
+                        }
+                        file.identity = checkpoint.after_identity.clone();
+                    }
                     manifest.patches[patch_index].state = ManifestPatchState::Applied;
                     if let Some(result) = manifest
                         .items
@@ -3946,7 +4522,6 @@ impl LibraryManager {
                         .find(|item| item.item_id == item_id)
                     {
                         result.metadata_patched = true;
-                        result.error = None;
                     } else {
                         manifest.items.push(MoveResultItem {
                             item_id,
@@ -4139,6 +4714,57 @@ impl LibraryManager {
             bail!("previously moved target was replaced or its content/access policy changed");
         }
         Ok(())
+    }
+
+    fn checkpointed_moved_nfo_identity(
+        &self,
+        file: &ManifestFile,
+        patches: &[PreparedNfoPatch],
+    ) -> Result<Option<String>> {
+        let Some(patch) = patches.iter().find(|patch| {
+            patch.patch.item_id == file.item_id && patch.target_path == file.target_path
+        }) else {
+            return Ok(None);
+        };
+        let (Some(expected_identity), Some(checkpoint)) = (
+            patch.expected_identity.as_deref(),
+            patch.replacement_checkpoint.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if file.identity != expected_identity && file.identity != checkpoint.after_identity {
+            bail!(
+                "moved NFO identity matches neither its approved source nor replacement checkpoint"
+            );
+        }
+
+        let target = self.absolute_path(&file.target_path)?;
+        self.coordinate_read(&target, |coordinated| {
+            if coordinated != target {
+                bail!("coordinated moved NFO path changed during checkpoint recovery");
+            }
+            let Some(bound_file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(None);
+            };
+            if bound_file.byte_len()? > SIDE_CAR_LIMIT.max(patch.replacement.len()) as u64 {
+                bail!("NFO exceeds its bounded patch verification limit");
+            }
+            let (token, digest) = token_for_bound_file(&bound_file)?;
+            if self.root.entry_identity(coordinated)? != Some(bound_file.identity()) {
+                bail!("moved NFO path was replaced during checkpoint recovery");
+            }
+            if self.nfo_checkpoint_matches_file(
+                patch,
+                checkpoint,
+                coordinated,
+                &bound_file,
+                &token,
+                &digest,
+            )? {
+                return Ok(Some(checkpoint.after_identity.clone()));
+            }
+            Ok(None)
+        })
     }
 
     #[cfg(test)]
@@ -5048,6 +5674,8 @@ impl LibraryManager {
         let index_budget = test_hooks.index_budget.unwrap_or(INDEX_LIMIT);
         #[cfg(test)]
         let mut expire_after_attachment_count = test_hooks.expire_after_attachment_count;
+        #[cfg(test)]
+        let mut expire_after_nfo_declaration_count = test_hooks.expire_after_nfo_declaration_count;
         #[cfg(not(test))]
         let index_budget = INDEX_LIMIT;
         #[cfg(not(test))]
@@ -5085,14 +5713,208 @@ impl LibraryManager {
             ));
         }
 
-        let sidecars = SidecarIndex::build(
+        let mut sidecars = SidecarIndex::build(
             &walk.files,
             &walk.incomplete_directories,
+            &walk.leaf_directories,
             &walk.directory_name_semantics,
         )?;
+        let primary_file_indices = walk
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| is_primary_media(&file.relative_path).then_some(index))
+            .collect::<Vec<_>>();
+        let mut declarations_by_media = HashMap::new();
+        'declarations: for (media_index, file_index) in primary_file_indices.iter().enumerate() {
+            if walk.timed_out || walk.started_at.elapsed() >= SCAN_TIMEOUT || {
+                #[cfg(test)]
+                {
+                    expire_after_nfo_declaration_count == Some(0)
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            } {
+                stop_scan_for_nfo_deadline(
+                    &mut walk.timed_out,
+                    &mut walk.warnings,
+                    &mut walk.migration_incomplete_paths,
+                    &walk.files,
+                    &primary_file_indices[media_index..],
+                );
+                break 'declarations;
+            }
+            let media_relative_path = walk.files[*file_index].relative_path.clone();
+            let nfo_paths = sidecars
+                .attached_files(&walk.files[*file_index])
+                .into_iter()
+                .filter(|path| attachment_kind(path) == "nfo")
+                .collect::<Vec<_>>();
+            if nfo_paths.len() > NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA {
+                walk.warnings.push(format!(
+                    "portable attachment declarations were ignored because {NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA} NFO sources is the per-media limit: {}",
+                    media_relative_path
+                ));
+                continue;
+            }
+            for nfo_path in nfo_paths {
+                if walk.timed_out || walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+                let absolute = self.absolute_path(&nfo_path)?;
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+                let read_result = self.read_file(&absolute, SIDE_CAR_LIMIT);
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+                match read_result {
+                    Ok(Some(contents)) => {
+                        let Ok(text) = String::from_utf8(contents) else {
+                            continue;
+                        };
+                        let mut declarations = match nfo_attachment_declarations(&text) {
+                            Ok(declarations) => declarations,
+                            Err(error) => {
+                                if text.to_ascii_lowercase().contains("<tvd_attachment") {
+                                    walk.warnings.push(format!(
+                                        "invalid portable attachment declaration in {nfo_path}: {error:#}"
+                                    ));
+                                }
+                                Vec::new()
+                            }
+                        };
+                        let explicit_declarations_invalid = declarations.is_empty()
+                            && text.to_ascii_lowercase().contains("<tvd_attachment");
+                        if !explicit_declarations_invalid {
+                            match nfo_local_thumb_declarations(&text) {
+                                Ok(thumbs) => {
+                                    let mut invalid = false;
+                                    for thumb in thumbs {
+                                        if let Some(existing) = declarations
+                                            .iter()
+                                            .find(|entry| entry.filename == thumb.filename)
+                                        {
+                                            if existing.role != thumb.role {
+                                                walk.warnings.push(format!(
+                                                    "NFO thumb role conflicts with its attachment declaration in {nfo_path}"
+                                                ));
+                                                invalid = true;
+                                                break;
+                                            }
+                                        } else {
+                                            declarations.push(thumb);
+                                        }
+                                    }
+                                    if invalid {
+                                        declarations.clear();
+                                    }
+                                    if declarations.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+                                        walk.warnings.push(format!(
+                                            "portable attachment declarations exceed the {NFO_ATTACHMENT_DECLARATION_LIMIT}-entry limit in {nfo_path}"
+                                        ));
+                                        declarations.clear();
+                                    }
+                                }
+                                Err(error) => {
+                                    walk.warnings.push(format!(
+                                        "local NFO thumb could not be resolved at {nfo_path}: {error:#}"
+                                    ));
+                                    declarations.clear();
+                                }
+                            }
+                        }
+                        if !declarations.is_empty() {
+                            declarations_by_media
+                                .entry(media_relative_path.clone())
+                                .or_insert_with(Vec::new)
+                                .extend(declarations);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if is_file_provider_access_error(&error) {
+                            walk.migration_incomplete_paths.insert(nfo_path.to_string());
+                        }
+                        walk.warnings.push(format!(
+                            "NFO attachment declarations unavailable at {nfo_path}: {error:#}"
+                        ));
+                    }
+                }
+                #[cfg(test)]
+                if let Some(remaining) = expire_after_nfo_declaration_count.as_mut() {
+                    if *remaining > 0 {
+                        *remaining -= 1;
+                    }
+                    if *remaining == 0 {
+                        stop_scan_for_nfo_deadline(
+                            &mut walk.timed_out,
+                            &mut walk.warnings,
+                            &mut walk.migration_incomplete_paths,
+                            &walk.files,
+                            &primary_file_indices[media_index..],
+                        );
+                        break 'declarations;
+                    }
+                }
+                if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                    stop_scan_for_nfo_deadline(
+                        &mut walk.timed_out,
+                        &mut walk.warnings,
+                        &mut walk.migration_incomplete_paths,
+                        &walk.files,
+                        &primary_file_indices[media_index..],
+                    );
+                    break 'declarations;
+                }
+            }
+        }
+        if !walk.timed_out && walk.started_at.elapsed() >= SCAN_TIMEOUT {
+            stop_scan_for_nfo_deadline(
+                &mut walk.timed_out,
+                &mut walk.warnings,
+                &mut walk.migration_incomplete_paths,
+                &walk.files,
+                &primary_file_indices,
+            );
+        }
+        let rejected_declarations = sidecars.add_declared_attachments(
+            &walk.files,
+            &declarations_by_media,
+            &walk.directory_name_semantics,
+        )?;
+        if rejected_declarations > 0 {
+            walk.warnings.push(format!(
+                "{rejected_declarations} NFO attachment declaration(s) were left unattached because their target was missing, ambiguous, or already owned"
+            ));
+        }
         if sidecars.ambiguous_count > 0 {
             walk.warnings.push(format!(
-                "{} sidecar file(s) were left unattached because their longest matching media stem is ambiguous",
+                "{} sidecar file(s) were left unattached because their media owner is ambiguous",
                 sidecars.ambiguous_count
             ));
         }
@@ -5844,9 +6666,33 @@ impl LibraryManager {
                 return Ok(());
             }
         };
+        let mut has_visible_child_directory = false;
+        for (name, identity) in &entries {
+            if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                walk.timed_out = true;
+                walk.incomplete_directories.insert(relative_string.clone());
+                if !walk
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("120-second scan budget"))
+                {
+                    walk.warnings.push("scan stopped at the 120-second scan budget; unvisited paths were not marked missing".to_string());
+                }
+                return Ok(());
+            }
+            if identity.is_dir()
+                && !excluded_entry(name, *identity, semantics, self.library_dir_identity)?
+            {
+                has_visible_child_directory = true;
+                break;
+            }
+        }
         walk.directory_name_semantics
             .insert(relative_string.clone(), semantics);
         walk.complete_directories.insert(relative_string.clone());
+        if !has_visible_child_directory {
+            walk.leaf_directories.insert(relative_string.clone());
+        }
         for (name, identity) in entries {
             if walk.started_at.elapsed() >= SCAN_TIMEOUT {
                 walk.timed_out = true;
@@ -6154,7 +7000,10 @@ impl LibraryManager {
             .iter()
             .map(|path| LibraryAttachment {
                 relative_path: path.clone(),
-                kind: attachment_kind(path).to_string(),
+                kind: sidecars
+                    .declared_role(&media.relative_path, path)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| attachment_kind(path).to_string()),
             })
             .collect();
         Ok(Some(BuiltLibraryItem {
@@ -6186,6 +7035,24 @@ impl LibraryManager {
     fn absolute_path(&self, relative: &str) -> Result<PathBuf> {
         let relative = self.safe_relative_path(relative, false)?;
         Ok(self.root.logical_root_path().join(relative))
+    }
+
+    fn name_semantics_for_relative_directory(
+        &self,
+        relative_directory: &Path,
+    ) -> Result<TargetNameSemantics> {
+        let relative = if relative_directory.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            safe_relative_path(&path_to_relative_string(relative_directory)?, true)?
+        };
+        let absolute = self.root.logical_root_path().join(&relative);
+        self.coordinate_read(&absolute, |coordinated| {
+            if self.path_in_root(coordinated)? != absolute {
+                bail!("coordinated name-semantics directory changed during preview");
+            }
+            rooted_directory_name_semantics(&self.root, &relative)
+        })
     }
 
     fn safe_relative_path(&self, value: &str, allow_empty: bool) -> Result<PathBuf> {
@@ -7066,6 +7933,40 @@ fn file_name_with_stem(source: &Path, stem: &str, suffix: &str) -> Result<String
     Ok(file_name)
 }
 
+fn keep_both_custom_attachment_name(source: &Path, keep_both_suffix: &str) -> Result<String> {
+    let source_stem = source
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
+    let extension_bytes = filename_tail_bytes(source, "")?;
+    let reserved_bytes = extension_bytes
+        .checked_add(keep_both_suffix.len())
+        .ok_or_else(|| anyhow!("filename component length overflowed"))?;
+    let stem_budget = MAX_FILENAME_COMPONENT_BYTES
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| {
+            anyhow!(
+                "attachment extension and KeepBoth suffix exceed the {MAX_FILENAME_COMPONENT_BYTES}-byte filename component limit"
+            )
+        })?;
+
+    // Keep the historical spelling for short custom names, including trailing
+    // spaces or dots. Only names that need truncation receive a stable
+    // discriminator so truncation alone does not collapse distinct names.
+    if source_stem.len() <= stem_budget {
+        return file_name_with_stem(source, &format!("{source_stem}{keep_both_suffix}"), "");
+    }
+
+    let source_name = source
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
+    let digest = sha256_bytes(source_name.as_bytes());
+    let distinct_suffix = format!("~{}{}", &digest[..16], keep_both_suffix);
+    let stem = budgeted_group_stem(source_stem, extension_bytes, &distinct_suffix, true)?;
+    file_name_with_stem(source, &stem, "")
+}
+
 fn with_extension(path: &Path, extension: &str) -> PathBuf {
     path.with_extension(extension)
 }
@@ -7216,6 +8117,89 @@ fn migration_targets_conflict(
         local.insert(&target.root, path)?;
     }
     Ok(false)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MigrationTargetDirectoryLayout {
+    existing_primary_count: usize,
+    has_visible_child_directory: bool,
+}
+
+fn migration_target_directory_reservation_key(
+    target: &LibraryManager,
+    relative_directory: &Path,
+) -> Result<TargetReservationKey> {
+    let probe = relative_directory.join("tvd-migration-directory-probe");
+    let probe = path_to_relative_string(&probe)?;
+    let mut reservations = TargetReservationSet {
+        private_library_identity: Some(target.library_dir_identity),
+        ..TargetReservationSet::default()
+    };
+    let mut key = reservations.key_for(&target.root, &probe)?;
+    key.components
+        .pop()
+        .ok_or_else(|| anyhow!("target directory reservation lost its probe component"))?;
+    Ok(key)
+}
+
+fn migration_target_directory_layout(
+    target: &LibraryManager,
+    relative_directory: &Path,
+    deadline: Instant,
+) -> Result<MigrationTargetDirectoryLayout> {
+    let identity = if relative_directory.as_os_str().is_empty() {
+        Some(target.root.root_identity())
+    } else {
+        let absolute = target.root.logical_root_path().join(relative_directory);
+        target.root.entry_identity_if_parent_exists(&absolute)?
+    };
+    let Some(identity) = identity else {
+        return Ok(MigrationTargetDirectoryLayout::default());
+    };
+    if !identity.is_dir() {
+        bail!("migration target parent is not a directory");
+    }
+    let entries = if relative_directory.as_os_str().is_empty() {
+        target
+            .root
+            .list_root_directory_until(MAX_ENTRIES, deadline)?
+    } else {
+        let absolute = target.root.logical_root_path().join(relative_directory);
+        let entry = target.root.bind_entry(&absolute, false)?;
+        target
+            .root
+            .list_bound_directory_until(&entry, identity, MAX_ENTRIES, deadline)?
+    };
+    let directory = open_validated_target_directory(&target.root, relative_directory, identity)?;
+    let semantics = target_name_semantics(&directory)
+        .context("filesystem name semantics unavailable for migration target layout")?;
+    let mut layout = MigrationTargetDirectoryLayout::default();
+    for (name, child_identity) in entries {
+        if excluded_entry(
+            &name,
+            child_identity,
+            semantics,
+            target.library_dir_identity,
+        )? {
+            continue;
+        }
+        if child_identity.is_dir() {
+            layout.has_visible_child_directory = true;
+        } else if child_identity.is_file() && name.to_str().is_some_and(is_primary_media) {
+            layout.existing_primary_count = layout.existing_primary_count.saturating_add(1);
+        }
+    }
+    Ok(layout)
+}
+
+fn migration_target_directory_is_strict_descendant(
+    parent: &TargetReservationKey,
+    candidate: &TargetReservationKey,
+) -> bool {
+    parent.directory_device == candidate.directory_device
+        && parent.directory_inode == candidate.directory_inode
+        && candidate.components.len() > parent.components.len()
+        && candidate.components.starts_with(&parent.components)
 }
 
 fn parse_sha256(value: &str) -> Result<[u8; 32]> {
@@ -8028,8 +9012,12 @@ fn operation_state_is_expired(modified_seconds: i64, now: SystemTime, retention:
 
 fn private_temp_sibling(path: &Path) -> PathBuf {
     let serial = PRIVATE_TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!(".{name}.next-{}-{serial}", std::process::id()))
+    let name = path.file_name().unwrap_or_default();
+    let name_digest = sha256_bytes(name.as_encoded_bytes());
+    path.with_file_name(format!(
+        ".nfo-atomic-{name_digest}.next-{}-{serial}",
+        std::process::id()
+    ))
 }
 
 fn validate_nfo_checkpoint_stage_path(target: &str, staged: &str) -> Result<()> {
@@ -8046,9 +9034,14 @@ fn validate_nfo_checkpoint_stage_path(target: &str, staged: &str) -> Result<()> 
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| anyhow!("NFO checkpoint filename is invalid"))?;
-    let prefix = format!(".{target_name}.next-");
+    if staged_name.len() > 255 {
+        bail!("NFO replacement checkpoint filename exceeds the component limit");
+    }
+    let hashed_prefix = format!(".nfo-atomic-{}.next-", sha256_bytes(target_name.as_bytes()));
+    let legacy_prefix = format!(".{target_name}.next-");
     let suffix = staged_name
-        .strip_prefix(&prefix)
+        .strip_prefix(&hashed_prefix)
+        .or_else(|| staged_name.strip_prefix(&legacy_prefix))
         .ok_or_else(|| anyhow!("NFO replacement checkpoint has an unexpected filename"))?;
     let (process_id, serial) = suffix
         .split_once('-')
@@ -8274,15 +9267,66 @@ fn is_sidecar(path: &str) -> bool {
     )
 }
 
+fn is_unqualified_legacy_sidecar(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if stem.contains('.') {
+        return false;
+    }
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = stem.to_ascii_lowercase();
+    if matches!(
+        stem.as_str(),
+        "cover" | "poster" | "folder" | "thumb" | "fanart" | "banner" | "landscape"
+    ) {
+        return matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp");
+    }
+    if matches!(
+        stem.as_str(),
+        "danmaku" | "danmu" | "barrage" | "comments" | "comment"
+    ) {
+        return matches!(extension.as_str(), "xml" | "json" | "txt");
+    }
+    if !matches!(extension.as_str(), "srt" | "vtt" | "ass") {
+        return false;
+    }
+    let mut subtags = stem.split(['-', '_']);
+    let Some(language) = subtags.next() else {
+        return false;
+    };
+    const LANGUAGE_TAGS: &[&str] = &[
+        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+        "fr", "ga", "gl", "he", "hi", "hr", "hu", "id", "is", "it", "ja", "ko", "lt", "lv", "ms",
+        "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv", "th", "tr", "uk", "ur", "vi",
+        "zh", "chi", "deu", "eng", "fra", "fre", "ger", "ita", "jpn", "kor", "nld", "pol", "por",
+        "rus", "spa", "zho",
+    ];
+    LANGUAGE_TAGS.contains(&language)
+        && subtags.all(|subtag| {
+            (2..=8).contains(&subtag.len())
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+}
+
 impl SidecarIndex {
     fn build(
         files: &[ScannedFile],
         incomplete_directories: &BTreeSet<String>,
+        leaf_directories: &BTreeSet<String>,
         directory_name_semantics: &HashMap<String, TargetNameSemantics>,
     ) -> Result<Self> {
         Self::build_with_case_fold(
             files,
             incomplete_directories,
+            leaf_directories,
             directory_name_semantics,
             platform_case_fold,
         )
@@ -8291,6 +9335,7 @@ impl SidecarIndex {
     fn build_with_case_fold<F>(
         files: &[ScannedFile],
         incomplete_directories: &BTreeSet<String>,
+        leaf_directories: &BTreeSet<String>,
         directory_name_semantics: &HashMap<String, TargetNameSemantics>,
         case_fold: F,
     ) -> Result<Self>
@@ -8298,6 +9343,7 @@ impl SidecarIndex {
         F: Fn(&str) -> Result<String> + Copy,
     {
         let mut owners: HashMap<String, HashMap<String, PrimaryStemOwner>> = HashMap::new();
+        let mut primary_counts = HashMap::<String, usize>::new();
         for file in files
             .iter()
             .filter(|file| is_primary_media(&file.relative_path))
@@ -8311,6 +9357,7 @@ impl SidecarIndex {
             if incomplete_directories.contains(&parent) {
                 continue;
             }
+            *primary_counts.entry(parent.clone()).or_default() += 1;
             let semantics = directory_name_semantics
                 .get(&parent)
                 .copied()
@@ -8352,23 +9399,40 @@ impl SidecarIndex {
             let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
-            let Some(stems) = owners.get(&parent) else {
-                continue;
-            };
-            let Some(owner) =
-                longest_matching_primary_stem_with(stem, stems, semantics, case_fold)?
-            else {
-                continue;
-            };
-            if owner.count > 1 {
-                index.ambiguous_count = index.ambiguous_count.saturating_add(1);
+            let matching_owner = owners
+                .get(&parent)
+                .map(|stems| longest_matching_primary_stem_with(stem, stems, semantics, case_fold))
+                .transpose()?
+                .flatten();
+            if let Some(owner) = matching_owner {
+                if owner.count > 1 {
+                    index.ambiguous_count = index.ambiguous_count.saturating_add(1);
+                    continue;
+                }
+                index
+                    .by_media
+                    .entry(owner.relative_path.clone())
+                    .or_default()
+                    .push(file.relative_path.clone());
                 continue;
             }
-            index
-                .by_media
-                .entry(owner.relative_path.clone())
-                .or_default()
-                .push(file.relative_path.clone());
+
+            let primary_count = primary_counts.get(&parent).copied().unwrap_or_default();
+            if primary_count == 1
+                && leaf_directories.contains(&parent)
+                && is_unqualified_legacy_sidecar(&file.relative_path)
+                && let Some(owner) = owners
+                    .get(&parent)
+                    .and_then(|stems| stems.values().find(|owner| owner.count == 1))
+            {
+                index
+                    .by_media
+                    .entry(owner.relative_path.clone())
+                    .or_default()
+                    .push(file.relative_path.clone());
+            } else if primary_count > 1 {
+                index.ambiguous_count = index.ambiguous_count.saturating_add(1);
+            }
         }
         for attachments in index.by_media.values_mut() {
             attachments.sort();
@@ -8416,6 +9480,190 @@ impl SidecarIndex {
         Ok(index)
     }
 
+    fn add_declared_attachments(
+        &mut self,
+        files: &[ScannedFile],
+        declarations_by_media: &HashMap<String, Vec<NfoAttachmentDeclaration>>,
+        directory_name_semantics: &HashMap<String, TargetNameSemantics>,
+    ) -> Result<usize> {
+        self.add_declared_attachments_with_case_fold(
+            files,
+            declarations_by_media,
+            directory_name_semantics,
+            platform_case_fold,
+        )
+    }
+
+    fn add_declared_attachments_with_case_fold<F>(
+        &mut self,
+        files: &[ScannedFile],
+        declarations_by_media: &HashMap<String, Vec<NfoAttachmentDeclaration>>,
+        directory_name_semantics: &HashMap<String, TargetNameSemantics>,
+        case_fold: F,
+    ) -> Result<usize>
+    where
+        F: Fn(&str) -> Result<String> + Copy,
+    {
+        let mut files_by_parent = HashMap::<String, Vec<&ScannedFile>>::new();
+        for file in files.iter().filter(|file| file.identity.is_file()) {
+            files_by_parent
+                .entry(parent_relative(&file.relative_path).to_string())
+                .or_default()
+                .push(file);
+        }
+        let mut claims = HashMap::<String, Vec<(String, String, String)>>::new();
+        let mut contested_paths = HashSet::<String>::new();
+        let mut rejected = 0usize;
+        for (media, declarations) in declarations_by_media {
+            if declarations.len()
+                > NFO_ATTACHMENT_DECLARATION_LIMIT * NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA
+            {
+                rejected = rejected.saturating_add(declarations.len());
+                continue;
+            }
+            let parent = parent_relative(media).to_string();
+            let semantics = directory_name_semantics
+                .get(&parent)
+                .copied()
+                .ok_or_else(|| anyhow!("filesystem name semantics unavailable under {parent}"))?;
+            let mut normalized = HashMap::<String, Vec<&NfoAttachmentDeclaration>>::new();
+            for declaration in declarations {
+                let key = target_component_key_with(&declaration.filename, semantics, |value| {
+                    case_fold(value)
+                })?;
+                normalized.entry(key).or_default().push(declaration);
+            }
+            if normalized.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+                rejected = rejected.saturating_add(declarations.len());
+                continue;
+            }
+            for (name_key, declarations) in normalized {
+                let mut matches = Vec::new();
+                for file in files_by_parent.get(&parent).into_iter().flatten() {
+                    let Some(basename) = Path::new(&file.relative_path)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                    else {
+                        continue;
+                    };
+                    let candidate_key =
+                        target_component_key_with(basename, semantics, |value| case_fold(value))?;
+                    if candidate_key == name_key {
+                        matches.push(*file);
+                    }
+                }
+                let roles = declarations
+                    .iter()
+                    .map(|declaration| declaration.role.as_str())
+                    .collect::<HashSet<_>>();
+                if roles.len() != 1 {
+                    contested_paths.extend(matches.iter().map(|file| file.relative_path.clone()));
+                    rejected = rejected.saturating_add(declarations.len());
+                    continue;
+                }
+                // Several attached NFOs may repeat the same declaration for one media item.
+                // Treat same-role claims as one logical owner, but keep conflicting roles
+                // ambiguous. The source NFO paths remain in LibraryItem.attachments and are
+                // still independently rewritten by the organizer.
+                let declaration = declarations[0];
+                if matches.len() != 1 {
+                    contested_paths.extend(matches.iter().map(|file| file.relative_path.clone()));
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+                let file = matches[0];
+                let basename = Path::new(&file.relative_path)
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| anyhow!("declared attachment has a non-UTF-8 basename"))?;
+                if is_primary_media(&file.relative_path)
+                    || is_private_downloader_component(basename, semantics)?
+                {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+                if !is_sidecar(&file.relative_path)
+                    || !nfo_attachment_role_matches_path(&declaration.role, &file.relative_path)
+                {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+                claims
+                    .entry(format!("{parent}\0{name_key}"))
+                    .or_default()
+                    .push((
+                        media.clone(),
+                        file.relative_path.clone(),
+                        declaration.role.clone(),
+                    ));
+            }
+        }
+
+        let mut accepted_claims = Vec::new();
+        for mut owners in claims.into_values() {
+            let mut unique_owners = HashSet::new();
+            owners.retain(|owner| unique_owners.insert(owner.clone()));
+            if owners.len() != 1 {
+                contested_paths.extend(owners.iter().map(|(_, attachment, _)| attachment.clone()));
+                rejected = rejected.saturating_add(owners.len());
+                continue;
+            }
+            let (media, attachment, role) = owners
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("declared attachment owner disappeared"))?;
+            if self
+                .by_media
+                .iter()
+                .any(|(existing_media, existing_attachments)| {
+                    existing_attachments
+                        .iter()
+                        .any(|existing| existing == &attachment && existing_media != &media)
+                })
+            {
+                contested_paths.insert(attachment);
+                rejected = rejected.saturating_add(1);
+                continue;
+            }
+            accepted_claims.push((media, attachment, role));
+        }
+
+        // A declaration conflict invalidates earlier stem or single-primary inference for the
+        // same actual filesystem entry. Apply this after collecting every claim so HashMap
+        // iteration order cannot let a later valid-looking owner reclaim a contested file.
+        for contested in &contested_paths {
+            for attachments in self.by_media.values_mut() {
+                attachments.retain(|attachment| attachment != contested);
+            }
+            for roles in self.declared_roles_by_media.values_mut() {
+                roles.remove(contested);
+            }
+        }
+        self.by_media
+            .retain(|_, attachments| !attachments.is_empty());
+        self.declared_roles_by_media
+            .retain(|_, roles| !roles.is_empty());
+
+        for (media, attachment, role) in accepted_claims {
+            if contested_paths.contains(&attachment) {
+                continue;
+            }
+            let attachments = self.by_media.entry(media.clone()).or_default();
+            if !attachments.contains(&attachment) {
+                attachments.push(attachment.clone());
+            }
+            self.declared_roles_by_media
+                .entry(media)
+                .or_default()
+                .insert(attachment, role);
+        }
+        for attachments in self.by_media.values_mut() {
+            attachments.sort();
+            attachments.dedup();
+        }
+        Ok(rejected)
+    }
+
     fn attached_files(&self, media: &ScannedFile) -> Vec<String> {
         self.by_media
             .get(&media.relative_path)
@@ -8426,6 +9674,17 @@ impl SidecarIndex {
     fn authoritative_nfo(&self, media_relative_path: &str) -> Option<&str> {
         self.authoritative_nfo_by_media
             .get(media_relative_path)
+            .map(String::as_str)
+    }
+
+    fn declared_role(
+        &self,
+        media_relative_path: &str,
+        attachment_relative_path: &str,
+    ) -> Option<&str> {
+        self.declared_roles_by_media
+            .get(media_relative_path)
+            .and_then(|roles| roles.get(attachment_relative_path))
             .map(String::as_str)
     }
 }
@@ -8681,6 +9940,538 @@ fn attachment_kind(path: &str) -> &'static str {
     }
 }
 
+fn attachment_role_for_nfo(attachment: &LibraryAttachment) -> Option<&'static str> {
+    match attachment.kind.as_str() {
+        "cover" => Some("cover"),
+        "subtitle" => Some("subtitle"),
+        "danmaku" => Some("danmaku"),
+        "danmaku_or_metadata"
+            if Path::new(&attachment.relative_path)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .is_some_and(|stem| {
+                    matches!(
+                        stem.to_ascii_lowercase().as_str(),
+                        "danmaku" | "danmu" | "barrage" | "comments" | "comment"
+                    )
+                }) =>
+        {
+            Some("danmaku")
+        }
+        "sidecar" if is_legacy_txt_danmaku_attachment(&attachment.relative_path) => Some("danmaku"),
+        _ => None,
+    }
+}
+
+fn is_legacy_txt_danmaku_attachment(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+        return false;
+    };
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+        && !stem.contains('.')
+        && matches!(
+            stem.to_ascii_lowercase().as_str(),
+            "danmaku" | "danmu" | "barrage" | "comments" | "comment"
+        )
+}
+
+fn attachment_nfo_update_for_move(
+    item: &LibraryItem,
+    move_item: &MovePreviewItem,
+    name_semantics: TargetNameSemantics,
+) -> Result<AttachmentNfoUpdate> {
+    let old_primary_filename = Path::new(&item.relative_path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("selected media has a non-UTF-8 filename"))?
+        .to_string();
+    let new_primary_filename = Path::new(&move_item.target_path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("target media has a non-UTF-8 filename"))?
+        .to_string();
+    let mut renamed_files = Vec::new();
+    for file in &move_item.files {
+        let source = Path::new(&file.source_path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("attached file has a non-UTF-8 filename"))?;
+        let target = Path::new(&file.target_path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("target attachment has a non-UTF-8 filename"))?;
+        if source != target {
+            renamed_files.push((source.to_string(), target.to_string()));
+        }
+    }
+
+    let move_targets = move_item
+        .files
+        .iter()
+        .map(|file| (file.source_path.as_str(), file.target_path.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut additions = Vec::new();
+    let mut seen = HashSet::new();
+    for attachment in &item.attachments {
+        if !is_unqualified_legacy_sidecar(&attachment.relative_path) {
+            continue;
+        }
+        let Some(role) = attachment_role_for_nfo(attachment) else {
+            continue;
+        };
+        let target = move_targets
+            .get(attachment.relative_path.as_str())
+            .copied()
+            .unwrap_or(attachment.relative_path.as_str());
+        let filename = Path::new(target)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("target attachment has a non-UTF-8 filename"))?
+            .to_string();
+        if seen.insert(filename.clone()) {
+            additions.push(NfoAttachmentDeclaration {
+                role: role.to_string(),
+                filename,
+            });
+        }
+    }
+    additions.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.filename.cmp(&right.filename))
+    });
+    if additions.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+        bail!(
+            "legacy attachment manifest exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+        );
+    }
+    Ok(AttachmentNfoUpdate {
+        additions,
+        renamed_files,
+        old_primary_filename,
+        new_primary_filename,
+        name_semantics,
+    })
+}
+
+fn supported_nfo_attachment_role(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cover" => Some("cover"),
+        "subtitle" => Some("subtitle"),
+        "danmaku" => Some("danmaku"),
+        _ => None,
+    }
+}
+
+fn nfo_attachment_role_matches_path(role: &str, path: &str) -> bool {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match supported_nfo_attachment_role(role) {
+        Some("cover") => matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp"),
+        Some("subtitle") => matches!(extension.as_str(), "srt" | "vtt" | "ass"),
+        Some("danmaku") => matches!(extension.as_str(), "xml" | "json" | "txt" | "ass"),
+        _ => false,
+    }
+}
+
+fn canonical_nfo_attachment_basename(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.len() > MAX_PATH_COMPONENT_BYTES
+        || value == "."
+        || value == ".."
+        || value.contains(['/', '\\', '\0'])
+        || value.contains(':')
+        || value.chars().any(char::is_control)
+    {
+        bail!("NFO attachment path is not a local filename");
+    }
+    let path = Path::new(value);
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+        || path.file_name().and_then(OsStr::to_str) != Some(value)
+    {
+        bail!("NFO attachment path must be one normalized basename");
+    }
+    Ok(value.to_string())
+}
+
+fn local_nfo_basename(value: &str) -> Option<String> {
+    if value != value.trim() {
+        return None;
+    }
+    let scheme_end = value.find(':');
+    if let Some(scheme_end) = scheme_end {
+        let scheme = &value[..scheme_end];
+        if !scheme.is_empty()
+            && scheme.chars().enumerate().all(|(index, character)| {
+                if index == 0 {
+                    character.is_ascii_alphabetic()
+                } else {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
+                }
+            })
+        {
+            return None;
+        }
+    }
+    canonical_nfo_attachment_basename(value).ok()
+}
+
+fn nfo_root_element_span(content: &str) -> Result<XmlElementSpan> {
+    let mut cursor = 0;
+    let root = loop {
+        let Some(markup) = xml_next_markup(content, cursor) else {
+            bail!("NFO has no document root element");
+        };
+        cursor = markup.end;
+        if markup.kind == XmlMarkupKind::Start {
+            break markup;
+        }
+    };
+    if root.self_closing {
+        return Ok(XmlElementSpan {
+            open_start: root.start,
+            open_end: root.end,
+            close_start: root.end,
+            close_end: root.end,
+            self_closing: true,
+        });
+    }
+    xml_element_span(content, root.name, root.start)
+        .filter(|span| span.open_start == root.start)
+        .ok_or_else(|| anyhow!("NFO root element has no matching close"))
+}
+
+fn direct_xml_elements_named(
+    content: &str,
+    parent: XmlElementSpan,
+    target: &str,
+) -> Result<Vec<XmlElementSpan>> {
+    let mut matches = Vec::new();
+    let match_limit =
+        if target.eq_ignore_ascii_case("tvd_attachment") || target.eq_ignore_ascii_case("thumb") {
+            Some(NFO_ATTACHMENT_DECLARATION_LIMIT)
+        } else {
+            None
+        };
+    if parent.self_closing {
+        return Ok(matches);
+    }
+    let mut open_names = Vec::new();
+    let mut cursor = parent.open_end;
+    while let Some(markup) = xml_next_markup(content, cursor) {
+        if markup.start >= parent.close_start {
+            break;
+        }
+        if markup.end > parent.close_start {
+            bail!("NFO child markup crosses its parent closing tag");
+        }
+        cursor = markup.end;
+        match markup.kind {
+            XmlMarkupKind::Start => {
+                if open_names.is_empty() && markup.name.eq_ignore_ascii_case(target) {
+                    let element = xml_element_span(content, target, markup.start)
+                        .filter(|span| span.open_start == markup.start)
+                        .ok_or_else(|| anyhow!("NFO {target} element has no matching close"))?;
+                    if element.close_end > parent.close_start {
+                        bail!("NFO {target} element crosses its parent closing tag");
+                    }
+                    if match_limit.is_some_and(|limit| matches.len() >= limit) {
+                        bail!(
+                            "NFO {target} count exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+                        );
+                    }
+                    matches.push(element);
+                }
+                if !markup.self_closing {
+                    open_names.push(markup.name);
+                }
+            }
+            XmlMarkupKind::End => {
+                let Some(open_name) = open_names.pop() else {
+                    bail!("NFO contains an unmatched closing tag");
+                };
+                if !open_name.eq_ignore_ascii_case(markup.name) {
+                    bail!("NFO contains mismatched nested tags");
+                }
+            }
+            XmlMarkupKind::Opaque => bail!("NFO contains unreadable markup"),
+            _ => {}
+        }
+    }
+    if !open_names.is_empty() {
+        bail!("NFO contains an unclosed child tag");
+    }
+    Ok(matches)
+}
+
+fn xml_attribute_values(tag: &str, attribute: &str) -> Vec<String> {
+    let Some(markup) = xml_next_markup(tag, 0) else {
+        return Vec::new();
+    };
+    if markup.kind != XmlMarkupKind::Start {
+        return Vec::new();
+    }
+    let bytes = tag.as_bytes();
+    let mut values = Vec::new();
+    let mut cursor = markup.name_end;
+    let tag_end = markup.end.saturating_sub(1);
+    while cursor < tag_end {
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_end || bytes[cursor] == b'/' {
+            break;
+        }
+        let name_start = cursor;
+        while cursor < tag_end
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
+        {
+            cursor += 1;
+        }
+        if name_start == cursor {
+            break;
+        }
+        let name = &tag[name_start..cursor];
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_end || bytes[cursor] != b'=' {
+            while cursor < tag_end && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            continue;
+        }
+        cursor += 1;
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let Some(&quote) = bytes.get(cursor) else {
+            break;
+        };
+        if quote != b'\'' && quote != b'"' {
+            break;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while cursor < tag_end && bytes[cursor] != quote {
+            cursor += 1;
+        }
+        if cursor >= tag_end {
+            break;
+        }
+        if name.eq_ignore_ascii_case(attribute) {
+            values.push(xml_unescape(&tag[value_start..cursor]));
+        }
+        cursor += 1;
+    }
+    values
+}
+
+fn nfo_attachment_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclaration>> {
+    if content.len() > SIDE_CAR_LIMIT {
+        bail!("NFO exceeds the {SIDE_CAR_LIMIT}-byte attachment parsing limit");
+    }
+    let root = nfo_root_element_span(content)?;
+    let mut declarations = Vec::new();
+    let mut seen = HashSet::new();
+    for element in direct_xml_elements_named(content, root, "tvd_attachment")? {
+        if element.self_closing || xml_has_inner_markup(content, element) {
+            bail!("NFO attachment declaration must contain a filename only");
+        }
+        let opening = &content[element.open_start..element.open_end];
+        let roles = xml_attribute_values(opening, "role");
+        if roles.len() != 1 {
+            bail!("NFO attachment declaration must have exactly one role");
+        }
+        let role = supported_nfo_attachment_role(&roles[0])
+            .ok_or_else(|| anyhow!("NFO attachment declaration has an unsupported role"))?;
+        let filename = canonical_nfo_attachment_basename(&xml_text_content(
+            &content[element.open_end..element.close_start],
+        ))?;
+        if !seen.insert(filename.clone()) {
+            bail!("NFO contains duplicate attachment declarations");
+        }
+        declarations.push(NfoAttachmentDeclaration {
+            role: role.to_string(),
+            filename,
+        });
+    }
+    Ok(declarations)
+}
+
+pub(crate) fn nfo_danmaku_attachment_filenames(content: &str) -> Result<Vec<String>> {
+    Ok(nfo_attachment_declarations(content)?
+        .into_iter()
+        .filter(|declaration| declaration.role == "danmaku")
+        .map(|declaration| declaration.filename)
+        .collect())
+}
+
+fn nfo_local_thumb_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclaration>> {
+    if content.len() > SIDE_CAR_LIMIT {
+        bail!("NFO exceeds the {SIDE_CAR_LIMIT}-byte thumb parsing limit");
+    }
+    let root = nfo_root_element_span(content)?;
+    let mut declarations = Vec::new();
+    for element in direct_xml_elements_named(content, root, "thumb")? {
+        if element.self_closing || xml_has_inner_markup(content, element) {
+            continue;
+        }
+        let text = xml_text_content(&content[element.open_end..element.close_start]);
+        let Some(filename) = local_nfo_basename(&text) else {
+            continue;
+        };
+        declarations.push(NfoAttachmentDeclaration {
+            role: "cover".to_string(),
+            filename,
+        });
+    }
+    Ok(declarations)
+}
+
+fn migration_nfo_local_attachment_declarations(
+    content: &str,
+) -> Option<Vec<NfoAttachmentDeclaration>> {
+    let mut declarations = nfo_attachment_declarations(content).ok()?;
+    if declarations.is_empty() && content.to_ascii_lowercase().contains("<tvd_attachment") {
+        return Some(Vec::new());
+    }
+    for thumb in nfo_local_thumb_declarations(content).ok()? {
+        if let Some(existing) = declarations
+            .iter()
+            .find(|declaration| declaration.filename == thumb.filename)
+        {
+            if existing.role != thumb.role {
+                return None;
+            }
+        } else {
+            declarations.push(thumb);
+        }
+    }
+    (declarations.len() <= NFO_ATTACHMENT_DECLARATION_LIMIT).then_some(declarations)
+}
+
+fn migration_nfo_proves_attachment(
+    media_relative_path: &str,
+    attachment_relative_path: &str,
+    actual_attachment_paths: &[String],
+    nfo_contents: &[Vec<u8>],
+    semantics: TargetNameSemantics,
+) -> Result<bool> {
+    let parent = Path::new(media_relative_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let Some(attachment_basename) = Path::new(attachment_relative_path)
+        .file_name()
+        .and_then(OsStr::to_str)
+    else {
+        return Ok(false);
+    };
+    let attachment_key =
+        target_component_key_with(attachment_basename, semantics, platform_case_fold)?;
+    let mut roles = HashSet::new();
+    let mut declared_basename = None;
+    for bytes in nfo_contents {
+        let Ok(content) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let Some(declarations) = migration_nfo_local_attachment_declarations(content) else {
+            continue;
+        };
+        for declaration in declarations {
+            if target_component_key_with(&declaration.filename, semantics, platform_case_fold)?
+                == attachment_key
+            {
+                roles.insert(declaration.role);
+                declared_basename.get_or_insert(declaration.filename);
+            }
+        }
+    }
+    if roles.len() != 1 {
+        return Ok(false);
+    }
+    let role = roles.into_iter().next().unwrap_or_default();
+    if !nfo_attachment_role_matches_path(&role, attachment_relative_path) {
+        return Ok(false);
+    }
+    let Some(declared_basename) = declared_basename else {
+        return Ok(false);
+    };
+    Ok(resolve_nfo_attachment_relative_path_with_semantics(
+        parent,
+        &declared_basename,
+        actual_attachment_paths,
+        semantics,
+    )?
+    .as_deref()
+        == Some(attachment_relative_path))
+}
+
+fn migration_nfo_references_need_rewrite(
+    content: &str,
+    source_primary_filename: &str,
+    target_primary_filename: &str,
+    planned_sources: &[(String, PathBuf, Option<String>)],
+    target_paths: &[String],
+    semantics: TargetNameSemantics,
+) -> bool {
+    if source_primary_filename != target_primary_filename {
+        let localfilename_exists = nfo_root_element_span(content)
+            .and_then(|root| direct_xml_elements_named(content, root, "localfilename"))
+            .map(|elements| !elements.is_empty())
+            .unwrap_or(true);
+        if localfilename_exists {
+            return true;
+        }
+    }
+
+    let declarations = match nfo_attachment_declarations(content) {
+        Ok(declarations) => declarations,
+        Err(_) if content.to_ascii_lowercase().contains("<tvd_attachment") => return true,
+        Err(_) => Vec::new(),
+    };
+    let thumbs = match nfo_local_thumb_declarations(content) {
+        Ok(thumbs) => thumbs,
+        Err(_) => return true,
+    };
+    let mut basename_renames = Vec::with_capacity(planned_sources.len());
+    for ((source, _, _), target) in planned_sources.iter().zip(target_paths) {
+        let Some(source_name) = Path::new(source).file_name().and_then(OsStr::to_str) else {
+            return true;
+        };
+        let Some(target_name) = Path::new(target).file_name().and_then(OsStr::to_str) else {
+            return true;
+        };
+        basename_renames.push((source_name.to_string(), target_name.to_string()));
+    }
+    let target_names = match nfo_rename_index_with(&basename_renames, semantics, platform_case_fold)
+    {
+        Ok(target_names) => target_names,
+        Err(_) => return true,
+    };
+    for declaration in declarations.iter().chain(thumbs.iter()) {
+        let key =
+            match target_component_key_with(&declaration.filename, semantics, platform_case_fold) {
+                Ok(key) => key,
+                Err(_) => return true,
+            };
+        match target_names.get(&key) {
+            Some(target) if target == &declaration.filename => {}
+            Some(_) | None => return true,
+        }
+    }
+    false
+}
+
 fn title_from_path(path: &str) -> String {
     Path::new(path)
         .file_stem()
@@ -8749,6 +10540,23 @@ fn push_scan_timeout_warning(warnings: &mut Vec<String>) {
                 .to_string(),
         );
     }
+}
+
+fn stop_scan_for_nfo_deadline(
+    timed_out: &mut bool,
+    warnings: &mut Vec<String>,
+    migration_incomplete_paths: &mut BTreeSet<String>,
+    files: &[ScannedFile],
+    pending_primary_indices: &[usize],
+) {
+    *timed_out = true;
+    push_scan_timeout_warning(warnings);
+    let incomplete_paths = pending_primary_indices
+        .iter()
+        .filter_map(|index| files.get(*index))
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<_>>();
+    migration_incomplete_paths.extend(incomplete_paths);
 }
 
 fn snapshot_revision(items: &[LibraryItem]) -> Result<String> {
@@ -8932,6 +10740,26 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
     deduplicate(ids)
 }
 
+fn nfo_source_id_types(content: &str) -> Result<HashSet<String>> {
+    let root = nfo_root_element_span(content)?;
+    Ok(direct_xml_elements_named(content, root, "uniqueid")?
+        .into_iter()
+        .filter_map(|element| {
+            if element.self_closing
+                || xml_text_content(&content[element.open_end..element.close_start])
+                    .trim()
+                    .is_empty()
+            {
+                return None;
+            }
+            let opening = &content[element.open_start..element.open_end];
+            xml_attribute(opening, "type")
+                .map(|kind| kind.trim().to_ascii_lowercase())
+                .filter(|kind| !kind.is_empty())
+        })
+        .collect())
+}
+
 fn nfo_organization_status(content: &str) -> Option<OrganizationStatus> {
     let element = xml_element_span(content, "tvd_organization", 0)?;
     if xml_element_span(content, "tvd_organization", element.close_end).is_some() {
@@ -8949,9 +10777,16 @@ fn nfo_organization_status(content: &str) -> Option<OrganizationStatus> {
 }
 
 fn nfo_has_collection_metadata(content: &str) -> bool {
-    ["set", "setid", "settype", "episode", "partid"]
-        .iter()
-        .any(|tag| xml_tag_text(content, tag).is_some_and(|value| !value.trim().is_empty()))
+    [
+        "set",
+        "setid",
+        "settype",
+        "episode",
+        "partid",
+        "tvshowtitle",
+    ]
+    .iter()
+    .any(|tag| xml_tag_text(content, tag).is_some_and(|value| !value.trim().is_empty()))
 }
 
 fn metadata_subfield_is_missing(content: &str, tag: &str, fill_missing_only: bool) -> bool {
@@ -9078,7 +10913,9 @@ fn xml_tag_text(content: &str, name: &str) -> Option<String> {
 }
 
 fn nfo_collection_title(content: &str) -> Option<String> {
-    let set = xml_element_span(content, "set", 0)?;
+    let Some(set) = xml_element_span(content, "set", 0) else {
+        return xml_tag_text(content, "tvshowtitle").filter(|value| !value.trim().is_empty());
+    };
     if set.self_closing {
         return None;
     }
@@ -9633,7 +11470,7 @@ fn self_closing_xml_tag_slash(content: &str, start: usize, open_end: usize) -> O
 }
 
 fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFieldChange> {
-    [
+    let mut changes: Vec<MetadataFieldChange> = [
         ("title", "title"),
         ("collection", "set"),
         ("collection_id", "setid"),
@@ -9641,6 +11478,9 @@ fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFiel
         ("order", "episode"),
         ("part_id", "partid"),
         ("organization_status", "tvd_organization"),
+        ("tvshowtitle", "tvshowtitle"),
+        ("localfilename", "localfilename"),
+        ("thumb", "thumb"),
     ]
     .into_iter()
     .filter_map(|(field, tag)| {
@@ -9659,7 +11499,263 @@ fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFiel
             after,
         })
     })
-    .collect()
+    .collect();
+    let attachment_summary = |xml: &str| {
+        nfo_attachment_declarations(xml)
+            .ok()?
+            .into_iter()
+            .map(|declaration| format!("{}:{}", declaration.role, declaration.filename))
+            .collect::<Vec<_>>()
+            .join(", ")
+            .into()
+    };
+    let after_attachments = attachment_summary(after);
+    let before_attachments = before.and_then(attachment_summary);
+    if after_attachments != before_attachments
+        && let Some(after) = after_attachments
+    {
+        changes.push(MetadataFieldChange {
+            field: "attachments".to_string(),
+            before: before_attachments,
+            after,
+        });
+    }
+    changes
+}
+
+fn insert_nfo_root_nodes(content: &str, nodes: &[String]) -> Result<String> {
+    if nodes.is_empty() {
+        return Ok(content.to_string());
+    }
+    let close = root_close_start(content).ok_or_else(|| {
+        anyhow!("NFO root closing tag could not be identified; leaving it unchanged")
+    })?;
+    let mut inserted =
+        String::with_capacity(content.len() + nodes.iter().map(String::len).sum::<usize>() + 2);
+    inserted.push_str(&content[..close]);
+    if !inserted.ends_with('\n') {
+        inserted.push('\n');
+    }
+    for node in nodes {
+        inserted.push_str(node);
+        inserted.push('\n');
+    }
+    inserted.push_str(&content[close..]);
+    Ok(inserted)
+}
+
+fn update_nfo_attachment_references(
+    content: &str,
+    update: NfoAttachmentReferenceUpdate<'_>,
+) -> Result<String> {
+    update_nfo_attachment_references_with_case_fold(content, update, platform_case_fold)
+}
+
+fn update_nfo_attachment_references_with_case_fold<F>(
+    content: &str,
+    update: NfoAttachmentReferenceUpdate<'_>,
+    case_fold: F,
+) -> Result<String>
+where
+    F: Fn(&str) -> Result<String> + Copy,
+{
+    let NfoAttachmentReferenceUpdate {
+        additions,
+        renamed_files,
+        old_primary_filename,
+        new_primary_filename,
+        add_localfilename_when_missing,
+        semantics,
+    } = update;
+    if additions.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+        bail!("attachment update exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit");
+    }
+    let rename_index = nfo_rename_index_with(renamed_files, semantics, case_fold)?;
+    let mut output = content.to_string();
+    let original_declarations = nfo_attachment_declarations(content)?;
+    for (index, declaration) in original_declarations.iter().enumerate() {
+        let key =
+            target_component_key_with(&declaration.filename, semantics, |value| case_fold(value))?;
+        let Some(replacement) = rename_index.get(&key) else {
+            continue;
+        };
+        let current = nfo_attachment_declarations(&output)?;
+        let element =
+            direct_xml_elements_named(&output, nfo_root_element_span(&output)?, "tvd_attachment")?
+                .get(index)
+                .copied()
+                .ok_or_else(|| anyhow!("NFO attachment declaration disappeared during rewrite"))?;
+        if current.get(index).is_none() {
+            bail!("NFO attachment declaration changed during rewrite");
+        }
+        output = replace_xml_element_span(&output, element, replacement)?;
+    }
+
+    let original_thumb_elements =
+        direct_xml_elements_named(content, nfo_root_element_span(content)?, "thumb")?;
+    for (index, original_element) in original_thumb_elements.iter().enumerate() {
+        if original_element.self_closing || xml_has_inner_markup(content, *original_element) {
+            continue;
+        }
+        let original_value =
+            xml_text_content(&content[original_element.open_end..original_element.close_start]);
+        let Some(filename) = local_nfo_basename(&original_value) else {
+            continue;
+        };
+        let key = target_component_key_with(&filename, semantics, |value| case_fold(value))?;
+        let Some(replacement) = rename_index.get(&key) else {
+            continue;
+        };
+        let elements =
+            direct_xml_elements_named(&output, nfo_root_element_span(&output)?, "thumb")?;
+        let element = elements
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow!("NFO thumb disappeared during rewrite"))?;
+        output = replace_xml_element_span(&output, element, replacement)?;
+    }
+
+    let root = nfo_root_element_span(&output)?;
+    let local_filenames = direct_xml_elements_named(&output, root, "localfilename")?;
+    if local_filenames.len() > 1 {
+        bail!("NFO contains multiple localfilename fields");
+    }
+    let mut nodes = Vec::new();
+    if let Some(element) = local_filenames.first().copied() {
+        if !element.self_closing && !xml_has_inner_markup(&output, element) {
+            let value = xml_text_content(&output[element.open_end..element.close_start])
+                .trim()
+                .to_string();
+            let value_key = target_component_key_with(&value, semantics, |name| case_fold(name))?;
+            let old_primary_key =
+                target_component_key_with(old_primary_filename, semantics, |name| case_fold(name))?;
+            if value_key == old_primary_key && value != new_primary_filename {
+                output = replace_xml_element_span(&output, element, new_primary_filename)?;
+            }
+        }
+    } else if add_localfilename_when_missing {
+        nodes.push(format!(
+            "  <localfilename>{}</localfilename>",
+            xml_escape(new_primary_filename)
+        ));
+    }
+
+    let existing = nfo_attachment_declarations(&output)?;
+    let thumbs = nfo_local_thumb_declarations(&output)?;
+    let mut by_filename = HashMap::<String, String>::new();
+    for declaration in existing.iter().chain(thumbs.iter()) {
+        let key =
+            target_component_key_with(&declaration.filename, semantics, |value| case_fold(value))?;
+        if let Some(existing_role) = by_filename.get(&key)
+            && existing_role != &declaration.role
+        {
+            bail!("NFO local thumb role conflicts with its attachment declaration");
+        }
+        by_filename.insert(key, declaration.role.clone());
+    }
+    if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+        bail!(
+            "NFO attachment and local thumb count exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+        );
+    }
+    let mut declared_filenames = existing
+        .iter()
+        .map(|declaration| {
+            target_component_key_with(&declaration.filename, semantics, |value| case_fold(value))
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    let mut added_cover_thumb = false;
+    for declaration in additions {
+        let role = supported_nfo_attachment_role(&declaration.role)
+            .ok_or_else(|| anyhow!("NFO attachment role is unsupported"))?;
+        let filename = canonical_nfo_attachment_basename(&declaration.filename)?;
+        let key = target_component_key_with(&filename, semantics, |value| case_fold(value))?;
+        if let Some(existing_role) = by_filename.get(&key) {
+            if existing_role != role {
+                bail!("NFO attachment filename is assigned more than one role");
+            }
+            if declared_filenames.contains(&key) {
+                continue;
+            }
+        } else {
+            by_filename.insert(key.clone(), role.to_string());
+        }
+        if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+            bail!(
+                "NFO attachment and local thumb count exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+            );
+        }
+        declared_filenames.insert(key);
+        nodes.push(format!(
+            "  <tvd_attachment role=\"{role}\">{}</tvd_attachment>",
+            xml_escape(&filename)
+        ));
+        if role == "cover" && !added_cover_thumb {
+            let thumbs =
+                direct_xml_elements_named(&output, nfo_root_element_span(&output)?, "thumb")?;
+            let has_nonempty_thumb = thumbs.iter().any(|element| {
+                !element.self_closing
+                    && !xml_text_content(&output[element.open_end..element.close_start])
+                        .trim()
+                        .is_empty()
+            });
+            if !has_nonempty_thumb {
+                nodes.push(format!("  <thumb>{}</thumb>", xml_escape(&filename)));
+                added_cover_thumb = true;
+            }
+        }
+    }
+    insert_nfo_root_nodes(&output, &nodes)
+}
+
+fn nfo_rename_index_with<F>(
+    renamed_files: &[(String, String)],
+    semantics: TargetNameSemantics,
+    case_fold: F,
+) -> Result<HashMap<String, String>>
+where
+    F: Fn(&str) -> Result<String> + Copy,
+{
+    let mut index = HashMap::with_capacity(renamed_files.len());
+    for (source, target) in renamed_files {
+        let key = target_component_key_with(source, semantics, |value| case_fold(value))?;
+        if let Some(previous) = index.get(&key)
+            && previous != target
+        {
+            bail!(
+                "multiple attached files share a filesystem name and cannot be rewritten unambiguously"
+            );
+        }
+        index.insert(key, target.clone());
+    }
+    Ok(index)
+}
+
+/// Rewrite local NFO references through a source-to-final basename mapping.
+///
+/// The rooted parent supplies the same filesystem name semantics used to resolve the source
+/// basenames during scanning. The function only transforms the supplied text; it never writes
+/// the NFO or changes the caller's file identity proof.
+pub(crate) fn rewrite_nfo_local_references(
+    content: &str,
+    renamed_files: &[(String, String)],
+    old_primary_filename: &str,
+    new_primary_filename: &str,
+    root: &RootedFs,
+    source_parent_relative: &Path,
+) -> Result<String> {
+    let semantics = rooted_directory_name_semantics(root, source_parent_relative)?;
+    update_nfo_attachment_references(
+        content,
+        NfoAttachmentReferenceUpdate {
+            additions: &[],
+            renamed_files,
+            old_primary_filename,
+            new_primary_filename,
+            add_localfilename_when_missing: false,
+            semantics,
+        },
+    )
 }
 
 fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String> {
@@ -9683,17 +11779,13 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             nodes.push(format!("  <title>{}</title>", xml_escape(title.trim())));
         }
     }
-    let existing_ids = nfo_source_ids(&output).into_iter().collect::<HashSet<_>>();
-    for id in normalize_source_ids(patch.source_ids.clone()) {
-        if existing_ids.contains(&id) {
-            continue;
-        }
-        if let Some((kind, value)) = source_id_nfo_value(&id) {
-            nodes.push(format!(
-                "  <uniqueid type=\"{kind}\">{}</uniqueid>",
-                xml_escape(&value)
-            ));
-        }
+    for id in accepted_patch_source_ids(Some(&output), &patch.source_ids)? {
+        let (kind, value) = source_id_nfo_value(&id)
+            .ok_or_else(|| anyhow!("accepted metadata source ID has no NFO representation"))?;
+        nodes.push(format!(
+            "  <uniqueid type=\"{kind}\">{}</uniqueid>",
+            xml_escape(&value)
+        ));
     }
     if let Some(collection) = patch.collection.as_ref()
         && (!patch.fill_missing_only
@@ -9707,6 +11799,12 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             if xml_element_span(&output, "set", 0).is_some() {
                 if !patch.fill_missing_only || can_fill_nfo_collection_title(&output)? {
                     output = replace_nfo_collection_title(&output, collection.title.trim())?;
+                }
+            } else if let Some(existing_tvshowtitle) =
+                xml_tag_text(&output, "tvshowtitle").filter(|value| !value.trim().is_empty())
+            {
+                if !existing_tvshowtitle.trim().eq(collection.title.trim()) {
+                    bail!("NFO tvshowtitle conflicts with the requested collection");
                 }
             } else {
                 nodes.push(format!(
@@ -9748,6 +11846,23 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
                 output = replace_xml_element(&output, "partid", part_id.trim())?;
             } else {
                 nodes.push(format!("  <partid>{}</partid>", xml_escape(part_id.trim())));
+            }
+        }
+        if !collection.title.trim().is_empty() {
+            let existing_tvshowtitle = xml_tag_text(&output, "tvshowtitle");
+            match existing_tvshowtitle.as_deref().map(str::trim) {
+                Some(existing) if !existing.is_empty() => {
+                    if !patch.fill_missing_only && existing != collection.title.trim() {
+                        bail!("NFO tvshowtitle conflicts with the requested collection");
+                    }
+                }
+                _ if xml_tag_text(&output, "tvshowtitle").is_some() => {
+                    output = replace_xml_element(&output, "tvshowtitle", collection.title.trim())?;
+                }
+                _ => nodes.push(format!(
+                    "  <tvshowtitle>{}</tvshowtitle>",
+                    xml_escape(collection.title.trim())
+                )),
             }
         }
     }
@@ -9897,6 +12012,10 @@ fn new_nfo(fallback_title: &str, patch: &MetadataPatch) -> String {
                 "  <set>{}</set>\n",
                 xml_escape(collection.title.trim())
             ));
+            content.push_str(&format!(
+                "  <tvshowtitle>{}</tvshowtitle>\n",
+                xml_escape(collection.title.trim())
+            ));
         }
         if let Some(order) = collection.order {
             content.push_str(&format!("  <episode>{order}</episode>\n"));
@@ -10004,12 +12123,31 @@ fn organization_status_nfo_value(status: OrganizationStatus) -> &'static str {
     }
 }
 
-fn missing_patch_source_ids(existing: Vec<String>, requested: &[String]) -> Vec<String> {
-    let existing = existing.into_iter().collect::<HashSet<_>>();
-    normalize_source_ids(requested.to_vec())
+fn accepted_patch_source_ids(
+    existing_nfo: Option<&str>,
+    requested: &[String],
+) -> Result<Vec<String>> {
+    let normalized = normalize_source_ids(requested.to_vec());
+    let Some(existing_nfo) = existing_nfo else {
+        return Ok(normalized
+            .into_iter()
+            .filter(|id| source_id_nfo_value(id).is_some())
+            .collect());
+    };
+
+    let existing_ids = nfo_source_ids(existing_nfo)
         .into_iter()
-        .filter(|id| !existing.contains(id))
-        .collect()
+        .collect::<HashSet<_>>();
+    let mut existing_id_types = nfo_source_id_types(existing_nfo)?;
+    Ok(normalized
+        .into_iter()
+        .filter(|id| {
+            let Some((kind, _)) = source_id_nfo_value(id) else {
+                return false;
+            };
+            !existing_ids.contains(id) && existing_id_types.insert(kind.to_ascii_lowercase())
+        })
+        .collect())
 }
 
 fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
@@ -12049,7 +14187,7 @@ mod tests {
             &MetadataPatch {
                 item_id: "item".to_string(),
                 title: Some("Patched title".to_string()),
-                source_ids: vec!["cid456".to_string()],
+                source_ids: vec!["cid456".to_string(), "BV1abcdefgh".to_string()],
                 collection: None,
                 fill_missing_only: false,
                 organization_status: None,
@@ -12062,8 +14200,12 @@ mod tests {
         ));
         assert!(patched.contains("<title>Patched title</title>"));
         assert!(patched.contains("<uniqueid type='bilibili-cid'>123</uniqueid>"));
-        assert!(patched.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
-        assert_eq!(nfo_source_ids(&patched), vec!["cid123", "cid456"]);
+        assert!(!patched.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
+        assert!(patched.contains("<uniqueid type=\"bilibili\">BV1abcdefgh</uniqueid>"));
+        assert_eq!(
+            nfo_source_ids(&patched).into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["cid123".to_string(), "BV1abcdefgh".to_string()])
+        );
         assert!(patched.contains("<future>keep</future>"));
     }
 
@@ -15621,6 +17763,16 @@ mod tests {
                     before: None,
                     after: "Part-A".to_string(),
                 },
+                MetadataFieldChange {
+                    field: "tvshowtitle".to_string(),
+                    before: None,
+                    after: "Series & More".to_string(),
+                },
+                MetadataFieldChange {
+                    field: "localfilename".to_string(),
+                    before: None,
+                    after: "clip.mp4".to_string(),
+                },
             ]
         );
         assert_eq!(
@@ -15647,6 +17799,8 @@ mod tests {
         assert!(patched.contains("<settype>bilibili_collection</settype>"));
         assert!(patched.contains("<episode>2</episode>"));
         assert!(patched.contains("<partid>Part-A</partid>"));
+        assert!(patched.contains("<tvshowtitle>Series &amp; More</tvshowtitle>"));
+        assert!(patched.contains("<localfilename>clip.mp4</localfilename>"));
         assert_eq!(
             fs::metadata(root.path().join("clip.nfo")).unwrap().mode() & 0o777,
             0o600,
@@ -16693,6 +18847,176 @@ mod tests {
         assert!(manifest.patches[0].replacement_checkpoint.is_some());
     }
 
+    struct FailMovedNfoAppliedBatchManifestWriteProvider {
+        batch_manifest_writes: AtomicUsize,
+        target_nfo: PathBuf,
+        failed_after_publication: AtomicBool,
+    }
+
+    impl QueueFileProvider for FailMovedNfoAppliedBatchManifestWriteProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            let is_batch_manifest = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(BATCH_PREFIX));
+            if is_batch_manifest && self.batch_manifest_writes.fetch_add(1, Ordering::SeqCst) == 4 {
+                let published = fs::read_to_string(&self.target_nfo).is_ok_and(|contents| {
+                    contents.contains("<localfilename>clip.mp4</localfilename>")
+                });
+                if published {
+                    self.failed_after_publication.store(true, Ordering::SeqCst);
+                    bail!("injected batch manifest failure after moved NFO publication");
+                }
+            }
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(source, destination)
+        }
+    }
+
+    #[test]
+    fn moved_nfo_checkpoint_recovers_when_manifest_identity_refresh_is_interrupted() {
+        let root = TemporaryRoot::new("moved-nfo-checkpoint-crash-window");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Before</title><future>keep</future></movie>",
+        )
+        .expect("NFO fixture should write");
+        fs::set_permissions(
+            root.path().join("clip.nfo"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("NFO fixture should become private");
+
+        let target_nfo = root.path().join("Moved/clip.nfo");
+        let provider_impl = Arc::new(FailMovedNfoAppliedBatchManifestWriteProvider {
+            batch_manifest_writes: AtomicUsize::new(0),
+            target_nfo: target_nfo.clone(),
+            failed_after_publication: AtomicBool::new(false),
+        });
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider.clone())
+            .expect("library manager should open");
+        let snapshot = manager.scan(&[]).expect("fixture scan should complete");
+        let preview = manager
+            .preview(
+                &[item_at(&snapshot, "clip.mp4").id.clone()],
+                "Moved",
+                false,
+                ConflictPolicy::Skip,
+            )
+            .expect("move preview should prepare");
+        assert_eq!(
+            preview.items[0].files.len(),
+            2,
+            "the move should include the primary video and its NFO"
+        );
+
+        assert!(
+            manager
+                .execute_preview(&preview.id, &preview.revision)
+                .is_err(),
+            "the final manifest write should fail after NFO publication"
+        );
+        assert!(
+            provider_impl
+                .failed_after_publication
+                .load(Ordering::SeqCst),
+            "the injected crash window must occur after the moved NFO has its new contents"
+        );
+        let current_nfo = fs::read_to_string(&target_nfo).expect("published NFO should read");
+        assert!(current_nfo.contains("<localfilename>clip.mp4</localfilename>"));
+
+        let batch_bytes = manager
+            .read_private_file(&manager.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("interrupted batch manifest should read")
+            .expect("interrupted batch manifest should exist");
+        let interrupted: BatchManifest =
+            serde_json::from_slice(&batch_bytes).expect("interrupted manifest should decode");
+        let patch = interrupted
+            .patches
+            .iter()
+            .find(|patch| patch.target_path == "Moved/clip.nfo")
+            .expect("moved NFO should have a prepared patch");
+        let checkpoint = patch
+            .replacement_checkpoint
+            .as_ref()
+            .expect("replacement identity checkpoint should be durable");
+        assert_eq!(patch.state, ManifestPatchState::Pending);
+        let moved_nfo = interrupted
+            .files
+            .iter()
+            .find(|file| file.target_path == "Moved/clip.nfo")
+            .expect("moved NFO should remain in the batch file manifest");
+        assert_eq!(moved_nfo.state, ManifestFileState::Moved);
+        assert_eq!(
+            moved_nfo.identity,
+            patch
+                .expected_identity
+                .clone()
+                .expect("original NFO proof should remain in the patch"),
+            "the disk manifest should retain the pre-patch file identity in the crash window"
+        );
+        assert_ne!(moved_nfo.identity, checkpoint.after_identity);
+
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&manager, &preview);
+        drop(manager);
+
+        let reopened = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should reopen against the same fixture provider");
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("checkpoint recovery should refresh the moved-file identity and complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+
+        let final_bytes = reopened
+            .read_private_file(&reopened.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("completed batch manifest should read")
+            .expect("completed batch manifest should remain available");
+        let completed: BatchManifest =
+            serde_json::from_slice(&final_bytes).expect("completed manifest should decode");
+        let completed_patch = completed
+            .patches
+            .iter()
+            .find(|patch| patch.target_path == "Moved/clip.nfo")
+            .expect("completed NFO patch should remain recorded");
+        let completed_nfo = completed
+            .files
+            .iter()
+            .find(|file| file.target_path == "Moved/clip.nfo")
+            .expect("completed moved NFO should remain recorded");
+        assert_eq!(completed_patch.state, ManifestPatchState::Applied);
+        assert_eq!(
+            completed_nfo.identity,
+            completed_patch
+                .replacement_checkpoint
+                .as_ref()
+                .expect("replacement checkpoint should remain durable")
+                .after_identity
+        );
+    }
+
     #[test]
     fn nfo_replacement_checkpoint_rejects_same_content_object_replacement() {
         let (root, current_manager, preview) =
@@ -16951,16 +19275,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_patch_target_conflicts_with_another_items_planned_nfo_move() {
+    fn metadata_patch_target_keep_both_reserves_another_items_planned_nfo_move() {
         let root = TemporaryRoot::new("nfo-cross-item-move");
         fs::create_dir_all(root.path().join("A")).unwrap();
         fs::create_dir_all(root.path().join("B")).unwrap();
         fs::write(root.path().join("A/clip.mp4"), b"first-video").unwrap();
-        fs::write(
-            root.path().join("A/clip.nfo"),
-            "<movie><title>First</title></movie>",
-        )
-        .unwrap();
+        let first_nfo_contents = "<movie><title>First</title></movie>";
+        fs::write(root.path().join("A/clip.nfo"), first_nfo_contents).unwrap();
         fs::write(root.path().join("B/clip.mkv"), b"second-video").unwrap();
         let manager = manager(&root);
         let snapshot = manager.scan(&[]).expect("scan should complete");
@@ -16974,19 +19295,94 @@ mod tests {
             fill_missing_only: false,
             organization_status: None,
         };
+        let preview = manager
+            .preview_with_hints_and_patches(
+                &[first.id.clone(), second.id.clone()],
+                Some("Moved"),
+                false,
+                ConflictPolicy::KeepBoth,
+                &[],
+                &[patch],
+            )
+            .expect(
+                "KeepBoth should reserve the generated NFO target before choosing its media name",
+            );
+        let first_move = preview
+            .items
+            .iter()
+            .find(|item| item.item_id == first.id)
+            .expect("the first media move should be previewed");
+        let second_move = preview
+            .items
+            .iter()
+            .find(|item| item.item_id == second.id)
+            .expect("the patched media move should be previewed");
+        assert_eq!(first_move.outcome, MoveOutcome::Move);
+        assert_eq!(second_move.outcome, MoveOutcome::Move);
+        let first_nfo_target = first_move
+            .files
+            .iter()
+            .find(|file| file.source_path == "A/clip.nfo")
+            .expect("the first item's NFO should be part of its planned move")
+            .target_path
+            .clone();
+        assert_eq!(first_nfo_target, "Moved/clip.nfo");
+        assert_eq!(second_move.target_path, "Moved/clip (2).mkv");
+        let second_nfo_target = preview
+            .metadata_patches
+            .iter()
+            .find(|patch| patch.item_id == second.id)
+            .expect("the second item's patch should be prepared")
+            .nfo_path
+            .clone();
+        assert_eq!(second_nfo_target, "Moved/clip (2).nfo");
+        assert_ne!(first_nfo_target, second_nfo_target);
+        let move_destinations = preview
+            .items
+            .iter()
+            .flat_map(|item| item.files.iter().map(|file| file.target_path.as_str()))
+            .collect::<Vec<_>>();
         assert!(
-            manager
-                .preview_with_hints_and_patches(
-                    &[first.id.clone(), second.id.clone()],
-                    Some("Moved"),
-                    false,
-                    ConflictPolicy::KeepBoth,
-                    &[],
-                    &[patch],
-                )
-                .is_err(),
-            "another item's planned NFO attachment move must reserve the shared target"
+            move_destinations
+                .iter()
+                .all(|target| *target != second_nfo_target.as_str()),
+            "the generated NFO patch destination must not be claimed by a moved file"
         );
+        assert_eq!(
+            fs::read_to_string(root.path().join("A/clip.nfo")).unwrap(),
+            first_nfo_contents
+        );
+        assert_eq!(
+            fs::read(root.path().join("B/clip.mkv")).unwrap(),
+            b"second-video"
+        );
+        assert!(
+            !root.path().join("Moved").exists(),
+            "preview must not create targets"
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("KeepBoth move and generated metadata patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let first_nfo = fs::read_to_string(root.path().join(&first_nfo_target)).unwrap();
+        assert!(first_nfo.contains("<title>First</title>"));
+        assert!(first_nfo.contains("<localfilename>clip.mp4</localfilename>"));
+        let second_nfo = fs::read_to_string(root.path().join(&second_nfo_target)).unwrap();
+        assert!(second_nfo.contains("<title>Second updated</title>"));
+
+        let rescanned = manager.scan(&[]).expect("both moved owners should rescan");
+        let moved_first = item_at(&rescanned, "Moved/clip.mp4");
+        let moved_second = item_at(&rescanned, "Moved/clip (2).mkv");
+        assert_eq!(
+            moved_first.authoritative_nfo_path.as_deref(),
+            Some("Moved/clip.nfo")
+        );
+        assert_eq!(
+            moved_second.authoritative_nfo_path.as_deref(),
+            Some("Moved/clip (2).nfo")
+        );
+        assert_eq!(moved_second.title, "Second updated");
     }
 
     #[test]
@@ -17269,6 +19665,36 @@ mod tests {
         assert_eq!(metadata.ino(), expected.2, "file should retain its inode");
     }
 
+    fn assert_organized_fixture_nfo_with_localfilename(
+        path: &Path,
+        expected: &(Vec<u8>, u64, u64),
+        target_primary_filename: &str,
+    ) {
+        let metadata = fs::metadata(path).expect("moved NFO should stat");
+        let original = std::str::from_utf8(&expected.0).expect("fixture NFO should be UTF-8");
+        assert_eq!(original.matches("</movie>").count(), 1);
+        let localfilename = format!(
+            "\n  <localfilename>{}</localfilename>\n</movie>",
+            xml_escape(target_primary_filename)
+        );
+        let expected_after = original.replacen("</movie>", &localfilename, 1);
+        assert_eq!(
+            fs::read_to_string(path).expect("updated NFO should be UTF-8"),
+            expected_after,
+            "confirmed move should add only the portable primary filename"
+        );
+        assert_eq!(
+            metadata.dev(),
+            expected.1,
+            "NFO should remain on its device"
+        );
+        assert_ne!(
+            metadata.ino(),
+            expected.2,
+            "atomic NFO replacement should publish the approved new object"
+        );
+    }
+
     #[test]
     fn nested_multi_part_collection_move_flattens_and_preserves_rich_sidecars() {
         let root = TemporaryRoot::new("nested-multipart-flatten");
@@ -17422,9 +19848,22 @@ mod tests {
             .expect("confirmed nested collection move should complete");
         assert_eq!(result.status, BatchStatus::Complete);
         for item in &preview.items {
+            let target_primary_filename = Path::new(&item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("target primary should have a filename");
             for file in &item.files {
                 let target = root.path().join(&file.target_path);
-                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                let expected = &original_files[&file.source_path];
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(
                     !root.path().join(&file.source_path).exists(),
                     "approved source should no longer exist after move: {}",
@@ -17575,9 +20014,22 @@ mod tests {
             .expect("confirmed selected-item move should complete");
         assert_eq!(result.status, BatchStatus::Complete);
         for item in &preview.items {
+            let target_primary_filename = Path::new(&item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("target primary should have a filename");
             for file in &item.files {
                 let target = root.path().join(&file.target_path);
-                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                let expected = &original_files[&file.source_path];
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(!root.path().join(&file.source_path).exists());
             }
         }
@@ -18504,7 +20956,7 @@ mod tests {
             round4_scanned_file("episode.multi.en.srt", 9),
         ];
         let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
-        let index = SidecarIndex::build(&files, &BTreeSet::new(), &semantics)
+        let index = SidecarIndex::build(&files, &BTreeSet::new(), &BTreeSet::new(), &semantics)
             .expect("filesystem name semantics should be available for every fixture parent");
 
         assert!(index.attached_files(&files[0]).is_empty());
@@ -18517,6 +20969,815 @@ mod tests {
         assert!(index.attached_files(&files[6]).is_empty());
         assert!(index.attached_files(&files[7]).is_empty());
         assert_eq!(index.ambiguous_count, 2);
+    }
+
+    #[test]
+    fn round6_sidecar_index_attaches_only_conventional_unqualified_files_in_single_video_dirs() {
+        let files = vec![
+            round4_scanned_file("single/Film.mkv", 1),
+            round4_scanned_file("single/cover.jpg", 2),
+            round4_scanned_file("single/zh-Hans.srt", 3),
+            round4_scanned_file("single/danmaku.xml", 4),
+            round4_scanned_file("single/Film.en.srt", 5),
+            round4_scanned_file("ambiguous/A.mkv", 6),
+            round4_scanned_file("ambiguous/B.mkv", 7),
+            round4_scanned_file("ambiguous/cover.jpg", 8),
+            round4_scanned_file("ambiguous/zh.srt", 9),
+            round4_scanned_file("ambiguous/danmaku.xml", 10),
+            round4_scanned_file("ambiguous/A.zh.srt", 11),
+            round4_scanned_file("incomplete/Only.mkv", 12),
+            round4_scanned_file("incomplete/cover.jpg", 13),
+            round4_scanned_file("nonleaf/Film.mkv", 14),
+            round4_scanned_file("nonleaf/cover.jpg", 15),
+        ];
+        let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
+        let incomplete = BTreeSet::from(["incomplete".to_string()]);
+        let leaf_directories = BTreeSet::from(["single".to_string(), "ambiguous".to_string()]);
+        let index = SidecarIndex::build(&files, &incomplete, &leaf_directories, &semantics)
+            .expect("filesystem semantics should cover each directory");
+
+        assert_eq!(
+            index.attached_files(&files[0]),
+            vec![
+                "single/Film.en.srt".to_string(),
+                "single/cover.jpg".to_string(),
+                "single/danmaku.xml".to_string(),
+                "single/zh-Hans.srt".to_string(),
+            ]
+        );
+        assert_eq!(
+            index.attached_files(&files[5]),
+            vec!["ambiguous/A.zh.srt".to_string()]
+        );
+        assert!(index.attached_files(&files[6]).is_empty());
+        assert!(index.attached_files(&files[11]).is_empty());
+        assert!(index.attached_files(&files[14]).is_empty());
+        assert_eq!(index.ambiguous_count, 3);
+    }
+
+    #[test]
+    fn root_legacy_leaf_fallback_ignores_private_library_directory_but_not_user_subdirectories() {
+        let root = TemporaryRoot::new("root-legacy-leaf-excludes-private-library");
+        fs::write(root.path().join("episode.mp4"), b"fixture video")
+            .expect("root media should write");
+        fs::write(root.path().join("cover.jpg"), b"fixture cover")
+            .expect("root cover should write");
+        fs::write(root.path().join("zh.srt"), b"fixture subtitle")
+            .expect("root subtitle should write");
+        fs::write(root.path().join("danmaku.xml"), b"<i/>").expect("root danmaku should write");
+
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&[])
+            .expect("root with only the internal library directory should scan");
+        let episode = item_at(&snapshot, "episode.mp4");
+        for (relative_path, kind) in [
+            ("cover.jpg", "cover"),
+            ("zh.srt", "subtitle"),
+            ("danmaku.xml", "danmaku_or_metadata"),
+        ] {
+            assert!(episode.attachments.iter().any(|attachment| {
+                attachment.relative_path == relative_path && attachment.kind == kind
+            }));
+        }
+
+        fs::create_dir(root.path().join("Series")).expect("real user subdirectory should create");
+        fs::write(root.path().join("Series/other.mp4"), b"another video")
+            .expect("nested primary should write");
+        let rescanned = manager
+            .scan(&[])
+            .expect("root with a user subdirectory should rescan");
+        assert!(
+            item_at(&rescanned, "episode.mp4").attachments.is_empty(),
+            "a real child directory must continue to disable the single-primary leaf fallback"
+        );
+    }
+
+    #[test]
+    fn round6_nfo_attachment_declarations_accept_portable_unicode_basenames_and_reject_unsafe_values()
+     {
+        let nfo = concat!(
+            "<?xml version=\"1.0\"?><movie>",
+            "<title>保留 titre</title>",
+            "<tvd_attachment role=\"cover\">封面.jpg</tvd_attachment>",
+            "<tvd_attachment role=\"subtitle\">Русский.srt</tvd_attachment>",
+            "<tvd_attachment role=\"subtitle\">Sous-titres français.srt</tvd_attachment>",
+            "<tvd_attachment role=\"subtitle\">Sottotitoli italiani.srt</tvd_attachment>",
+            "</movie>"
+        );
+        assert_eq!(
+            nfo_attachment_declarations(nfo).expect("Unicode attachment declarations should parse"),
+            vec![
+                NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "封面.jpg".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "subtitle".to_string(),
+                    filename: "Русский.srt".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "subtitle".to_string(),
+                    filename: "Sous-titres français.srt".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "subtitle".to_string(),
+                    filename: "Sottotitoli italiani.srt".to_string(),
+                },
+            ]
+        );
+
+        let too_long_basename = "a".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        for value in [
+            "../secret.jpg",
+            "/tmp/cover.jpg",
+            "file:///tmp/cover.jpg",
+            "https://example.test/cover.jpg",
+            "folder/cover.jpg",
+            "..",
+            " cover.jpg ",
+            too_long_basename.as_str(),
+        ] {
+            let invalid = format!(
+                "<movie><tvd_attachment role=\"cover\">{}</tvd_attachment></movie>",
+                xml_escape(value)
+            );
+            assert!(
+                nfo_attachment_declarations(&invalid).is_err(),
+                "unsafe declaration should be rejected: {value}"
+            );
+        }
+        assert!(
+            nfo_attachment_declarations(
+                "<movie><tvd_attachment role=\"unknown\">cover.jpg</tvd_attachment></movie>"
+            )
+            .is_err()
+        );
+        assert!(nfo_attachment_declarations(
+            "<movie><tvd_attachment role=\"cover\">cover.jpg</tvd_attachment><tvd_attachment role=\"cover\">cover.jpg</tvd_attachment></movie>"
+        )
+        .is_err());
+        let too_many = format!(
+            "<movie>{}</movie>",
+            (0..=NFO_ATTACHMENT_DECLARATION_LIMIT)
+                .map(|index| format!(
+                    "<tvd_attachment role=\"cover\">cover-{index}.jpg</tvd_attachment>"
+                ))
+                .collect::<String>()
+        );
+        assert!(
+            nfo_attachment_declarations(&too_many).is_err(),
+            "over-limit manifests must reject atomically rather than retain a prefix"
+        );
+    }
+
+    #[test]
+    fn round6_sidecar_index_keeps_manifest_targets_local_and_rejects_multiowner_claims() {
+        let files = vec![
+            round4_scanned_file("group/A.mkv", 1),
+            round4_scanned_file("group/B.mkv", 2),
+            round4_scanned_file("group/bonus.ass", 3),
+            round4_scanned_file("group/shared.jpg", 4),
+            round4_scanned_file("group/A.zh.srt", 5),
+            round4_scanned_file("group/A.nfo", 6),
+            round4_scanned_file("group/B.nfo", 7),
+        ];
+        let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
+        let mut index = SidecarIndex::build(&files, &BTreeSet::new(), &BTreeSet::new(), &semantics)
+            .expect("base stem index should build");
+        let declarations = HashMap::from([
+            (
+                "group/A.mkv".to_string(),
+                vec![
+                    NfoAttachmentDeclaration {
+                        role: "subtitle".to_string(),
+                        filename: "bonus.ass".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "subtitle".to_string(),
+                        filename: "A.zh.srt".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "cover".to_string(),
+                        filename: "shared.jpg".to_string(),
+                    },
+                ],
+            ),
+            (
+                "group/B.mkv".to_string(),
+                vec![NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "shared.jpg".to_string(),
+                }],
+            ),
+        ]);
+
+        let rejected = index
+            .add_declared_attachments(&files, &declarations, &semantics)
+            .expect("manifest paths should be validated within their containing directory");
+        assert_eq!(rejected, 2, "the shared asset must remain ambiguous");
+        assert_eq!(
+            index.attached_files(&files[0]),
+            vec![
+                "group/A.nfo".to_string(),
+                "group/A.zh.srt".to_string(),
+                "group/bonus.ass".to_string()
+            ]
+        );
+        assert_eq!(
+            index.declared_role("group/A.mkv", "group/bonus.ass"),
+            Some("subtitle")
+        );
+        assert_eq!(
+            index.attached_files(&files[1]),
+            vec!["group/B.nfo".to_string()]
+        );
+    }
+
+    #[test]
+    fn round6_attachment_declarations_reject_primary_media_and_role_incompatible_files() {
+        let files = vec![
+            round4_scanned_file("group/A.mkv", 1),
+            round4_scanned_file("group/B.mkv", 2),
+            round4_scanned_file("group/cover.jpg", 3),
+            round4_scanned_file("group/A.nfo", 4),
+            round4_scanned_file("group/subtitle.srt", 5),
+            round4_scanned_file("group/B.nfo", 6),
+            round4_scanned_file("group/.telegram-video-downloader-queue.json", 7),
+        ];
+        let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
+        let mut index = SidecarIndex::build(&files, &BTreeSet::new(), &BTreeSet::new(), &semantics)
+            .expect("base sidecar ownership should build");
+        let declarations = HashMap::from([
+            (
+                "group/A.mkv".to_string(),
+                vec![
+                    NfoAttachmentDeclaration {
+                        role: "cover".to_string(),
+                        filename: "B.mkv".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "cover".to_string(),
+                        filename: "A.nfo".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "cover".to_string(),
+                        filename: "subtitle.srt".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "cover".to_string(),
+                        filename: "cover.jpg".to_string(),
+                    },
+                    NfoAttachmentDeclaration {
+                        role: "danmaku".to_string(),
+                        filename: ".telegram-video-downloader-queue.json".to_string(),
+                    },
+                ],
+            ),
+            (
+                "group/B.mkv".to_string(),
+                vec![NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "cover.jpg".to_string(),
+                }],
+            ),
+        ]);
+
+        let rejected = index
+            .add_declared_attachments(&files, &declarations, &semantics)
+            .expect("all declarations should receive a bounded local validation");
+        assert_eq!(rejected, 6);
+        assert_eq!(index.declared_role("group/A.mkv", "group/B.mkv"), None);
+        assert_eq!(index.declared_role("group/A.mkv", "group/A.nfo"), None);
+        assert_eq!(
+            index.declared_role("group/A.mkv", "group/subtitle.srt"),
+            None
+        );
+        assert_eq!(index.declared_role("group/A.mkv", "group/cover.jpg"), None);
+        assert_eq!(index.declared_role("group/B.mkv", "group/cover.jpg"), None);
+        assert_eq!(
+            index.declared_role("group/A.mkv", "group/.telegram-video-downloader-queue.json"),
+            None,
+            "queue protocol files cannot become declared media attachments"
+        );
+        assert!(
+            index
+                .attached_files(&files[0])
+                .contains(&"group/A.nfo".to_string()),
+            "the primary's NFO remains metadata, never a declared cover"
+        );
+        assert!(
+            !index
+                .attached_files(&files[0])
+                .contains(&"group/B.mkv".to_string()),
+            "a declared cover must never consume another primary media file"
+        );
+    }
+
+    #[test]
+    fn round6_remote_thumb_is_not_a_local_attachment_declaration() {
+        assert_eq!(
+            nfo_local_thumb_declarations(
+                "<movie><thumb>https://example.test/poster.jpg</thumb><thumb>poster.jpg</thumb></movie>"
+            )
+            .expect("remote and local thumb tags should parse without fetching"),
+            vec![NfoAttachmentDeclaration {
+                role: "cover".to_string(),
+                filename: "poster.jpg".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn only_recognized_bare_txt_danmaku_names_get_a_persistable_role() {
+        for filename in [
+            "comments.txt",
+            "comment.TXT",
+            "danmaku.txt",
+            "danmu.txt",
+            "barrage.txt",
+        ] {
+            let attachment = LibraryAttachment {
+                relative_path: filename.to_string(),
+                kind: "sidecar".to_string(),
+            };
+            assert_eq!(
+                attachment_role_for_nfo(&attachment),
+                Some("danmaku"),
+                "recognized legacy TXT should persist a danmaku role: {filename}"
+            );
+        }
+        for filename in ["notes.txt", "Episode.comments.txt"] {
+            let attachment = LibraryAttachment {
+                relative_path: filename.to_string(),
+                kind: "sidecar".to_string(),
+            };
+            assert_eq!(
+                attachment_role_for_nfo(&attachment),
+                None,
+                "arbitrary or qualified TXT should not be labelled as danmaku: {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn round6_nfo_rename_preserves_unknown_fields_and_clear_unique_ids() {
+        let original = concat!(
+            "<movie><uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid>",
+            "<tvshowtitle>Saved show</tvshowtitle>",
+            "<localfilename>Film.mkv</localfilename>",
+            "<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>",
+            "<thumb>cover.jpg</thumb><futureField keep=\"yes\">value</futureField></movie>"
+        );
+        let renamed = update_nfo_attachment_references(
+            original,
+            NfoAttachmentReferenceUpdate {
+                additions: &[],
+                renamed_files: &[("cover.jpg".to_string(), "artwork.jpg".to_string())],
+                old_primary_filename: "Film.mkv",
+                new_primary_filename: "Film (2).mkv",
+                add_localfilename_when_missing: true,
+                semantics: TargetNameSemantics::default(),
+            },
+        )
+        .expect("local references should update safely");
+        assert!(
+            renamed.contains("<uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid>")
+        );
+        assert!(renamed.contains("<tvshowtitle>Saved show</tvshowtitle>"));
+        assert!(renamed.contains("<localfilename>Film (2).mkv</localfilename>"));
+        assert!(renamed.contains("<tvd_attachment role=\"cover\">artwork.jpg</tvd_attachment>"));
+        assert!(renamed.contains("<thumb>artwork.jpg</thumb>"));
+        assert!(renamed.contains("<futureField keep=\"yes\">value</futureField>"));
+
+        let patch = MetadataPatch {
+            item_id: "unused-in-helper".to_string(),
+            title: None,
+            source_ids: vec!["BV7654321".to_string(), "youtube:abcdefghijk".to_string()],
+            collection: None,
+            fill_missing_only: false,
+            organization_status: None,
+        };
+        let patched = append_metadata_patch(&renamed, &patch)
+            .expect("additional identifiers should be additive");
+        assert_eq!(
+            direct_xml_elements_named(
+                &patched,
+                nfo_root_element_span(&patched).unwrap(),
+                "uniqueid"
+            )
+            .unwrap()
+            .iter()
+            .filter(|element| {
+                xml_attribute(&patched[element.open_start..element.open_end], "type").as_deref()
+                    == Some("bilibili")
+            })
+            .count(),
+            1,
+            "a second Bilibili value cannot replace or shadow the clear saved ID"
+        );
+        assert!(patched.contains("<uniqueid type=\"youtube\">abcdefghijk</uniqueid>"));
+        assert!(patched.contains("<futureField keep=\"yes\">value</futureField>"));
+    }
+
+    #[test]
+    fn nfo_rewrite_matches_case_and_normalization_aliases_and_rejects_ambiguous_maps() {
+        let semantics = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: true,
+            hfs_ignorable: false,
+        };
+        let case_fold = |value: &str| Ok(value.to_lowercase());
+        let scanned_files = vec![
+            round4_scanned_file("Episode.mkv", 1),
+            round4_scanned_file("Film.Cover.JPG", 2),
+            round4_scanned_file("Café.srt", 3),
+            round4_scanned_file("Episode.nfo", 4),
+        ];
+        let directory_semantics = round4_semantics_by_parent(&scanned_files, semantics);
+        let mut sidecars = SidecarIndex::build_with_case_fold(
+            &scanned_files,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &directory_semantics,
+            case_fold,
+        )
+        .expect("synthetic case-folded filesystem semantics should build");
+        let declarations = HashMap::from([(
+            "Episode.mkv".to_string(),
+            vec![
+                NfoAttachmentDeclaration {
+                    role: "cover".to_string(),
+                    filename: "film.cover.jpg".to_string(),
+                },
+                NfoAttachmentDeclaration {
+                    role: "subtitle".to_string(),
+                    filename: "Cafe\u{301}.srt".to_string(),
+                },
+            ],
+        )]);
+        assert_eq!(
+            sidecars
+                .add_declared_attachments_with_case_fold(
+                    &scanned_files,
+                    &declarations,
+                    &directory_semantics,
+                    case_fold,
+                )
+                .expect("scan declaration matching should use the test filesystem semantics"),
+            0
+        );
+        assert_eq!(
+            sidecars.declared_role("Episode.mkv", "Film.Cover.JPG"),
+            Some("cover")
+        );
+        assert_eq!(
+            sidecars.declared_role("Episode.mkv", "Café.srt"),
+            Some("subtitle")
+        );
+
+        let original = concat!(
+            "<movie><localfilename>Cafe\u{301}.MKV</localfilename>",
+            "<tvd_attachment role=\"cover\">FILM.COVER.JPG</tvd_attachment>",
+            "<thumb>film.cover.jpg</thumb>",
+            "<tvd_attachment role=\"subtitle\">Cafe\u{301}.srt</tvd_attachment>",
+            "<thumb>https://example.test/Film.Cover.JPG</thumb>",
+            "<futureField keep=\"yes\">保留</futureField></movie>"
+        );
+        let renamed = update_nfo_attachment_references_with_case_fold(
+            original,
+            NfoAttachmentReferenceUpdate {
+                additions: &[],
+                renamed_files: &[
+                    (
+                        "Film.Cover.JPG".to_string(),
+                        "Film (2).Cover.JPG".to_string(),
+                    ),
+                    ("Café.srt".to_string(), "Café (2).srt".to_string()),
+                    ("Café.mkv".to_string(), "Episode (2).mkv".to_string()),
+                ],
+                old_primary_filename: "Café.mkv",
+                new_primary_filename: "Episode (2).mkv",
+                add_localfilename_when_missing: false,
+                semantics,
+            },
+            case_fold,
+        )
+        .expect("case and normalization-equivalent local references should rewrite");
+        assert!(renamed.contains("<localfilename>Episode (2).mkv</localfilename>"));
+        assert!(
+            renamed.contains("<tvd_attachment role=\"cover\">Film (2).Cover.JPG</tvd_attachment>")
+        );
+        assert!(renamed.contains("<thumb>Film (2).Cover.JPG</thumb>"));
+        assert!(
+            renamed.contains("<tvd_attachment role=\"subtitle\">Café (2).srt</tvd_attachment>")
+        );
+        assert!(renamed.contains("<thumb>https://example.test/Film.Cover.JPG</thumb>"));
+        assert!(renamed.contains("<futureField keep=\"yes\">保留</futureField>"));
+
+        let ambiguous = update_nfo_attachment_references_with_case_fold(
+            "<movie><tvd_attachment role=\"cover\">film.jpg</tvd_attachment></movie>",
+            NfoAttachmentReferenceUpdate {
+                additions: &[],
+                renamed_files: &[
+                    ("Film.jpg".to_string(), "Film (2).jpg".to_string()),
+                    ("film.JPG".to_string(), "Film (3).jpg".to_string()),
+                ],
+                old_primary_filename: "Film.mkv",
+                new_primary_filename: "Film (2).mkv",
+                add_localfilename_when_missing: false,
+                semantics,
+            },
+            case_fold,
+        )
+        .expect_err("two filesystem-equivalent source names cannot map to different targets");
+        assert!(
+            format!("{ambiguous:#}").contains("filesystem name"),
+            "ambiguous source aliases should fail closed: {ambiguous:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_nfo_cannot_claim_a_symlink_as_a_local_cover() {
+        let root = TemporaryRoot::new("nfo-cover-symlink-rejected");
+        let outside = TemporaryRoot::new("nfo-cover-symlink-target");
+        let group = root.path().join("Film");
+        fs::create_dir_all(&group).expect("media group should exist");
+        fs::write(group.join("Film.mkv"), b"fixture video").expect("primary media should write");
+        fs::write(outside.path().join("cover.jpg"), b"outside cover")
+            .expect("outside cover should write");
+        symlink(outside.path().join("cover.jpg"), group.join("cover.jpg"))
+            .expect("symlink fixture should create");
+        fs::write(
+            group.join("Film.nfo"),
+            "<movie><tvd_attachment role=\"cover\">cover.jpg</tvd_attachment></movie>",
+        )
+        .expect("manifest NFO should write");
+
+        let snapshot = manager(&root).scan(&[]).expect("library should scan");
+        let item = item_at(&snapshot, "Film/Film.mkv");
+        assert!(
+            item.attachments
+                .iter()
+                .all(|attachment| attachment.relative_path != "Film/cover.jpg"),
+            "symlink targets are not regular local attachments"
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("declaration(s) were left unattached") })
+        );
+        assert!(outside.path().join("cover.jpg").exists());
+    }
+
+    #[test]
+    fn round6_same_owner_nfo_claims_for_one_attachment_are_deduplicated() {
+        let root = TemporaryRoot::new("multiple-nfo-claims-one-attachment");
+        fs::write(root.path().join("A.mkv"), b"fixture video").expect("primary media should write");
+        fs::write(root.path().join("bonus.jpg"), b"fixture image")
+            .expect("unqualified non-conventional image should write");
+        let declaration = "<tvd_attachment role=\"cover\">bonus.jpg</tvd_attachment>";
+        fs::write(
+            root.path().join("A.nfo"),
+            format!("<movie>{declaration}</movie>"),
+        )
+        .expect("authoritative NFO should write");
+        fs::write(
+            root.path().join("A.extra.nfo"),
+            format!("<movie>{declaration}</movie>"),
+        )
+        .expect("secondary attached NFO should write");
+
+        let snapshot = manager(&root).scan(&[]).expect("library should scan");
+        let item = item_at(&snapshot, "A.mkv");
+        assert_eq!(
+            item.attachments
+                .iter()
+                .filter(|attachment| attachment.relative_path == "bonus.jpg")
+                .count(),
+            1,
+            "equivalent same-owner declarations should yield one logical attachment"
+        );
+        assert!(
+            item.attachments.iter().any(|attachment| {
+                attachment.relative_path == "A.nfo" && attachment.kind == "nfo"
+            })
+        );
+        assert!(item.attachments.iter().any(|attachment| {
+            attachment.relative_path == "A.extra.nfo" && attachment.kind == "nfo"
+        }));
+        assert!(
+            !snapshot
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("declaration(s) were left unattached") }),
+            "same-owner duplicate declarations are not ambiguous claims"
+        );
+    }
+
+    #[test]
+    fn round6_legacy_organize_persists_attachment_manifest_only_after_confirmation() {
+        let root = TemporaryRoot::new("legacy-organize-attachment-manifest");
+        let source_dir = root.path().join("Film");
+        fs::create_dir_all(&source_dir).expect("source group should exist");
+        fs::write(source_dir.join("Film.mkv"), b"fixture video")
+            .expect("primary fixture should write");
+        fs::write(source_dir.join("cover.jpg"), b"fixture cover")
+            .expect("cover fixture should write");
+        fs::write(source_dir.join("zh.srt"), b"fixture subtitle")
+            .expect("subtitle fixture should write");
+        fs::write(source_dir.join("danmaku.xml"), b"<i/>").expect("danmaku fixture should write");
+        fs::write(source_dir.join("comments.txt"), "legacy danmaku comments")
+            .expect("legacy TXT danmaku fixture should write");
+        let destination_dir = root.path().join("Organized");
+        fs::create_dir_all(&destination_dir).expect("destination group should exist");
+        fs::write(destination_dir.join("existing.mp4"), b"another primary")
+            .expect("destination primary should write");
+
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&[])
+            .expect("read-only scan should complete without creating an NFO");
+        let source = item_at(&snapshot, "Film/Film.mkv");
+        assert!(!source_dir.join("Film.nfo").exists());
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&source.id),
+                "Organized",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("legacy organize should prepare its NFO in the confirmation preview");
+        let nfo_path = preview
+            .metadata_patches
+            .iter()
+            .find(|patch| patch.item_id == source.id)
+            .expect("preview should show the generated metadata patch")
+            .nfo_path
+            .clone();
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "attachments"),
+            "attachment ownership must be reviewable before confirmation"
+        );
+        assert!(!root.path().join(&nfo_path).exists());
+        assert!(!source_dir.join("Film.nfo").exists());
+        fs::write(source_dir.join("unrelated.txt"), b"benign directory churn")
+            .expect("unrelated child churn should be introduced after preview");
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed move and NFO patch should commit through one durable preview");
+        assert_eq!(result.status, BatchStatus::Complete);
+        assert_eq!(
+            fs::read(source_dir.join("unrelated.txt")).unwrap(),
+            b"benign directory churn",
+            "an unrelated child entry does not invalidate selected object proofs"
+        );
+        let nfo_contents = fs::read_to_string(root.path().join(&nfo_path))
+            .expect("portable attachment NFO should be written after confirmation");
+        assert!(nfo_contents.contains("<localfilename>Film.mkv</localfilename>"));
+        assert!(nfo_contents.contains("<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>"));
+        assert!(nfo_contents.contains("<tvd_attachment role=\"subtitle\">zh.srt</tvd_attachment>"));
+        assert!(
+            nfo_contents.contains("<tvd_attachment role=\"danmaku\">danmaku.xml</tvd_attachment>")
+        );
+        assert!(
+            nfo_contents.contains("<tvd_attachment role=\"danmaku\">comments.txt</tvd_attachment>"),
+            "a recognized bare TXT danmaku file must keep its role in the durable NFO manifest"
+        );
+        assert!(!nfo_contents.contains(root.path().to_string_lossy().as_ref()));
+
+        let rescanned = manager
+            .scan(&[])
+            .expect("moved declarations should resolve from their new parent");
+        let moved_path = preview.items[0].target_path.clone();
+        let moved = item_at(&rescanned, &moved_path);
+        assert!(
+            moved
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == "cover")
+        );
+        assert!(
+            moved
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == "subtitle")
+        );
+        assert!(
+            moved
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == "danmaku")
+        );
+        assert!(moved.attachments.iter().any(|attachment| {
+            attachment.relative_path == "Organized/comments.txt" && attachment.kind == "danmaku"
+        }));
+    }
+
+    #[test]
+    fn round6_confirmed_rename_rewrites_local_manifest_refs_and_preserves_user_nfo_fields() {
+        let root = TemporaryRoot::new("confirmed-rename-preserves-portable-nfo");
+        let group = root.path().join("Film");
+        fs::create_dir_all(&group).expect("source group should exist");
+        fs::write(group.join("Film.mkv"), b"fixture video").expect("primary fixture should write");
+        fs::write(group.join("封面.png"), b"fixture cover").expect("cover fixture should write");
+        fs::write(group.join("Русский.srt"), b"Russian subtitle")
+            .expect("Russian subtitle fixture should write");
+        fs::write(group.join("Sous-titres français.srt"), b"French subtitle")
+            .expect("French subtitle fixture should write");
+        fs::write(group.join("Sottotitoli italiani.srt"), b"Italian subtitle")
+            .expect("Italian subtitle fixture should write");
+        fs::write(
+            group.join("Film.nfo"),
+            concat!(
+                "<movie><title>Renamed Film</title>",
+                "<uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid>",
+                "<localfilename>Film.mkv</localfilename>",
+                "<tvd_attachment role=\"cover\">封面.png</tvd_attachment>",
+                "<thumb>封面.png</thumb>",
+                "<tvd_attachment role=\"subtitle\">Русский.srt</tvd_attachment>",
+                "<tvd_attachment role=\"subtitle\">Sous-titres français.srt</tvd_attachment>",
+                "<tvd_attachment role=\"subtitle\">Sottotitoli italiani.srt</tvd_attachment>",
+                "<futureField keep=\"yes\">preserve</futureField></movie>"
+            ),
+        )
+        .expect("portable source NFO should write");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("source should scan");
+        let source = item_at(&snapshot, "Film/Film.mkv");
+        assert_eq!(
+            source
+                .attachments
+                .iter()
+                .filter(|attachment| attachment.kind != "nfo")
+                .count(),
+            4
+        );
+        for (filename, kind) in [
+            ("封面.png", "cover"),
+            ("Русский.srt", "subtitle"),
+            ("Sous-titres français.srt", "subtitle"),
+            ("Sottotitoli italiani.srt", "subtitle"),
+        ] {
+            assert!(source.attachments.iter().any(|attachment| {
+                attachment.relative_path == format!("Film/{filename}") && attachment.kind == kind
+            }));
+        }
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&source.id),
+                "Organized",
+                true,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("renamed organize should prepare the NFO rewrite");
+        let target_filename = Path::new(&preview.items[0].target_path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("renamed target filename should be UTF-8")
+            .to_string();
+        let nfo_path = preview.metadata_patches[0].nfo_path.clone();
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed rename should move files and rewrite portable refs");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let nfo = fs::read_to_string(root.path().join(nfo_path))
+            .expect("renamed NFO should remain available");
+        assert!(nfo.contains(&format!("<localfilename>{target_filename}</localfilename>")));
+        assert!(nfo.contains("<tvd_attachment role=\"cover\">封面.png</tvd_attachment>"));
+        assert!(nfo.contains("<thumb>封面.png</thumb>"));
+        assert!(nfo.contains("<tvd_attachment role=\"subtitle\">Русский.srt</tvd_attachment>"));
+        assert!(nfo.contains(
+            "<tvd_attachment role=\"subtitle\">Sous-titres français.srt</tvd_attachment>"
+        ));
+        assert!(nfo.contains(
+            "<tvd_attachment role=\"subtitle\">Sottotitoli italiani.srt</tvd_attachment>"
+        ));
+        assert!(nfo.contains("<uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid>"));
+        assert!(nfo.contains("<futureField keep=\"yes\">preserve</futureField>"));
+        assert!(!group.join("Film.nfo").exists());
+
+        let rescanned = manager
+            .scan(&[])
+            .expect("renamed relative refs should rescan");
+        let moved = item_at(&rescanned, &preview.items[0].target_path);
+        for (filename, kind) in [
+            ("封面.png", "cover"),
+            ("Русский.srt", "subtitle"),
+            ("Sous-titres français.srt", "subtitle"),
+            ("Sottotitoli italiani.srt", "subtitle"),
+        ] {
+            assert!(moved.attachments.iter().any(|attachment| {
+                attachment.relative_path.ends_with(filename) && attachment.kind == kind
+            }));
+        }
     }
 
     #[test]
@@ -18536,7 +21797,7 @@ mod tests {
         }
 
         let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
-        let index = SidecarIndex::build(&files, &BTreeSet::new(), &semantics)
+        let index = SidecarIndex::build(&files, &BTreeSet::new(), &BTreeSet::new(), &semantics)
             .expect("filesystem name semantics should be available for every fixture parent");
 
         assert_eq!(index.by_media.len(), MEDIA_COUNT);
@@ -18656,6 +21917,7 @@ mod tests {
         let insensitive_index = SidecarIndex::build_with_case_fold(
             &insensitive_files,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &insensitive_semantics,
             round5_full_fold_for_test,
         )
@@ -18673,6 +21935,7 @@ mod tests {
             round4_semantics_by_parent(&sensitive_files, round4_sensitive_semantics());
         let sensitive_index = SidecarIndex::build_with_case_fold(
             &sensitive_files,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &sensitive_semantics,
             round5_full_fold_for_test,
@@ -18693,6 +21956,7 @@ mod tests {
         let normalized_index = SidecarIndex::build_with_case_fold(
             &normalized_files,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &normalized_semantics,
             round5_full_fold_for_test,
         )
@@ -18710,6 +21974,7 @@ mod tests {
         let ambiguous_semantics = round4_semantics_by_parent(&ambiguous_files, insensitive);
         let ambiguous_index = SidecarIndex::build_with_case_fold(
             &ambiguous_files,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &ambiguous_semantics,
             round5_full_fold_for_test,
@@ -18730,6 +21995,7 @@ mod tests {
         let missing_semantics = HashMap::new();
         let error = SidecarIndex::build_with_case_fold(
             &sensitive_files,
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &missing_semantics,
             round5_full_fold_for_test,
@@ -18976,21 +22242,22 @@ mod tests {
             .expect("the complete attachment groups should move");
         assert_eq!(result.status, BatchStatus::Complete);
         for preview_item in &preview.items {
+            let target_primary_filename = Path::new(&preview_item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("renamed primary should have a filename");
             for file in &preview_item.files {
-                let (contents, device, inode) = &original_files[&file.source_path];
+                let expected = &original_files[&file.source_path];
                 let target = root.path().join(&file.target_path);
-                let metadata = fs::metadata(&target).expect("moved group member should stat");
-                assert_eq!(fs::read(&target).unwrap().as_slice(), contents.as_slice());
-                assert_eq!(
-                    metadata.dev(),
-                    *device,
-                    "rename should keep the source device"
-                );
-                assert_eq!(
-                    metadata.ino(),
-                    *inode,
-                    "rename should keep the source object"
-                );
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(!root.path().join(&file.source_path).exists());
             }
         }
@@ -19793,6 +23060,7 @@ mod tests {
             fs::write(root.path().join(&relative_path), &media_bytes)
                 .expect("bulk media fixture should write");
             contents.insert(relative_path.clone(), media_bytes);
+            let mut authoritative_nfo_path = None;
             if include_nfo {
                 let nfo_path = with_extension(Path::new(&relative_path), "nfo");
                 let nfo_relative_path = path_to_relative_string(&nfo_path)
@@ -19802,13 +23070,22 @@ mod tests {
                         .into_bytes();
                 fs::write(root.path().join(&nfo_relative_path), &nfo_bytes)
                     .expect("bulk NFO fixture should write");
-                contents.insert(nfo_relative_path, nfo_bytes);
+                contents.insert(nfo_relative_path.clone(), nfo_bytes);
+                authoritative_nfo_path = Some(nfo_relative_path);
             }
-            items.push(index_fixture_item(
+            let mut item = index_fixture_item(
                 &format!("{prefix}-{index:04}"),
                 &relative_path,
                 Presence::Present,
-            ));
+            );
+            if let Some(nfo_path) = authoritative_nfo_path {
+                item.attachments.push(LibraryAttachment {
+                    relative_path: nfo_path.clone(),
+                    kind: "nfo".to_string(),
+                });
+                item.authoritative_nfo_path = Some(nfo_path);
+            }
+            items.push(item);
         }
         (
             LibrarySnapshot {
@@ -20689,4 +23966,6 @@ mod tests {
             platform_case_fold("ς").expect("CFStringFold should support final sigma")
         );
     }
+
+    include!("file_manager_review_regression_tests.rs");
 }

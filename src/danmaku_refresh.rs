@@ -236,6 +236,16 @@ struct CapturedItem {
     xml: SidecarCapture,
     ass: SidecarCapture,
     nfo: Option<SidecarCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nfo_danmaku_xml_relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nfo_danmaku_ass_relative_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DeclaredDanmakuAttachments {
+    xml_relative_path: Option<String>,
+    ass_relative_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -303,6 +313,7 @@ enum PublishFailure {
 
 #[derive(Clone, Copy)]
 enum AttachmentOwnershipFailure {
+    Stale,
     Conflict,
     Unverifiable,
 }
@@ -375,6 +386,7 @@ pub(super) fn preview(
         }
         match capture_item(
             root,
+            snapshot,
             item,
             &primary_paths,
             snapshot_primary_paths_complete,
@@ -466,6 +478,7 @@ fn selected_items<'a>(
 
 fn capture_item(
     root: &RootedFs,
+    snapshot: &LibrarySnapshot,
     item: &LibraryItem,
     snapshot_primary_paths: &[String],
     snapshot_primary_paths_complete: bool,
@@ -489,11 +502,45 @@ fn capture_item(
         return Err(CaptureError::Skip(MEDIA_IDENTITY_REASON));
     }
 
+    let observed_nfo = item
+        .authoritative_nfo_path
+        .as_deref()
+        .map(|relative| {
+            let observed = observe_for_preview(
+                root,
+                relative,
+                MAX_NFO_BYTES,
+                aggregate_bytes,
+                inspection_started,
+            )?;
+            if !matches!(observed.capture.state, CapturedFileState::Present(_)) {
+                return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
+            }
+            Ok(observed)
+        })
+        .transpose()?;
+    let declared_danmaku = match observed_nfo
+        .as_ref()
+        .and_then(|observed| observed.bytes.as_deref())
+    {
+        Some(bytes) => declared_danmaku_attachments(
+            root,
+            snapshot,
+            item,
+            bytes,
+            snapshot_primary_paths_complete,
+        )?,
+        None => None,
+    };
+    if has_unproven_custom_danmaku_attachment(root, item, declared_danmaku.as_ref())? {
+        return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+    }
     let (xml_relative, ass_relative) = sidecar_paths(
         root,
         item,
         snapshot_primary_paths,
         snapshot_primary_paths_complete,
+        declared_danmaku.as_ref(),
     )?;
     let xml = observe_for_preview(
         root,
@@ -509,23 +556,24 @@ fn capture_item(
         aggregate_bytes,
         inspection_started,
     )?;
-    let nfo = item
-        .authoritative_nfo_path
-        .as_deref()
-        .map(|relative| {
-            let observed = observe_for_preview(
-                root,
-                relative,
-                MAX_NFO_BYTES,
-                aggregate_bytes,
-                inspection_started,
-            )?;
-            if !matches!(observed.capture.state, CapturedFileState::Present(_)) {
-                return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
-            }
-            Ok(observed.capture)
+    if declared_danmaku
+        .as_ref()
+        .and_then(|declared| declared.xml_relative_path.as_deref())
+        .is_some_and(|path| {
+            path == xml_relative.as_str()
+                && matches!(&xml.capture.state, CapturedFileState::Missing)
         })
-        .transpose()?;
+        || declared_danmaku
+            .as_ref()
+            .and_then(|declared| declared.ass_relative_path.as_deref())
+            .is_some_and(|path| {
+                path == ass_relative.as_str()
+                    && matches!(&ass.capture.state, CapturedFileState::Missing)
+            })
+    {
+        return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+    }
+    let nfo = observed_nfo.map(|observed| observed.capture);
 
     let old_xml = match xml.bytes.as_deref() {
         Some(bytes) => {
@@ -556,6 +604,12 @@ fn capture_item(
         xml: xml.capture,
         ass: ass.capture,
         nfo,
+        nfo_danmaku_xml_relative_path: declared_danmaku
+            .as_ref()
+            .and_then(|declared| declared.xml_relative_path.clone()),
+        nfo_danmaku_ass_relative_path: declared_danmaku
+            .as_ref()
+            .and_then(|declared| declared.ass_relative_path.clone()),
     })
 }
 
@@ -564,6 +618,7 @@ fn sidecar_paths(
     item: &LibraryItem,
     snapshot_primary_paths: &[String],
     snapshot_primary_paths_complete: bool,
+    declared_danmaku: Option<&DeclaredDanmakuAttachments>,
 ) -> std::result::Result<(String, String), CaptureError> {
     let media_path = Path::new(&item.relative_path);
     validate_relative_path(media_path)
@@ -676,7 +731,7 @@ fn sidecar_paths(
     if associated_ass.len() > 1 {
         return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
     }
-    let ass_relative = if let Some(path) = associated_ass.first() {
+    let mut ass_relative = if let Some(path) = associated_ass.first() {
         (**path).clone()
     } else {
         path_to_string(&expected_ass).map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?
@@ -695,12 +750,66 @@ fn sidecar_paths(
             return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
         }
     }
+    let mut xml_relative = xml_relative;
+    if let Some(declared) = declared_danmaku {
+        if let Some(path) = &declared.xml_relative_path {
+            let legacy_path = path_to_string(&legacy_xml)
+                .map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?;
+            let danmaku_path = path_to_string(&danmaku_xml)
+                .map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?;
+            let is_conventional = path == &legacy_path || path == &danmaku_path;
+            xml_relative = path.clone();
+
+            if !is_conventional && declared.ass_relative_path.is_none() {
+                let canonical_ass = path_to_string(&danmaku_ass)
+                    .map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?;
+                if !item
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.relative_path == canonical_ass)
+                {
+                    let absolute = safe_root_path(root, &canonical_ass)
+                        .map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?;
+                    if root
+                        .entry_identity(&absolute)
+                        .map_err(|_| CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?
+                        .is_some()
+                    {
+                        return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
+                    }
+                }
+                ass_relative = canonical_ass;
+            }
+        }
+        if let Some(path) = &declared.ass_relative_path {
+            ass_relative = path.clone();
+        }
+    }
+
     let output_paths = [xml_relative.clone(), ass_relative.clone()];
-    if snapshot_primary_paths_complete {
+    let mut guarded_output_paths = Vec::with_capacity(output_paths.len());
+    for path in &output_paths {
+        let explicitly_declared = declared_danmaku.is_some_and(|declared| {
+            declared.xml_relative_path.as_deref() == Some(path.as_str())
+                || declared.ass_relative_path.as_deref() == Some(path.as_str())
+        });
+        if explicitly_declared && !is_conventional_danmaku_path(path, parent, stem) {
+            let absolute = safe_root_path(root, path)
+                .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
+            let identity = root
+                .entry_identity(&absolute)
+                .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
+            if identity.is_some_and(|identity| identity.is_file()) {
+                continue;
+            }
+        }
+        guarded_output_paths.push(path.clone());
+    }
+    if !guarded_output_paths.is_empty() && snapshot_primary_paths_complete {
         let snapshot_owner =
             crate::file_manager::sidecar_paths_are_unambiguously_owned_by_snapshot(
                 root,
-                &output_paths,
+                &guarded_output_paths,
                 snapshot_primary_paths,
                 &item.relative_path,
             )
@@ -709,17 +818,206 @@ fn sidecar_paths(
             return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
         }
     }
-    let current_owner =
-        crate::file_manager::sidecar_paths_are_unambiguously_owned_by_current_directory(
-            root,
-            &output_paths,
-            &item.relative_path,
-        )
-        .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
-    if !current_owner {
-        return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+    if !guarded_output_paths.is_empty() {
+        let current_owner =
+            crate::file_manager::sidecar_paths_are_unambiguously_owned_by_current_directory(
+                root,
+                &guarded_output_paths,
+                &item.relative_path,
+            )
+            .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?;
+        if !current_owner {
+            return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+        }
     }
     Ok((xml_relative, ass_relative))
+}
+
+fn is_conventional_danmaku_path(path: &str, parent: &Path, stem: &str) -> bool {
+    let candidate = Path::new(path);
+    if candidate.parent().unwrap_or_else(|| Path::new("")) != parent {
+        return false;
+    }
+    let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    [
+        format!("{stem}.xml"),
+        format!("{stem}.danmaku.xml"),
+        format!("{stem}.ass"),
+        format!("{stem}.danmaku.ass"),
+    ]
+    .iter()
+    .any(|conventional| name.eq_ignore_ascii_case(conventional))
+}
+
+fn declared_danmaku_attachments(
+    root: &RootedFs,
+    snapshot: &LibrarySnapshot,
+    item: &LibraryItem,
+    nfo_bytes: &[u8],
+    snapshot_primary_paths_complete: bool,
+) -> std::result::Result<Option<DeclaredDanmakuAttachments>, CaptureError> {
+    if !snapshot_primary_paths_complete {
+        return Ok(None);
+    }
+    let content = match std::str::from_utf8(nfo_bytes) {
+        Ok(content) => content,
+        Err(_) => return Ok(None),
+    };
+    let filenames = match crate::file_manager::nfo_danmaku_attachment_filenames(content) {
+        Ok(filenames) => filenames,
+        Err(_) if content.to_ascii_lowercase().contains("<tvd_attachment") => {
+            return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
+        }
+        Err(_) => return Ok(None),
+    };
+    let parent = Path::new(&item.relative_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let Some(authoritative_nfo) = item.authoritative_nfo_path.as_deref() else {
+        return Ok(None);
+    };
+    let authoritative_nfo = Path::new(authoritative_nfo);
+    if authoritative_nfo.parent().unwrap_or_else(|| Path::new("")) != parent {
+        return Ok(None);
+    }
+
+    let item_danmaku_paths = item
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.kind == "danmaku")
+        .map(|attachment| attachment.relative_path.clone())
+        .collect::<Vec<_>>();
+    let mut xml_paths = Vec::new();
+    let mut ass_paths = Vec::new();
+    for filename in filenames {
+        let extension = Path::new(&filename)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let paths = match extension.as_str() {
+            "xml" => &mut xml_paths,
+            "ass" => &mut ass_paths,
+            _ => continue,
+        };
+        let relative_path = crate::file_manager::resolve_nfo_attachment_relative_path(
+            root,
+            parent,
+            &filename,
+            &item_danmaku_paths,
+        )
+        .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?
+        .ok_or(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON))?;
+        let matching_item_attachments = item
+            .attachments
+            .iter()
+            .filter(|attachment| {
+                attachment.relative_path == relative_path && attachment.kind == "danmaku"
+            })
+            .count();
+        let snapshot_owners = snapshot
+            .items
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.relative_path == relative_path)
+            })
+            .count();
+        if matching_item_attachments != 1 || snapshot_owners != 1 {
+            return Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON));
+        }
+        paths.push(relative_path);
+    }
+    if xml_paths.len() > 1 || ass_paths.len() > 1 {
+        return Err(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON));
+    }
+    let declared = DeclaredDanmakuAttachments {
+        xml_relative_path: xml_paths.pop(),
+        ass_relative_path: ass_paths.pop(),
+    };
+    Ok(
+        (declared.xml_relative_path.is_some() || declared.ass_relative_path.is_some())
+            .then_some(declared),
+    )
+}
+
+fn has_unproven_custom_danmaku_attachment(
+    root: &RootedFs,
+    item: &LibraryItem,
+    declared: Option<&DeclaredDanmakuAttachments>,
+) -> std::result::Result<bool, CaptureError> {
+    let item_danmaku_paths = item
+        .attachments
+        .iter()
+        .filter(|attachment| attachment.kind == "danmaku")
+        .map(|attachment| attachment.relative_path.clone())
+        .collect::<Vec<_>>();
+    let refreshable_paths = item_danmaku_paths
+        .iter()
+        .filter(|path| {
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("xml") || extension.eq_ignore_ascii_case("ass")
+                })
+        })
+        .collect::<Vec<_>>();
+    if refreshable_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let declared_paths = declared
+        .into_iter()
+        .flat_map(|declared| {
+            [
+                declared.xml_relative_path.as_deref(),
+                declared.ass_relative_path.as_deref(),
+            ]
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+    let unproven_paths = refreshable_paths
+        .into_iter()
+        .filter(|path| !declared_paths.contains(path.as_str()))
+        .collect::<Vec<_>>();
+    if unproven_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let media_path = Path::new(&item.relative_path);
+    let parent = media_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = media_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or(CaptureError::Skip(UNSUPPORTED_SIDECAR_REASON))?;
+    let conventional_names = [
+        format!("{stem}.xml"),
+        format!("{stem}.danmaku.xml"),
+        format!("{stem}.ass"),
+        format!("{stem}.danmaku.ass"),
+    ];
+    let mut conventional_paths = HashSet::new();
+    for name in conventional_names {
+        if let Some(path) = crate::file_manager::resolve_nfo_attachment_relative_path(
+            root,
+            parent,
+            &name,
+            &item_danmaku_paths,
+        )
+        .map_err(|_| CaptureError::Skip(SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON))?
+        {
+            conventional_paths.insert(path);
+        }
+    }
+    Ok(unproven_paths
+        .into_iter()
+        .any(|path| !conventional_paths.contains(path.as_str())))
 }
 
 fn snapshot_primary_paths_complete(snapshot: &LibrarySnapshot) -> bool {
@@ -1608,6 +1906,18 @@ fn verify_media_and_sidecars(root: &RootedFs, capture: &CapturedItem) -> Result<
 }
 
 fn verify_captured_nfo(root: &RootedFs, capture: &CapturedItem) -> Result<()> {
+    if let Some(path) = &capture.nfo_danmaku_xml_relative_path {
+        ensure!(
+            capture.nfo.is_some() && capture.xml.relative_path == *path,
+            "captured danmaku XML does not match its NFO declaration proof"
+        );
+    }
+    if let Some(path) = &capture.nfo_danmaku_ass_relative_path {
+        ensure!(
+            capture.nfo.is_some() && capture.ass.relative_path == *path,
+            "captured danmaku ASS does not match its NFO declaration proof"
+        );
+    }
     if let Some(nfo) = &capture.nfo {
         verify_sidecar(root, nfo)?;
     }
@@ -1618,10 +1928,31 @@ fn verify_attachment_ownership(
     root: &RootedFs,
     capture: &CapturedItem,
 ) -> std::result::Result<(), AttachmentOwnershipFailure> {
-    let paths = [
-        capture.xml.relative_path.clone(),
-        capture.ass.relative_path.clone(),
-    ];
+    let xml_is_existing_nfo_custom = is_existing_nfo_custom_path(
+        capture,
+        &capture.xml.relative_path,
+        &capture.xml,
+        capture.nfo_danmaku_xml_relative_path.as_deref(),
+    );
+    let ass_is_existing_nfo_custom = is_existing_nfo_custom_path(
+        capture,
+        &capture.ass.relative_path,
+        &capture.ass,
+        capture.nfo_danmaku_ass_relative_path.as_deref(),
+    );
+    if xml_is_existing_nfo_custom || ass_is_existing_nfo_custom {
+        verify_captured_nfo(root, capture).map_err(|_| AttachmentOwnershipFailure::Stale)?;
+    }
+    let mut paths = Vec::with_capacity(2);
+    if !xml_is_existing_nfo_custom {
+        paths.push(capture.xml.relative_path.clone());
+    }
+    if !ass_is_existing_nfo_custom {
+        paths.push(capture.ass.relative_path.clone());
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
     match crate::file_manager::sidecar_paths_are_unambiguously_owned_by_current_directory(
         root,
         &paths,
@@ -1633,8 +1964,29 @@ fn verify_attachment_ownership(
     }
 }
 
+fn is_existing_nfo_custom_path(
+    capture: &CapturedItem,
+    relative_path: &str,
+    sidecar: &SidecarCapture,
+    declared_path: Option<&str>,
+) -> bool {
+    if declared_path != Some(relative_path)
+        || !matches!(&sidecar.state, CapturedFileState::Present(_))
+    {
+        return false;
+    }
+    let media_path = Path::new(&capture.relative_path);
+    let parent = media_path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = media_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    !is_conventional_danmaku_path(relative_path, parent, stem)
+}
+
 fn attachment_ownership_failure_reason(failure: AttachmentOwnershipFailure) -> &'static str {
     match failure {
+        AttachmentOwnershipFailure::Stale => REVIEWED_FILES_CHANGED,
         AttachmentOwnershipFailure::Conflict => SIDECAR_OWNERSHIP_CHANGED_REASON,
         AttachmentOwnershipFailure::Unverifiable => SIDECAR_OWNERSHIP_UNVERIFIABLE_REASON,
     }
@@ -1804,6 +2156,7 @@ fn publish_pair(
 
 fn publish_ownership_failure(failure: AttachmentOwnershipFailure) -> PublishFailure {
     match failure {
+        AttachmentOwnershipFailure::Stale => PublishFailure::Stale,
         AttachmentOwnershipFailure::Conflict => PublishFailure::OwnershipConflict,
         AttachmentOwnershipFailure::Unverifiable => PublishFailure::OwnershipUnverifiable,
     }
@@ -2418,7 +2771,7 @@ mod tests {
         item.relative_path = "episode.mp4".to_owned();
         let duplicate_stems = vec!["episode.mp4".to_owned(), "episode.mkv".to_owned()];
         assert!(matches!(
-            sidecar_paths(&root, &item, &duplicate_stems, true),
+            sidecar_paths(&root, &item, &duplicate_stems, true, None),
             Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON))
         ));
 
@@ -2440,6 +2793,7 @@ mod tests {
                 &item,
                 &truncated_snapshot_paths,
                 snapshot_primary_paths_complete(&incomplete_snapshot),
+                None,
             ),
             Err(CaptureError::Skip(SIDECAR_OWNERSHIP_CONFLICT_REASON))
         ));

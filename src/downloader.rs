@@ -48,6 +48,7 @@ use crate::bilibili_core;
 use crate::bilibili_planning;
 use crate::config::AppConfig;
 use crate::episode_retry::{EpisodeFailureDisposition, classify_episode_failure};
+use crate::file_manager::rewrite_nfo_local_references;
 use crate::library::PhysicalItemIdentity;
 use crate::media_libraries::{
     StagingMigrationControlReceipt, TaskTransferControl, TaskTransferControlKind,
@@ -64,6 +65,8 @@ use crate::safe_fs::{
     BoundDirectory, BoundDirectoryCursorEntry, BoundEntry, BoundFile, EntryIdentity, RootedFs,
     identity_for_open_file,
 };
+
+const NFO_ATTACHMENT_DECLARATION_LIMIT: usize = 128;
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static VIDEO_STAGING_CLEANUP_LEASE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +98,8 @@ const VIDEO_STAGING_PUBLICATION_MAX_STEPS: usize = 4096;
 const VIDEO_STAGING_RETENTION_FILE_NAME: &str = ".retained.json";
 const VIDEO_STAGING_RETENTION_VERSION: u32 = 1;
 const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
+const VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME: &str = ".publication-nfo";
+const NFO_LOCAL_REFERENCE_REWRITE_LIMIT: usize = 1024 * 1024;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
 const VIDEO_STAGING_TASK_RETRY_RETENTION_REASON: &str =
@@ -10098,13 +10103,6 @@ async fn run_bilibili_job_locked(
     if let Some(metadata_warning) = metadata_warning {
         details.push(metadata_warning);
     }
-    let mut created_nfos = Vec::new();
-    if config.video.write_nfo {
-        match write_bilibili_nfos(&output_dir, url, &plan, &report) {
-            Ok(created) => created_nfos = created,
-            Err(err) => details.push(format!("NFO skipped: {err}")),
-        }
-    }
     let flat_collection_layout = worker_context
         .request
         .expected_plan
@@ -10138,6 +10136,15 @@ async fn run_bilibili_job_locked(
     } else {
         None
     };
+    // Generate new NFOs after flattening so their local references are based on the final
+    // collection staging names. Existing SDK NFOs are remapped owner-by-owner by the flattener.
+    let mut created_nfos = Vec::new();
+    if config.video.write_nfo {
+        match write_bilibili_nfos(&output_dir, url, &plan, &report) {
+            Ok(created) => created_nfos = created,
+            Err(err) => details.push(format!("NFO skipped: {err}")),
+        }
+    }
     if !created_nfos.is_empty() {
         let reported_nfos = created_nfos
             .iter()
@@ -10904,6 +10911,75 @@ fn flatten_bilibili_collection_staging_output(
             }
             remapped.insert(source.clone(), destination.clone());
             pending_moves.push((source.clone(), destination, *identity));
+        }
+        if !primary_media.is_empty() {
+            let renamed_files = pending_moves
+                .iter()
+                .map(|(source, destination, _)| {
+                    Ok((
+                        source
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .context("Bilibili collection source filename is not UTF-8")?
+                            .to_string(),
+                        destination
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .context("Bilibili flat filename is not UTF-8")?
+                            .to_string(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let source_parent_relative = rooted_relative_directory(root, directory)?;
+            let nfo_paths = direct_files
+                .iter()
+                .filter(|(path, _, _)| is_nfo_path(path))
+                .map(|(path, _, identity)| (path.clone(), *identity))
+                .collect::<Vec<_>>();
+            for (nfo_path, source_identity) in nfo_paths {
+                let nfo_stem = nfo_path.file_stem();
+                let primary = primary_media
+                    .iter()
+                    .find(|path| path.file_stem() == nfo_stem)
+                    .or_else(|| (primary_media.len() == 1).then(|| &primary_media[0]));
+                let Some(primary) = primary else {
+                    continue;
+                };
+                let primary_destination = remapped
+                    .get(primary)
+                    .context("Bilibili NFO primary media is absent from the flatten map")?;
+                let old_primary_filename = primary
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Bilibili NFO primary filename is not UTF-8")?;
+                let new_primary_filename = primary_destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Bilibili flat primary filename is not UTF-8")?;
+                let (nfo_identity, rewritten, original_sha256) = read_nfo_local_reference_rewrite(
+                    root,
+                    &nfo_path,
+                    Some(source_identity),
+                    &renamed_files,
+                    old_primary_filename,
+                    new_primary_filename,
+                    &source_parent_relative,
+                )?;
+                if let Some(contents) = rewritten {
+                    let updated_identity = replace_bilibili_nfo_atomically(
+                        root,
+                        &nfo_path,
+                        nfo_identity,
+                        &contents,
+                        original_sha256,
+                    )?;
+                    let pending_move = pending_moves
+                        .iter_mut()
+                        .find(|(source, _, _)| source == &nfo_path)
+                        .context("Bilibili NFO disappeared from the flatten move plan")?;
+                    pending_move.2 = updated_identity;
+                }
+            }
         }
         for (source, destination, identity) in pending_moves {
             let source_entry = root.bind_entry(&source, false)?;
@@ -13197,7 +13273,8 @@ fn write_bilibili_nfos(
         let Some(primary_media) = bilibili_entry_primary_media(cwd, report_entry) else {
             continue;
         };
-        if !primary_media.is_file()
+        if !fs::symlink_metadata(&primary_media)
+            .is_ok_and(|metadata| metadata.file_type().is_file())
             || (!is_video_file(&primary_media) && !is_audio_file(&primary_media))
         {
             continue;
@@ -13221,6 +13298,17 @@ fn write_bilibili_nfos(
             .iter()
             .map(|(unique_id_type, unique_id)| (unique_id_type.as_str(), unique_id.as_str()))
             .collect::<Vec<_>>();
+        let primary_filename = primary_media
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let tvshowtitle = plan
+            .title
+            .trim()
+            .ne(title.unwrap_or_default().trim())
+            .then_some(plan.title.as_str())
+            .filter(|value| !value.trim().is_empty());
+        let attachments = bilibili_nfo_attachments(cwd, &primary_media, report_entry)?;
         let nfo_path = write_nfo_for_media(
             &primary_media,
             &MediaNfo {
@@ -13234,11 +13322,287 @@ fn write_bilibili_nfos(
                     .and_then(|entry| entry.uploader.as_deref())
                     .or(Some("Bilibili")),
                 premiered: plan_entry.and_then(|entry| entry.publish_date.as_deref()),
+                tvshowtitle,
+                localfilename: Some(primary_filename),
+                attachments,
             },
         )?;
         nfos.push(nfo_path);
     }
     Ok(nfos)
+}
+
+fn rooted_relative_directory(root: &RootedFs, directory: &Path) -> Result<PathBuf> {
+    let relative = directory
+        .strip_prefix(root.logical_root_path())
+        .context("NFO source directory is outside the configured download root")?;
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("NFO source directory is not a safe rooted relative path");
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn read_nfo_local_reference_rewrite(
+    root: &RootedFs,
+    path: &Path,
+    expected_identity: Option<EntryIdentity>,
+    renamed_files: &[(String, String)],
+    old_primary_filename: &str,
+    new_primary_filename: &str,
+    source_parent_relative: &Path,
+) -> Result<(EntryIdentity, Option<Vec<u8>>, [u8; 32])> {
+    let entry = root.bind_entry(path, false)?;
+    let identity = root
+        .bound_entry_identity(&entry)?
+        .with_context(|| format!("NFO disappeared: {}", path.display()))?;
+    if expected_identity.is_some_and(|expected| expected != identity) {
+        bail!("NFO identity changed before local-reference remapping");
+    }
+    let file = root.open_bound_file_if_identity(&entry, identity)?;
+    let original = file.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
+    let original_sha256: [u8; 32] = Sha256::digest(&original).into();
+    let text = std::str::from_utf8(&original).context("NFO is not valid UTF-8")?;
+    let rewritten = rewrite_nfo_local_references(
+        text,
+        renamed_files,
+        old_primary_filename,
+        new_primary_filename,
+        root,
+        source_parent_relative,
+    )?;
+    if rewritten.len() > NFO_LOCAL_REFERENCE_REWRITE_LIMIT {
+        bail!("rewritten NFO exceeds its bounded size");
+    }
+    let contents = (rewritten.as_bytes() != original.as_slice()).then(|| rewritten.into_bytes());
+    Ok((identity, contents, original_sha256))
+}
+
+fn replace_bilibili_nfo_atomically(
+    root: &RootedFs,
+    path: &Path,
+    expected_identity: EntryIdentity,
+    contents: &[u8],
+    original_sha256: [u8; 32],
+) -> Result<EntryIdentity> {
+    let entry = root.bind_entry(path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(expected_identity) {
+        bail!("Bilibili NFO identity changed before atomic rewrite");
+    }
+    let metadata = root.open_bound_metadata_file_if_identity(&entry, expected_identity)?;
+    let mode = (metadata.access_policy()?.mode & 0o777) as u16;
+    let temp_path = path
+        .parent()
+        .context("Bilibili NFO has no parent directory")?
+        .join(format!(
+            ".tvd-nfo-remap-{:016x}.tmp",
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+    let (_, new_identity) = root.replace_bound_file_atomically_if_identity_with_checkpoint(
+        &entry,
+        expected_identity,
+        &temp_path,
+        contents,
+        mode,
+        NFO_LOCAL_REFERENCE_REWRITE_LIMIT,
+        &mut |staged_entry, staged_file, staged_identity| {
+            let current = root.open_bound_file_if_identity(&entry, expected_identity)?;
+            let current_contents = current.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
+            let current_sha256: [u8; 32] = Sha256::digest(&current_contents).into();
+            if current_sha256 != original_sha256 {
+                bail!("NFO content changed during local-reference remapping");
+            }
+            if staged_file.identity() != staged_identity
+                || root.bound_entry_identity(staged_entry)? != Some(staged_identity)
+                || staged_file.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents
+            {
+                bail!("staged NFO contents changed during local-reference remapping");
+            }
+            Ok(())
+        },
+    )?;
+    let saved = root.open_bound_file_if_identity(&entry, new_identity)?;
+    if saved.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents {
+        bail!("NFO contents changed after atomic local-reference rewrite");
+    }
+    Ok(new_identity)
+}
+
+fn rewrite_publication_nfo_copies(
+    root: &RootedFs,
+    staging_dir: &Path,
+    plan: &mut [MoveStep],
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<()> {
+    let primaries = plan
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| is_primary_media_file(&step.source, primary_media_kind))
+        .map(|(index, step)| (index, step.source.clone(), step.destination.clone()))
+        .collect::<Vec<_>>();
+    if primaries.is_empty() {
+        return Ok(());
+    }
+
+    let nfo_indices = plan
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| is_nfo_path(&step.source))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if !nfo_indices.is_empty()
+        && root
+            .entry_identity(&staging_dir.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME))?
+            .is_some()
+    {
+        bail!("cannot rewrite NFO copies while staged publication recovery is pending");
+    }
+    for nfo_index in nfo_indices {
+        let nfo_source = plan[nfo_index].source.clone();
+        let Some(owner_index) = staged_video_sidecar_owner_index(&nfo_source, &primaries) else {
+            continue;
+        };
+        let (_, primary_source, primary_destination) = primaries
+            .iter()
+            .find(|(index, _, _)| *index == owner_index)
+            .context("NFO lost its staged primary owner")?;
+        let mut renamed_files = Vec::new();
+        for (index, step) in plan.iter().enumerate() {
+            if index == nfo_index
+                || staged_video_sidecar_owner_index(&step.source, &primaries) != Some(owner_index)
+            {
+                continue;
+            }
+            renamed_files.push((
+                step.source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("staged filename is not UTF-8")?
+                    .to_string(),
+                step.destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("publication filename is not UTF-8")?
+                    .to_string(),
+            ));
+        }
+        let old_primary_filename = primary_source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("staged primary filename is not UTF-8")?;
+        let new_primary_filename = primary_destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("publication primary filename is not UTF-8")?;
+        let source_parent = nfo_source
+            .parent()
+            .context("NFO has no staged source parent")?;
+        let source_parent_relative = rooted_relative_directory(root, source_parent)?;
+        let (identity, rewritten, original_sha256) = read_nfo_local_reference_rewrite(
+            root,
+            &nfo_source,
+            None,
+            &renamed_files,
+            old_primary_filename,
+            new_primary_filename,
+            &source_parent_relative,
+        )?;
+        let Some(contents) = rewritten else {
+            continue;
+        };
+        let copy = persist_publication_nfo_copy(root, staging_dir, &nfo_source, &contents)?;
+        let source_entry = root.bind_entry(&nfo_source, false)?;
+        let source = root.open_bound_file_if_identity(&source_entry, identity)?;
+        let source_contents = source.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
+        let source_sha256: [u8; 32] = Sha256::digest(&source_contents).into();
+        if source_sha256 != original_sha256 {
+            bail!("NFO source contents changed while its publication copy was prepared");
+        }
+        plan[nfo_index].logical_source = Some(nfo_source);
+        plan[nfo_index].source = copy;
+        if plan[nfo_index].expected_identity.is_some() {
+            bail!("NFO source identity was captured before remapping");
+        }
+        // The retry source remains unchanged; only the private publication copy is remapped.
+    }
+    Ok(())
+}
+
+fn persist_publication_nfo_copy(
+    root: &RootedFs,
+    staging_dir: &Path,
+    original_nfo: &Path,
+    contents: &[u8],
+) -> Result<PathBuf> {
+    let relative = original_nfo
+        .strip_prefix(staging_dir)
+        .context("NFO source is outside its owned staging directory")?;
+    let relative = relative.to_str().context("NFO source path is not UTF-8")?;
+    let cache_directory = staging_dir.join(VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME);
+    root.create_dir(&cache_directory, 0o700)?;
+    let cache_entry = root.bind_entry(&cache_directory, false)?;
+    let cache_identity = root
+        .bound_entry_identity(&cache_entry)?
+        .context("NFO publication cache directory disappeared")?;
+    root.validate_private_bound_directory(&cache_entry, cache_identity, 0o700)?;
+
+    let cache_name = format!("{:x}.nfo", Sha256::digest(relative.as_bytes()));
+    let cache_path = cache_directory.join(cache_name);
+    if let Some(identity) = root.entry_identity(&cache_path)? {
+        let entry = root.bind_entry(&cache_path, false)?;
+        let prior = root.open_bound_file_if_identity(&entry, identity)?;
+        prior.validate_private_single_link(0o600)?;
+        root.remove_bound_file_if_identity(&entry, identity)?;
+    }
+    let (_, identity) = root.create_new_bound_file(&cache_path, contents, 0o600)?;
+    let saved_entry = root.bind_entry(&cache_path, false)?;
+    let saved = root.open_bound_file_if_identity(&saved_entry, identity)?;
+    saved.validate_private_single_link(0o600)?;
+    if saved.read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)? != contents {
+        bail!("NFO publication copy changed after creation");
+    }
+    root.validate_private_bound_directory(&cache_entry, cache_identity, 0o700)?;
+    Ok(cache_path)
+}
+
+fn staged_video_sidecar_owner_index(
+    source: &Path,
+    primaries: &[(usize, PathBuf, PathBuf)],
+) -> Option<usize> {
+    if let Some((index, _, _)) = primaries.iter().find(|(_, primary, _)| primary == source) {
+        return Some(*index);
+    }
+    let matched = primaries
+        .iter()
+        .filter_map(|(index, primary, _)| {
+            sidecar_suffix_for_video(source, primary)?;
+            Some((primary.file_stem()?.to_str()?.len(), *index))
+        })
+        .max_by_key(|(stem_len, _)| *stem_len)
+        .map(|(_, index)| index);
+    if matched.is_some() {
+        return matched;
+    }
+    let filename = source.file_name()?.to_str()?;
+    if unbound_bilibili_sidecar_suffix(source).is_none()
+        && !youtube_is_conventional_unqualified_sidecar(filename)
+    {
+        return None;
+    }
+    let mut matching = primaries
+        .iter()
+        .filter(|(_, primary, _)| primary.parent() == source.parent());
+    let (index, _, _) = matching.next()?;
+    matching.next().is_none().then_some(*index)
+}
+
+fn is_nfo_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"))
 }
 
 fn bilibili_entry_primary_media(
@@ -13261,6 +13625,91 @@ struct BilibiliNfoIds {
     primary_unique_id_type: String,
     primary_unique_id: String,
     alternate_unique_ids: Vec<(String, String)>,
+}
+
+struct MediaNfoAttachment {
+    role: &'static str,
+    filename: String,
+}
+
+fn bilibili_nfo_attachments(
+    cwd: &Path,
+    primary_media: &Path,
+    report_entry: &BilibiliEntryDownloadReport,
+) -> Result<Vec<MediaNfoAttachment>> {
+    let Some(parent) = primary_media.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut by_filename = BTreeMap::<String, &'static str>::new();
+    let mut conflicted = BTreeSet::new();
+    for file in &report_entry.files {
+        let role = match file.kind.as_str() {
+            "cover" => "cover",
+            "subtitle" => "subtitle",
+            "danmaku" | "danmaku_ass" => "danmaku",
+            _ => continue,
+        };
+        let path = resolve_command_output_path(cwd, &file.path);
+        if path == primary_media || path.parent() != Some(parent) {
+            continue;
+        }
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            continue;
+        }
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !valid_nfo_attachment_basename(filename)
+            || !nfo_attachment_role_matches_extension(role, filename)
+        {
+            continue;
+        }
+        match by_filename.get(filename) {
+            Some(existing) if *existing != role => {
+                conflicted.insert(filename.to_string());
+            }
+            Some(_) => {}
+            None => {
+                by_filename.insert(filename.to_string(), role);
+                if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+                    bail!(
+                        "downloaded attachment manifest exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+                    );
+                }
+            }
+        }
+    }
+    Ok(by_filename
+        .into_iter()
+        .filter(|(filename, _)| !conflicted.contains(filename))
+        .map(|(filename, role)| MediaNfoAttachment { role, filename })
+        .collect())
+}
+
+fn valid_nfo_attachment_basename(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\', ':', '\0'])
+        && !value.chars().any(char::is_control)
+        && Path::new(value).components().count() == 1
+        && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+fn nfo_attachment_role_matches_extension(role: &str, filename: &str) -> bool {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match role {
+        "cover" => matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp"),
+        "subtitle" => matches!(extension.as_str(), "srt" | "vtt" | "ass"),
+        "danmaku" => matches!(extension.as_str(), "xml" | "json" | "txt" | "ass"),
+        _ => false,
+    }
 }
 
 fn bilibili_nfo_ids(entry: Option<&BilibiliDownloadEntry>) -> Option<BilibiliNfoIds> {
@@ -14117,6 +14566,10 @@ async fn run_staged_video_job(
         staging: Some(&staging),
         bilibili_group_receipt: group_receipt_context,
         bilibili_collection_destination: None,
+        rewrite_local_nfo_references: matches!(
+            job,
+            JobRequest::Bilibili { .. } | JobRequest::Youtube { .. }
+        ),
     };
     send_bilibili_worker_entry_stage(
         progress.as_ref(),
@@ -20581,6 +21034,9 @@ fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
         || path == staging_dir.join(BILIBILI_WORKER_REQUEST_FILE_NAME)
         || path == staging_dir.join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME)
         || path == staging_dir.join(BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME)
+        || path
+            .strip_prefix(staging_dir)
+            .is_ok_and(|relative| relative.starts_with(VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME))
 }
 
 fn remove_sensitive_staging_support_files(
@@ -22153,6 +22609,7 @@ fn collect_regular_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Res
 #[derive(Debug, Clone)]
 struct MoveStep {
     source: PathBuf,
+    logical_source: Option<PathBuf>,
     destination: PathBuf,
     expected_identity: Option<EntryIdentity>,
 }
@@ -22163,6 +22620,7 @@ struct MoveExecutionContext<'a> {
     staging: Option<&'a BoundStagingDir>,
     bilibili_group_receipt: Option<BilibiliGroupReceiptWriteContext<'a>>,
     bilibili_collection_destination: Option<BilibiliCollectionDestinationContext<'a>>,
+    rewrite_local_nfo_references: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -22181,6 +22639,7 @@ struct BilibiliCollectionDestinationContext<'a> {
 #[derive(Debug)]
 struct MovedFile {
     source: PathBuf,
+    logical_source: PathBuf,
     destination: PathBuf,
     source_entry: BoundEntry,
     destination_entry: BoundEntry,
@@ -22198,6 +22657,7 @@ struct MovePlanResult {
 struct StagedVideoMoveResult {
     primary_destinations: Vec<PathBuf>,
     primary_source_destinations: BTreeMap<PathBuf, PathBuf>,
+    logical_source_destinations: BTreeMap<PathBuf, PathBuf>,
     bilibili_group_receipt: Option<BilibiliGroupPublicationReceipt>,
 }
 
@@ -23630,6 +24090,7 @@ fn move_staged_video_files(
             staging: None,
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
+            rewrite_local_nfo_references: false,
         },
         staging_dir,
         final_dir,
@@ -23740,6 +24201,11 @@ where
                 .filter(|file| is_primary_media_file(&file.source, primary_media_kind))
                 .map(|file| (file.source.clone(), file.destination.clone()))
                 .collect();
+            let logical_source_destinations = moved
+                .moved
+                .iter()
+                .map(|file| (file.logical_source.clone(), file.destination.clone()))
+                .collect();
             if let Some(acquisition) = acquisition {
                 let committed_target = moved
                     .moved_videos
@@ -23756,6 +24222,7 @@ where
             Ok(StagedVideoMoveResult {
                 primary_destinations: moved.moved_videos,
                 primary_source_destinations,
+                logical_source_destinations,
                 bilibili_group_receipt: moved.bilibili_group_receipt,
             })
         }
@@ -23786,6 +24253,12 @@ where
         overwrite_target,
         primary_media_kind,
     )?;
+    if context.rewrite_local_nfo_references {
+        let staging = context
+            .staging
+            .context("NFO publication remapping requires owned staging")?;
+        rewrite_publication_nfo_copies(root, staging.path(), &mut plan, primary_media_kind)?;
+    }
     let bilibili_group_receipt = if let Some(receipt_context) = context.bilibili_group_receipt {
         let media_moves = plan
             .iter()
@@ -23999,6 +24472,7 @@ fn move_staged_artifact_files(
             staging: None,
             bilibili_group_receipt: None,
             bilibili_collection_destination: None,
+            rewrite_local_nfo_references: false,
         },
         staging_dir,
         final_dir,
@@ -24119,6 +24593,7 @@ fn staged_artifact_move_plan(
         reserved.insert(destination.clone());
         steps.push(MoveStep {
             source: source.clone(),
+            logical_source: None,
             destination,
             expected_identity: None,
         });
@@ -24280,6 +24755,7 @@ fn staged_move_plan(
         reserved.insert(destination.clone());
         steps.push(MoveStep {
             source: source.clone(),
+            logical_source: None,
             destination,
             expected_identity: None,
         });
@@ -24592,8 +25068,10 @@ fn move_step_with_bound_parents_and_destination(
         &destination_entry,
         identity,
     )?;
+    let logical_source = step.logical_source.unwrap_or_else(|| step.source.clone());
     let moved = MovedFile {
         source: step.source,
+        logical_source,
         destination: step.destination,
         source_entry,
         destination_entry,
@@ -25757,6 +26235,9 @@ struct MediaNfo<'a> {
     source_url: &'a str,
     studio: Option<&'a str>,
     premiered: Option<&'a str>,
+    tvshowtitle: Option<&'a str>,
+    localfilename: Option<&'a str>,
+    attachments: Vec<MediaNfoAttachment>,
 }
 
 fn write_youtube_nfo_bound(
@@ -25775,6 +26256,7 @@ fn write_youtube_nfo_bound(
     let source_url = metadata.webpage_url.as_deref().unwrap_or(requested_url);
     let studio = metadata.uploader.as_deref().or(metadata.channel.as_deref());
     let premiered = metadata.upload_date.as_deref().and_then(format_yt_date);
+    let attachments = youtube_nfo_attachments(root, video_path, &video)?;
     let nfo = MediaNfo {
         title,
         plot: metadata.description.as_deref(),
@@ -25784,6 +26266,9 @@ fn write_youtube_nfo_bound(
         source_url,
         studio,
         premiered: premiered.as_deref(),
+        tvshowtitle: None,
+        localfilename: video_path.file_name().and_then(|name| name.to_str()),
+        attachments,
     };
     let title = nfo
         .title
@@ -25821,14 +26306,240 @@ fn write_youtube_nfo_bound(
     }
 }
 
+fn youtube_nfo_attachments(
+    root: &RootedFs,
+    video_path: &Path,
+    expected_video: &BoundFile,
+) -> Result<Vec<MediaNfoAttachment>> {
+    let parent = video_path
+        .parent()
+        .context("downloaded video has no parent directory")?;
+    let parent_identity = if parent == root.logical_root_path() {
+        root.root_identity()
+    } else {
+        root.entry_identity(parent)?
+            .ok_or_else(|| anyhow!("downloaded video directory disappeared"))?
+    };
+    if !parent_identity.is_dir() {
+        bail!("downloaded video parent is no longer a directory");
+    }
+    let entries = if parent == root.logical_root_path() {
+        root.list_root_directory()?
+    } else {
+        let parent_entry = root.bind_entry(parent, false)?;
+        root.list_bound_directory(&parent_entry, parent_identity)?
+    };
+    let mut primary_stems = BTreeMap::<String, usize>::new();
+    let mut primary_count = 0usize;
+    for (name, identity) in &entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let path = Path::new(name);
+        if is_video_file(path) || is_audio_file(path) {
+            if video_path
+                .file_name()
+                .is_some_and(|video_name| video_name == std::ffi::OsStr::new(name))
+            {
+                let current = root.open_bound_file(video_path)?;
+                if current.as_ref() != Some(expected_video)
+                    || current
+                        .as_ref()
+                        .is_none_or(|file| file.identity() != *identity)
+                {
+                    bail!("downloaded video identity changed during attachment discovery");
+                }
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            *primary_stems.entry(stem).or_default() += 1;
+            primary_count = primary_count.saturating_add(1);
+        }
+    }
+    let expected_stem = video_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("downloaded video has a non-UTF-8 filename"))?
+        .to_lowercase();
+    let mut by_filename = BTreeMap::<String, &'static str>::new();
+    for (name, identity) in entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(filename) = name.to_str() else {
+            continue;
+        };
+        if filename
+            .to_ascii_lowercase()
+            .starts_with(".telegram-video-downloader-")
+        {
+            continue;
+        }
+        let Some(sidecar_stem) = Path::new(filename)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        let matching_primary = primary_stems
+            .keys()
+            .filter(|stem| {
+                let stem = stem.as_str();
+                sidecar_stem == stem
+                    || sidecar_stem
+                        .strip_prefix(stem)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+            .max_by_key(|stem| stem.len());
+        let exact_owner = matching_primary.is_some_and(|stem| {
+            stem.as_str() == expected_stem && primary_stems.get(stem.as_str()).copied() == Some(1)
+        });
+        let unqualified = matching_primary.is_none()
+            && primary_count == 1
+            && youtube_is_conventional_unqualified_sidecar(filename);
+        let Some(role) = youtube_attachment_role(filename, exact_owner, unqualified) else {
+            continue;
+        };
+        if !valid_nfo_attachment_basename(filename)
+            || !nfo_attachment_role_matches_extension(role, filename)
+        {
+            continue;
+        }
+        by_filename.insert(filename.to_string(), role);
+        if by_filename.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+            bail!(
+                "downloaded attachment manifest exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+            );
+        }
+    }
+    Ok(by_filename
+        .into_iter()
+        .map(|(filename, role)| MediaNfoAttachment { role, filename })
+        .collect())
+}
+
+fn youtube_attachment_role(
+    filename: &str,
+    exact_owner: bool,
+    unqualified: bool,
+) -> Option<&'static str> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?
+        .to_ascii_lowercase();
+    if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
+        && (exact_owner || unqualified && youtube_is_cover_stem(&stem))
+    {
+        return Some("cover");
+    }
+    if matches!(extension.as_str(), "srt" | "vtt" | "ass")
+        && (exact_owner || unqualified && youtube_is_language_stem(&stem))
+    {
+        return Some("subtitle");
+    }
+    if matches!(extension.as_str(), "xml" | "json" | "txt" | "ass")
+        && ((exact_owner && youtube_is_danmaku_stem(&stem))
+            || (unqualified && youtube_is_danmaku_stem(&stem)))
+    {
+        return Some("danmaku");
+    }
+    None
+}
+
+fn youtube_is_conventional_unqualified_sidecar(filename: &str) -> bool {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (youtube_is_cover_stem(&stem) && matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp"))
+        || (youtube_is_danmaku_stem(&stem)
+            && matches!(extension.as_str(), "xml" | "json" | "txt" | "ass"))
+        || (youtube_is_language_stem(&stem) && matches!(extension.as_str(), "srt" | "vtt" | "ass"))
+}
+
+fn youtube_is_cover_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "cover" | "poster" | "folder" | "thumb" | "fanart" | "banner" | "landscape"
+    )
+}
+
+fn youtube_is_danmaku_stem(stem: &str) -> bool {
+    matches!(
+        stem,
+        "danmaku" | "danmu" | "barrage" | "comments" | "comment"
+    ) || [".danmaku", ".danmu", ".barrage"]
+        .iter()
+        .any(|suffix| stem.ends_with(suffix))
+}
+
+fn youtube_is_language_stem(stem: &str) -> bool {
+    let mut subtags = stem.split(['-', '_']);
+    let Some(language) = subtags.next() else {
+        return false;
+    };
+    const LANGUAGE_TAGS: &[&str] = &[
+        "af", "ar", "bg", "ca", "cs", "cy", "da", "de", "el", "en", "es", "et", "eu", "fa", "fi",
+        "fr", "ga", "gl", "he", "hi", "hr", "hu", "id", "is", "it", "ja", "ko", "lt", "lv", "ms",
+        "nl", "no", "pl", "pt", "ro", "ru", "sk", "sl", "sr", "sv", "th", "tr", "uk", "ur", "vi",
+        "zh", "chi", "deu", "eng", "fra", "fre", "ger", "ita", "jpn", "kor", "nld", "pol", "por",
+        "rus", "spa", "zho",
+    ];
+    LANGUAGE_TAGS.contains(&language)
+        && subtags.all(|subtag| {
+            (2..=8).contains(&subtag.len())
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+}
+
 fn write_nfo_for_media(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
+    if nfo.attachments.len() > NFO_ATTACHMENT_DECLARATION_LIMIT {
+        bail!(
+            "NFO attachment list exceeds the {NFO_ATTACHMENT_DECLARATION_LIMIT}-declaration limit"
+        );
+    }
     let title = nfo
         .title
         .or_else(|| video_path.file_stem().and_then(|stem| stem.to_str()))
         .unwrap_or("Untitled");
     let nfo_path = video_path.with_extension("nfo");
-    fs::write(&nfo_path, render_nfo(title, nfo))
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&nfo_path)
+        .with_context(|| {
+            format!(
+                "failed to create {} without replacing existing metadata",
+                nfo_path.display()
+            )
+        })?;
+    output
+        .write_all(render_nfo(title, nfo).as_bytes())
         .with_context(|| format!("failed to write {}", nfo_path.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", nfo_path.display()))?;
     Ok(nfo_path)
 }
 
@@ -25847,6 +26558,36 @@ fn render_nfo(title: &str, nfo: &MediaNfo<'_>) -> String {
             xml_escape(unique_id_type),
             xml_escape(unique_id)
         ));
+    }
+    if let Some(tvshowtitle) = nfo.tvshowtitle.filter(|value| !value.trim().is_empty()) {
+        content.push_str(&format!(
+            "  <tvshowtitle>{}</tvshowtitle>\n",
+            xml_escape(tvshowtitle.trim())
+        ));
+    }
+    if let Some(localfilename) = nfo
+        .localfilename
+        .filter(|value| valid_nfo_attachment_basename(value))
+    {
+        content.push_str(&format!(
+            "  <localfilename>{}</localfilename>\n",
+            xml_escape(localfilename)
+        ));
+    }
+    let mut added_cover_thumb = false;
+    for attachment in &nfo.attachments {
+        content.push_str(&format!(
+            "  <tvd_attachment role=\"{}\">{}</tvd_attachment>\n",
+            attachment.role,
+            xml_escape(&attachment.filename)
+        ));
+        if attachment.role == "cover" && !added_cover_thumb {
+            content.push_str(&format!(
+                "  <thumb>{}</thumb>\n",
+                xml_escape(&attachment.filename)
+            ));
+            added_cover_thumb = true;
+        }
     }
     content.push_str(&format!(
         "  <trailer>{}</trailer>\n",
@@ -27221,6 +27962,7 @@ mod tests {
         let destination = selected.join("E0001-P001-cid100.nfo");
         let plan = vec![MoveStep {
             source: staged_file.clone(),
+            logical_source: None,
             destination: destination.clone(),
             expected_identity: None,
         }];
@@ -28260,6 +29002,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -28435,6 +29178,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -28542,6 +29286,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &direct_staging_dir,
             &category_root,
@@ -28669,6 +29414,7 @@ mod tests {
                         progress: None,
                     }),
                     bilibili_collection_destination: None,
+                    rewrite_local_nfo_references: false,
                 },
                 &staging_dir,
                 &collection_dir,
@@ -28761,6 +29507,7 @@ mod tests {
                     progress: None,
                 }),
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &collection_dir,
@@ -35741,6 +36488,7 @@ mod tests {
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
@@ -36527,6 +37275,7 @@ mod tests {
             &root,
             MoveStep {
                 source: source.clone(),
+                logical_source: None,
                 destination: destination.clone(),
                 expected_identity: None,
             },
@@ -36581,6 +37330,7 @@ mod tests {
                 staging: None,
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
@@ -38953,6 +39703,7 @@ mod tests {
             &root,
             MoveStep {
                 source: staged,
+                logical_source: None,
                 destination: existing.clone(),
                 expected_identity: None,
             },
@@ -39031,6 +39782,7 @@ mod tests {
                 staging: Some(&staging),
                 bilibili_group_receipt: None,
                 bilibili_collection_destination: None,
+                rewrite_local_nfo_references: false,
             },
             &staging_dir,
             &final_dir,
@@ -39096,6 +39848,7 @@ mod tests {
             &root,
             MoveStep {
                 source: staged,
+                logical_source: None,
                 destination: existing.clone(),
                 expected_identity: None,
             },
@@ -41722,6 +42475,12 @@ mv video.original video.m4s || exit 46
                 source_url: "https://example.com/?a=1&b=2",
                 studio: Some("Studio"),
                 premiered: Some("2026-05-17"),
+                tvshowtitle: Some("Series & Group"),
+                localfilename: Some("Example.mkv"),
+                attachments: vec![MediaNfoAttachment {
+                    role: "cover",
+                    filename: "封面.jpg".to_string(),
+                }],
             },
         );
 
@@ -41729,6 +42488,97 @@ mv video.original video.m4s || exit 46
         assert!(nfo.contains("<uniqueid type=\"youtube-alt\">alt &amp; id</uniqueid>"));
         assert!(nfo.contains("<plot>x &lt; y</plot>"));
         assert!(nfo.contains("<year>2026</year>"));
+        assert!(nfo.contains("<tvshowtitle>Series &amp; Group</tvshowtitle>"));
+        assert!(nfo.contains("<localfilename>Example.mkv</localfilename>"));
+        assert!(nfo.contains("<tvd_attachment role=\"cover\">封面.jpg</tvd_attachment>"));
+        assert!(nfo.contains("<thumb>封面.jpg</thumb>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bilibili_nfo_manifest_uses_only_local_regular_role_compatible_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("bilibili-nfo-attachments");
+        let group = root.join("Group");
+        fs::create_dir_all(&group).expect("group directory should create");
+        let primary = group.join("Film.mkv");
+        let cover = group.join("cover.jpg");
+        fs::write(&primary, b"video").expect("primary video should write");
+        fs::write(&cover, b"local cover").expect("local cover should write");
+        fs::write(group.join("not-cover.mkv"), b"other video").expect("other primary should write");
+        fs::write(group.join("Film.nfo"), b"not a cover").expect("NFO file should write");
+        let outside = temp_test_dir("bilibili-nfo-attachments-outside");
+        let outside_cover = outside.join("cover.jpg");
+        fs::write(&outside_cover, b"outside cover").expect("outside cover should write");
+        symlink(&outside_cover, group.join("linked.jpg")).expect("cover symlink should create");
+
+        let report = BilibiliEntryDownloadReport {
+            index: 1,
+            title: "Film".to_string(),
+            files: vec![
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: cover.clone(),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("linked.jpg"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("not-cover.mkv"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: group.join("Film.nfo"),
+                },
+                BilibiliDownloadedFile {
+                    kind: "cover".to_string(),
+                    path: outside_cover.clone(),
+                },
+            ],
+            mux: None,
+        };
+
+        let attachments = bilibili_nfo_attachments(&root, &primary, &report)
+            .expect("local report attachments should be safely indexed");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].role, "cover");
+        assert_eq!(attachments[0].filename, "cover.jpg");
+        assert!(
+            outside_cover.exists(),
+            "outside file should remain untouched"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn generated_nfo_never_replaces_an_existing_clear_source_id() {
+        let root = temp_test_dir("nfo-create-only-preserves-clear-id");
+        let video = root.join("Film.mkv");
+        let nfo_path = root.join("Film.nfo");
+        let original =
+            b"<movie><uniqueid type=\"bilibili\" default=\"true\">BV1234567</uniqueid></movie>";
+        fs::write(&video, b"video").expect("media should write");
+        fs::write(&nfo_path, original).expect("existing NFO should write");
+        let nfo = MediaNfo {
+            title: Some("New title"),
+            plot: None,
+            unique_id_type: "bilibili",
+            unique_id: "BV7654321",
+            alternate_unique_ids: Vec::new(),
+            source_url: "https://example.test/video",
+            studio: None,
+            premiered: None,
+            tvshowtitle: None,
+            localfilename: Some("Film.mkv"),
+            attachments: Vec::new(),
+        };
+        assert!(write_nfo_for_media(&video, &nfo).is_err());
+        assert_eq!(fs::read(&nfo_path).unwrap(), original);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -41736,6 +42586,13 @@ mv video.original video.m4s || exit 46
         let root_dir = temp_test_dir("youtube-bound-nfo");
         let video = root_dir.join("Example.mkv");
         fs::write(&video, "video").expect("video should write");
+        fs::write(root_dir.join("Example.jpg"), "cover").expect("cover should write");
+        fs::write(root_dir.join("Example.zh-Hans.srt"), "subtitle").expect("subtitle should write");
+        fs::write(root_dir.join("Example.danmaku.xml"), "danmaku").expect("danmaku should write");
+        fs::write(root_dir.join("Another.mkv"), "another video")
+            .expect("second primary should write");
+        fs::write(root_dir.join("cover.jpg"), "ambiguous bare cover")
+            .expect("bare cover should write");
         let root = RootedFs::new(&root_dir).expect("output root should bind");
         let metadata = YoutubeMetadata {
             id: Some("PHH1wTDF-1M".to_string()),
@@ -41756,6 +42613,15 @@ mv video.original video.m4s || exit 46
         assert!(nfo.contains("<title>Example &amp; title</title>"));
         assert!(nfo.contains("<uniqueid type=\"youtube\" default=\"true\">PHH1wTDF-1M</uniqueid>"));
         assert!(nfo.contains("<premiered>2026-05-17</premiered>"));
+        assert!(nfo.contains("<tvd_attachment role=\"cover\">Example.jpg</tvd_attachment>"));
+        assert!(
+            nfo.contains("<tvd_attachment role=\"subtitle\">Example.zh-Hans.srt</tvd_attachment>")
+        );
+        assert!(
+            nfo.contains("<tvd_attachment role=\"danmaku\">Example.danmaku.xml</tvd_attachment>")
+        );
+        assert!(!nfo.contains("<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>"));
+        assert!(!nfo.contains("<tvd_attachment role=\"cover\">Another.mkv</tvd_attachment>"));
         let _ = fs::remove_dir_all(root_dir);
     }
 
