@@ -172,9 +172,25 @@ pub(super) async fn miniapp_test_fixture() -> Result<MiniAppTestFixture> {
         shutdown,
         hash,
     } = miniapp_test_environment()?;
-    let snapshot = service.miniapp_adopt(17, hash.clone()).await?;
+    let mut snapshot = service.miniapp_adopt(17, hash.clone()).await?;
+    if snapshot.files.is_empty() || snapshot.inventory_revision == 0 {
+        let task_id = snapshot.task_id.clone();
+        snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut delay = Duration::from_millis(5);
+            loop {
+                tokio::time::sleep(delay).await;
+                let refreshed = service.miniapp_detail(17, task_id.clone()).await?;
+                if !refreshed.files.is_empty() && refreshed.inventory_revision > 0 {
+                    return Ok::<_, anyhow::Error>(refreshed);
+                }
+                delay = (delay * 2).min(Duration::from_millis(100));
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for Mini App torrent inventory"))??;
+    }
     anyhow::ensure!(
-        !snapshot.files.is_empty(),
+        !snapshot.files.is_empty() && snapshot.inventory_revision > 0,
         "test torrent inventory was not prepared"
     );
     Ok(MiniAppTestFixture {

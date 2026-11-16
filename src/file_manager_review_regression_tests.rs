@@ -840,3 +840,500 @@ fn review78_nfo_declaration_deadline_preserves_prior_rows_and_recovers() {
             .all(|warning| !warning.contains("120-second scan budget"))
     );
 }
+
+#[test]
+fn review5629_max_component_names_add_missing_localfilename_for_ascii_and_unicode() {
+    let root = TemporaryRoot::new("review5629-max-component-localfilename");
+    let ascii_stem = "a".repeat(MAX_FILENAME_COMPONENT_BYTES - ".mkv".len());
+    let unicode_stem = format!("{}ab", "界".repeat(83));
+    assert_eq!(ascii_stem.len(), 251);
+    assert_eq!(unicode_stem.len(), 251);
+
+    let stems = [ascii_stem, unicode_stem];
+    let mut media_names = Vec::new();
+    for (index, stem) in stems.iter().enumerate() {
+        let media_name = format!("{stem}.mkv");
+        let nfo_name = format!("{stem}.nfo");
+        assert_eq!(media_name.len(), MAX_FILENAME_COMPONENT_BYTES);
+        assert_eq!(nfo_name.len(), MAX_FILENAME_COMPONENT_BYTES);
+        fs::write(root.path().join(&media_name), format!("media-{index}"))
+            .expect("maximum-length media fixture should write");
+        fs::write(
+            root.path().join(&nfo_name),
+            format!(
+                "<movie><title>Long fixture {index}</title><future>preserve {index}</future></movie>"
+            ),
+        )
+        .expect("maximum-length NFO fixture should write without localfilename");
+        media_names.push(media_name);
+    }
+
+    let manager = manager(&root);
+    let snapshot = manager
+        .scan(&[])
+        .expect("maximum-length media and NFO names should scan");
+    let selected_ids = media_names
+        .iter()
+        .map(|name| item_at(&snapshot, name).id.clone())
+        .collect::<Vec<_>>();
+    let preview = manager
+        .preview(&selected_ids, "Moved", false, ConflictPolicy::KeepBoth)
+        .expect("maximum-length NFO localfilename patch should preview");
+    assert_eq!(preview.items.len(), 2);
+    assert!(
+        preview
+            .items
+            .iter()
+            .all(|item| item.outcome == MoveOutcome::Move)
+    );
+
+    let persisted = manager
+        .read_persisted_preview(&preview.id)
+        .expect("prepared maximum-length NFO patches should persist");
+    assert_eq!(persisted.patches.len(), 2);
+    for media_name in &media_names {
+        let nfo_target = format!(
+            "Moved/{}",
+            Path::new(media_name)
+                .with_extension("nfo")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let expected_localfilename = format!("<localfilename>{media_name}</localfilename>");
+        let prepared = persisted
+            .patches
+            .iter()
+            .find(|patch| patch.target_path == nfo_target)
+            .unwrap_or_else(|| panic!("preview should patch {nfo_target}"));
+        let replacement =
+            std::str::from_utf8(&prepared.replacement).expect("prepared NFO patch should be UTF-8");
+        assert!(replacement.contains(&expected_localfilename));
+        assert!(replacement.contains("<future>preserve "));
+    }
+
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("maximum-length media moves and NFO patches should complete");
+    assert_eq!(result.status, BatchStatus::Complete);
+    let rescanned = manager
+        .scan(&[])
+        .expect("maximum-length moved media should rescan");
+    for media_name in &media_names {
+        let media_target = format!("Moved/{media_name}");
+        let nfo_target = format!(
+            "Moved/{}",
+            Path::new(media_name)
+                .with_extension("nfo")
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let item = item_at(&rescanned, &media_target);
+        assert_eq!(
+            item.authoritative_nfo_path.as_deref(),
+            Some(nfo_target.as_str())
+        );
+        let nfo_contents = fs::read_to_string(root.path().join(&nfo_target))
+            .expect("published maximum-length NFO should read");
+        assert!(nfo_contents.contains(&format!("<localfilename>{media_name}</localfilename>")));
+        assert!(nfo_contents.contains("<future>preserve "));
+    }
+}
+
+struct FailLongNfoPublicationManifestWriteProvider {
+    targets: Vec<(PathBuf, String)>,
+    failed_after_publication: std::sync::atomic::AtomicBool,
+}
+
+impl QueueFileProvider for FailLongNfoPublicationManifestWriteProvider {
+    fn coordinate_read(
+        &self,
+        path: &Path,
+        accessor: &mut dyn FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
+        accessor(path)
+    }
+
+    fn coordinate_write(
+        &self,
+        path: &Path,
+        accessor: &mut dyn FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let is_batch_manifest = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with(BATCH_PREFIX));
+        let published = self.targets.iter().any(|(target_nfo, media_name)| {
+            fs::read_to_string(target_nfo).is_ok_and(|contents| {
+                contents.contains(&format!("<localfilename>{media_name}</localfilename>"))
+            })
+        });
+        if is_batch_manifest
+            && published
+            && !self.failed_after_publication.swap(true, Ordering::SeqCst)
+        {
+            bail!("injected batch manifest failure after long NFO publication");
+        }
+        accessor(path)
+    }
+
+    fn coordinate_move(
+        &self,
+        source: &Path,
+        destination: &Path,
+        accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+    ) -> Result<()> {
+        accessor(source, destination)
+    }
+}
+
+#[test]
+fn review5629_max_component_nfo_checkpoint_recovers_with_identity_and_digest_guard() {
+    let root = TemporaryRoot::new("review5629-max-component-nfo-recovery");
+    let stem = "a".repeat(MAX_FILENAME_COMPONENT_BYTES - ".mkv".len());
+    let media_name = format!("{stem}.mkv");
+    let nfo_name = format!("{stem}.nfo");
+    assert_eq!(media_name.len(), MAX_FILENAME_COMPONENT_BYTES);
+    assert_eq!(nfo_name.len(), MAX_FILENAME_COMPONENT_BYTES);
+    fs::write(
+        root.path().join(&media_name),
+        b"maximum-length media fixture",
+    )
+    .expect("maximum-length media should write");
+    fs::write(
+        root.path().join(&nfo_name),
+        "<movie><title>Before</title><future>preserve</future></movie>",
+    )
+    .expect("maximum-length NFO without localfilename should write");
+
+    let target_nfo = root.path().join("Moved").join(&nfo_name);
+    let provider_impl = Arc::new(FailLongNfoPublicationManifestWriteProvider {
+        targets: vec![(target_nfo.clone(), media_name.clone())],
+        failed_after_publication: std::sync::atomic::AtomicBool::new(false),
+    });
+    let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+    let manager = LibraryManager::open_with_provider(root.path(), Arc::clone(&provider))
+        .expect("library manager should open with the scoped fault provider");
+    let snapshot = manager
+        .scan(&[])
+        .expect("maximum-length fixture should scan");
+    let preview = manager
+        .preview(
+            &[item_at(&snapshot, &media_name).id.clone()],
+            "Moved",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("maximum-length NFO move should preview");
+    assert!(preview.items[0].files.iter().any(|file| {
+        file.source_path == nfo_name && file.target_path == format!("Moved/{nfo_name}")
+    }));
+
+    assert!(
+        manager
+            .execute_preview(&preview.id, &preview.revision)
+            .is_err(),
+        "the scoped provider should interrupt after the long NFO replacement"
+    );
+    assert!(
+        provider_impl
+            .failed_after_publication
+            .load(Ordering::SeqCst)
+    );
+    let target_relative = format!("Moved/{nfo_name}");
+    let current_bytes = fs::read(&target_nfo).expect("published NFO should remain readable");
+    assert!(
+        String::from_utf8_lossy(&current_bytes)
+            .contains(&format!("<localfilename>{media_name}</localfilename>"))
+    );
+
+    let batch_path = manager.batch_path(&preview.id);
+    let batch_bytes = manager
+        .read_private_file(&batch_path, MANIFEST_LIMIT)
+        .expect("interrupted manifest should read")
+        .expect("interrupted manifest should exist");
+    let interrupted: BatchManifest =
+        serde_json::from_slice(&batch_bytes).expect("interrupted manifest should decode");
+    let patch = interrupted
+        .patches
+        .iter()
+        .find(|patch| patch.target_path == target_relative)
+        .expect("maximum-length NFO patch should remain journaled")
+        .clone();
+    let checkpoint = patch
+        .replacement_checkpoint
+        .as_ref()
+        .expect("replacement identity checkpoint should be durable");
+    assert_eq!(patch.state, ManifestPatchState::Pending);
+    let stage_basename = Path::new(&checkpoint.staged_path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("journaled stage basename should be UTF-8");
+    assert!(
+        stage_basename.len() <= MAX_FILENAME_COMPONENT_BYTES,
+        "journaled stage basename should be within the filesystem component limit"
+    );
+    let checkpoint_digest = checkpoint
+        .after_identity
+        .rsplit(':')
+        .next()
+        .expect("checkpoint identity should contain a digest");
+    assert_eq!(checkpoint_digest, patch.after_sha256);
+    assert_eq!(
+        decode_identity_token(&checkpoint.after_identity)
+            .unwrap()
+            .size,
+        patch.replacement.len() as u64
+    );
+
+    let moved_nfo = interrupted
+        .files
+        .iter()
+        .find(|file| file.target_path == target_relative)
+        .expect("moved NFO should remain in the batch file manifest")
+        .clone();
+    assert_eq!(moved_nfo.state, ManifestFileState::Moved);
+    assert_eq!(
+        moved_nfo.identity,
+        patch
+            .expected_identity
+            .clone()
+            .expect("original NFO identity should remain in the manifest")
+    );
+    let bound_target = manager
+        .root
+        .open_bound_file(&target_nfo)
+        .expect("checkpointed target should bind")
+        .expect("checkpointed NFO should exist");
+    let (checkpoint_token, checkpointed_digest) = token_for_bound_file(&bound_target)
+        .expect("checkpointed target identity and digest should read");
+    assert_eq!(checkpoint_token, checkpoint.after_identity);
+    assert_eq!(checkpointed_digest, patch.after_sha256);
+    assert!(
+        manager
+            .nfo_checkpoint_matches_file(
+                &patch,
+                checkpoint,
+                &target_nfo,
+                &bound_target,
+                &checkpoint_token,
+                &checkpointed_digest,
+            )
+            .expect("checkpoint validation should run")
+    );
+    drop(bound_target);
+
+    let retained_original = root.path().join("checkpointed-original");
+    let approved_mode = fs::metadata(&target_nfo)
+        .expect("checkpointed target metadata should read")
+        .permissions()
+        .mode()
+        & 0o777;
+    fs::rename(&target_nfo, &retained_original)
+        .expect("approved checkpointed object should be retained for the guard check");
+    fs::write(&target_nfo, &current_bytes).expect("same-content replacement object should write");
+    fs::set_permissions(&target_nfo, fs::Permissions::from_mode(approved_mode))
+        .expect("replacement should use the approved access mode");
+    let replacement_file = manager
+        .root
+        .open_bound_file(&target_nfo)
+        .expect("same-content replacement should bind")
+        .expect("same-content replacement should exist");
+    let (replacement_token, replacement_digest) = token_for_bound_file(&replacement_file)
+        .expect("same-content replacement identity and digest should read");
+    assert_eq!(replacement_digest, patch.after_sha256);
+    assert_ne!(replacement_token, checkpoint.after_identity);
+    assert!(
+        manager
+            .checkpointed_moved_nfo_identity(&moved_nfo, &interrupted.patches)
+            .expect("replacement checkpoint should reject the new object")
+            .is_none()
+    );
+    assert!(
+        manager
+            .validate_moved_file(&preview.id, &moved_nfo)
+            .is_err()
+    );
+    drop(replacement_file);
+    fs::remove_file(&target_nfo).expect("external replacement should be removed");
+    fs::rename(&retained_original, &target_nfo)
+        .expect("the exact approved checkpointed object should be restored");
+    assert_eq!(
+        manager
+            .checkpointed_moved_nfo_identity(&moved_nfo, &interrupted.patches)
+            .expect("restored checkpoint should verify"),
+        Some(checkpoint.after_identity.clone())
+    );
+
+    release_nfo_preview_anchors_if_restart_proof_is_persistent(&manager, &preview);
+    drop(manager);
+    let reopened = LibraryManager::open_with_provider(root.path(), provider)
+        .expect("library manager should reopen for checkpoint recovery");
+    let result = reopened
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("the journaled long-name NFO patch should recover and finish");
+    assert_eq!(result.status, BatchStatus::Complete);
+    let final_nfo = fs::read_to_string(&target_nfo).expect("recovered long-name NFO should read");
+    assert!(final_nfo.contains(&format!("<localfilename>{media_name}</localfilename>")));
+    assert!(final_nfo.contains("<future>preserve</future>"));
+    let final_batch = reopened
+        .read_private_file(&reopened.batch_path(&preview.id), MANIFEST_LIMIT)
+        .expect("completed long-name manifest should read")
+        .expect("completed long-name manifest should exist");
+    let completed: BatchManifest =
+        serde_json::from_slice(&final_batch).expect("completed manifest should decode");
+    let completed_patch = completed
+        .patches
+        .iter()
+        .find(|patch| patch.target_path == target_relative)
+        .expect("completed NFO patch should remain recorded");
+    let completed_file = completed
+        .files
+        .iter()
+        .find(|file| file.target_path == target_relative)
+        .expect("completed NFO move should remain recorded");
+    let completed_checkpoint = completed_patch
+        .replacement_checkpoint
+        .as_ref()
+        .expect("recovered checkpoint should remain durable");
+    assert_eq!(completed_patch.state, ManifestPatchState::Applied);
+    assert_eq!(
+        completed_checkpoint.after_identity,
+        checkpoint.after_identity
+    );
+    assert_eq!(completed_file.identity, checkpoint.after_identity);
+}
+
+#[test]
+fn review5629_conflicting_cover_and_ass_claims_do_not_keep_inferred_owners() {
+    let root = TemporaryRoot::new("review5629-conflicting-inferred-owners");
+    fs::write(root.path().join("A.mkv"), b"A media").expect("A media should write");
+    fs::write(root.path().join("B.mkv"), b"B media").expect("B media should write");
+    let cover_bytes = b"contested A cover";
+    let ass_bytes = b"contested A ASS";
+    fs::write(root.path().join("A.cover.jpg"), cover_bytes)
+        .expect("stem-matched cover should write");
+    fs::write(root.path().join("A.ass"), ass_bytes).expect("stem-matched ASS should write");
+    let a_nfo = concat!(
+        "<movie><title>A title</title>",
+        "<tvd_attachment role=\"cover\">A.cover.jpg</tvd_attachment>",
+        "<tvd_attachment role=\"subtitle\">A.ass</tvd_attachment></movie>"
+    );
+    let a_secondary_nfo = "<movie><tvd_attachment role=\"danmaku\">A.ass</tvd_attachment></movie>";
+    let b_nfo = concat!(
+        "<movie><title>B title</title>",
+        "<tvd_attachment role=\"cover\">A.cover.jpg</tvd_attachment>",
+        "<tvd_attachment role=\"subtitle\">A.ass</tvd_attachment></movie>"
+    );
+    fs::write(root.path().join("A.nfo"), a_nfo).expect("A authoritative NFO should write");
+    fs::write(root.path().join("A.extra.nfo"), a_secondary_nfo)
+        .expect("A secondary role-conflict NFO should write");
+    fs::write(root.path().join("B.nfo"), b_nfo).expect("B NFO should write");
+
+    let manager = manager(&root);
+    let snapshot = manager
+        .scan(&[])
+        .expect("conflicting NFO claims should scan");
+    for media_path in ["A.mkv", "B.mkv"] {
+        let item = item_at(&snapshot, media_path);
+        assert!(item.attachments.iter().all(|attachment| {
+            attachment.relative_path != "A.cover.jpg" && attachment.relative_path != "A.ass"
+        }));
+    }
+    let a = item_at(&snapshot, "A.mkv");
+    let preview = manager
+        .preview(
+            std::slice::from_ref(&a.id),
+            "Organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("organizing A without contested sidecars should preview");
+    assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .all(|file| { file.source_path != "A.cover.jpg" && file.source_path != "A.ass" })
+    );
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .any(|file| file.source_path == "A.mkv")
+    );
+
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("confirmed A organization should complete without contested files");
+    assert_eq!(result.status, BatchStatus::Complete);
+    assert!(!root.path().join("A.mkv").exists());
+    assert!(root.path().join("Organized/A.mkv").exists());
+    assert_eq!(
+        fs::read(root.path().join("A.cover.jpg")).unwrap(),
+        cover_bytes
+    );
+    assert_eq!(fs::read(root.path().join("A.ass")).unwrap(), ass_bytes);
+    assert_eq!(
+        fs::read_to_string(root.path().join("B.nfo")).unwrap(),
+        b_nfo
+    );
+    assert!(root.path().join("B.mkv").exists());
+}
+
+#[test]
+fn review5629_foreign_claim_does_not_preserve_a_stem_inferred_cover_owner() {
+    let root = TemporaryRoot::new("review5629-foreign-claim-vs-inference");
+    fs::write(root.path().join("A.mkv"), b"A media").expect("A media should write");
+    fs::write(root.path().join("B.mkv"), b"B media").expect("B media should write");
+    let cover_bytes = b"A cover claimed only by B";
+    fs::write(root.path().join("A.cover.jpg"), cover_bytes)
+        .expect("stem-matched cover should write");
+    let b_nfo = "<movie><title>B title</title><tvd_attachment role=\"cover\">A.cover.jpg</tvd_attachment></movie>";
+    fs::write(root.path().join("B.nfo"), b_nfo).expect("B NFO should write");
+
+    let manager = manager(&root);
+    let snapshot = manager
+        .scan(&[])
+        .expect("foreign explicit claim should scan");
+    for media_path in ["A.mkv", "B.mkv"] {
+        assert!(
+            item_at(&snapshot, media_path)
+                .attachments
+                .iter()
+                .all(|attachment| attachment.relative_path != "A.cover.jpg")
+        );
+    }
+    let a = item_at(&snapshot, "A.mkv");
+    let preview = manager
+        .preview(
+            std::slice::from_ref(&a.id),
+            "Organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("organizing A without B's contested cover should preview");
+    assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .all(|file| file.source_path != "A.cover.jpg")
+    );
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("confirmed A organization should leave B's claim target in place");
+    assert_eq!(result.status, BatchStatus::Complete);
+    assert_eq!(
+        fs::read(root.path().join("A.cover.jpg")).unwrap(),
+        cover_bytes
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("B.nfo")).unwrap(),
+        b_nfo
+    );
+    assert!(root.path().join("B.mkv").exists());
+}
