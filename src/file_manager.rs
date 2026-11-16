@@ -483,6 +483,44 @@ where
     Ok(key)
 }
 
+/// Resolve a safe NFO basename only against scanned paths under its bound parent.
+/// Unavailable semantics or invalid paths return an error; no or multiple matches return `Ok(None)`.
+pub(crate) fn resolve_nfo_attachment_relative_path(
+    root: &RootedFs,
+    parent_relative: &Path,
+    declared_basename: &str,
+    actual_attachment_paths: &[String],
+) -> Result<Option<String>> {
+    let declared_basename = canonical_nfo_attachment_basename(declared_basename)?;
+    let parent = if parent_relative.as_os_str().is_empty() {
+        PathBuf::new()
+    } else {
+        safe_relative_path(&path_to_relative_string(parent_relative)?, true)?
+    };
+    let semantics = target_name_semantics_for_directory(root, &parent)?;
+    let declared_key =
+        target_component_key_with(&declared_basename, semantics, platform_case_fold)?;
+    let mut matches = HashSet::new();
+    for candidate in actual_attachment_paths {
+        let candidate = safe_relative_path(candidate, false)?;
+        if candidate.parent().unwrap_or_else(|| Path::new("")) != parent.as_path() {
+            continue;
+        }
+        let basename = candidate
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| anyhow!("scanned attachment has a non-UTF-8 basename"))?;
+        let candidate_key = target_component_key_with(basename, semantics, platform_case_fold)?;
+        if candidate_key == declared_key {
+            matches.insert(path_to_relative_string(&candidate)?);
+        }
+    }
+    if matches.len() != 1 {
+        return Ok(None);
+    }
+    Ok(matches.into_iter().next())
+}
+
 fn is_private_downloader_component_with<F>(
     name: &str,
     semantics: TargetNameSemantics,
@@ -1830,6 +1868,7 @@ impl LibraryManager {
             let (mut target_path, mut target_paths) = candidate_for_stem("")?;
             let has_conflict = migration_targets_conflict(target, &target_paths, &mut reserved)?;
             let mut skip_group = has_conflict && conflict == ConflictPolicy::Skip;
+            let mut checked_nfo_content_digests = HashMap::new();
             if has_conflict && conflict == ConflictPolicy::KeepBoth {
                 let mut found = false;
                 for number in 2..=10_000 {
@@ -1852,36 +1891,59 @@ impl LibraryManager {
                         bail!("could not find a free keep-both migration filename");
                     }
                 } else {
-                    let references_need_rewrite = if let Some(nfo_relative) =
-                        item.authoritative_nfo_path.as_deref()
+                    let mut nfo_sources = item
+                        .attachments
+                        .iter()
+                        .filter(|attachment| attachment.kind == "nfo")
+                        .map(|attachment| attachment.relative_path.clone())
+                        .collect::<Vec<_>>();
+                    if let Some(authoritative) = &item.authoritative_nfo_path {
+                        nfo_sources.push(authoritative.clone());
+                    }
+                    nfo_sources.sort();
+                    nfo_sources.dedup();
+                    let references_need_rewrite = if nfo_sources.len()
+                        > NFO_DECLARATION_SOURCE_LIMIT_PER_MEDIA
                     {
-                        let nfo_path = self.absolute_path(nfo_relative)?;
-                        let contents = self
-                            .read_file(&nfo_path, SIDE_CAR_LIMIT)?
-                            .ok_or_else(|| anyhow!("authoritative migration NFO disappeared"))?;
-                        match String::from_utf8(contents) {
-                            Ok(content) => {
-                                let source_primary_filename = Path::new(&item.relative_path)
-                                    .file_name()
-                                    .and_then(OsStr::to_str)
-                                    .unwrap_or_default();
-                                let target_primary_filename = Path::new(&target_path)
-                                    .file_name()
-                                    .and_then(OsStr::to_str)
-                                    .unwrap_or_default();
-                                migration_nfo_references_need_rewrite(
-                                    &content,
-                                    source_primary_filename,
-                                    target_primary_filename,
-                                    &planned_sources,
-                                    &target_paths,
-                                    source_name_semantics,
-                                )
-                            }
-                            Err(_) => true,
-                        }
+                        true
                     } else {
-                        false
+                        let source_primary_filename = Path::new(&item.relative_path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default();
+                        let target_primary_filename = Path::new(&target_path)
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or_default();
+                        let mut needs_rewrite = false;
+                        for nfo_relative in nfo_sources {
+                            let nfo_path = self.absolute_path(&nfo_relative)?;
+                            let contents =
+                                self.read_file(&nfo_path, SIDE_CAR_LIMIT)?.ok_or_else(|| {
+                                    if item.authoritative_nfo_path.as_deref()
+                                        == Some(nfo_relative.as_str())
+                                    {
+                                        anyhow!("authoritative migration NFO disappeared")
+                                    } else {
+                                        anyhow!("attached migration NFO disappeared")
+                                    }
+                                })?;
+                            checked_nfo_content_digests
+                                .insert(nfo_relative, sha256_bytes(&contents));
+                            let Ok(content) = String::from_utf8(contents) else {
+                                needs_rewrite = true;
+                                continue;
+                            };
+                            needs_rewrite |= migration_nfo_references_need_rewrite(
+                                &content,
+                                source_primary_filename,
+                                target_primary_filename,
+                                &planned_sources,
+                                &target_paths,
+                                source_name_semantics,
+                            );
+                        }
+                        needs_rewrite
                     };
                     if references_need_rewrite {
                         // Migration has no NFO rewrite transaction. A KeepBoth rename that would
@@ -1897,6 +1959,12 @@ impl LibraryManager {
             let mut files = Vec::with_capacity(planned_sources.len());
             for ((source_path, _, _), target_path) in planned_sources.iter().zip(&target_paths) {
                 let proof = self.migration_file_proof(source_path)?;
+                if checked_nfo_content_digests
+                    .get(source_path)
+                    .is_some_and(|digest| digest != &proof.sha256)
+                {
+                    skip_group = true;
+                }
                 files.push(MigrationPlannedFile {
                     source_path: source_path.clone(),
                     target_path: target_path.clone(),

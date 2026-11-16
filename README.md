@@ -76,6 +76,8 @@ Declaration reads share the scan's 120-second deadline. An expired scan stops re
 
 When NFO output is enabled and a new NFO is created, Bilibili and YouTube downloads include local attachment declarations. Existing NFOs are not replaced by download metadata. Final publication remaps local NFO references for both providers when KeepBoth changes their filenames. Confirmed organize or rename operations update `localfilename`, attachment declarations and local `<thumb>` references in the same durable operation; scans and previews do not write NFOs. Unknown NFO fields and clear source IDs are preserved. Missing `tvshowtitle` is filled from collection metadata. Migration keeps references when basenames stay stable and skips a KeepBoth rename when it cannot safely update a reference.
 
+Migration checks every attached NFO source before allowing a KeepBoth rename. Custom XML/ASS danmaku refresh requires a verified declaration in the captured authoritative NFO, resolved with the filesystem's case and normalization rules. An existing custom output without that proof causes a skip rather than an unrelated canonical output.
+
 ## 配置
 
 复制示例配置并填入 Telegram token：

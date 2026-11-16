@@ -3186,3 +3186,288 @@ fn migration_keep_both_skips_when_nfo_localfilename_would_become_stale() {
     );
     assert!(!target_root.path().join("Film (2).mkv").exists());
 }
+
+const SECONDARY_NFO_FILM_BYTES: &[u8] = b"secondary NFO migration film bytes";
+const SECONDARY_NFO_COVER_BYTES: &[u8] = b"secondary NFO migration cover bytes";
+const SECONDARY_NFO_AUTHORITATIVE: &str = "<movie><title>Film title</title></movie>";
+const SECONDARY_NFO_EXTRA: &str = concat!(
+    "<movie><tvd_attachment role=\"cover\">Film.cover.jpg</tvd_attachment>",
+    "<thumb>Film.cover.jpg</thumb></movie>"
+);
+
+fn secondary_nfo_migration_fixture(
+    label: &str,
+    existing_target_media: Option<&[u8]>,
+) -> (TestRoot, TestRoot, MigrationEngine) {
+    let source_root = TestRoot::new(&format!("{label}-source"));
+    let target_root = TestRoot::new(&format!("{label}-target"));
+    fs::write(
+        source_root.path().join("Film.mkv"),
+        SECONDARY_NFO_FILM_BYTES,
+    )
+    .expect("source film should write");
+    fs::write(
+        source_root.path().join("Film.nfo"),
+        SECONDARY_NFO_AUTHORITATIVE,
+    )
+    .expect("title-only authoritative NFO should write");
+    fs::write(
+        source_root.path().join("Film.extra.nfo"),
+        SECONDARY_NFO_EXTRA,
+    )
+    .expect("secondary NFO should write");
+    fs::write(
+        source_root.path().join("Film.cover.jpg"),
+        SECONDARY_NFO_COVER_BYTES,
+    )
+    .expect("declared cover should write");
+    if let Some(bytes) = existing_target_media {
+        fs::write(target_root.path().join("Film.mkv"), bytes)
+            .expect("pre-existing destination media should write");
+    }
+
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    (source_root, target_root, engine)
+}
+
+fn selected_secondary_nfo_migration_preview(
+    engine: &MigrationEngine,
+    conflict: ConflictPolicy,
+) -> MigrationPreview {
+    let snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source library should scan");
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("source film should be indexed");
+    assert_eq!(item.authoritative_nfo_path.as_deref(), Some("Film.nfo"));
+    for (path, kind) in [
+        ("Film.nfo", "nfo"),
+        ("Film.extra.nfo", "nfo"),
+        ("Film.cover.jpg", "cover"),
+    ] {
+        assert!(
+            item.attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == kind })
+        );
+    }
+
+    engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item.id.clone()],
+            conflict,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("secondary NFO migration should produce a preview")
+}
+
+fn drive_migration_to_completed(engine: &MigrationEngine, migration_id: &str) -> MigrationStatus {
+    for _ in 0..64 {
+        let status = engine
+            .status(migration_id)
+            .expect("migration status should read")
+            .expect("migration status should exist");
+        if status.status == MigrationRunStatus::Completed {
+            return status;
+        }
+        assert!(
+            !matches!(
+                status.status,
+                MigrationRunStatus::Partial | MigrationRunStatus::Failed
+            ),
+            "migration should not fail while being driven to completion: {status:?}"
+        );
+        engine
+            .step(migration_id)
+            .expect("one migration checkpoint should complete");
+    }
+    engine
+        .status(migration_id)
+        .expect("final migration status should read")
+        .expect("final migration status should exist")
+}
+
+#[test]
+fn migration_keep_both_skips_secondary_nfo_references_without_partial_publication() {
+    const EXISTING_TARGET_BYTES: &[u8] = b"pre-existing destination film bytes";
+    let (source_root, target_root, engine) = secondary_nfo_migration_fixture(
+        "secondary-nfo-keep-both-skip",
+        Some(EXISTING_TARGET_BYTES),
+    );
+    let source_bytes = [
+        ("Film.mkv", SECONDARY_NFO_FILM_BYTES),
+        ("Film.nfo", SECONDARY_NFO_AUTHORITATIVE.as_bytes()),
+        ("Film.extra.nfo", SECONDARY_NFO_EXTRA.as_bytes()),
+        ("Film.cover.jpg", SECONDARY_NFO_COVER_BYTES),
+    ];
+    let existing_destination = fs::read(target_root.path().join("Film.mkv"))
+        .expect("existing destination media should read");
+    let preview = selected_secondary_nfo_migration_preview(&engine, ConflictPolicy::KeepBoth);
+    assert_eq!(preview.items.len(), 1);
+    assert!(preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Skipped);
+    assert_eq!(preview.conflict_count, 1);
+    for path in ["Film.mkv", "Film.nfo", "Film.extra.nfo", "Film.cover.jpg"] {
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.source_path == path)
+        );
+    }
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("reviewable skipped migration should confirm");
+    let status = drive_migration_to_completed(&engine, &preview.id);
+    assert_eq!(status.status, MigrationRunStatus::Completed);
+    assert_eq!(status.success_count, 0);
+    assert_eq!(status.skipped_count, 1);
+    assert_eq!(status.items[0].status, MigrationItemPhase::Skipped);
+    assert!(
+        status.items[0]
+            .files
+            .iter()
+            .all(|file| file.status == MigrationItemPhase::Skipped)
+    );
+
+    for (relative_path, expected) in source_bytes {
+        assert_eq!(
+            fs::read(source_root.path().join(relative_path))
+                .unwrap_or_else(|error| panic!("source {relative_path} should remain: {error}")),
+            expected,
+            "a skipped group must preserve every source file byte-for-byte"
+        );
+    }
+    let unchanged_source = engine
+        .source
+        .migration_scan()
+        .expect("source should rescan after the completed skip");
+    let unchanged_film = unchanged_source
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("skipped source film should remain indexed");
+    assert_eq!(
+        unchanged_film.authoritative_nfo_path.as_deref(),
+        Some("Film.nfo")
+    );
+    for (path, kind) in [
+        ("Film.nfo", "nfo"),
+        ("Film.extra.nfo", "nfo"),
+        ("Film.cover.jpg", "cover"),
+    ] {
+        assert!(
+            unchanged_film
+                .attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == kind })
+        );
+    }
+    assert_eq!(
+        fs::read(target_root.path().join("Film.mkv")).unwrap(),
+        existing_destination,
+        "a skipped group must preserve the existing destination bytes"
+    );
+    assert_eq!(existing_destination, EXISTING_TARGET_BYTES);
+    assert!(
+        fs::read_dir(target_root.path())
+            .expect("target directory should list")
+            .filter_map(std::result::Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with("Film (2)"))
+    );
+}
+
+#[test]
+fn migration_preserves_secondary_nfo_references_when_group_names_stay_stable() {
+    let (source_root, target_root, engine) =
+        secondary_nfo_migration_fixture("secondary-nfo-stable-names", None);
+    let preview = selected_secondary_nfo_migration_preview(&engine, ConflictPolicy::KeepBoth);
+    assert_eq!(preview.items.len(), 1);
+    assert!(!preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Copying);
+    for path in ["Film.mkv", "Film.nfo", "Film.extra.nfo", "Film.cover.jpg"] {
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.source_path == path && file.target_path == path)
+        );
+    }
+
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("stable-name migration should confirm");
+    let status = drive_migration_to_completed(&engine, &preview.id);
+    assert_eq!(status.status, MigrationRunStatus::Completed);
+    assert_eq!(status.success_count, 1);
+    assert_eq!(status.skipped_count, 0);
+
+    assert_eq!(
+        fs::read(target_root.path().join("Film.mkv")).unwrap(),
+        SECONDARY_NFO_FILM_BYTES
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Film.nfo")).unwrap(),
+        SECONDARY_NFO_AUTHORITATIVE.as_bytes()
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Film.extra.nfo")).unwrap(),
+        SECONDARY_NFO_EXTRA.as_bytes(),
+        "stable group names should preserve both secondary NFO references"
+    );
+    assert_eq!(
+        fs::read(target_root.path().join("Film.cover.jpg")).unwrap(),
+        SECONDARY_NFO_COVER_BYTES
+    );
+    for path in ["Film.mkv", "Film.nfo", "Film.extra.nfo", "Film.cover.jpg"] {
+        assert!(!source_root.path().join(path).exists());
+    }
+
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("target should rescan the stable-name migration");
+    let migrated = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("migrated film should be indexed");
+    assert_eq!(migrated.authoritative_nfo_path.as_deref(), Some("Film.nfo"));
+    for (path, kind) in [
+        ("Film.nfo", "nfo"),
+        ("Film.extra.nfo", "nfo"),
+        ("Film.cover.jpg", "cover"),
+    ] {
+        assert!(
+            migrated
+                .attachments
+                .iter()
+                .any(|attachment| { attachment.relative_path == path && attachment.kind == kind })
+        );
+    }
+}

@@ -1509,3 +1509,243 @@ async fn danmaku_refresh_uses_only_selected_nfo_owned_custom_xml_e2e() {
     );
     harness.close().await;
 }
+
+#[tokio::test]
+async fn danmaku_refresh_resolves_nfo_name_alias_to_scanned_custom_xml_e2e() {
+    let old_xml = danmaku_xml(&[("1.0", "alias custom XML comment retained")]);
+    let remote_xml = danmaku_xml(&[("2.0", "alias custom XML comment appended")]);
+    let mut harness = danmaku_refresh_harness(
+        "danmaku-refresh-nfo-name-alias",
+        &[("Series Alpha/episode-one.mp4", "Episode one", "123456789")],
+        test_fetcher(remote_xml),
+    )
+    .await;
+
+    let selected_media = harness
+        .fixture
+        .archive_root
+        .join("Series Alpha/episode-one.mp4");
+    let selected_media_before = fs::read(&selected_media).unwrap();
+    let selected_nfo = selected_media.with_extension("nfo");
+    let actual_basename = "Comm-e\u{301}nts.xml";
+    let declared_basename = "comm-énts.XML";
+    let selected_nfo_contents = source_nfo("Episode one", "123456789").replace(
+        "</movie>",
+        &format!("<tvd_attachment role=\"danmaku\">{declared_basename}</tvd_attachment></movie>"),
+    );
+    fs::write(&selected_nfo, &selected_nfo_contents).unwrap();
+    let custom_xml_path = selected_media.with_file_name(actual_basename);
+    fs::write(&custom_xml_path, &old_xml).unwrap();
+
+    let snapshot = harness.scan(1).await;
+    let selected_item = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "Series Alpha/episode-one.mp4")
+        .unwrap();
+    let custom_relative_path = format!("Series Alpha/{actual_basename}");
+    assert!(
+        selected_item["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attachment| {
+                attachment["relative_path"].as_str() == Some(custom_relative_path.as_str())
+                    && attachment["kind"] == "danmaku"
+            }),
+        "the scanner should retain the on-disk spelling for the declared attachment alias"
+    );
+    let selected_item_id = selected_item["id"].as_str().unwrap();
+
+    let preview = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "selected", "item_ids": [selected_item_id],
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    assert_eq!(public_preview(&preview)["ready"], 1);
+    assert_eq!(public_preview(&preview)["skipped"], 0);
+    assert_eq!(fs::read(&custom_xml_path).unwrap(), old_xml);
+
+    let confirmed = harness
+        .request(
+            3,
+            confirmation_payload(&harness, 2, public_preview(&preview)),
+        )
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 1);
+    assert_eq!(result["summary"]["added_comments"], 1);
+    let merged_xml = String::from_utf8(fs::read(&custom_xml_path).unwrap()).unwrap();
+    assert!(merged_xml.contains("alias custom XML comment retained"));
+    assert!(merged_xml.contains("alias custom XML comment appended"));
+    assert!(
+        !selected_media
+            .with_file_name("episode-one.danmaku.xml")
+            .exists()
+    );
+    assert_eq!(fs::read(&selected_media).unwrap(), selected_media_before);
+    assert_eq!(
+        fs::read(&selected_nfo).unwrap(),
+        selected_nfo_contents.as_bytes()
+    );
+
+    let rescanned = harness.scan(4).await;
+    assert!(rescanned["items"].as_array().unwrap().iter().any(|item| {
+        item["relative_path"] == "Series Alpha/episode-one.mp4"
+            && item["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attachment| {
+                    attachment["relative_path"].as_str() == Some(custom_relative_path.as_str())
+                        && attachment["kind"] == "danmaku"
+                })
+    }));
+    assert!(
+        take_cloud_test_telegram_requests(
+            harness
+                .telegram_requests
+                .as_mut()
+                .expect("Telegram request capture should remain open")
+        )
+        .is_empty(),
+        "danmaku refresh must not send Telegram messages"
+    );
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn danmaku_refresh_skips_custom_xml_declared_only_by_secondary_nfo_e2e() {
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = {
+        let fetch_calls = Arc::clone(&fetch_calls);
+        crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |_cid| {
+            let fetch_calls = Arc::clone(&fetch_calls);
+            Box::pin(async move {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(danmaku_xml(&[(
+                    "2.0",
+                    "must not replace secondary NFO comments",
+                )]))
+            })
+        }))
+    };
+    let harness = danmaku_refresh_harness(
+        "danmaku-refresh-secondary-nfo-only-custom-xml",
+        &[("Series Alpha/episode-one.mp4", "Episode one", "123456789")],
+        fetcher,
+    )
+    .await;
+
+    let selected_media = harness
+        .fixture
+        .archive_root
+        .join("Series Alpha/episode-one.mp4");
+    let selected_nfo = selected_media.with_extension("nfo");
+    let selected_nfo_before = fs::read(&selected_nfo).unwrap();
+    let secondary_nfo = selected_media.with_file_name("episode-one.extra.nfo");
+    let secondary_nfo_contents = source_nfo("Episode one secondary", "123456789").replace(
+        "</movie>",
+        "<tvd_attachment role=\"danmaku\">review-comments.xml</tvd_attachment></movie>",
+    );
+    fs::write(&secondary_nfo, &secondary_nfo_contents).unwrap();
+    let custom_xml_path = selected_media.with_file_name("review-comments.xml");
+    let custom_xml_before = danmaku_xml(&[("1.0", "secondary NFO comments stay untouched")]);
+    fs::write(&custom_xml_path, &custom_xml_before).unwrap();
+    let selected_media_before = fs::read(&selected_media).unwrap();
+
+    let snapshot = harness.scan(1).await;
+    let selected_item = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "Series Alpha/episode-one.mp4")
+        .unwrap();
+    let custom_relative_path = "Series Alpha/review-comments.xml";
+    assert!(selected_item["attachments"].as_array().unwrap().iter().any(
+        |attachment| attachment["relative_path"] == custom_relative_path
+            && attachment["kind"] == "danmaku"
+    ));
+    assert!(selected_item["attachments"].as_array().unwrap().iter().any(
+        |attachment| attachment["relative_path"] == "Series Alpha/episode-one.extra.nfo"
+            && attachment["kind"] == "nfo"
+    ));
+    let selected_item_id = selected_item["id"].as_str().unwrap();
+
+    let preview = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "selected", "item_ids": [selected_item_id],
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    assert_eq!(public_preview(&preview)["ready"], 0);
+    assert_eq!(public_preview(&preview)["skipped"], 1);
+    assert!(
+        public_preview(&preview)["items"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ownership")
+    );
+
+    let confirmed = harness
+        .request(
+            3,
+            confirmation_payload(&harness, 2, public_preview(&preview)),
+        )
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    assert_eq!(confirmed.result.as_ref().unwrap()["summary"]["updated"], 0);
+    assert_eq!(confirmed.result.as_ref().unwrap()["summary"]["skipped"], 1);
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&custom_xml_path).unwrap(), custom_xml_before);
+    assert_eq!(fs::read(&selected_nfo).unwrap(), selected_nfo_before);
+    assert_eq!(
+        fs::read(&secondary_nfo).unwrap(),
+        secondary_nfo_contents.as_bytes()
+    );
+    assert_eq!(fs::read(&selected_media).unwrap(), selected_media_before);
+    assert!(
+        !selected_media
+            .with_file_name("episode-one.danmaku.xml")
+            .exists()
+    );
+    assert!(
+        !selected_media
+            .with_file_name("episode-one.danmaku.ass")
+            .exists()
+    );
+    harness.close().await;
+}
