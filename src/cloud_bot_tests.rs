@@ -2225,6 +2225,14 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
         crate::cloud_snapshot_budget::compact_file_preview_receipt_result(&preview_receipt)
             .expect("the saved plan should produce a bounded preview summary");
     assert!(compact_preview_result["preview"].get("items").is_none());
+    assert_eq!(compact_preview_result["preview"]["metadata_patch_count"], 1);
+    let mut compact_preview_receipt = preview_receipt.clone();
+    compact_preview_receipt.result = Some(compact_preview_result.clone());
+    assert!(
+        crate::cloud_snapshot_budget::is_valid_compact_file_preview_result(
+            &compact_preview_receipt
+        )
+    );
     runtime
         .inbox
         .update(704, |record| record.result = Some(compact_preview_result))
@@ -6539,7 +6547,7 @@ async fn oversized_cloud_file_preview_keeps_a_bounded_receipt_and_full_plan() {
     assert_eq!(
         fs::read_to_string(video_root.join("c00.nfo"))
             .expect("confirmed metadata patch should create its NFO"),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n  <title>Small preview</title>\n</movie>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n  <title>Small preview</title>\n  <localfilename>c00.mp4</localfilename>\n</movie>\n"
     );
 
     drop(runtime);

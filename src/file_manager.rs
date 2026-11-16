@@ -17,7 +17,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -72,6 +72,8 @@ const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 const MAX_PATH_COMPONENT_BYTES: usize = MAX_FILENAME_COMPONENT_BYTES;
 const MAX_ENTRIES: usize = 200_000;
 const MAX_MEDIA_ITEMS: usize = 50_000;
+const MAX_SIDECAR_OWNER_DIRECTORY_ENTRIES: usize = 50_000;
+const SIDECAR_OWNER_DIRECTORY_BUDGET: Duration = Duration::from_secs(5);
 const MAX_PINNED_PREVIEWS: usize = 64;
 const MAX_PINNED_FILES_PER_PREVIEW: usize = 512;
 const MAX_PINNED_FILES_TOTAL: usize = 4096;
@@ -4032,9 +4034,20 @@ impl LibraryManager {
             let mut failed = false;
             for file_index in item_files {
                 if manifest.files[file_index].state == ManifestFileState::Moved {
-                    match self
-                        .validate_moved_file(&manifest.preview.id, &manifest.files[file_index])
-                    {
+                    let checkpoint_identity = self.checkpointed_moved_nfo_identity(
+                        &manifest.files[file_index],
+                        &manifest.patches,
+                    );
+                    let validation = match checkpoint_identity {
+                        Ok(Some(identity)) => {
+                            manifest.files[file_index].identity = identity;
+                            Ok(())
+                        }
+                        Ok(None) => self
+                            .validate_moved_file(&manifest.preview.id, &manifest.files[file_index]),
+                        Err(error) => Err(error),
+                    };
+                    match validation {
                         Ok(()) => {
                             manifest.files[file_index].error = None;
                             manifest.items[item_index].moved_files += 1;
@@ -4097,6 +4110,23 @@ impl LibraryManager {
             );
             match patch_result {
                 Ok(()) => {
+                    if let (Some(expected_identity), Some(checkpoint)) = (
+                        manifest.patches[patch_index].expected_identity.as_deref(),
+                        manifest.patches[patch_index]
+                            .replacement_checkpoint
+                            .as_ref(),
+                    ) && let Some(file) = manifest.files.iter_mut().find(|file| {
+                        file.item_id == item_id && file.target_path == patch.target_path
+                    }) {
+                        if file.identity != expected_identity
+                            && file.identity != checkpoint.after_identity
+                        {
+                            bail!(
+                                "moved NFO identity does not match its prepared replacement checkpoint"
+                            );
+                        }
+                        file.identity = checkpoint.after_identity.clone();
+                    }
                     manifest.patches[patch_index].state = ManifestPatchState::Applied;
                     if let Some(result) = manifest
                         .items
@@ -4297,6 +4327,57 @@ impl LibraryManager {
             bail!("previously moved target was replaced or its content/access policy changed");
         }
         Ok(())
+    }
+
+    fn checkpointed_moved_nfo_identity(
+        &self,
+        file: &ManifestFile,
+        patches: &[PreparedNfoPatch],
+    ) -> Result<Option<String>> {
+        let Some(patch) = patches.iter().find(|patch| {
+            patch.patch.item_id == file.item_id && patch.target_path == file.target_path
+        }) else {
+            return Ok(None);
+        };
+        let (Some(expected_identity), Some(checkpoint)) = (
+            patch.expected_identity.as_deref(),
+            patch.replacement_checkpoint.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        if file.identity != expected_identity && file.identity != checkpoint.after_identity {
+            bail!(
+                "moved NFO identity matches neither its approved source nor replacement checkpoint"
+            );
+        }
+
+        let target = self.absolute_path(&file.target_path)?;
+        self.coordinate_read(&target, |coordinated| {
+            if coordinated != target {
+                bail!("coordinated moved NFO path changed during checkpoint recovery");
+            }
+            let Some(bound_file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(None);
+            };
+            if bound_file.byte_len()? > SIDE_CAR_LIMIT.max(patch.replacement.len()) as u64 {
+                bail!("NFO exceeds its bounded patch verification limit");
+            }
+            let (token, digest) = token_for_bound_file(&bound_file)?;
+            if self.root.entry_identity(coordinated)? != Some(bound_file.identity()) {
+                bail!("moved NFO path was replaced during checkpoint recovery");
+            }
+            if self.nfo_checkpoint_matches_file(
+                patch,
+                checkpoint,
+                coordinated,
+                &bound_file,
+                &token,
+                &digest,
+            )? {
+                return Ok(Some(checkpoint.after_identity.clone()));
+            }
+            Ok(None)
+        })
     }
 
     #[cfg(test)]
@@ -8904,6 +8985,188 @@ impl SidecarIndex {
     }
 }
 
+/// Return whether a hypothetical sidecar would be attached to `expected_owner` by the same
+/// longest-stem rule used by `SidecarIndex`. The caller supplies only names from a complete
+/// snapshot; this helper deliberately does not infer filesystem ownership from a missing path.
+pub(crate) fn sidecar_paths_are_unambiguously_owned_by_snapshot(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    primary_relative_paths: &[String],
+    expected_owner: &str,
+) -> Result<bool> {
+    ensure!(
+        !sidecar_relative_paths.is_empty(),
+        "sidecar ownership check requires at least one path"
+    );
+    let sidecars = sidecar_relative_paths
+        .iter()
+        .map(|path| safe_relative_path(path, false))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    ensure!(
+        sidecars
+            .iter()
+            .all(|sidecar| sidecar.parent().unwrap_or_else(|| Path::new("")) == parent),
+        "sidecar ownership paths must share a parent directory"
+    );
+    let semantics = target_name_semantics_for_directory(root, parent)?;
+    sidecar_paths_are_owned_by_paths_with_semantics(
+        &sidecars,
+        primary_relative_paths,
+        expected_owner,
+        semantics,
+    )
+}
+
+/// Rebuild the owner candidates from a bounded live listing of the sidecar's parent directory.
+/// Unreadable directories and over-limit listings are errors, never partial evidence of unique
+/// ownership. Child additions unrelated to primary media do not change the matcher result.
+pub(crate) fn sidecar_paths_are_unambiguously_owned_by_current_directory(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    expected_owner: &str,
+) -> Result<bool> {
+    sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+        root,
+        sidecar_relative_paths,
+        expected_owner,
+        MAX_SIDECAR_OWNER_DIRECTORY_ENTRIES,
+    )
+}
+
+fn sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+    root: &RootedFs,
+    sidecar_relative_paths: &[String],
+    expected_owner: &str,
+    entry_limit: usize,
+) -> Result<bool> {
+    ensure!(
+        !sidecar_relative_paths.is_empty(),
+        "sidecar ownership check requires at least one path"
+    );
+    let sidecars = sidecar_relative_paths
+        .iter()
+        .map(|path| safe_relative_path(path, false))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    ensure!(
+        sidecars
+            .iter()
+            .all(|sidecar| sidecar.parent().unwrap_or_else(|| Path::new("")) == parent),
+        "sidecar ownership paths must share a parent directory"
+    );
+    let parent_identity = directory_identity(root, parent)?;
+    let semantics =
+        target_name_semantics_for_directory_with_identity(root, parent, parent_identity)?;
+    let deadline = Instant::now() + SIDECAR_OWNER_DIRECTORY_BUDGET;
+    let entries = if parent.as_os_str().is_empty() {
+        root.list_root_directory_until(entry_limit, deadline)?
+    } else {
+        let absolute_parent = root.logical_root_path().join(parent);
+        let entry = root.bind_entry(&absolute_parent, false)?;
+        root.list_bound_directory_until(&entry, parent_identity, entry_limit, deadline)?
+    };
+    let mut primary_relative_paths = Vec::new();
+    for (name, identity) in entries {
+        if !identity.is_file() {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let relative = parent.join(name);
+        let relative = path_to_relative_string(&relative)?;
+        if is_primary_media(&relative) {
+            primary_relative_paths.push(relative);
+        }
+    }
+    sidecar_paths_are_owned_by_paths_with_semantics(
+        &sidecars,
+        &primary_relative_paths,
+        expected_owner,
+        semantics,
+    )
+}
+
+fn directory_identity(root: &RootedFs, relative: &Path) -> Result<EntryIdentity> {
+    if relative.as_os_str().is_empty() {
+        return Ok(root.root_identity());
+    }
+    let absolute = root.logical_root_path().join(relative);
+    root.entry_identity(&absolute)?
+        .filter(|identity| identity.is_dir())
+        .ok_or_else(|| anyhow!("sidecar parent directory is unavailable"))
+}
+
+fn target_name_semantics_for_directory(
+    root: &RootedFs,
+    relative: &Path,
+) -> Result<TargetNameSemantics> {
+    let identity = directory_identity(root, relative)?;
+    target_name_semantics_for_directory_with_identity(root, relative, identity)
+}
+
+fn target_name_semantics_for_directory_with_identity(
+    root: &RootedFs,
+    relative: &Path,
+    identity: EntryIdentity,
+) -> Result<TargetNameSemantics> {
+    let directory = open_validated_target_directory(root, relative, identity)?;
+    target_name_semantics(&directory)
+        .context("filesystem name semantics unavailable for sidecar ownership")
+}
+
+fn sidecar_paths_are_owned_by_paths_with_semantics(
+    sidecars: &[PathBuf],
+    primary_relative_paths: &[String],
+    expected_owner: &str,
+    semantics: TargetNameSemantics,
+) -> Result<bool> {
+    let parent = sidecars[0].parent().unwrap_or_else(|| Path::new(""));
+    let mut primary_stems: HashMap<String, PrimaryStemOwner> = HashMap::new();
+    for primary_relative_path in primary_relative_paths {
+        let primary = safe_relative_path(primary_relative_path, false)?;
+        if primary.parent().unwrap_or_else(|| Path::new("")) != parent {
+            continue;
+        }
+        let Some(stem) = primary.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let key = target_component_key_with(stem, semantics, platform_case_fold)?;
+        match primary_stems.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let owner = entry.get_mut();
+                owner.count = owner.count.saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PrimaryStemOwner {
+                    relative_path: primary_relative_path.clone(),
+                    count: 1,
+                });
+            }
+        }
+    }
+    for sidecar in sidecars {
+        let sidecar_stem = sidecar
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .context("sidecar filename has no valid stem")?;
+        let Some(owner) = longest_matching_primary_stem_with(
+            sidecar_stem,
+            &primary_stems,
+            semantics,
+            platform_case_fold,
+        )?
+        else {
+            return Ok(false);
+        };
+        if owner.count != 1 || owner.relative_path != expected_owner {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn longest_matching_primary_stem_with<'a, F>(
     sidecar_stem: &str,
     primary_stems: &'a HashMap<String, PrimaryStemOwner>,
@@ -9325,6 +9588,14 @@ fn nfo_attachment_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclara
         });
     }
     Ok(declarations)
+}
+
+pub(crate) fn nfo_danmaku_attachment_filenames(content: &str) -> Result<Vec<String>> {
+    Ok(nfo_attachment_declarations(content)?
+        .into_iter()
+        .filter(|declaration| declaration.role == "danmaku")
+        .map(|declaration| declaration.filename)
+        .collect())
 }
 
 fn nfo_local_thumb_declarations(content: &str) -> Result<Vec<NfoAttachmentDeclaration>> {
@@ -12993,7 +13264,7 @@ mod tests {
             &MetadataPatch {
                 item_id: "item".to_string(),
                 title: Some("Patched title".to_string()),
-                source_ids: vec!["cid456".to_string()],
+                source_ids: vec!["cid456".to_string(), "BV1abcdefgh".to_string()],
                 collection: None,
                 fill_missing_only: false,
                 organization_status: None,
@@ -13006,8 +13277,12 @@ mod tests {
         ));
         assert!(patched.contains("<title>Patched title</title>"));
         assert!(patched.contains("<uniqueid type='bilibili-cid'>123</uniqueid>"));
-        assert!(patched.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
-        assert_eq!(nfo_source_ids(&patched), vec!["cid123", "cid456"]);
+        assert!(!patched.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
+        assert!(patched.contains("<uniqueid type=\"bilibili\">BV1abcdefgh</uniqueid>"));
+        assert_eq!(
+            nfo_source_ids(&patched).into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["cid123".to_string(), "BV1abcdefgh".to_string()])
+        );
         assert!(patched.contains("<future>keep</future>"));
     }
 
@@ -16565,6 +16840,16 @@ mod tests {
                     before: None,
                     after: "Part-A".to_string(),
                 },
+                MetadataFieldChange {
+                    field: "tvshowtitle".to_string(),
+                    before: None,
+                    after: "Series & More".to_string(),
+                },
+                MetadataFieldChange {
+                    field: "localfilename".to_string(),
+                    before: None,
+                    after: "clip.mp4".to_string(),
+                },
             ]
         );
         assert_eq!(
@@ -16591,6 +16876,8 @@ mod tests {
         assert!(patched.contains("<settype>bilibili_collection</settype>"));
         assert!(patched.contains("<episode>2</episode>"));
         assert!(patched.contains("<partid>Part-A</partid>"));
+        assert!(patched.contains("<tvshowtitle>Series &amp; More</tvshowtitle>"));
+        assert!(patched.contains("<localfilename>clip.mp4</localfilename>"));
         assert_eq!(
             fs::metadata(root.path().join("clip.nfo")).unwrap().mode() & 0o777,
             0o600,
@@ -17637,6 +17924,176 @@ mod tests {
         assert!(manifest.patches[0].replacement_checkpoint.is_some());
     }
 
+    struct FailMovedNfoAppliedBatchManifestWriteProvider {
+        batch_manifest_writes: AtomicUsize,
+        target_nfo: PathBuf,
+        failed_after_publication: AtomicBool,
+    }
+
+    impl QueueFileProvider for FailMovedNfoAppliedBatchManifestWriteProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            let is_batch_manifest = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(BATCH_PREFIX));
+            if is_batch_manifest && self.batch_manifest_writes.fetch_add(1, Ordering::SeqCst) == 4 {
+                let published = fs::read_to_string(&self.target_nfo).is_ok_and(|contents| {
+                    contents.contains("<localfilename>clip.mp4</localfilename>")
+                });
+                if published {
+                    self.failed_after_publication.store(true, Ordering::SeqCst);
+                    bail!("injected batch manifest failure after moved NFO publication");
+                }
+            }
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(source, destination)
+        }
+    }
+
+    #[test]
+    fn moved_nfo_checkpoint_recovers_when_manifest_identity_refresh_is_interrupted() {
+        let root = TemporaryRoot::new("moved-nfo-checkpoint-crash-window");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Before</title><future>keep</future></movie>",
+        )
+        .expect("NFO fixture should write");
+        fs::set_permissions(
+            root.path().join("clip.nfo"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("NFO fixture should become private");
+
+        let target_nfo = root.path().join("Moved/clip.nfo");
+        let provider_impl = Arc::new(FailMovedNfoAppliedBatchManifestWriteProvider {
+            batch_manifest_writes: AtomicUsize::new(0),
+            target_nfo: target_nfo.clone(),
+            failed_after_publication: AtomicBool::new(false),
+        });
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider.clone())
+            .expect("library manager should open");
+        let snapshot = manager.scan(&[]).expect("fixture scan should complete");
+        let preview = manager
+            .preview(
+                &[item_at(&snapshot, "clip.mp4").id.clone()],
+                "Moved",
+                false,
+                ConflictPolicy::Skip,
+            )
+            .expect("move preview should prepare");
+        assert_eq!(
+            preview.items[0].files.len(),
+            2,
+            "the move should include the primary video and its NFO"
+        );
+
+        assert!(
+            manager
+                .execute_preview(&preview.id, &preview.revision)
+                .is_err(),
+            "the final manifest write should fail after NFO publication"
+        );
+        assert!(
+            provider_impl
+                .failed_after_publication
+                .load(Ordering::SeqCst),
+            "the injected crash window must occur after the moved NFO has its new contents"
+        );
+        let current_nfo = fs::read_to_string(&target_nfo).expect("published NFO should read");
+        assert!(current_nfo.contains("<localfilename>clip.mp4</localfilename>"));
+
+        let batch_bytes = manager
+            .read_private_file(&manager.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("interrupted batch manifest should read")
+            .expect("interrupted batch manifest should exist");
+        let interrupted: BatchManifest =
+            serde_json::from_slice(&batch_bytes).expect("interrupted manifest should decode");
+        let patch = interrupted
+            .patches
+            .iter()
+            .find(|patch| patch.target_path == "Moved/clip.nfo")
+            .expect("moved NFO should have a prepared patch");
+        let checkpoint = patch
+            .replacement_checkpoint
+            .as_ref()
+            .expect("replacement identity checkpoint should be durable");
+        assert_eq!(patch.state, ManifestPatchState::Pending);
+        let moved_nfo = interrupted
+            .files
+            .iter()
+            .find(|file| file.target_path == "Moved/clip.nfo")
+            .expect("moved NFO should remain in the batch file manifest");
+        assert_eq!(moved_nfo.state, ManifestFileState::Moved);
+        assert_eq!(
+            moved_nfo.identity,
+            patch
+                .expected_identity
+                .clone()
+                .expect("original NFO proof should remain in the patch"),
+            "the disk manifest should retain the pre-patch file identity in the crash window"
+        );
+        assert_ne!(moved_nfo.identity, checkpoint.after_identity);
+
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&manager, &preview);
+        drop(manager);
+
+        let reopened = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should reopen against the same fixture provider");
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("checkpoint recovery should refresh the moved-file identity and complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+
+        let final_bytes = reopened
+            .read_private_file(&reopened.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("completed batch manifest should read")
+            .expect("completed batch manifest should remain available");
+        let completed: BatchManifest =
+            serde_json::from_slice(&final_bytes).expect("completed manifest should decode");
+        let completed_patch = completed
+            .patches
+            .iter()
+            .find(|patch| patch.target_path == "Moved/clip.nfo")
+            .expect("completed NFO patch should remain recorded");
+        let completed_nfo = completed
+            .files
+            .iter()
+            .find(|file| file.target_path == "Moved/clip.nfo")
+            .expect("completed moved NFO should remain recorded");
+        assert_eq!(completed_patch.state, ManifestPatchState::Applied);
+        assert_eq!(
+            completed_nfo.identity,
+            completed_patch
+                .replacement_checkpoint
+                .as_ref()
+                .expect("replacement checkpoint should remain durable")
+                .after_identity
+        );
+    }
+
     #[test]
     fn nfo_replacement_checkpoint_rejects_same_content_object_replacement() {
         let (root, current_manager, preview) =
@@ -18213,6 +18670,36 @@ mod tests {
         assert_eq!(metadata.ino(), expected.2, "file should retain its inode");
     }
 
+    fn assert_organized_fixture_nfo_with_localfilename(
+        path: &Path,
+        expected: &(Vec<u8>, u64, u64),
+        target_primary_filename: &str,
+    ) {
+        let metadata = fs::metadata(path).expect("moved NFO should stat");
+        let original = std::str::from_utf8(&expected.0).expect("fixture NFO should be UTF-8");
+        assert_eq!(original.matches("</movie>").count(), 1);
+        let localfilename = format!(
+            "\n  <localfilename>{}</localfilename>\n</movie>",
+            xml_escape(target_primary_filename)
+        );
+        let expected_after = original.replacen("</movie>", &localfilename, 1);
+        assert_eq!(
+            fs::read_to_string(path).expect("updated NFO should be UTF-8"),
+            expected_after,
+            "confirmed move should add only the portable primary filename"
+        );
+        assert_eq!(
+            metadata.dev(),
+            expected.1,
+            "NFO should remain on its device"
+        );
+        assert_ne!(
+            metadata.ino(),
+            expected.2,
+            "atomic NFO replacement should publish the approved new object"
+        );
+    }
+
     #[test]
     fn nested_multi_part_collection_move_flattens_and_preserves_rich_sidecars() {
         let root = TemporaryRoot::new("nested-multipart-flatten");
@@ -18366,9 +18853,22 @@ mod tests {
             .expect("confirmed nested collection move should complete");
         assert_eq!(result.status, BatchStatus::Complete);
         for item in &preview.items {
+            let target_primary_filename = Path::new(&item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("target primary should have a filename");
             for file in &item.files {
                 let target = root.path().join(&file.target_path);
-                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                let expected = &original_files[&file.source_path];
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(
                     !root.path().join(&file.source_path).exists(),
                     "approved source should no longer exist after move: {}",
@@ -18519,9 +19019,22 @@ mod tests {
             .expect("confirmed selected-item move should complete");
         assert_eq!(result.status, BatchStatus::Complete);
         for item in &preview.items {
+            let target_primary_filename = Path::new(&item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("target primary should have a filename");
             for file in &item.files {
                 let target = root.path().join(&file.target_path);
-                assert_organized_fixture_file(&target, &original_files[&file.source_path]);
+                let expected = &original_files[&file.source_path];
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(!root.path().join(&file.source_path).exists());
             }
         }
@@ -20520,21 +21033,22 @@ mod tests {
             .expect("the complete attachment groups should move");
         assert_eq!(result.status, BatchStatus::Complete);
         for preview_item in &preview.items {
+            let target_primary_filename = Path::new(&preview_item.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("renamed primary should have a filename");
             for file in &preview_item.files {
-                let (contents, device, inode) = &original_files[&file.source_path];
+                let expected = &original_files[&file.source_path];
                 let target = root.path().join(&file.target_path);
-                let metadata = fs::metadata(&target).expect("moved group member should stat");
-                assert_eq!(fs::read(&target).unwrap().as_slice(), contents.as_slice());
-                assert_eq!(
-                    metadata.dev(),
-                    *device,
-                    "rename should keep the source device"
-                );
-                assert_eq!(
-                    metadata.ino(),
-                    *inode,
-                    "rename should keep the source object"
-                );
+                if Path::new(&file.source_path).extension() == Some(OsStr::new("nfo")) {
+                    assert_organized_fixture_nfo_with_localfilename(
+                        &target,
+                        expected,
+                        target_primary_filename,
+                    );
+                } else {
+                    assert_organized_fixture_file(&target, expected);
+                }
                 assert!(!root.path().join(&file.source_path).exists());
             }
         }
@@ -22198,6 +22712,27 @@ mod tests {
         assert_ne!(root_key, nested_key);
         assert_eq!(root_key.components, vec!["Clip.mp4".to_string()]);
         assert_eq!(nested_key.components, vec!["Clip.mp4".to_string()]);
+    }
+
+    #[test]
+    fn danmaku_sidecar_owner_check_refuses_a_partial_directory_listing() {
+        let root = TemporaryRoot::new("sidecar-owner-listing-limit");
+        fs::write(root.path().join("episode.mp4"), b"media").expect("primary fixture should write");
+        fs::write(root.path().join("notes.txt"), b"unrelated child")
+            .expect("unrelated fixture should write");
+        let rooted = RootedFs::new(root.path()).expect("media root should open");
+
+        let error = sidecar_paths_are_unambiguously_owned_by_current_directory_with_limit(
+            &rooted,
+            &[
+                "episode.danmaku.xml".to_owned(),
+                "episode.danmaku.ass".to_owned(),
+            ],
+            "episode.mp4",
+            1,
+        )
+        .expect_err("an over-limit listing must not prove unique ownership");
+        assert!(error.to_string().contains("entry limit"));
     }
 
     #[cfg(target_os = "macos")]
