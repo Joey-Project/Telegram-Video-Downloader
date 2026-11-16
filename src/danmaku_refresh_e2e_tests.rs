@@ -28,11 +28,26 @@ struct DanmakuRefreshHarness {
 }
 
 impl DanmakuRefreshHarness {
+    async fn drain_dispatch(&self) {
+        // Durable completion is visible just before the detached request child
+        // releases its runtime clone and management permit.
+        let runtime = self.runtime.as_ref().expect("runtime should be open");
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.management_dispatch.acquire(),
+        )
+        .await
+        .expect("management child should finish before fixture shutdown")
+        .expect("management dispatch semaphore should remain open");
+        drop(permit);
+    }
+
     async fn close(mut self) {
         if let Some(dispatcher) = self.dispatcher.take() {
             dispatcher.abort();
             let _ = dispatcher.await;
         }
+        self.drain_dispatch().await;
         if let (Some(shutdown), Some(server)) =
             (self.telegram_shutdown.take(), self.telegram_server.take())
         {
@@ -87,6 +102,7 @@ impl DanmakuRefreshHarness {
             dispatcher.abort();
             let _ = dispatcher.await;
         }
+        self.drain_dispatch().await;
         let (config, telegram, queue, fetcher) = {
             let runtime = self.runtime.as_ref().expect("runtime should be open");
             (
@@ -527,6 +543,12 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
     );
     assert_eq!(fs::read(&media).unwrap(), original_media);
 
+    let calls_after_stale = fetch_calls.load(Ordering::SeqCst);
+    assert!(
+        calls_after_stale <= 1,
+        "at most the selected CID may be fetched"
+    );
+
     let snapshot = harness.scan(4).await;
     let item_id = snapshot_item_id(&snapshot, "episode.mp4");
     let preview = harness
@@ -567,9 +589,10 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
         externally_changed
     );
     assert_eq!(fs::read(&media).unwrap(), original_media);
-    assert!(
-        fetch_calls.load(Ordering::SeqCst) >= 2,
-        "preview should use only the mock fetcher"
+    assert_eq!(
+        fetch_calls.load(Ordering::SeqCst),
+        calls_after_stale,
+        "an offline root must fail before another source request"
     );
     harness.close().await;
 }
@@ -645,8 +668,46 @@ async fn danmaku_refresh_rejects_unsafe_cid_and_wrong_root_binding_without_write
     );
     assert_eq!(
         fetch_calls.load(Ordering::SeqCst),
+        0,
+        "wrong roots must not fetch"
+    );
+    let snapshot = harness.scan(4).await;
+    let fresh = harness
+        .request(
+            5,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        fresh.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        fresh.error
+    );
+    let confirmed = harness
+        .request(6, confirmation_payload(&harness, 5, public_preview(&fresh)))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 1);
+    assert_eq!(result["summary"]["skipped"], 1);
+    assert_eq!(
+        fetch_calls.load(Ordering::SeqCst),
         1,
-        "invalid CID must never reach the fetch hook"
+        "only the valid CID may fetch"
+    );
+    assert_eq!(
+        read_sidecar(&harness.fixture.archive_root, "unsafe.mp4"),
+        unsafe_xml
     );
     harness.close().await;
 }

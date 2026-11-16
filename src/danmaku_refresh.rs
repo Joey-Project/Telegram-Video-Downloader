@@ -1512,7 +1512,9 @@ where
             verify_file_proof(root, &entry, &file, expected).map_err(|_| PublishFailure::Stale)?;
             let mode =
                 u16::try_from(expected.access.mode & 0o777).map_err(|_| PublishFailure::Io)?;
-            let temp = temporary_sibling(&capture.relative_path).map_err(|_| PublishFailure::Io)?;
+            let temp = root
+                .logical_root_path()
+                .join(temporary_sibling(&capture.relative_path).map_err(|_| PublishFailure::Io)?);
             let mut checkpoint_failure = None;
             let replacement = root.replace_bound_file_atomically_if_identity_with_checkpoint(
                 &entry,

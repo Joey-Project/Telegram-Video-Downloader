@@ -1,7 +1,7 @@
 ---
 id: 20261116-drf01
 title: Append-only danmaku refresh for existing library videos
-status: active
+status: completed
 created: 2026-11-16
 updated: 2026-11-16
 branch: "codex/danmaku-refresh"
@@ -45,7 +45,7 @@ superseded_by: ""
 - Preserve the configured ASS presentation and support repairing an interrupted
   XML-first publication. Unknown extra ASS comments remain protected.
 
-## Validation plan
+## Validation
 
 - Mock Telegram/inbox/Bilibili E2E covers preview, confirm, cancellation, repeated
   updates, restart and replay, local-only comments, mixed-library eligibility,
@@ -54,11 +54,18 @@ superseded_by: ""
   cancel actions, durable reload, results and failure states.
 - Additive D1 migration coverage preserves existing requests and high-water
   sequence values. Existing Rust and Cloud CI commands discover the new tests.
-- Formatting, strict workspace Clippy and relevant Rust/Cloud tests are required
-  before a signed landing commit and current-head remote review.
+- The focused native suite passes all 42 cases, including mock Telegram replay,
+  restart, cancellation, stale content and real XML-first interruption/retry.
+  Native converter workspace coverage passes 27 unit and 8 E2E cases.
+- Cloud validation passes 442 Worker/helper cases, 112 Mini App cases and 4 Widget
+  regressions, plus typechecking and a Worker bundle dry run.
+- Formatting, strict workspace Clippy, diff and project-journal checks pass.
+  The existing Rust and Cloud CI workflows discover the added tests and retain
+  their full workspace, service-helper and test-runtime validation.
 
-## Next steps
+## Delivery boundaries
 
-- Complete implementation and the validation described above.
-- Deliver this work as the first PR, before settings login, legacy attachment
-  interoperability, and core metadata-query resource limits in separate PRs.
+- Root-bound local tests use temporary fixtures and mock Telegram/Bilibili data.
+  No production media refresh or service deployment is needed for acceptance.
+- Settings login, legacy attachment interoperability and core metadata-query
+  limits are separate follow-up workstreams.
