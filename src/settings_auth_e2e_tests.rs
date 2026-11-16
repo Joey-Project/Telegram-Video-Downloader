@@ -138,6 +138,33 @@ async fn wait_for_bilibili_poll(
     );
 }
 
+async fn wait_for_bilibili_response_written(
+    responses_written: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    expected: &str,
+    case: &str,
+) {
+    let mut observed = Vec::new();
+    let event = tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            match responses_written.recv().await {
+                Some(event) if event == expected => break event,
+                Some(event) => observed.push(event),
+                None => break String::new(),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "mock Bilibili API did not finish writing poll response {expected} in {case}; observed completed responses: {observed:?}"
+        )
+    });
+    assert_eq!(
+        event, expected,
+        "mock Bilibili API response channel closed before {expected} in {case}; observed completed responses: {observed:?}"
+    );
+}
+
 async fn wait_for_login_lock_idle() {
     tokio::time::timeout(E2E_TIMEOUT, async {
         loop {
@@ -610,9 +637,20 @@ async fn telegram_bbdown_login_generations_are_fresh_and_settings_cancel_is_scop
     #[cfg(unix)]
     fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700))
         .expect("private auth fixture should remain private");
-    let (bilibili_base_url, mut polls, release_poll, bilibili_shutdown, bilibili_server) =
-        spawn_fake_bilibili_auth_api(Vec::new(), vec![tv_succeeded(), tv_succeeded()], &[1, 2])
-            .await;
+    let (
+        bilibili_base_url,
+        mut polls,
+        _poll_responses_written,
+        release_poll,
+        bilibili_shutdown,
+        bilibili_server,
+    ) = spawn_fake_bilibili_auth_api(
+        Vec::new(),
+        vec![tv_succeeded(), tv_succeeded()],
+        &[1, 2],
+        &[],
+    )
+    .await;
 
     let mut config = AppConfig::for_test();
     config.telegram.allowed_chat_ids = vec![OWNER_CHAT_ID];
@@ -795,24 +833,32 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700))
         .expect("private fixture directory should remain private");
 
-    let (bilibili_base_url, mut polls, release_poll, bilibili_shutdown, bilibili_server) =
-        spawn_fake_bilibili_auth_api(
-            vec![
-                web_wait_for_confirmation(),
-                web_wait_for_confirmation(),
-                web_expired(),
-                web_failed(),
-            ],
-            vec![
-                tv_succeeded(),
-                tv_succeeded(),
-                tv_succeeded(),
-                tv_succeeded(),
-                tv_succeeded(),
-            ],
-            &[1, 2, 3, 4, 5],
-        )
-        .await;
+    let (
+        bilibili_base_url,
+        mut polls,
+        mut poll_responses_written,
+        release_poll,
+        bilibili_shutdown,
+        bilibili_server,
+    ) = spawn_fake_bilibili_auth_api(
+        vec![
+            web_wait_for_confirmation(),
+            web_wait_for_confirmation(),
+            web_wait_for_confirmation(),
+            web_expired(),
+            web_failed(),
+        ],
+        vec![
+            tv_succeeded(),
+            tv_succeeded(),
+            tv_succeeded(),
+            tv_succeeded(),
+            tv_succeeded(),
+        ],
+        &[1, 2, 3, 4, 5],
+        &[1, 2, 4],
+    )
+    .await;
 
     let mut config = AppConfig::for_test();
     config.telegram.allowed_chat_ids = vec![OWNER_CHAT_ID];
@@ -1297,6 +1343,12 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         "local credential store should contain the mock TV access key"
     );
 
+    let waiting_for_scan_min_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake cloud post lock should not poison")
+        .len()
+        + 1;
     let start_web =
         dispatch_auth_request(&runtime, 3, json!({"operation": "login", "mode": "web"})).await;
     assert_eq!(start_web.result.as_ref().unwrap()["status"], "accepted");
@@ -1304,14 +1356,31 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         .as_u64()
         .expect("web start should include a safe generation");
     wait_for_bilibili_poll(&mut polls, "web:1", "web QR confirmation lifecycle").await;
-    let confirming = wait_for_auth_phase("waiting_for_confirmation", web_generation).await;
-    let confirming_updated_at = confirming["updated_at_ms"].as_u64();
+    wait_for_auth_phase("waiting_for_scan", web_generation).await;
+    let (waiting_for_scan_publication, _) = wait_for_cloud_auth_publication(
+        &cloud_state,
+        "waiting_for_scan",
+        waiting_for_scan_min_posts,
+    )
+    .await;
+    assert_no_bilibili_secrets(&waiting_for_scan_publication.to_string());
     let confirming_min_posts = cloud_state
         .state_posts
         .lock()
         .expect("fake cloud post lock should not poison")
         .len()
         + 1;
+    release_poll
+        .send("web:1".to_string())
+        .expect("web QR scan response should be released after its publication is acknowledged");
+    wait_for_bilibili_response_written(
+        &mut poll_responses_written,
+        "web:1",
+        "web QR confirmation lifecycle",
+    )
+    .await;
+    let confirming = wait_for_auth_phase("waiting_for_confirmation", web_generation).await;
+    let confirming_updated_at = confirming["updated_at_ms"].as_u64();
     let (confirming_publication, confirming_post) = wait_for_cloud_auth_publication(
         &cloud_state,
         "waiting_for_confirmation",
@@ -1323,14 +1392,45 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         Some("1")
     );
     assert_no_bilibili_secrets(&confirming_publication.to_string());
-    let confirming_post_count = cloud_state
-        .state_posts
-        .lock()
-        .expect("fake cloud post lock should not poison")
-        .len();
-
     wait_for_bilibili_poll(&mut polls, "web:2", "web QR repeated confirmation poll").await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let confirming_refresh =
+        request_user_settings_snapshot_refresh(&runtime, &mut refresh_results, 6).await;
+    assert_eq!(confirming_refresh["status"], "published");
+    let confirming_post_count = {
+        let body_count = cloud_state
+            .state_bodies
+            .lock()
+            .expect("fake cloud body lock should not poison")
+            .len();
+        let post_count = cloud_state
+            .state_posts
+            .lock()
+            .expect("fake cloud post lock should not poison")
+            .len();
+        assert_eq!(
+            body_count, post_count,
+            "the baseline must include only acknowledged fake-cloud publications"
+        );
+        post_count
+    };
+
+    release_poll
+        .send("web:2".to_string())
+        .expect("repeated web confirmation response should be released");
+    wait_for_bilibili_response_written(
+        &mut poll_responses_written,
+        "web:2",
+        "web QR repeated confirmation poll",
+    )
+    .await;
+    wait_for_bilibili_poll(&mut polls, "web:3", "second web QR confirmation poll").await;
+    wait_for_bilibili_response_written(
+        &mut poll_responses_written,
+        "web:3",
+        "second web QR confirmation poll",
+    )
+    .await;
+    wait_for_bilibili_poll(&mut polls, "web:4", "web QR expiration lifecycle").await;
     let repeated_confirmation = bilibili_settings_auth_snapshot().await;
     assert_eq!(
         repeated_confirmation["updated_at_ms"].as_u64(),
@@ -1347,12 +1447,29 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
         "repeated confirmation polls must not create extra cloud publications"
     );
 
-    wait_for_bilibili_poll(&mut polls, "web:3", "web QR expiration lifecycle").await;
+    release_poll
+        .send("web:4".to_string())
+        .expect("web QR expiration response should be released");
+    wait_for_bilibili_response_written(
+        &mut poll_responses_written,
+        "web:4",
+        "web QR expiration lifecycle",
+    )
+    .await;
     let expired = wait_for_auth_phase("expired", web_generation).await;
     assert_eq!(expired["credential_summary"]["has_tv_access_key"], true);
     wait_for_login_lock_idle().await;
     let (expired_publication, expired_post) =
         wait_for_cloud_auth_publication(&cloud_state, "expired", confirming_post_count + 1).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake cloud post lock should not poison")
+            .len(),
+        confirming_post_count + 1,
+        "only the expiration transition should publish after the acknowledged confirmation baseline"
+    );
     assert_eq!(expired_post["snapshot_notify_viewers"].as_str(), Some("1"));
     assert_no_bilibili_secrets(&expired_publication.to_string());
 
@@ -1370,7 +1487,7 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     let failed_generation = start_failed_web.result.as_ref().unwrap()["generation"]
         .as_u64()
         .expect("failed web start should include a safe generation");
-    wait_for_bilibili_poll(&mut polls, "web:4", "web QR failed lifecycle").await;
+    wait_for_bilibili_poll(&mut polls, "web:5", "web QR failed lifecycle").await;
     let failed = wait_for_auth_phase("failed", failed_generation).await;
     assert_eq!(failed["credential_summary"]["has_tv_access_key"], true);
     wait_for_login_lock_idle().await;
