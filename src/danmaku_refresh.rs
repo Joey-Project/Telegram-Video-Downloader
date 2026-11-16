@@ -5,6 +5,8 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +37,8 @@ const MEDIA_IDENTITY_REASON: &str = "The media file identity is unavailable.";
 const NOT_PRESENT_REASON: &str = "The media item is not currently available.";
 const DEFERRED_BATCH_REASON: &str =
     "This batch reached its local inspection limit; preview the remaining videos in another batch.";
+const DEFERRED_TIME_LIMIT_REASON: &str =
+    "This refresh reached its time limit; preview the remaining videos in another batch.";
 const REVIEWED_FILES_CHANGED: &str =
     "A reviewed media or danmaku file changed; create a fresh preview.";
 const GUARD_STOPPED: &str =
@@ -44,8 +48,91 @@ const REFRESH_FAILED_REASON: &str = "The danmaku source or sidecar update failed
 static PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) type TestDanmakuFetcher =
-    Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>> + Send + Sync>;
+pub(super) type TestDanmakuFetchFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
+pub(super) type TestDanmakuFetch = dyn Fn(u64) -> TestDanmakuFetchFuture + Send + Sync;
+
+#[derive(Clone)]
+pub(super) struct TestDanmakuFetcher {
+    fetch: Arc<TestDanmakuFetch>,
+    #[cfg(test)]
+    refresh_duration: Duration,
+    #[cfg(test)]
+    expire_after_successful_publish: Arc<AtomicBool>,
+    #[cfg(test)]
+    between_item_deadline_hits: Arc<AtomicUsize>,
+}
+
+impl TestDanmakuFetcher {
+    #[cfg(test)]
+    pub(super) fn new(fetch: Arc<TestDanmakuFetch>) -> Self {
+        Self {
+            fetch,
+            refresh_duration: MAX_REFRESH_DURATION,
+            expire_after_successful_publish: Arc::new(AtomicBool::new(false)),
+            between_item_deadline_hits: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_refresh_duration(
+        fetch: Arc<TestDanmakuFetch>,
+        refresh_duration: Duration,
+    ) -> Self {
+        assert!(!refresh_duration.is_zero());
+        assert!(refresh_duration <= MAX_REFRESH_DURATION);
+        Self {
+            fetch,
+            refresh_duration,
+            expire_after_successful_publish: Arc::new(AtomicBool::new(false)),
+            between_item_deadline_hits: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn expiring_after_first_successful_publish(fetch: Arc<TestDanmakuFetch>) -> Self {
+        let fetcher = Self::new(fetch);
+        fetcher
+            .expire_after_successful_publish
+            .store(true, Ordering::SeqCst);
+        fetcher
+    }
+
+    #[cfg(test)]
+    pub(super) fn between_item_deadline_hit_count(&self) -> usize {
+        self.between_item_deadline_hits.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn expire_after_successful_publish(&self, budget: &mut FetchBudget) {
+        if self
+            .expire_after_successful_publish
+            .swap(false, Ordering::SeqCst)
+        {
+            budget.deadline = Instant::now();
+        }
+    }
+
+    #[cfg(test)]
+    fn note_between_item_deadline_hit(&self) {
+        self.between_item_deadline_hits
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn refresh_duration(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.refresh_duration
+        }
+        #[cfg(not(test))]
+        {
+            MAX_REFRESH_DURATION
+        }
+    }
+
+    fn fetch(&self, cid: u64) -> TestDanmakuFetchFuture {
+        (self.fetch)(cid)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct DanmakuRefreshPreview {
@@ -208,7 +295,17 @@ enum PublishFailure {
 
 struct FetchBudget {
     consumed_bytes: usize,
-    started: Instant,
+    deadline: Instant,
+}
+
+impl FetchBudget {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn is_expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
 }
 
 pub(super) fn preview(
@@ -643,7 +740,7 @@ fn preview_id(revision: &str, library_id: &str, root_binding: &str) -> String {
     hasher.update(root_binding.as_bytes());
     hasher.update(nanos.to_be_bytes());
     hasher.update(sequence.to_be_bytes());
-    format!("dmr1:{}", encode_hex(&hasher.finalize()[..16]))
+    format!("dmr1-{}", encode_hex(&hasher.finalize()[..16]))
 }
 
 pub(super) async fn execute_with_guard(
@@ -653,12 +750,11 @@ pub(super) async fn execute_with_guard(
     fetcher: Option<TestDanmakuFetcher>,
     guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> Result<DanmakuRefreshResult> {
-    tokio::time::timeout(
-        MAX_REFRESH_DURATION,
-        execute_inner(config, root, plan, fetcher, guard),
-    )
-    .await
-    .map_err(|_| anyhow!("danmaku refresh exceeded its time limit"))?
+    let duration = fetcher
+        .as_ref()
+        .map_or(MAX_REFRESH_DURATION, TestDanmakuFetcher::refresh_duration);
+    let deadline = Instant::now() + duration;
+    execute_inner(config, root, plan, fetcher, guard, deadline).await
 }
 
 async fn execute_inner(
@@ -667,6 +763,7 @@ async fn execute_inner(
     plan: DanmakuRefreshPreview,
     fetcher: Option<TestDanmakuFetcher>,
     guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    deadline: Instant,
 ) -> Result<DanmakuRefreshResult> {
     validate_plan_shape(&plan)?;
     validate_result_budget(&plan)?;
@@ -695,29 +792,25 @@ async fn execute_inner(
         .collect::<HashMap<_, _>>();
     let mut fetch_budget = FetchBudget {
         consumed_bytes: 0,
-        started: Instant::now(),
+        deadline,
     };
 
-    for item in plan.items {
+    let mut items = plan.items.into_iter();
+    while let Some(item) = items.next() {
         if item.status == "skipped" {
-            summary.skipped += 1;
-            results.push(DanmakuRefreshResultItem {
-                item_id: item.item_id,
-                title: item.title,
-                status: "skipped".to_owned(),
-                deferred: item.deferred,
-                reason: item.reason,
-                added_comments: 0,
-            });
+            append_skipped_result(item, &mut summary, &mut results);
             continue;
         }
-        let capture = captures
-            .remove(&item.item_id)
-            .ok_or_else(|| anyhow!("the reviewed danmaku plan is incomplete"))?;
-        if bounded_text(&capture.relative_path, 512) != item.relative_path
-            || bounded_text(&capture.title, 240) != item.title
-        {
-            bail!("the reviewed danmaku plan does not match its public item list");
+        let capture = take_capture(&item, &mut captures)?;
+        if fetch_budget.is_expired() {
+            #[cfg(test)]
+            if let Some(fetcher) = fetcher.as_ref() {
+                fetcher.note_between_item_deadline_hit();
+            }
+            guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
+            append_deferred_result(item, &mut summary, &mut results);
+            append_remaining_results(items, &mut captures, &mut summary, &mut results)?;
+            break;
         }
         guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
         let fetched = match fetch_xml(
@@ -725,10 +818,17 @@ async fn execute_inner(
             client.as_ref(),
             fetcher.as_ref(),
             &mut fetch_budget,
+            request_timeout,
         )
         .await
         {
             Ok(fetched) => fetched,
+            Err(_) if fetch_budget.is_expired() => {
+                guard().map_err(|_| anyhow!(GUARD_STOPPED))?;
+                append_deferred_result(item, &mut summary, &mut results);
+                append_remaining_results(items, &mut captures, &mut summary, &mut results)?;
+                break;
+            }
             Err(_) => {
                 summary.failed += 1;
                 results.push(failed_row(&item));
@@ -809,6 +909,10 @@ async fn execute_inner(
                     reason: None,
                     added_comments: merged.appended_comments,
                 });
+                #[cfg(test)]
+                if let Some(fetcher) = fetcher.as_ref() {
+                    fetcher.expire_after_successful_publish(&mut fetch_budget);
+                }
             }
             Err(PublishFailure::Guard) => bail!(GUARD_STOPPED),
             Err(PublishFailure::Stale) => bail!(REVIEWED_FILES_CHANGED),
@@ -827,6 +931,70 @@ async fn execute_inner(
         items: results,
         media_files_changed: false,
     })
+}
+
+fn append_skipped_result(
+    item: DanmakuRefreshPreviewItem,
+    summary: &mut DanmakuRefreshSummary,
+    results: &mut Vec<DanmakuRefreshResultItem>,
+) {
+    summary.skipped += 1;
+    results.push(DanmakuRefreshResultItem {
+        item_id: item.item_id,
+        title: item.title,
+        status: "skipped".to_owned(),
+        deferred: item.deferred,
+        reason: item.reason,
+        added_comments: 0,
+    });
+}
+
+fn append_deferred_result(
+    item: DanmakuRefreshPreviewItem,
+    summary: &mut DanmakuRefreshSummary,
+    results: &mut Vec<DanmakuRefreshResultItem>,
+) {
+    summary.skipped += 1;
+    results.push(DanmakuRefreshResultItem {
+        item_id: item.item_id,
+        title: item.title,
+        status: "skipped".to_owned(),
+        deferred: true,
+        reason: Some(DEFERRED_TIME_LIMIT_REASON.to_owned()),
+        added_comments: 0,
+    });
+}
+
+fn append_remaining_results(
+    items: impl Iterator<Item = DanmakuRefreshPreviewItem>,
+    captures: &mut HashMap<String, CapturedItem>,
+    summary: &mut DanmakuRefreshSummary,
+    results: &mut Vec<DanmakuRefreshResultItem>,
+) -> Result<()> {
+    for item in items {
+        if item.status == "skipped" {
+            append_skipped_result(item, summary, results);
+        } else {
+            take_capture(&item, captures)?;
+            append_deferred_result(item, summary, results);
+        }
+    }
+    Ok(())
+}
+
+fn take_capture(
+    item: &DanmakuRefreshPreviewItem,
+    captures: &mut HashMap<String, CapturedItem>,
+) -> Result<CapturedItem> {
+    let capture = captures
+        .remove(&item.item_id)
+        .ok_or_else(|| anyhow!("the reviewed danmaku plan is incomplete"))?;
+    if bounded_text(&capture.relative_path, 512) != item.relative_path
+        || bounded_text(&capture.title, 240) != item.title
+    {
+        bail!("the reviewed danmaku plan does not match its public item list");
+    }
+    Ok(capture)
 }
 
 fn validate_plan_shape(plan: &DanmakuRefreshPreview) -> Result<()> {
@@ -881,9 +1049,9 @@ fn validate_plan_shape(plan: &DanmakuRefreshPreview) -> Result<()> {
 }
 
 fn validate_result_budget(plan: &DanmakuRefreshPreview) -> Result<()> {
-    // Build a worst-case-shaped receipt before the first network request or write. Failed rows
+    // Build a worst-case-shaped receipt before the first network request or write. Deferred rows
     // carry the longest fixed status/reason pair; per-item comment counts use the widest JSON
-    // integer representation. Skipped rows retain their reviewed reason.
+    // integer representation. Reviewed skipped rows retain their existing reason.
     let items = plan
         .items
         .iter()
@@ -901,9 +1069,9 @@ fn validate_result_budget(plan: &DanmakuRefreshPreview) -> Result<()> {
                 DanmakuRefreshResultItem {
                     item_id: item.item_id.clone(),
                     title: item.title.clone(),
-                    status: "failed".to_owned(),
-                    deferred: false,
-                    reason: Some(REFRESH_FAILED_REASON.to_owned()),
+                    status: "skipped".to_owned(),
+                    deferred: true,
+                    reason: Some(DEFERRED_BATCH_REASON.to_owned()),
                     added_comments: usize::MAX,
                 }
             }
@@ -947,6 +1115,7 @@ async fn fetch_xml(
     client: Option<&reqwest::Client>,
     fetcher: Option<&TestDanmakuFetcher>,
     budget: &mut FetchBudget,
+    request_timeout: Duration,
 ) -> Result<FetchedXml> {
     ensure!(cid > 0, "invalid recorded danmaku CID");
     let remaining_budget = MAX_AGGREGATE_REFRESH_BYTES.saturating_sub(budget.consumed_bytes);
@@ -956,12 +1125,13 @@ async fn fetch_xml(
     );
     // Reserve room for the core decoder's full bounded output before starting another request.
     let wire_limit = MAX_DANMAKU_BODY_BYTES.min(remaining_budget - MAX_DANMAKU_BODY_BYTES);
+    let timeout = request_timeout.min(budget.remaining());
     ensure!(
-        budget.started.elapsed() < MAX_REFRESH_DURATION,
+        !timeout.is_zero(),
         "danmaku refresh exceeded its time limit"
     );
     let bytes = match fetcher {
-        Some(fetcher) => tokio::time::timeout(MAX_REQUEST_TIMEOUT, (fetcher)(cid))
+        Some(fetcher) => tokio::time::timeout(timeout, fetcher.fetch(cid))
             .await
             .map_err(|_| anyhow!("danmaku source request timed out"))??,
         None => {
@@ -970,6 +1140,7 @@ async fn fetch_xml(
             let mut response = client
                 .get(url)
                 .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                .timeout(timeout)
                 .send()
                 .await
                 .map_err(|_| anyhow!("danmaku source request failed"))?;
@@ -1020,7 +1191,7 @@ async fn fetch_xml(
         "danmaku refresh exceeded its aggregate byte limit"
     );
     ensure!(
-        budget.started.elapsed() < MAX_REFRESH_DURATION,
+        !budget.is_expired(),
         "danmaku refresh exceeded its time limit"
     );
     Ok(FetchedXml { xml })
@@ -1416,7 +1587,7 @@ fn capture_parent(root: &RootedFs, relative: &Path) -> Result<ParentProof> {
             access: None,
         });
     }
-    let absolute = root.root_path().join(relative);
+    let absolute = root.logical_root_path().join(relative);
     let entry = root.bind_entry(&absolute, false)?;
     let identity = root
         .bound_entry_identity(&entry)?
@@ -1512,7 +1683,9 @@ where
             verify_file_proof(root, &entry, &file, expected).map_err(|_| PublishFailure::Stale)?;
             let mode =
                 u16::try_from(expected.access.mode & 0o777).map_err(|_| PublishFailure::Io)?;
-            let temp = temporary_sibling(&capture.relative_path).map_err(|_| PublishFailure::Io)?;
+            let temp = root
+                .logical_root_path()
+                .join(temporary_sibling(&capture.relative_path).map_err(|_| PublishFailure::Io)?);
             let mut checkpoint_failure = None;
             let replacement = root.replace_bound_file_atomically_if_identity_with_checkpoint(
                 &entry,
@@ -1666,7 +1839,7 @@ fn temporary_sibling(relative: &str) -> Result<PathBuf> {
 fn safe_root_path(root: &RootedFs, relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     validate_relative_path(relative)?;
-    Ok(root.root_path().join(relative))
+    Ok(root.logical_root_path().join(relative))
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
@@ -1876,15 +2049,15 @@ mod tests {
         });
         let mut config = AppConfig::for_test();
         config.bilibili.danmaku = style;
-        let fetcher: TestDanmakuFetcher = Arc::new(move |_cid| {
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
             let response = remote_xml.as_bytes().to_vec();
             Box::pin(async move { Ok(response) })
-        });
+        }));
         let interrupted_result = execute_with_guard(
             Arc::new(config.clone()),
             root.clone(),
             first_plan,
-            Some(Arc::clone(&fetcher)),
+            Some(fetcher.clone()),
             guard,
         )
         .await;
@@ -1961,10 +2134,10 @@ mod tests {
         )?;
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch_calls = Arc::clone(&calls);
-        let fetcher: TestDanmakuFetcher = Arc::new(move |_cid| {
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
             fetch_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(xml_with_chatid(12_345, "new comment").into_bytes()) })
-        });
+        }));
         let guard: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
         let result = execute_with_guard(
             Arc::new(AppConfig::for_test()),
@@ -2020,14 +2193,14 @@ mod tests {
             &root, &snapshot, "library", "binding", "revision", "library", None,
         )?;
         assert_eq!(plan.ready, 2);
-        let fetcher: TestDanmakuFetcher = Arc::new(|cid| {
+        let fetcher = TestDanmakuFetcher::new(Arc::new(|cid| {
             let response = if cid == 111 {
                 xml_with_chatid(999, "wrong source").into_bytes()
             } else {
                 xml_with_chatid(cid, "valid source").into_bytes()
             };
             Box::pin(async move { Ok(response) })
-        });
+        }));
         let guard: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(|| Ok(()));
         let result = execute_with_guard(
             Arc::new(AppConfig::for_test()),
@@ -2052,16 +2225,16 @@ mod tests {
     async fn exhausted_fetch_budget_does_not_call_source() {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch_calls = Arc::clone(&calls);
-        let fetcher: TestDanmakuFetcher = Arc::new(move |_cid| {
+        let fetcher = TestDanmakuFetcher::new(Arc::new(move |_cid| {
             fetch_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(Vec::new()) })
-        });
+        }));
         let mut budget = FetchBudget {
             consumed_bytes: MAX_AGGREGATE_REFRESH_BYTES,
-            started: Instant::now(),
+            deadline: Instant::now() + MAX_REFRESH_DURATION,
         };
         assert!(
-            fetch_xml(123, None, Some(&fetcher), &mut budget)
+            fetch_xml(123, None, Some(&fetcher), &mut budget, MAX_REQUEST_TIMEOUT,)
                 .await
                 .is_err()
         );
@@ -2087,6 +2260,48 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("another batch"))
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_root_alias_and_child_churn_preserve_media_identity_checks() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(actual.join("nested"))?;
+        std::os::unix::fs::symlink(&actual, &alias)?;
+        let media = alias.join("nested/episode.mp4");
+        std::fs::write(&media, b"original media")?;
+        let root = RootedFs::new(&alias)?;
+        let mut item = test_item(vec!["cid12345".to_owned()]);
+        item.relative_path = "nested/episode.mp4".to_owned();
+        item.physical_identity = Some(
+            root.open_bound_file(&media)?
+                .context("test media should exist")?
+                .physical_identity()?,
+        );
+        let snapshot = LibrarySnapshot {
+            revision: "revision".to_owned(),
+            scanned_at: 1,
+            root_label: "test".to_owned(),
+            items: vec![item],
+            categories: Vec::new(),
+            warnings: Vec::new(),
+        };
+        std::fs::write(alias.join("nested/unrelated.txt"), b"benign child churn")?;
+        let plan = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(plan.ready, 1, "logical root spelling must remain usable");
+        // Replacing the media changes the protected object, unlike child churn.
+        std::fs::rename(&media, media.with_extension("retained"))?;
+        std::fs::write(&media, b"replacement media")?;
+        let replaced = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(replaced.ready, 0);
+        assert_eq!(replaced.skipped, 1);
         Ok(())
     }
 

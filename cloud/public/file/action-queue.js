@@ -6,7 +6,7 @@ export const ACTION_SURFACE_FILE = "file";
 export const ACTION_RECEIPT_STORAGE_PREFIX = "file-manager.action-receipt.v1:";
 
 const SETTINGS_ACTION_KINDS = new Set([
-  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
+  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan", "bilibili_auth",
 ]);
 
 const MAX_ACTION_CLOCK_SKEW_MS = 5 * 60 * 1000;

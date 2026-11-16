@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -27,12 +27,35 @@ struct DanmakuRefreshHarness {
     telegram_server: Option<JoinHandle<Result<()>>>,
 }
 
+struct FetchCancellationProbe(Arc<AtomicBool>);
+
+impl Drop for FetchCancellationProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 impl DanmakuRefreshHarness {
+    async fn drain_dispatch(&self) {
+        // Durable completion is visible just before the detached request child
+        // releases its runtime clone and management permit.
+        let runtime = self.runtime.as_ref().expect("runtime should be open");
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.management_dispatch.acquire(),
+        )
+        .await
+        .expect("management child should finish before fixture shutdown")
+        .expect("management dispatch semaphore should remain open");
+        drop(permit);
+    }
+
     async fn close(mut self) {
         if let Some(dispatcher) = self.dispatcher.take() {
             dispatcher.abort();
             let _ = dispatcher.await;
         }
+        self.drain_dispatch().await;
         if let (Some(shutdown), Some(server)) =
             (self.telegram_shutdown.take(), self.telegram_server.take())
         {
@@ -87,6 +110,7 @@ impl DanmakuRefreshHarness {
             dispatcher.abort();
             let _ = dispatcher.await;
         }
+        self.drain_dispatch().await;
         let (config, telegram, queue, fetcher) = {
             let runtime = self.runtime.as_ref().expect("runtime should be open");
             (
@@ -213,10 +237,10 @@ fn confirmation_payload(
 }
 
 fn test_fetcher(xml: Vec<u8>) -> crate::danmaku_refresh::TestDanmakuFetcher {
-    Arc::new(move |_cid| {
+    crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |_cid| {
         let xml = xml.clone();
         Box::pin(async move { Ok(xml) })
-    })
+    }))
 }
 
 #[tokio::test]
@@ -467,11 +491,412 @@ async fn danmaku_refresh_library_preview_reports_unsupported_items_and_collectio
 }
 
 #[tokio::test]
+async fn danmaku_refresh_deadline_keeps_completed_items_and_defers_remaining_e2e() {
+    let remote_xml = danmaku_xml(&[("1.0", "new comment")]);
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let cancelled_pending_fetch = Arc::new(AtomicBool::new(false));
+    let fetcher = {
+        let fetch_calls = Arc::clone(&fetch_calls);
+        let cancelled_pending_fetch = Arc::clone(&cancelled_pending_fetch);
+        let remote_xml = remote_xml.clone();
+        crate::danmaku_refresh::TestDanmakuFetcher::with_refresh_duration(
+            Arc::new(move |_cid| {
+                let call = fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let cancelled_pending_fetch = Arc::clone(&cancelled_pending_fetch);
+                let remote_xml = remote_xml.clone();
+                Box::pin(async move {
+                    if call == 1 {
+                        let _probe = FetchCancellationProbe(cancelled_pending_fetch);
+                        std::future::pending::<anyhow::Result<Vec<u8>>>().await
+                    } else {
+                        Ok(remote_xml)
+                    }
+                })
+            }),
+            std::time::Duration::from_millis(300),
+        )
+    };
+    let mut harness = danmaku_refresh_harness(
+        "danmaku-refresh-deadline",
+        &[
+            ("episode-1.mp4", "Episode one", "123456789"),
+            ("episode-2.mp4", "Episode two", "123456789"),
+            ("episode-3.mp4", "Episode three", "123456789"),
+        ],
+        fetcher,
+    )
+    .await;
+    let media_paths = ["episode-1.mp4", "episode-2.mp4", "episode-3.mp4"];
+    let old_xml = [
+        danmaku_xml(&[("0.5", "first retained")]),
+        danmaku_xml(&[("0.5", "second retained")]),
+        danmaku_xml(&[("0.5", "third retained")]),
+    ];
+    for (path, xml) in media_paths.iter().zip(&old_xml) {
+        fs::write(
+            harness
+                .fixture
+                .archive_root
+                .join(path)
+                .with_extension("xml"),
+            xml,
+        )
+        .expect("existing sidecar should write");
+    }
+    let original_media = media_paths
+        .iter()
+        .map(|path| fs::read(harness.fixture.archive_root.join(path)).unwrap())
+        .collect::<Vec<_>>();
+
+    let snapshot = harness.scan(1).await;
+    let preview_record = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    assert_eq!(preview["ready"], 3);
+    let preview_rows = preview["items"].as_array().unwrap();
+    let item_ids = media_paths
+        .iter()
+        .map(|path| {
+            preview_rows
+                .iter()
+                .find(|item| item["relative_path"] == *path)
+                .and_then(|item| item["item_id"].as_str())
+                .expect("preview should contain each requested video")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    let confirmed = harness
+        .request(3, confirmation_payload(&harness, 2, &preview))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    harness.drain_dispatch().await;
+    assert!(cancelled_pending_fetch.load(Ordering::SeqCst));
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 2);
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 1);
+    assert_eq!(result["summary"]["skipped"], 2);
+    assert_eq!(result["summary"]["added_comments"], 1);
+    let result_rows = result["items"].as_array().unwrap();
+    let first_result = result_rows
+        .iter()
+        .find(|item| item["item_id"] == item_ids[0])
+        .expect("first completed item should appear in the result");
+    assert_eq!(first_result["status"], "updated");
+    assert_eq!(first_result["deferred"], false);
+    for item_id in &item_ids[1..] {
+        let deferred = result_rows
+            .iter()
+            .find(|item| item["item_id"] == *item_id)
+            .expect("remaining item should appear in the result");
+        assert_eq!(deferred["status"], "skipped");
+        assert_eq!(deferred["deferred"], true);
+    }
+    for (index, path) in media_paths.iter().enumerate().skip(1) {
+        assert_eq!(
+            read_sidecar(&harness.fixture.archive_root, path),
+            old_xml[index],
+            "a deferred item's existing sidecar must remain unchanged"
+        );
+    }
+    for (path, original) in media_paths.iter().zip(&original_media) {
+        assert_eq!(
+            fs::read(harness.fixture.archive_root.join(path)).unwrap(),
+            *original
+        );
+    }
+    assert!(
+        String::from_utf8(read_sidecar(&harness.fixture.archive_root, media_paths[0]))
+            .unwrap()
+            .contains("new comment")
+    );
+
+    harness.runtime.as_mut().unwrap().test_danmaku_fetcher = Some(test_fetcher(remote_xml));
+    let replayed = harness.restart(3).await;
+    assert_eq!(replayed.status, InboxStatus::Completed);
+    assert_eq!(replayed.result, confirmed.result);
+    let snapshot = harness.scan(4).await;
+    let preview_record = harness
+        .request(
+            5,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    let confirmed = harness
+        .request(6, confirmation_payload(&harness, 5, &preview))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 2);
+    assert_eq!(result["summary"]["unchanged"], 1);
+    assert_eq!(result["summary"]["added_comments"], 2);
+    let first_xml =
+        String::from_utf8(read_sidecar(&harness.fixture.archive_root, media_paths[0])).unwrap();
+    assert_eq!(first_xml.matches("new comment").count(), 1);
+    for (index, path) in media_paths.iter().enumerate().skip(1) {
+        let updated_xml =
+            String::from_utf8(read_sidecar(&harness.fixture.archive_root, path)).unwrap();
+        assert!(updated_xml.contains(["second retained", "third retained"][index - 1]));
+        assert_eq!(updated_xml.matches("new comment").count(), 1);
+    }
+    for (path, original) in media_paths.iter().zip(&original_media) {
+        assert_eq!(
+            fs::read(harness.fixture.archive_root.join(path)).unwrap(),
+            *original
+        );
+    }
+    harness.close().await;
+}
+
+#[tokio::test]
+async fn danmaku_refresh_between_items_deadline_keeps_completed_items_and_defers_remaining_e2e() {
+    let remote_xml = danmaku_xml(&[("1.0", "new comment")]);
+    let fetch_calls = Arc::new(AtomicUsize::new(0));
+    let fetcher = {
+        let fetch_calls = Arc::clone(&fetch_calls);
+        let remote_xml = remote_xml.clone();
+        crate::danmaku_refresh::TestDanmakuFetcher::expiring_after_first_successful_publish(
+            Arc::new(move |_cid| {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                let remote_xml = remote_xml.clone();
+                Box::pin(async move {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(remote_xml)
+                })
+            }),
+        )
+    };
+    let deadline_probe = fetcher.clone();
+    let harness = danmaku_refresh_harness(
+        "danmaku-refresh-between-items-deadline",
+        &[
+            ("episode-1.mp4", "Episode one", "123456789"),
+            ("episode-2.mp4", "Episode two", "123456789"),
+            ("episode-3.mp4", "Episode three", "123456789"),
+        ],
+        fetcher,
+    )
+    .await;
+    let media_paths = ["episode-1.mp4", "episode-2.mp4", "episode-3.mp4"];
+    let old_xml = [
+        danmaku_xml(&[("0.5", "first retained")]),
+        danmaku_xml(&[("0.5", "second retained")]),
+        danmaku_xml(&[("0.5", "third retained")]),
+    ];
+    for (path, xml) in media_paths.iter().zip(&old_xml) {
+        fs::write(
+            harness
+                .fixture
+                .archive_root
+                .join(path)
+                .with_extension("xml"),
+            xml,
+        )
+        .expect("existing sidecar should write");
+    }
+    let original_media = media_paths
+        .iter()
+        .map(|path| fs::read(harness.fixture.archive_root.join(path)).unwrap())
+        .collect::<Vec<_>>();
+    let original_ass = media_paths
+        .iter()
+        .map(|path| {
+            fs::read(
+                harness
+                    .fixture
+                    .archive_root
+                    .join(path)
+                    .with_extension("ass"),
+            )
+            .ok()
+        })
+        .collect::<Vec<_>>();
+
+    let snapshot = harness.scan(1).await;
+    let preview_record = harness
+        .request(
+            2,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    assert_eq!(preview["ready"], 3);
+    let preview_rows = preview["items"].as_array().unwrap();
+    let item_ids = media_paths
+        .iter()
+        .map(|path| {
+            preview_rows
+                .iter()
+                .find(|item| item["relative_path"] == *path)
+                .and_then(|item| item["item_id"].as_str())
+                .expect("preview should contain each requested video")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+
+    let confirmed = harness
+        .request(3, confirmation_payload(&harness, 2, &preview))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    harness.drain_dispatch().await;
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(deadline_probe.between_item_deadline_hit_count(), 1);
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 1);
+    assert_eq!(result["summary"]["skipped"], 2);
+    assert_eq!(result["summary"]["added_comments"], 1);
+    let result_rows = result["items"].as_array().unwrap();
+    let first_result = result_rows
+        .iter()
+        .find(|item| item["item_id"] == item_ids[0])
+        .expect("first completed item should appear in the result");
+    assert_eq!(first_result["status"], "updated");
+    assert_eq!(first_result["deferred"], false);
+    for item_id in &item_ids[1..] {
+        let deferred = result_rows
+            .iter()
+            .find(|item| item["item_id"] == *item_id)
+            .expect("remaining item should appear in the result");
+        assert_eq!(deferred["status"], "skipped");
+        assert_eq!(deferred["deferred"], true);
+    }
+    for (index, path) in media_paths.iter().enumerate().skip(1) {
+        assert_eq!(
+            read_sidecar(&harness.fixture.archive_root, path),
+            old_xml[index],
+            "a deferred item's existing XML sidecar must remain unchanged"
+        );
+        assert_eq!(
+            fs::read(
+                harness
+                    .fixture
+                    .archive_root
+                    .join(path)
+                    .with_extension("ass")
+            )
+            .ok(),
+            original_ass[index],
+            "a deferred item's ASS sidecar state must remain unchanged"
+        );
+    }
+    for (path, original) in media_paths.iter().zip(&original_media) {
+        assert_eq!(
+            fs::read(harness.fixture.archive_root.join(path)).unwrap(),
+            *original
+        );
+    }
+    assert!(
+        String::from_utf8(read_sidecar(&harness.fixture.archive_root, media_paths[0]))
+            .unwrap()
+            .contains("new comment")
+    );
+
+    let snapshot = harness.scan(4).await;
+    let preview_record = harness
+        .request(
+            5,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = public_preview(&preview_record).clone();
+    let continued = harness
+        .request(6, confirmation_payload(&harness, 5, &preview))
+        .await;
+    assert_eq!(
+        continued.status,
+        InboxStatus::Completed,
+        "{:?}",
+        continued.error
+    );
+    harness.drain_dispatch().await;
+    let continued_result = continued.result.as_ref().unwrap();
+    assert_eq!(continued_result["summary"]["updated"], 2);
+    assert_eq!(continued_result["summary"]["unchanged"], 1);
+    assert_eq!(continued_result["summary"]["added_comments"], 2);
+    assert_eq!(fetch_calls.load(Ordering::SeqCst), 4);
+    for (index, path) in media_paths.iter().enumerate() {
+        let updated_xml = String::from_utf8(read_sidecar(&harness.fixture.archive_root, path))
+            .expect("continued XML sidecar should remain readable");
+        assert!(
+            updated_xml.contains(["first retained", "second retained", "third retained"][index])
+        );
+        assert_eq!(updated_xml.matches("new comment").count(), 1);
+    }
+    for (path, original) in media_paths.iter().zip(&original_media) {
+        assert_eq!(
+            fs::read(harness.fixture.archive_root.join(path)).unwrap(),
+            *original
+        );
+    }
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_change_media_e2e() {
     let fetch_calls = Arc::new(AtomicUsize::new(0));
-    let fetcher: crate::danmaku_refresh::TestDanmakuFetcher = {
+    let fetcher = {
         let fetch_calls = Arc::clone(&fetch_calls);
-        Arc::new(move |cid| {
+        crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |cid| {
             let fetch_calls = Arc::clone(&fetch_calls);
             Box::pin(async move {
                 if cid != 123_456_789 {
@@ -480,7 +905,7 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(danmaku_xml(&[("1.0", "remote comment")]))
             })
-        })
+        }))
     };
     let harness = danmaku_refresh_harness(
         "danmaku-refresh-stale",
@@ -527,6 +952,12 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
     );
     assert_eq!(fs::read(&media).unwrap(), original_media);
 
+    let calls_after_stale = fetch_calls.load(Ordering::SeqCst);
+    assert!(
+        calls_after_stale <= 1,
+        "at most the selected CID may be fetched"
+    );
+
     let snapshot = harness.scan(4).await;
     let item_id = snapshot_item_id(&snapshot, "episode.mp4");
     let preview = harness
@@ -567,9 +998,10 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
         externally_changed
     );
     assert_eq!(fs::read(&media).unwrap(), original_media);
-    assert!(
-        fetch_calls.load(Ordering::SeqCst) >= 2,
-        "preview should use only the mock fetcher"
+    assert_eq!(
+        fetch_calls.load(Ordering::SeqCst),
+        calls_after_stale,
+        "an offline root must fail before another source request"
     );
     harness.close().await;
 }
@@ -577,15 +1009,15 @@ async fn danmaku_refresh_stale_sidecar_missing_root_and_invalid_cid_do_not_chang
 #[tokio::test]
 async fn danmaku_refresh_rejects_unsafe_cid_and_wrong_root_binding_without_writes_e2e() {
     let fetch_calls = Arc::new(AtomicUsize::new(0));
-    let fetcher: crate::danmaku_refresh::TestDanmakuFetcher = {
+    let fetcher = {
         let fetch_calls = Arc::clone(&fetch_calls);
-        Arc::new(move |_cid| {
+        crate::danmaku_refresh::TestDanmakuFetcher::new(Arc::new(move |_cid| {
             let fetch_calls = Arc::clone(&fetch_calls);
             Box::pin(async move {
                 fetch_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(danmaku_xml(&[("1.0", "remote comment")]))
             })
-        })
+        }))
     };
     let harness = danmaku_refresh_harness(
         "danmaku-refresh-unsafe-cid",
@@ -645,8 +1077,46 @@ async fn danmaku_refresh_rejects_unsafe_cid_and_wrong_root_binding_without_write
     );
     assert_eq!(
         fetch_calls.load(Ordering::SeqCst),
+        0,
+        "wrong roots must not fetch"
+    );
+    let snapshot = harness.scan(4).await;
+    let fresh = harness
+        .request(
+            5,
+            json!({
+                "operation": "preview", "library_id": harness.library_id,
+                "root_binding": harness.root_binding, "expected_revision": snapshot["revision"],
+                "scope": "library",
+            }),
+        )
+        .await;
+    assert_eq!(
+        fresh.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        fresh.error
+    );
+    let confirmed = harness
+        .request(6, confirmation_payload(&harness, 5, public_preview(&fresh)))
+        .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let result = confirmed.result.as_ref().unwrap();
+    assert_eq!(result["summary"]["updated"], 1);
+    assert_eq!(result["summary"]["skipped"], 1);
+    assert_eq!(
+        fetch_calls.load(Ordering::SeqCst),
         1,
-        "invalid CID must never reach the fetch hook"
+        "only the valid CID may fetch"
+    );
+    assert_eq!(
+        read_sidecar(&harness.fixture.archive_root, "unsafe.mp4"),
+        unsafe_xml
     );
     harness.close().await;
 }

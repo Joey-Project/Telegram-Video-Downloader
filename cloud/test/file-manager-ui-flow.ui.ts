@@ -1272,6 +1272,50 @@ describe("file manager UI flow", () => {
     await vi.waitFor(() => expect(element<HTMLElement>("#operation-list").textContent).toContain("Danmaku preview cancelled"));
   });
 
+  it("keeps compact danmaku previews cancellable and restores review from complete details", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const preview = {
+      id: "dmr-budget-preview", revision: "dmr-budget-r1", scope: "selected",
+      library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      ready: 2, skipped: 0, total: 2, truncated: false,
+      items: [{ item_id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", status: "ready" }],
+    };
+    const compact = {
+      seq: 880, kind: "danmaku_refresh", operation: "preview", status: "awaiting_confirmation",
+      preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+      preview, preview_incomplete: true, incomplete: true, reload_required: true,
+    };
+    const oldOperation = { ...compact, result: { operation: "preview", preview } };
+    const initial = { ...ownerSnapshot, state_version: 1, pending_requests: [], operations: [oldOperation], previews: [compact] };
+    const fixture = await mountFileManagerFixture(initial, makeMemoryStorage(), async (action, seq, publishSnapshot) => {
+      expect(action.kind).toBe("danmaku_refresh");
+      expect(action.payload).toEqual({ operation: "cancel", preview_seq: 880,
+        preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING });
+      await publishSnapshot({ ...initial, state_version: 4, previews: [], operations: [{
+        seq, request_id: action.request_id, kind: "danmaku_refresh", operation: "cancel", status: "completed",
+        library_id: LIBRARY_ID, root_binding: ROOT_BINDING,
+        result: { operation: "cancel", preview_id: preview.id, revision: preview.revision, library_id: LIBRARY_ID, root_binding: ROOT_BINDING },
+      }] });
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(true);
+    expect(element<HTMLButtonElement>("[data-danmaku-refresh-cancel]").disabled).toBe(false);
+    expect(document.querySelector(".danmaku-refresh-preview")?.textContent).toContain("Cancel unused previews");
+
+    const full = { ...compact, preview_incomplete: false, incomplete: false, reload_required: false,
+      preview: { ...preview, items: [...preview.items, { item_id: "item-beta", title: "Beta video", relative_path: "Films/Beta.mkv", status: "ready" }] } };
+    await fixture.publishSnapshot({ ...initial, state_version: 2, previews: [full] });
+    publishMockSnapshot(2);
+    await vi.waitFor(() => expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(false));
+    await fixture.publishSnapshot({ ...initial, state_version: 3 });
+    publishMockSnapshot(3);
+    await vi.waitFor(() => expect(element<HTMLButtonElement>("[data-danmaku-refresh-confirm]").disabled).toBe(true));
+    element<HTMLButtonElement>("[data-danmaku-refresh-cancel]").click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+  });
+
   it("previews failed and deferred danmaku rows while preserving the selection draft", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

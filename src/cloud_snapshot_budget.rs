@@ -20,6 +20,8 @@ const MAX_CLOUD_REQUEST_ID_BYTES: usize = 256;
 const MAX_PREVIEW_SNAPSHOT_RECORDS: usize = 100;
 const MAX_PREVIEW_SNAPSHOT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PREVIEW_ID_JSON_BYTES: usize = 128;
+const MAX_BOUND_PREVIEW_SUMMARY_BYTES: usize = 12 * 1024;
+const MAX_BOUND_PREVIEW_SAMPLE_ITEMS: usize = 4;
 const MAX_LIBRARY_ID_BYTES: usize = 128;
 const MAX_LIBRARY_ID_JSON_BYTES: usize = MAX_LIBRARY_ID_BYTES * 6 + 2;
 const MAX_MIGRATION_PREVIEW_SUMMARY_BYTES: usize = 12 * 1024;
@@ -882,13 +884,14 @@ pub(crate) fn preview_snapshots(
     let invalid_staging_cleanup_preview_count = active
         .iter()
         .filter(|record| {
-            record.request.is_bound_preview() && bound_library_preview_snapshot(record).is_none()
+            record.request.is_bound_preview()
+                && bound_library_preview_snapshot(record, false).is_none()
         })
         .count();
     active.retain(|record| {
         (record.request.kind != "file_preview" || file_preview_has_valid_root_binding(record))
             && (!record.request.is_bound_preview()
-                || bound_library_preview_snapshot(record).is_some())
+                || bound_library_preview_snapshot(record, false).is_some())
     });
 
     let locally_omitted = active.len().saturating_sub(MAX_PREVIEW_SNAPSHOT_RECORDS);
@@ -900,15 +903,15 @@ pub(crate) fn preview_snapshots(
         .saturating_add(invalid_staging_cleanup_preview_count)
         .saturating_add(locally_omitted);
 
-    // Reserve one bounded, actionable fallback for each valid migration preview before any full
-    // preview can consume the shared budget. The cloud still confirms only the exact persisted
-    // ID/revision; sample paths and omission counts never reconstruct or alter the local plan.
+    // Reserve bounded identity/count/sample fallbacks before any full preview consumes the
+    // shared budget. Exact identities remain available for cancellation; partial rows never
+    // reconstruct a local plan or make an incomplete preview confirmable.
     let mut snapshots = active
         .iter()
         .map(|record| {
             let result = record.result.as_ref();
             if record.request.is_bound_preview()
-                && let Some(snapshot) = bound_library_preview_snapshot(record)
+                && let Some(snapshot) = bound_library_preview_snapshot(record, false)
             {
                 return snapshot;
             }
@@ -1009,6 +1012,16 @@ pub(crate) fn preview_snapshots(
 
     for (index, record) in active.iter().enumerate().rev() {
         if record.request.is_bound_preview() {
+            let placeholder_bytes = json_size_within(&snapshots[index], MAX_PREVIEW_SNAPSHOT_BYTES)
+                .expect("bounded library preview placeholder should fit");
+            let remaining = MAX_PREVIEW_SNAPSHOT_BYTES
+                .saturating_sub(total_bytes.saturating_sub(placeholder_bytes));
+            if let Some(candidate) = bound_library_preview_snapshot(record, true)
+                && let Some(candidate_bytes) = json_size_within(&candidate, remaining)
+            {
+                snapshots[index] = candidate;
+                total_bytes = total_bytes - placeholder_bytes + candidate_bytes;
+            }
             continue;
         }
         let result = record.result.as_ref();
@@ -1531,7 +1544,6 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
     let envelope = json!({
         "seq": record.request.seq,
         "kind": record.request.kind,
-        "operation": "preview",
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
@@ -1743,7 +1755,7 @@ fn strip_bound_library_preview_proofs(value: &mut Value) {
     }
 }
 
-fn bound_library_preview_snapshot(record: &InboxRecord) -> Option<Value> {
+fn bound_library_preview_snapshot(record: &InboxRecord, full_details: bool) -> Option<Value> {
     if !record.request.is_bound_preview() || record.status != InboxStatus::AwaitingConfirmation {
         return None;
     }
@@ -1758,6 +1770,8 @@ fn bound_library_preview_snapshot(record: &InboxRecord) -> Option<Value> {
     let root_binding = result.get("root_binding")?.as_str()?;
     if !valid_library_id(library_id)
         || !valid_root_binding_token(root_binding)
+        || exact_bounded_scalar_field(result, "preview_id", MAX_PREVIEW_ID_JSON_BYTES).is_none()
+        || exact_bounded_scalar_field(result, "revision", 256 * 6 + 2).is_none()
         || record
             .request
             .payload
@@ -1777,19 +1791,91 @@ fn bound_library_preview_snapshot(record: &InboxRecord) -> Option<Value> {
     {
         return None;
     }
-    let mut public_preview = preview.clone();
-    strip_bound_library_preview_proofs(&mut public_preview);
-    json_size_within(&public_preview, MAX_PREVIEW_SNAPSHOT_BYTES)?;
-    Some(json!({
+    let public_preview = if full_details {
+        let mut value = preview.clone();
+        strip_bound_library_preview_proofs(&mut value);
+        json_size_within(&value, MAX_PREVIEW_SNAPSHOT_BYTES)?;
+        value
+    } else {
+        bounded_library_preview_summary(preview)?
+    };
+    let mut snapshot = json!({
         "seq": record.request.seq,
         "kind": record.request.kind,
+        "operation": "preview",
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
         "library_id": library_id,
         "root_binding": root_binding,
         "preview": public_preview,
-    }))
+    });
+    if !full_details {
+        snapshot["preview_incomplete"] = json!(true);
+        snapshot["incomplete"] = json!(true);
+        snapshot["reload_required"] = json!(true);
+        snapshot["reason"] = json!(PREVIEW_DETAILS_OMITTED_REASON);
+    }
+    Some(snapshot)
+}
+
+fn bounded_library_preview_summary(preview: &Value) -> Option<Value> {
+    let mut summary = Map::new();
+    for (field, limit) in [
+        ("id", MAX_PREVIEW_ID_JSON_BYTES),
+        ("revision", 256 * 6 + 2),
+        ("library_id", MAX_LIBRARY_ID_JSON_BYTES),
+        ("root_binding", 80),
+        ("scope", 64),
+        ("created_at", 32),
+        ("ready", 32),
+        ("skipped", 32),
+        ("total", 32),
+        ("item_count", 32),
+        ("total_bytes", 32),
+    ] {
+        if let Some(value) = exact_bounded_scalar_field(preview, field, limit) {
+            summary.insert(field.to_owned(), value);
+        }
+    }
+    for field in ["sample_items", "items"]
+        .into_iter()
+        .filter(|field| preview.get(*field).is_some_and(Value::is_array))
+        .take(1)
+    {
+        if let Some(items) = preview.get(field).and_then(Value::as_array) {
+            let sample = items
+                .iter()
+                .take(MAX_BOUND_PREVIEW_SAMPLE_ITEMS)
+                .map(|item| {
+                    let mut fields = Map::new();
+                    for (name, limit) in [
+                        ("id", 128),
+                        ("item_id", 128),
+                        ("title", 256),
+                        ("relative_path", 512),
+                        ("reason", 512),
+                        ("status", 64),
+                        ("eligible", 8),
+                        ("deferred", 8),
+                        ("bytes", 32),
+                    ] {
+                        if let Some(value) = item
+                            .get(name)
+                            .and_then(|value| compact_scalar_value(value, limit))
+                        {
+                            fields.insert(name.to_owned(), value);
+                        }
+                    }
+                    Value::Object(fields)
+                })
+                .collect::<Vec<_>>();
+            summary.insert(field.to_owned(), Value::Array(sample));
+        }
+    }
+    let summary = Value::Object(summary);
+    json_size_within(&summary, MAX_BOUND_PREVIEW_SUMMARY_BYTES)?;
+    Some(summary)
 }
 
 fn library_scan_receipt(result: &Value) -> Value {
@@ -3180,6 +3266,7 @@ mod tests {
         let previews = preview_snapshots(&[&receipt], 0);
         assert_eq!(operations[0]["operation"], "preview");
         assert_eq!(previews[0]["kind"], "danmaku_refresh");
+        assert_eq!(previews[0]["operation"], "preview");
         assert_eq!(previews[0]["preview"]["ready"], 1);
         for published in [&operations[0], &previews[0]] {
             let encoded = serde_json::to_string(published).unwrap();
@@ -3197,7 +3284,69 @@ mod tests {
             }
         }
         receipt.result.as_mut().unwrap()["root_binding"] = json!("root-replaced");
-        assert!(bound_library_preview_snapshot(&receipt).is_none());
+        assert!(bound_library_preview_snapshot(&receipt, true).is_none());
+    }
+
+    #[test]
+    fn many_large_danmaku_previews_share_a_budget_and_keep_cancellation_identity() {
+        let records = (1..=10).map(|seq| {
+            let preview_id = format!("danmaku-preview-{seq}");
+            let revision = format!("danmaku-revision-{seq}");
+            let items = (0..1000).map(|index| json!({
+                "item_id": format!("video-{index}"), "title": "t".repeat(200),
+                "relative_path": "p".repeat(200), "status": "skipped",
+                "reason": "No exact CID was found.",
+                "proofs": {"private_digest": "local-only-proof"},
+            })).collect::<Vec<_>>();
+            let mut receipt = record(seq, "danmaku_refresh", InboxStatus::AwaitingConfirmation,
+                Some(json!({"operation":"preview", "preview_id":preview_id, "revision":revision,
+                    "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING,
+                    "preview":{"id":preview_id, "revision":revision, "scope":"library",
+                        "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING,
+                        "ready":0, "skipped":1000, "total":1000, "truncated":false, "items":items}})), None);
+            receipt.request.payload = json!({"operation":"preview", "library_id":"ml-test-root", "root_binding":TEST_ROOT_BINDING});
+            assert!(crate::cloud::CloudInbox::dispatch_result_fits(&receipt.request,
+                InboxStatus::AwaitingConfirmation, receipt.result.as_ref().unwrap()).unwrap());
+            receipt
+        }).collect::<Vec<_>>();
+        let refs = records.iter().collect::<Vec<_>>();
+        let unbudgeted = refs
+            .iter()
+            .map(|record| bound_library_preview_snapshot(record, true).unwrap())
+            .collect::<Vec<_>>();
+        assert!(serde_json::to_vec(&unbudgeted).unwrap().len() > MAX_PREVIEW_SNAPSHOT_BYTES);
+        let snapshots = preview_snapshots(&refs, 0);
+        assert_eq!(snapshots.len(), records.len());
+        assert!(serde_json::to_vec(&snapshots).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+        assert!(
+            snapshots
+                .iter()
+                .any(|preview| preview["preview_incomplete"] == true)
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|preview| preview["preview_incomplete"] != true)
+        );
+        for (record, snapshot) in records.iter().zip(&snapshots) {
+            assert_eq!(snapshot["seq"], record.request.seq);
+            assert_eq!(snapshot["operation"], "preview");
+            for field in ["preview_id", "revision", "library_id", "root_binding"] {
+                assert_eq!(snapshot[field], record.result.as_ref().unwrap()[field]);
+            }
+            assert_eq!(snapshot["preview"]["total"], 1000);
+            if snapshot["preview_incomplete"] == true {
+                assert!(
+                    snapshot["preview"]["items"].as_array().unwrap().len()
+                        <= MAX_BOUND_PREVIEW_SAMPLE_ITEMS
+                );
+            }
+            assert!(
+                !serde_json::to_string(snapshot)
+                    .unwrap()
+                    .contains("local-only-proof")
+            );
+        }
     }
 
     #[test]

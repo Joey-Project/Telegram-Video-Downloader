@@ -17,7 +17,8 @@ export type RequestKind =
   | "library_migration_control"
   | "staging_cleanup"
   | "danmaku_refresh"
-  | "torrent_action";
+  | "torrent_action"
+  | "bilibili_auth";
 
 export interface InboxEnvelope {
   seq: number;
@@ -182,8 +183,25 @@ export interface LocalSnapshot {
         is_default: boolean;
         root_binding?: string | null;
       }>;
+      bilibili_auth?: BilibiliAuthSnapshot;
     };
   };
+}
+
+export type BilibiliAuthPhase = "signed_out" | "waiting_for_scan" | "waiting_for_confirmation" | "connected" | "expired" | "cancelled" | "failed";
+export type BilibiliAuthMode = "web" | "tv" | "access_key";
+export interface BilibiliAuthSnapshot {
+  phase: BilibiliAuthPhase;
+  mode: BilibiliAuthMode | null;
+  generation: number;
+  credential_revision: number;
+  credential_summary: {
+    has_cookie: boolean;
+    has_access_key: boolean;
+    has_tv_access_key: boolean;
+  };
+  updated_at_ms: number;
+  safe_reason: string | null;
 }
 
 export interface PreparedSnapshotContent {

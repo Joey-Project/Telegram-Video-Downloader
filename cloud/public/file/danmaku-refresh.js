@@ -1,5 +1,10 @@
 export const DANMAKU_REFRESH_SAMPLE_LIMIT = 24;
 
+export function isIncompleteBoundPreview(entry) {
+  return ["preview_incomplete", "incomplete", "reload_required", "details_incomplete", "result_truncated"]
+    .some((field) => entry?.[field] === true);
+}
+
 export function danmakuRefreshOperationName(entry) {
   return entry?.operation ?? entry?.result?.operation ?? entry?.payload?.operation ?? null;
 }
@@ -34,7 +39,9 @@ export function danmakuRefreshPreviewEntries(snapshot) {
     const previousIsTerminal = previous && !isReviewable(previous.status);
     if (!previous || incomingIsTerminal && !previousIsTerminal
         || !incomingIsTerminal && !previousIsTerminal
-          && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items)) {
+          && (!isIncompleteBoundPreview(normalized) && isIncompleteBoundPreview(previous)
+            || isIncompleteBoundPreview(normalized) === isIncompleteBoundPreview(previous)
+              && Array.isArray(normalized.preview?.items) && !Array.isArray(previous.preview?.items))) {
       entries.set(key, normalized);
     }
   }
@@ -51,6 +58,7 @@ export function danmakuRefreshItemSample(preview, escapeHtml) {
     const reason = typeof item?.reason === "string" ? `<br><span class="preview-reason">${escapeHtml(item.reason)}</span>` : "";
     return `<div class="preview-line"><span>${escapeHtml(title)}<br><span class="field-hint">${escapeHtml(path)}</span>${reason}</span><strong class="${item?.status === "ready" ? "move" : "skip"}">${status}</strong></div>`;
   }).join("");
-  const omitted = Math.max(0, items.length - sample.length);
+  const total = Number.isSafeInteger(preview?.total) ? preview.total : items.length;
+  const omitted = Math.max(0, total - sample.length);
   return `${rows}${omitted ? `<p class="field-hint">${omitted.toLocaleString()} additional videos are included in this preview.</p>` : ""}`;
 }

@@ -1,11 +1,11 @@
 ---
 id: 20261116-drf01
 title: Append-only danmaku refresh for existing library videos
-status: active
+status: completed
 created: 2026-11-16
 updated: 2026-11-16
 branch: "codex/danmaku-refresh"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/76"
 supersedes: []
 superseded_by: ""
 ---
@@ -40,8 +40,17 @@ superseded_by: ""
 - Keep the actual worker's library I/O lease until all work ends, including when
   its async caller is cancelled. Recheck the cloud epoch and registered library
   binding after network waits before publishing sidecars.
+- Reuse BBDown-rust's public bounded decoder and pure ASS renderer, introduced
+  by [BBDown-rust #125](https://github.com/Joey-Project/BBDown-rust/pull/125).
+- Preserve the configured ASS presentation and support repairing an interrupted
+  XML-first publication. Unknown extra ASS comments remain protected.
+- Preserve per-video results when the batch time budget ends. Cancel an in-flight
+  fetch at its remaining deadline and defer unprocessed videos for a new preview.
+- Reserve bounded identities, counts and samples for pending previews before
+  restoring complete details within the shared snapshot budget. Omitted details
+  keep cancellation available; confirmation waits for the complete preview.
 
-## Validation plan
+## Validation
 
 - Mock Telegram/inbox/Bilibili E2E covers preview, confirm, cancellation, repeated
   updates, restart and replay, local-only comments, mixed-library eligibility,
@@ -50,11 +59,24 @@ superseded_by: ""
   cancel actions, durable reload, results and failure states.
 - Additive D1 migration coverage preserves existing requests and high-water
   sequence values. Existing Rust and Cloud CI commands discover the new tests.
-- Formatting, strict workspace Clippy and relevant Rust/Cloud tests are required
-  before a signed landing commit and current-head remote review.
+- The final focused native run passes 50 danmaku cases, including mock Telegram
+  replay, restart, cancellation, deadline deferral and XML-first interruption;
+  one opt-in graphical-render test stays ignored. All 38 snapshot budget tests
+  pass, including multiple individually valid previews exceeding the shared cap.
+  Deterministic E2E covers expiry between two videos as well as during a fetch,
+  preserving completed results and allowing fresh-preview continuation.
+  Native converter workspace coverage passes 27 unit and 8 E2E cases.
+- Cloud validation passes 442 Worker/helper cases, 113 Mini App cases and 4 Widget
+  regressions, plus typechecking and a Worker bundle dry run.
+- Formatting, strict workspace Clippy, diff and project-journal checks pass.
+  The existing Rust and Cloud CI workflows discover the added tests and retain
+  their full workspace, service-helper and test-runtime validation.
+- All nine Mini App notification tests pass with immutable Telegram replay
+  timestamps, keeping duplicate payload hashes stable across clock boundaries.
 
-## Next steps
+## Delivery boundaries
 
-- Complete implementation and the validation described above.
-- Deliver this work as the first PR, before settings login, legacy attachment
-  interoperability, and core metadata-query resource limits in separate PRs.
+- Root-bound local tests use temporary fixtures and mock Telegram/Bilibili data.
+  No production media refresh or service deployment is needed for acceptance.
+- Settings login, legacy attachment interoperability and core metadata-query
+  limits are separate follow-up workstreams.

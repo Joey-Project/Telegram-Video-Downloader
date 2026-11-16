@@ -17,7 +17,7 @@ const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const MAX_ACTION_QUEUE = ACTION_QUEUE_LIMIT;
 const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
 const SETTINGS_KINDS = new Set([
-  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
+  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan", "bilibili_auth",
 ]);
 
 const telegram = window.Telegram?.WebApp;
@@ -288,7 +288,9 @@ function settleLocalActions() {
     if (!Number.isSafeInteger(local.seq)) continue;
     const operation = operations.find((entry) => entry?.seq === local.seq && entry?.kind === local.kind);
     if (!operation || !["completed", "failed", "stale", "uncertain"].includes(String(operation.status))) continue;
-    const error = String(operation.error ?? operation.result?.error ?? "The local operation did not complete.");
+    const error = local.kind === "bilibili_auth"
+      ? "The local Bilibili login did not complete. Check its status in this card."
+      : String(operation.error ?? operation.result?.error ?? "The local operation did not complete.");
     if (operation.status === "completed" && local.kind === "library_register") {
       const form = byId("register-form");
       if (form && form.dataset.pendingRequestId === requestId) {
@@ -460,6 +462,72 @@ function renderSync() {
   setSnapshotRefreshStatus(snapshotRefreshMessage, snapshotRefreshPending ? "pending" : "");
 }
 
+const BILIBILI_PHASE_LABELS = Object.freeze({
+  signed_out: "Signed out",
+  waiting_for_scan: "Waiting for QR scan",
+  waiting_for_confirmation: "Waiting for confirmation",
+  connected: "Credentials saved",
+  expired: "Login expired",
+  cancelled: "Login cancelled",
+  failed: "Login failed",
+});
+const BILIBILI_SAFE_REASONS = Object.freeze({
+  duplicate_start: "A login is already in progress. Check the status or cancel that attempt first.",
+  login_expired: "The login attempt expired. Start a new login to try again.",
+  login_cancelled: "The login attempt was cancelled.",
+  login_failed: "The local login could not be completed. Try again from Telegram.",
+  credentials_removed: "Local Bilibili credentials were removed.",
+  stale_generation: "This login attempt is no longer current. Refresh status before acting.",
+  stale_credentials: "The saved credentials changed. Refresh status before logging out.",
+  logout_failed: "The desktop could not remove credentials. Refresh status and try again.",
+  invalid_request: "The desktop rejected this login request. Refresh status before retrying.",
+});
+
+function renderBilibiliAuth() {
+  const snapshot = state.snapshot;
+  const applied = snapshot?.settings?.applied;
+  const auth = applied?.bilibili_auth;
+  const fresh = snapshot?.synced === true && snapshot?.stale !== true && auth && typeof auth === "object";
+  const phase = fresh && Object.hasOwn(BILIBILI_PHASE_LABELS, auth.phase) ? BILIBILI_PHASE_LABELS[auth.phase] : "Status unavailable";
+  const badge = byId("bilibili-auth-badge");
+  badge.textContent = fresh ? phase : "Unavailable";
+  badge.className = `state-pill${fresh && auth.phase === "connected" ? "" : " pending"}`;
+  byId("bilibili-auth-phase").textContent = phase;
+  byId("bilibili-auth-updated").textContent = fresh
+    ? `Updated ${formatTime(auth.updated_at_ms, "milliseconds")}.`
+    : snapshot?.stale === true ? "The saved snapshot is outdated. Refresh to check current login status." : "Refresh settings after the desktop publishes an authentication status.";
+  const reason = fresh && typeof auth.safe_reason === "string" && Object.hasOwn(BILIBILI_SAFE_REASONS, auth.safe_reason)
+    ? BILIBILI_SAFE_REASONS[auth.safe_reason] : null;
+  const waiting = fresh && (auth.phase === "waiting_for_scan" || auth.phase === "waiting_for_confirmation");
+  byId("bilibili-auth-detail").textContent = reason ?? (waiting
+    ? "Open the bot owner’s private Telegram chat to scan the QR code and confirm login."
+    : fresh && auth.phase === "connected"
+      ? "Bilibili credentials are saved locally. This snapshot does not verify their current validity."
+      : fresh && auth.phase === "signed_out"
+        ? "No Bilibili login is saved on the desktop."
+        : fresh && auth.phase === "expired" ? "The last login attempt expired. Start a new login from this page."
+          : fresh && auth.phase === "cancelled" ? "The last login attempt was cancelled."
+            : fresh && auth.phase === "failed" ? "The local login could not be completed. Start a new login from this page."
+              : snapshot?.stale === true ? "Refresh settings before relying on the saved login status."
+                : "Status is unavailable until the desktop publishes a settings snapshot.");
+  const summary = fresh && auth.credential_summary;
+  const credentialTypes = summary ? [
+    summary.has_cookie && "web credentials",
+    summary.has_access_key && "access-key credentials",
+    summary.has_tv_access_key && "TV credentials",
+  ].filter(Boolean) : [];
+  byId("bilibili-auth-account").textContent = credentialTypes.length
+    ? `Saved credential types: ${credentialTypes.join(", ")}. Account identity is not included in this view.`
+    : fresh && auth.phase === "signed_out" ? "No Bilibili credentials are saved locally."
+      : "Saved credential details are unavailable in this status view.";
+  byId("bilibili-auth-cancel").disabled = !(fresh && waiting && Number.isSafeInteger(auth.generation) && auth.generation > 0
+    && Number.isSafeInteger(auth.credential_revision) && auth.credential_revision >= 0);
+  byId("bilibili-auth-logout").disabled = !(fresh && credentialTypes.length > 0
+    && Number.isSafeInteger(auth.generation) && Number.isSafeInteger(auth.credential_revision));
+  byId("bilibili-auth-card").dataset.generation = fresh ? String(auth.generation) : "";
+  byId("bilibili-auth-card").dataset.credentialRevision = fresh ? String(auth.credential_revision) : "";
+}
+
 function libraryDescriptor(entry) {
   // mediaLibraryEntries already joins applied settings and live status. Do not
   // re-merge a stale status descriptor here: it could restore the old root
@@ -569,7 +637,12 @@ function renderPending() {
   for (const action of unknown) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(action.kind))} · delivery outcome unknown</h3><p>${escapeHtml(action.delivery_error ?? "The replay window ended before a receipt could be confirmed. Check the desktop before dismissing this request.")}</p><p>This request will not be sent again automatically. Check the desktop for its result, then dismiss this notice.</p></div><span class="state-pill pending">Check desktop</span></div><button class="small-button" type="button" data-dismiss-unknown-action="${escapeHtml(action.request_id)}">I checked the desktop · dismiss</button></article>`);
   for (const action of local) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(action.kind))}</h3><p>Saved in this browser retry queue. No local change has been applied.</p></div><span class="state-pill pending">Browser queue</span></div></article>`);
   for (const request of pending) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(request.kind))}</h3><p>Saved in the cloud inbox. Waiting for the desktop; applied settings have not changed yet.</p></div><span class="state-pill pending">Waiting · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgoMilliseconds(request.created_at))}</p></article>`);
-  for (const operation of inProgress) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(operation.kind))}</h3><p>${escapeHtml(operation.error ?? "The desktop received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusLabel(operation.status))}</span></div>${operation.updated_at ? `<p>Updated ${escapeHtml(timeAgoSeconds(operation.updated_at))}</p>` : ""}</article>`);
+  for (const operation of inProgress) {
+    const message = operation.kind === "bilibili_auth"
+      ? "The desktop is handling a login request. Authentication details are not shown here."
+      : operation.error ?? "The desktop received this request and is working on it.";
+    rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(operation.kind))}</h3><p>${escapeHtml(message)}</p></div><span class="state-pill pending">${escapeHtml(statusLabel(operation.status))}</span></div>${operation.updated_at ? `<p>Updated ${escapeHtml(timeAgoSeconds(operation.updated_at))}</p>` : ""}</article>`);
+  }
   byId("waiting-list").innerHTML = rows.length
     ? rows.join("")
     : '<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>Nothing is waiting</h2><p>New library requests appear here until the desktop finishes them.</p></div>';
@@ -580,7 +653,7 @@ function renderPending() {
 
 function settingsOperations() {
   return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
-    .filter((entry) => SETTINGS_KINDS.has(entry?.kind))
+    .filter((entry) => SETTINGS_KINDS.has(entry?.kind) && entry.kind !== "bilibili_auth")
     .slice(-30)
     .reverse();
 }
@@ -606,6 +679,7 @@ function renderOperations() {
 function render() {
   if (!mayUsePrivateSnapshot(state)) return;
   renderSync();
+  renderBilibiliAuth();
   renderLibraries();
   renderPending();
   renderOperations();
@@ -646,6 +720,33 @@ function displayedLibraryFromForm(form) {
 
 function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
+  byId("bilibili-auth-card").addEventListener("click", (event) => {
+    const login = event.target.closest("[data-bilibili-login]");
+    if (login) {
+      const mode = login.dataset.bilibiliLogin;
+      if (!["web", "tv", "access_key"].includes(mode)) return;
+      const names = { web: "Web QR login", tv: "TV QR login", access_key: "Access-key login" };
+      void submitAction("bilibili_auth", { operation: "login", mode }, names[mode]);
+      return;
+    }
+    const cancel = event.target.closest("#bilibili-auth-cancel");
+    if (cancel) {
+      const generation = Number(byId("bilibili-auth-card").dataset.generation);
+      const credential_revision = Number(byId("bilibili-auth-card").dataset.credentialRevision);
+      if (!Number.isSafeInteger(generation) || generation <= 0 || !Number.isSafeInteger(credential_revision)
+          || credential_revision < 0 || cancel.disabled) return;
+      void submitAction("bilibili_auth", { operation: "cancel", generation, credential_revision }, "Cancel Bilibili login");
+      return;
+    }
+    const logout = event.target.closest("#bilibili-auth-logout");
+    if (logout) {
+      const generation = Number(byId("bilibili-auth-card").dataset.generation);
+      const credential_revision = Number(byId("bilibili-auth-card").dataset.credentialRevision);
+      if (!Number.isSafeInteger(generation) || !Number.isSafeInteger(credential_revision) || logout.disabled) return;
+      if (!window.confirm("Log out of Bilibili on the desktop? This removes the locally saved credentials.")) return;
+      void submitAction("bilibili_auth", { operation: "logout", generation, credential_revision }, "Log out of Bilibili");
+    }
+  });
   byId("waiting-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-dismiss-unknown-action]");
     if (!button) return;
