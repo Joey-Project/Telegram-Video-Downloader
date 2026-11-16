@@ -825,7 +825,11 @@ pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
             continue;
         }
 
-        let compacted = compact_result_summary(&original);
+        let compacted = if fields.get("kind").and_then(Value::as_str) == Some("danmaku_refresh") {
+            compact_danmaku_result_summary(&original)
+        } else {
+            compact_result_summary(&original)
+        };
         if fields.get("result") != Some(&compacted) {
             fields.insert("result".to_string(), compacted);
             changed = true;
@@ -1645,6 +1649,8 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
             let public_result = bound_library_public_result(result);
             if include_full_result {
                 public_result
+            } else if record.request.kind == "danmaku_refresh" {
+                compact_danmaku_result_summary(&public_result)
             } else {
                 compact_result_summary(&public_result)
             }
@@ -1908,6 +1914,37 @@ fn bound_operation_metadata(fields: &mut Map<String, Value>) -> bool {
         changed = true;
     }
     changed
+}
+
+fn compact_danmaku_result_summary(result: &Value) -> Value {
+    let mut compacted = compact_result_summary(result);
+    let Some(original_counts) = result.get("summary").and_then(Value::as_object) else {
+        return compacted;
+    };
+    let mut counts = Map::new();
+    for field in [
+        "updated",
+        "unchanged",
+        "skipped",
+        "failed",
+        "added_comments",
+    ] {
+        let Some(value) = original_counts
+            .get(field)
+            .and_then(Value::as_u64)
+            .filter(|value| *value <= MAX_MIGRATION_SUMMARY_SAFE_INTEGER)
+        else {
+            return compacted;
+        };
+        counts.insert(field.to_owned(), json!(value));
+    }
+    compacted["summary"] = Value::Object(counts);
+    if json_size_within(&compacted, MAX_COMPACT_OPERATION_RESULT_BYTES).is_none()
+        && let Some(fields) = compacted.as_object_mut()
+    {
+        fields.remove("summary");
+    }
+    compacted
 }
 
 fn compact_result_summary(result: &Value) -> Value {
@@ -3240,6 +3277,65 @@ mod tests {
                 assert!(malformed.get("preview_id").is_none());
                 assert!(malformed.get("operation").is_none());
             }
+        }
+    }
+
+    #[test]
+    fn compact_danmaku_results_preserve_bounded_aggregate_counts_in_both_paths() {
+        let counts = json!({"updated":3, "unchanged":2, "skipped":1, "failed":4,
+            "added_comments":12});
+        let mut receipt = record(
+            55,
+            "danmaku_refresh",
+            InboxStatus::Completed,
+            Some(json!({"operation":"confirm", "library_id":"ml-test-root",
+                "root_binding":TEST_ROOT_BINDING, "preview_id":"dmr-counts",
+                "revision":"counts-revision", "summary":counts,
+                "items":[{"item_id":"video-one", "reason":"x".repeat(12_000)}]})),
+            None,
+        );
+        receipt.request.payload = json!({"operation":"confirm", "library_id":"ml-test-root",
+            "root_binding":TEST_ROOT_BINDING, "preview_seq":54, "preview_id":"dmr-counts",
+            "revision":"counts-revision"});
+        receipt.result.as_mut().unwrap()["summary"]["private_unknown_field"] = json!("local-only");
+        let initial_compact = operation_snapshot(&receipt, false);
+        let mut rejected_upload = vec![operation_snapshot(&receipt, true)];
+        assert!(compact_operation_receipts(&mut rejected_upload));
+        for snapshot in [initial_compact, rejected_upload.remove(0)] {
+            assert_eq!(snapshot["result"]["summary"], counts);
+            assert_eq!(snapshot["result"]["preview_id"], "dmr-counts");
+            assert!(snapshot["result"].get("items").is_none());
+            assert!(
+                json_size_within(&snapshot["result"], MAX_COMPACT_OPERATION_RESULT_BYTES).is_some()
+            );
+            assert!(
+                !serde_json::to_string(&snapshot)
+                    .unwrap()
+                    .contains("local-only")
+            );
+        }
+    }
+
+    #[test]
+    fn compact_danmaku_results_keep_zero_distinct_from_missing_or_invalid_counts() {
+        let zeros = json!({"updated":0, "unchanged":0, "skipped":0, "failed":0,
+            "added_comments":0});
+        assert_eq!(
+            compact_danmaku_result_summary(&json!({"summary":zeros}))["summary"],
+            zeros
+        );
+        for invalid in [
+            Value::Null,
+            json!({"updated":0}),
+            json!({"updated":"3", "unchanged":0, "skipped":0, "failed":0, "added_comments":0}),
+            json!({"updated":0, "unchanged":0, "skipped":0, "failed":-1, "added_comments":0}),
+            json!({"updated":u64::MAX, "unchanged":0, "skipped":0, "failed":0, "added_comments":0}),
+        ] {
+            assert!(
+                compact_danmaku_result_summary(&json!({"summary":invalid}))
+                    .get("summary")
+                    .is_none()
+            );
         }
     }
 
