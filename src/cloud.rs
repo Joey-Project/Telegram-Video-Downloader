@@ -6027,15 +6027,27 @@ mod tests {
                 .update(seq, |record| record.status = InboxStatus::Failed)
                 .unwrap();
         }
+        // A failed confirmation makes that reviewed plan stale. Cancellation is
+        // tested against a fresh preview, rather than reviving the failed one.
+        let mut fresh = request(4, "fresh danmaku preview");
+        fresh.kind = "danmaku_refresh".into();
+        fresh.payload =
+            json!({"operation":"preview", "library_id":"library-one", "root_binding":"root-one"});
+        inbox.persist(fresh).unwrap();
+        inbox.update(4, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(json!({"operation":"preview", "preview_id":"danmaku-cancel", "revision":"revision-two",
+                "library_id":"library-one", "root_binding":"root-one"}));
+        }).unwrap();
         assert!(
             inbox
-                .cancel_awaiting_preview("staging_cleanup", 1, "danmaku-one", "revision-one")
+                .cancel_awaiting_preview("staging_cleanup", 4, "danmaku-cancel", "revision-two")
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             inbox
-                .cancel_awaiting_preview("danmaku_refresh", 1, "danmaku-one", "revision-one")
+                .cancel_awaiting_preview("danmaku_refresh", 4, "danmaku-cancel", "revision-two")
                 .unwrap()
                 .unwrap()
                 .status,
@@ -6046,7 +6058,7 @@ mod tests {
                 .state_index
                 .lock()
                 .unwrap()
-                .awaiting_preview_sequence_for_kind("danmaku-one", "danmaku_refresh")
+                .awaiting_preview_sequence_for_kind("danmaku-cancel", "danmaku_refresh")
                 .is_none()
         );
         drop(inbox);

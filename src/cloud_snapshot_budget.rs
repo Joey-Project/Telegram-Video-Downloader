@@ -1531,7 +1531,6 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
     let envelope = json!({
         "seq": record.request.seq,
         "kind": record.request.kind,
-        "operation": "preview",
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
@@ -1783,6 +1782,7 @@ fn bound_library_preview_snapshot(record: &InboxRecord) -> Option<Value> {
     Some(json!({
         "seq": record.request.seq,
         "kind": record.request.kind,
+        "operation": "preview",
         "preview_id": preview_id,
         "revision": revision,
         "status": "awaiting_confirmation",
@@ -3180,6 +3180,7 @@ mod tests {
         let previews = preview_snapshots(&[&receipt], 0);
         assert_eq!(operations[0]["operation"], "preview");
         assert_eq!(previews[0]["kind"], "danmaku_refresh");
+        assert_eq!(previews[0]["operation"], "preview");
         assert_eq!(previews[0]["preview"]["ready"], 1);
         for published in [&operations[0], &previews[0]] {
             let encoded = serde_json::to_string(published).unwrap();

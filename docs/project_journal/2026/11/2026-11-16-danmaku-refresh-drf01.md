@@ -5,7 +5,7 @@ status: active
 created: 2026-11-16
 updated: 2026-11-16
 branch: "codex/danmaku-refresh"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/76"
 supersedes: []
 superseded_by: ""
 ---
@@ -40,6 +40,10 @@ superseded_by: ""
 - Keep the actual worker's library I/O lease until all work ends, including when
   its async caller is cancelled. Recheck the cloud epoch and registered library
   binding after network waits before publishing sidecars.
+- Reuse BBDown-rust's public bounded decoder and pure ASS renderer, introduced
+  by [BBDown-rust #125](https://github.com/Joey-Project/BBDown-rust/pull/125).
+- Preserve the configured ASS presentation and support repairing an interrupted
+  XML-first publication. Unknown extra ASS comments remain protected.
 
 ## Validation plan
 

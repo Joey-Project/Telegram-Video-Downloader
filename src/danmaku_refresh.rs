@@ -643,7 +643,7 @@ fn preview_id(revision: &str, library_id: &str, root_binding: &str) -> String {
     hasher.update(root_binding.as_bytes());
     hasher.update(nanos.to_be_bytes());
     hasher.update(sequence.to_be_bytes());
-    format!("dmr1:{}", encode_hex(&hasher.finalize()[..16]))
+    format!("dmr1-{}", encode_hex(&hasher.finalize()[..16]))
 }
 
 pub(super) async fn execute_with_guard(
@@ -1416,7 +1416,7 @@ fn capture_parent(root: &RootedFs, relative: &Path) -> Result<ParentProof> {
             access: None,
         });
     }
-    let absolute = root.root_path().join(relative);
+    let absolute = root.logical_root_path().join(relative);
     let entry = root.bind_entry(&absolute, false)?;
     let identity = root
         .bound_entry_identity(&entry)?
@@ -1666,7 +1666,7 @@ fn temporary_sibling(relative: &str) -> Result<PathBuf> {
 fn safe_root_path(root: &RootedFs, relative: &str) -> Result<PathBuf> {
     let relative = Path::new(relative);
     validate_relative_path(relative)?;
-    Ok(root.root_path().join(relative))
+    Ok(root.logical_root_path().join(relative))
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
@@ -2087,6 +2087,48 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("another batch"))
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_root_alias_and_child_churn_preserve_media_identity_checks() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let actual = directory.path().join("actual");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir_all(actual.join("nested"))?;
+        std::os::unix::fs::symlink(&actual, &alias)?;
+        let media = alias.join("nested/episode.mp4");
+        std::fs::write(&media, b"original media")?;
+        let root = RootedFs::new(&alias)?;
+        let mut item = test_item(vec!["cid12345".to_owned()]);
+        item.relative_path = "nested/episode.mp4".to_owned();
+        item.physical_identity = Some(
+            root.open_bound_file(&media)?
+                .context("test media should exist")?
+                .physical_identity()?,
+        );
+        let snapshot = LibrarySnapshot {
+            revision: "revision".to_owned(),
+            scanned_at: 1,
+            root_label: "test".to_owned(),
+            items: vec![item],
+            categories: Vec::new(),
+            warnings: Vec::new(),
+        };
+        std::fs::write(alias.join("nested/unrelated.txt"), b"benign child churn")?;
+        let plan = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(plan.ready, 1, "logical root spelling must remain usable");
+        // Replacing the media changes the protected object, unlike child churn.
+        std::fs::rename(&media, media.with_extension("retained"))?;
+        std::fs::write(&media, b"replacement media")?;
+        let replaced = preview(
+            &root, &snapshot, "library", "binding", "revision", "library", None,
+        )?;
+        assert_eq!(replaced.ready, 0);
+        assert_eq!(replaced.skipped, 1);
         Ok(())
     }
 
