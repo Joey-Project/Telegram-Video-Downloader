@@ -2839,3 +2839,163 @@ fn migration_record_warning_classifier_ignores_unrelated_execution_errors() {
         Some(MigrationDiscoveryWarningKind::SourceBindingMismatch)
     );
 }
+
+#[test]
+fn migration_preserves_portable_attachment_references_when_group_names_stay_stable() {
+    let source_root = TestRoot::new("portable-attachment-preserved-source");
+    let target_root = TestRoot::new("portable-attachment-preserved-target");
+    let nfo = concat!(
+        "<movie><uniqueid type=\"bilibili\" default=\"true\">BV1</uniqueid>",
+        "<localfilename>Film.mkv</localfilename>",
+        "<tvd_attachment role=\"cover\">cover.jpg</tvd_attachment>",
+        "<thumb>cover.jpg</thumb></movie>"
+    );
+    fs::write(source_root.path().join("Film.mkv"), MEDIA_BYTES).expect("source media should write");
+    fs::write(source_root.path().join("cover.jpg"), b"synthetic cover")
+        .expect("source cover should write");
+    fs::write(source_root.path().join("Film.nfo"), nfo).expect("source NFO should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine.source.migration_scan().expect("source should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("source media should index")
+        .id
+        .clone();
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("same-name migration should preview");
+    assert!(
+        preview.items[0]
+            .files
+            .iter()
+            .any(|file| { file.source_path == "cover.jpg" && file.target_path == "cover.jpg" })
+    );
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Copying);
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("same-name migration should confirm");
+    for _ in 0..40 {
+        let status = engine
+            .status(&preview.id)
+            .expect("migration status should read")
+            .expect("migration status should exist");
+        if status.status == MigrationRunStatus::Completed {
+            break;
+        }
+        assert!(!matches!(
+            status.status,
+            MigrationRunStatus::Partial | MigrationRunStatus::Failed
+        ));
+        engine
+            .step(&preview.id)
+            .expect("migration step should complete");
+    }
+    let final_status = engine
+        .status(&preview.id)
+        .expect("final migration status should read")
+        .expect("final migration status should exist");
+    assert_eq!(final_status.status, MigrationRunStatus::Completed);
+    assert_eq!(
+        fs::read_to_string(target_root.path().join("Film.nfo")).unwrap(),
+        nfo,
+        "relative names stay valid when the group is migrated without a filename change"
+    );
+    let target_snapshot = engine
+        .target
+        .migration_scan()
+        .expect("target should rescan");
+    let migrated_item = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv")
+        .expect("migrated media should index");
+    assert!(migrated_item.attachments.iter().any(|attachment| {
+        attachment.kind == "cover" && attachment.relative_path == "cover.jpg"
+    }));
+    assert!(!source_root.path().join("Film.mkv").exists());
+}
+
+#[test]
+fn migration_keep_both_skips_when_nfo_localfilename_would_become_stale() {
+    let source_root = TestRoot::new("portable-attachment-keep-both-source");
+    let target_root = TestRoot::new("portable-attachment-keep-both-target");
+    fs::write(source_root.path().join("Film.mkv"), MEDIA_BYTES).expect("source media should write");
+    fs::write(source_root.path().join("cover.jpg"), b"synthetic cover")
+        .expect("source cover should write");
+    fs::write(
+        source_root.path().join("Film.nfo"),
+        "<movie><localfilename>Film.mkv</localfilename><tvd_attachment role=\"cover\">cover.jpg</tvd_attachment></movie>",
+    )
+    .expect("source NFO should write");
+    fs::write(target_root.path().join("Film.mkv"), b"existing target")
+        .expect("conflicting target media should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine.source.migration_scan().expect("source should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Film.mkv" && item.presence == Presence::Present)
+        .expect("source media should index")
+        .id
+        .clone();
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: ConflictPolicy::KeepBoth,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("keep-both conflict should remain reviewable as a skip");
+    assert!(preview.items[0].conflict);
+    assert_eq!(preview.items[0].status, MigrationItemPhase::Skipped);
+    assert_eq!(
+        fs::read(source_root.path().join("Film.nfo")).unwrap(),
+        b"<movie><localfilename>Film.mkv</localfilename><tvd_attachment role=\"cover\">cover.jpg</tvd_attachment></movie>"
+    );
+    assert!(!target_root.path().join("Film (2).mkv").exists());
+}
