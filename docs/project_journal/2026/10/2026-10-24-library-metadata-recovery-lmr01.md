@@ -3,7 +3,7 @@ id: 20261024-lmr01
 title: User-triggered library metadata recovery
 status: completed
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-11-16
 branch: "codex/library-metadata-recovery"
 pr: ""
 supersedes: []
@@ -30,8 +30,9 @@ superseded_by: ""
 
 ## Core resolver follow-up
 
-- UGC lookup reuses the pinned BBDown-rust full collection resolver. The adapter rejects declared groups and returned flattened lists beyond 512 entries, but the latter check occurs after the core has expanded archive pages. Async query deadlines are not hard CPU or allocation limits.
-- A separate BBDown-rust API should enforce response bytes, raw archive counts, and expanded page counts before parsing/expansion. The pinned public API does not expose those limits; adding them is a follow-up rather than a guarantee of this adapter.
+- Bounded BBDown-rust APIs cover UGC membership and full collection resolution. The bot opts into them only for optional UGC membership and collection-order enrichment: responses are capped at 1 MiB, each collection resolution at 64 requests, raw archives and expanded pages at 512 each, and returned strings at 4 MiB. The source-video probe and other metadata paths retain their existing behavior.
+- Membership lookup failure, a limit refusal, or its deadline retains base video metadata. Collection-order failure, a limit refusal, or its deadline retains verified membership without order. The existing complete-result APIs remain available to compatibility callers.
+- Bot adapter scope and test coverage are recorded in [bounded UGC enrichment](../11/2026-11-16-bounded-ugc-bot-enrichment-bot4.md).
 
 ## Validation
 

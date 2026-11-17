@@ -6501,13 +6501,15 @@ pub(crate) async fn resolve_bilibili_metadata_recovery_source(
         parsed_bvid.as_deref(),
         enrichment_deadline,
         |bvid| async move {
+            let limits = bilibili_core::ugc_metadata_resolve_options();
             Ok(membership_client
-                .resolve_video_collection_membership(&bvid)
+                .resolve_video_collection_membership_with_options(&bvid, &limits)
                 .await?)
         },
         |reference| async move {
+            let limits = bilibili_core::ugc_metadata_resolve_options();
             Ok(collection_client
-                .resolve_video_collection(&reference, None)
+                .resolve_video_collection_with_options(&reference, None, &limits)
                 .await?)
         },
     )
