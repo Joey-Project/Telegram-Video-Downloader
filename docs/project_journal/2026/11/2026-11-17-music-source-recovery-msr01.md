@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-17
 updated: 2026-11-17
 branch: "codex/music-source-recovery"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/81"
 supersedes: []
 superseded_by: ""
 ---

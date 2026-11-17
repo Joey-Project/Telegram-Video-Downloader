@@ -108,8 +108,9 @@ telegram-video-downloader --music-recover-local-source /absolute/config.toml /ab
 ```
 
 Both commands require the original object identity and size, then recapture and
-validate the explicitly approved current digest. Preview does not rewrite state. Apply atomically updates
-only the selected source proof and queues that job; attempts, retained staging,
+validate the explicitly approved current digest. Preview does not rewrite state.
+Apply atomically updates only the selected source proof and queues that job;
+attempts, retained staging,
 status references and other jobs remain intact. The commands do not start a
 worker, call Music or send Telegram messages. Restarting the normal signed bot
 processes the queued job through normal deduplication and import checks. Jobs
