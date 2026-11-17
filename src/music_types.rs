@@ -87,8 +87,9 @@ pub struct LocalMusicFile {
 impl LocalMusicFile {
     /// Capture a bounded proof for a regular file reached below `source_root` without symlinks.
     ///
-    /// This reads the selected file once to bind its SHA-256, size, and object identity. Call it
-    /// off the async update loop and only after the torrent client reports the file complete.
+    /// This confirms the selected content with paired SHA-256 reads and bounded retry before
+    /// binding its size and object identity. Call it off the async update loop and only after
+    /// the torrent client reports the file complete.
     pub fn capture(
         source_key: String,
         source_root: PathBuf,
@@ -139,6 +140,18 @@ impl LocalMusicFile {
 
     pub(crate) fn matches_content(&self, sha256: &str, size: u64) -> bool {
         self.file_size == size && self.proof.sha256.eq_ignore_ascii_case(sha256)
+    }
+
+    pub(crate) fn content_sha256(&self) -> &str {
+        &self.proof.sha256
+    }
+
+    pub(crate) fn revalidate_source_binding(&self, max_file_bytes: u64) -> Result<()> {
+        local_snapshot::revalidate_source_binding(self, max_file_bytes)
+    }
+
+    pub(crate) fn same_source_binding(&self, other: &Self) -> bool {
+        local_snapshot::same_source_binding(self, other)
     }
 
     pub(crate) fn resolved_path(&self) -> PathBuf {

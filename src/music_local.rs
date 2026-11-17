@@ -21,6 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use super::{LocalMusicFile, MusicCancellation};
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_CAPTURE_HASH_ATTEMPTS: usize = 2;
 const MAX_SOURCE_KEY_BYTES: usize = 512;
 const MAX_FILE_NAME_BYTES: usize = 512;
 #[cfg(target_os = "macos")]
@@ -52,35 +53,135 @@ pub(super) fn capture_source(
     max_file_bytes: u64,
     cancel: &MusicCancellation,
 ) -> Result<SourceProof> {
+    capture_source_with_hash_hook(source_root, relative_path, max_file_bytes, cancel, |_| {
+        Ok(())
+    })
+}
+
+fn capture_source_with_hash_hook(
+    source_root: &Path,
+    relative_path: &Path,
+    max_file_bytes: u64,
+    cancel: &MusicCancellation,
+    mut after_hash: impl FnMut(usize) -> Result<()>,
+) -> Result<SourceProof> {
     validate_root_path(source_root)?;
     validate_relative_path(relative_path)?;
     let resolved_root = resolve_source_root(source_root)?;
     let root = open_root_directory(&resolved_root)?;
     let root_identity = directory_identity(&root)?;
     let mut source = open_relative_file(&root, relative_path)?;
-    let before = regular_file_identity(&source, max_file_bytes)?;
-    let sha256 = hash_file(&mut source, before.size, max_file_bytes, cancel)?;
-    let after = regular_file_identity(&source, max_file_bytes)?;
-    if before != after {
-        bail!("selected local file identity or size changed while it was captured");
+    let captured_identity = regular_file_identity(&source, max_file_bytes)?;
+    let mut hash_index = 0;
+    let mut divergences = Vec::with_capacity(MAX_CAPTURE_HASH_ATTEMPTS);
+
+    for attempt in 1..=MAX_CAPTURE_HASH_ATTEMPTS {
+        let before = regular_file_identity(&source, max_file_bytes)?;
+        ensure_capture_identity("before hashing", captured_identity, before)?;
+
+        let first_sha = hash_file(&mut source, before.size, max_file_bytes, cancel)
+            .context("hash local source during stable capture (first pass)")?;
+        after_hash(hash_index)?;
+        hash_index += 1;
+        let after_first = regular_file_identity(&source, max_file_bytes)?;
+        ensure_capture_identity("after first hash pass", captured_identity, after_first)?;
+
+        let second_sha = hash_file(&mut source, after_first.size, max_file_bytes, cancel)
+            .context("hash local source during stable capture (verification pass)")?;
+        after_hash(hash_index)?;
+        hash_index += 1;
+        let after_second = regular_file_identity(&source, max_file_bytes)?;
+        ensure_capture_identity(
+            "after verification hash pass",
+            captured_identity,
+            after_second,
+        )?;
+
+        // Validate the same rooted path on every attempt. A digest mismatch may be retried once,
+        // but replacement, access, materialization, cancellation, and read failures remain errors.
+        verify_bound_path(
+            source_root,
+            &resolved_root,
+            relative_path,
+            root_identity,
+            captured_identity,
+        )
+        .with_context(|| format!("revalidate local source path after capture attempt {attempt}"))?;
+
+        if same_sha256(&first_sha, &second_sha) {
+            return Ok(SourceProof {
+                requested_root: source_root.to_path_buf(),
+                resolved_root,
+                root_device: root_identity.device,
+                root_inode: root_identity.inode,
+                file_device: captured_identity.device,
+                file_inode: captured_identity.inode,
+                file_size: captured_identity.size,
+                sha256: second_sha,
+            });
+        }
+
+        divergences.push((first_sha, second_sha));
     }
-    verify_bound_path(
-        source_root,
-        &resolved_root,
-        relative_path,
-        root_identity,
-        before,
-    )?;
-    Ok(SourceProof {
-        requested_root: source_root.to_path_buf(),
-        resolved_root,
-        root_device: root_identity.device,
-        root_inode: root_identity.inode,
-        file_device: before.device,
-        file_inode: before.inode,
-        file_size: before.size,
-        sha256,
-    })
+
+    let detail = divergences
+        .iter()
+        .enumerate()
+        .map(|(index, (first, second))| {
+            format!(
+                "attempt {} first SHA-256 {first}, verification SHA-256 {second}",
+                index + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "local source content remained unstable during bounded capture after {MAX_CAPTURE_HASH_ATTEMPTS} attempts: {detail}"
+    )
+}
+
+fn ensure_capture_identity(
+    phase: &str,
+    expected: ObjectIdentity,
+    observed: ObjectIdentity,
+) -> Result<()> {
+    if expected != observed {
+        bail!(
+            "local source identity changed {phase}: expected device/inode/size {}/{}/{}, observed {}/{}/{}",
+            expected.device,
+            expected.inode,
+            expected.size,
+            observed.device,
+            observed.inode,
+            observed.size,
+        );
+    }
+    Ok(())
+}
+
+/// Revalidate the captured filesystem object binding without requiring its old content digest.
+/// Explicit recovery may recapture changed bytes from this same bound object, but never from a
+/// replacement root or file.
+pub(super) fn revalidate_source_binding(file: &LocalMusicFile, max_file_bytes: u64) -> Result<()> {
+    validate_source_shape(file, max_file_bytes)?;
+    let _ = open_bound_source(file, max_file_bytes, &MusicCancellation::default())?;
+    Ok(())
+}
+
+/// Compare captured source bindings while allowing an explicitly authorized recapture to change
+/// only the content digest. The caller separately checks the logical `source_key`.
+pub(super) fn same_source_binding(left: &LocalMusicFile, right: &LocalMusicFile) -> bool {
+    left.source_root == right.source_root
+        && left.relative_path == right.relative_path
+        && left.file_name == right.file_name
+        && left.file_size == right.file_size
+        && left.proof.requested_root == right.proof.requested_root
+        && left.proof.resolved_root == right.proof.resolved_root
+        && left.proof.root_device == right.proof.root_device
+        && left.proof.root_inode == right.proof.root_inode
+        && left.proof.file_device == right.proof.file_device
+        && left.proof.file_inode == right.proof.file_inode
+        && left.proof.file_size == right.proof.file_size
 }
 
 pub(super) fn validate_source_shape(file: &LocalMusicFile, max_file_bytes: u64) -> Result<()> {
@@ -152,17 +253,28 @@ pub(super) fn copy_verified_snapshot(
         bail!("Music staging did not create an independent file snapshot");
     }
     if !same_sha256(&copied_sha, &selected.proof.sha256) {
-        bail!("selected local file content changed before it could be snapshotted");
+        bail!(
+            "private Music snapshot digest mismatch after copy: expected proof SHA-256 {}, observed copied SHA-256 {}",
+            selected.proof.sha256,
+            copied_sha,
+        );
     }
 
     // Re-read the held source and staged destination. This binds the copied bytes to the proof
     // and catches in-place mutation during the copy, including same-size writes.
-    let source_sha = hash_file(&mut source, source_identity.size, max_file_bytes, cancel)?;
-    let destination_sha = hash_file(&mut target, target_identity.size, max_file_bytes, cancel)?;
+    let source_sha = hash_file(&mut source, source_identity.size, max_file_bytes, cancel)
+        .context("re-hash selected source after snapshot copy")?;
+    let destination_sha = hash_file(&mut target, target_identity.size, max_file_bytes, cancel)
+        .context("re-hash private snapshot after copy")?;
     if !same_sha256(&source_sha, &selected.proof.sha256)
         || !same_sha256(&destination_sha, &selected.proof.sha256)
     {
-        bail!("selected local file or its private snapshot changed during copying");
+        bail!(
+            "post-copy digest mismatch: expected proof SHA-256 {}, observed source SHA-256 {}, observed snapshot SHA-256 {}",
+            selected.proof.sha256,
+            source_sha,
+            destination_sha,
+        );
     }
     if regular_file_identity(&source, max_file_bytes)? != source_identity
         || regular_file_identity(&target, max_file_bytes)? != target_identity
@@ -201,7 +313,12 @@ pub(super) fn verify_existing_snapshot(
     if !same_sha256(&source_sha, &selected.proof.sha256)
         || !same_sha256(&target_sha, &selected.proof.sha256)
     {
-        bail!("retained Music snapshot does not match the selected local source proof");
+        bail!(
+            "retained Music snapshot digest mismatch: expected proof SHA-256 {}, observed source SHA-256 {}, observed snapshot SHA-256 {}",
+            selected.proof.sha256,
+            source_sha,
+            target_sha,
+        );
     }
     if regular_file_identity(&source, max_file_bytes)? != source_identity
         || regular_file_identity(&target, max_file_bytes)? != target_identity
@@ -642,4 +759,281 @@ fn reject_dataless_path(path: &Path) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn reject_dataless_path(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_CAPTURE_HASH_ATTEMPTS, MusicCancellation, capture_source_with_hash_hook,
+        revalidate_source_binding, same_source_binding,
+    };
+    use sha2::{Digest, Sha256};
+    use std::fs::{self, FileTimes, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    fn write_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    fn expected_sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn capture_retries_same_identity_same_size_content_divergence_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        let original = vec![b'a'; 256 * 1024];
+        let replacement = vec![b'b'; original.len()];
+        fs::write(&path, &original).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let cancellation = MusicCancellation::default();
+        let mut changed = false;
+
+        let proof = capture_source_with_hash_hook(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &cancellation,
+            |hash_index| {
+                if hash_index == 0 && !changed {
+                    write_in_place(&path, &replacement)?;
+                    changed = true;
+                }
+                Ok(())
+            },
+        )
+        .expect("a single same-size mutation should be retried and recaptured stably");
+
+        let after = fs::metadata(&path).unwrap();
+        assert!(changed);
+        assert_eq!(proof.sha256, expected_sha256(&replacement));
+        assert_eq!(proof.file_size, replacement.len() as u64);
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len()),
+            "the mutation must preserve object identity and size",
+        );
+    }
+
+    #[test]
+    fn capture_accepts_metadata_transition_when_content_stays_equal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        let bytes = b"same audio bytes across provider metadata transition";
+        fs::write(&path, bytes).unwrap();
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let cancellation = MusicCancellation::default();
+        let mut changed_time = false;
+
+        let proof = capture_source_with_hash_hook(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &cancellation,
+            |hash_index| {
+                if hash_index == 0 && !changed_time {
+                    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+                    file.set_times(FileTimes::new().set_modified(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    ))?;
+                    changed_time = true;
+                }
+                Ok(())
+            },
+        )
+        .expect("mtime changes alone must not invalidate stable source content");
+
+        let modified_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(changed_time);
+        assert_ne!(original_modified, modified_after);
+        assert_eq!(proof.sha256, expected_sha256(bytes));
+    }
+
+    #[test]
+    fn capture_bounds_unstable_content_and_reports_both_observed_digests() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        let first_bytes = vec![b'a'; 64 * 1024];
+        let second_bytes = vec![b'b'; first_bytes.len()];
+        fs::write(&path, &first_bytes).unwrap();
+        let cancellation = MusicCancellation::default();
+        let mut writes = 0;
+
+        let error = capture_source_with_hash_hook(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &cancellation,
+            |hash_index| {
+                let bytes = if hash_index % 2 == 0 {
+                    &second_bytes
+                } else {
+                    &first_bytes
+                };
+                write_in_place(&path, bytes)?;
+                writes += 1;
+                Ok(())
+            },
+        )
+        .expect_err("repeated same-size writes must exhaust the bounded capture");
+
+        let chain = format!("{error:#}");
+        assert_eq!(writes, MAX_CAPTURE_HASH_ATTEMPTS * 2);
+        assert!(chain.contains("unstable during bounded capture"), "{chain}");
+        assert!(chain.contains(&expected_sha256(&first_bytes)), "{chain}");
+        assert!(chain.contains(&expected_sha256(&second_bytes)), "{chain}");
+    }
+
+    #[test]
+    fn capture_does_not_retry_cancellation_as_content_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        fs::write(&path, b"bounded cancellation fixture").unwrap();
+        let cancellation = MusicCancellation::default();
+        let mut completed_hashes = 0;
+
+        let error = capture_source_with_hash_hook(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &cancellation,
+            |_| {
+                completed_hashes += 1;
+                cancellation.cancel();
+                Ok(())
+            },
+        )
+        .expect_err("cancellation must propagate without a stability retry");
+
+        assert_eq!(completed_hashes, 1);
+        assert!(format!("{error:#}").contains("cancelled"));
+    }
+
+    #[test]
+    fn copy_digest_failure_reports_expected_and_observed_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("selected.flac");
+        let original = vec![b'a'; 64 * 1024];
+        let replacement = vec![b'b'; original.len()];
+        fs::write(&path, &original).unwrap();
+        let proof = super::capture_source(
+            &root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .unwrap();
+        let selected = source_file(proof, &root);
+        write_in_place(&path, &replacement).unwrap();
+
+        let error = super::copy_verified_snapshot(
+            &selected,
+            &directory.path().join("original.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .expect_err("copying bytes that differ from the captured proof must fail");
+
+        let chain = format!("{error:#}");
+        assert!(chain.contains("private Music snapshot digest mismatch after copy"));
+        assert!(chain.contains(&expected_sha256(&original)));
+        assert!(chain.contains(&expected_sha256(&replacement)));
+    }
+
+    #[test]
+    fn binding_revalidation_allows_changed_content_on_the_same_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        let original = b"captured source bytes";
+        let replacement = b"replaced source bytes";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, original).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let proof = super::capture_source(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .unwrap();
+        let source = source_file(proof, root);
+        write_in_place(&path, replacement).unwrap();
+        let fresh_proof = super::capture_source(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .unwrap();
+        let fresh_source = source_file(fresh_proof, root);
+        let after = fs::metadata(&path).unwrap();
+
+        revalidate_source_binding(&source, 1024 * 1024)
+            .expect("explicit recovery may recapture changed bytes from the same object");
+        assert_ne!(source.proof.sha256, fresh_source.proof.sha256);
+        assert!(same_source_binding(&source, &fresh_source));
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+    }
+
+    #[test]
+    fn binding_revalidation_rejects_replaced_file_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = root.join("selected.flac");
+        let original = b"captured source bytes";
+        let replacement = b"replaced source bytes";
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, original).unwrap();
+        let proof = super::capture_source(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .unwrap();
+        let selected = source_file(proof, root);
+        let old_path = root.join("old-selected.flac");
+        fs::rename(&path, &old_path).unwrap();
+        fs::write(&path, replacement).unwrap();
+        let replacement_proof = super::capture_source(
+            root,
+            Path::new("selected.flac"),
+            1024 * 1024,
+            &MusicCancellation::default(),
+        )
+        .unwrap();
+        let replacement_source = source_file(replacement_proof, root);
+
+        let error = revalidate_source_binding(&selected, 1024 * 1024)
+            .expect_err("recovery must reject a replacement object even at the same size");
+        assert!(format!("{error:#}").contains("replaced or resized"));
+        assert!(!same_source_binding(&selected, &replacement_source));
+    }
+
+    fn source_file(source: super::SourceProof, root: &Path) -> super::LocalMusicFile {
+        super::LocalMusicFile {
+            source_key: "test-source".to_string(),
+            source_root: root.to_path_buf(),
+            relative_path: Path::new("selected.flac").to_path_buf(),
+            file_name: "selected.flac".to_string(),
+            file_size: source.file_size,
+            proof: source,
+        }
+    }
 }

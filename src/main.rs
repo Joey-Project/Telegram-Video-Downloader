@@ -33,6 +33,7 @@ mod music_automation;
 #[cfg(test)]
 mod music_cleanup_e2e_tests;
 mod music_conversion;
+mod music_diagnostics;
 mod music_import;
 mod music_manager;
 mod music_native;
@@ -330,6 +331,23 @@ async fn main() -> Result<()> {
         .init();
 
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--music-recover-local-source"))
+    {
+        let apply = args
+            .get(3)
+            .is_some_and(|arg| arg == std::ffi::OsStr::new("--apply"));
+        if args.len() != 3 && !(args.len() == 4 && apply) {
+            bail!("usage: --music-recover-local-source CONFIG REQUEST_JSON [--apply]");
+        }
+        println!(
+            "{}",
+            music_manager::run_source_recovery_cli(Path::new(&args[1]), Path::new(&args[2]), apply)
+                .await?
+        );
+        return Ok(());
+    }
     if args
         .first()
         .is_some_and(|arg| arg == std::ffi::OsStr::new("--music-seed-accepted"))

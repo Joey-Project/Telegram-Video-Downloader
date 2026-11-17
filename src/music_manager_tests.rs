@@ -1,7 +1,7 @@
 use super::*;
 
 use std::collections::VecDeque;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -293,6 +293,7 @@ pub(crate) struct MockBackend {
     pub(crate) evictions: AtomicUsize,
     pub(crate) ready_failure: AtomicBool,
     pub(crate) add_failure: AtomicBool,
+    pub(crate) query_failure: AtomicBool,
     pub(crate) defer_eviction: AtomicBool,
     pub(crate) cloud_status: Mutex<String>,
     pub(crate) archive_states: Mutex<VecDeque<ArchiveState>>,
@@ -330,6 +331,7 @@ impl MockBackend {
             evictions: AtomicUsize::new(0),
             ready_failure: AtomicBool::new(false),
             add_failure: AtomicBool::new(false),
+            query_failure: AtomicBool::new(false),
             defer_eviction: AtomicBool::new(false),
             cloud_status: Mutex::new("uploaded".to_string()),
             archive_states: Mutex::new(VecDeque::new()),
@@ -483,6 +485,9 @@ impl MusicBackend for MockBackend {
 
     fn query_track(&self, persistent_id: &str) -> Result<MusicTrack> {
         self.queries.fetch_add(1, Ordering::Relaxed);
+        if self.query_failure.load(Ordering::Acquire) {
+            return Err(std::io::Error::other("synthetic Music query bridge failure").into());
+        }
         Ok(MusicTrack {
             persistent_id: persistent_id.to_string(),
             location: Some(PathBuf::from("/Music/Accepted Track.m4a")),
@@ -1151,6 +1156,36 @@ pub(crate) async fn open_manager(
     backend: Arc<dyn MusicBackend>,
 ) -> Arc<MusicManager> {
     MusicManager::open(settings, server.client.clone(), backend).expect("music manager should open")
+}
+
+fn read_diagnostic_record(
+    settings: &MusicSettings,
+    job_id: &str,
+    stage: &str,
+) -> serde_json::Value {
+    let path = settings.state_dir.join("diagnostics/failures.json");
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).expect("diagnostic journal should be durable"))
+            .expect("diagnostic journal should be valid JSON");
+    journal["records"]
+        .as_array()
+        .expect("diagnostic journal should contain records")
+        .iter()
+        .find(|record| {
+            record["job_id"].as_str() == Some(job_id) && record["stage"].as_str() == Some(stage)
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no {stage} diagnostic was written for job {job_id}"))
+}
+
+fn diagnostic_error_chain(record: &serde_json::Value) -> String {
+    record["error_chain"]
+        .as_array()
+        .expect("diagnostic record should contain an error chain")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn wait_for_stage(manager: &MusicManager, job_id: &str, stage: JobStage) -> StoredJob {
@@ -3434,6 +3469,216 @@ async fn local_batch_capacity_failure_admits_no_partial_jobs() {
     let after = manager.store.snapshot().unwrap();
     assert_eq!(after.jobs.len(), before.jobs.len());
     assert!(after.jobs.values().all(|job| job.local_source.is_none()));
+    server.stop();
+}
+
+#[tokio::test]
+async fn changed_local_source_failure_preserves_snapshot_and_records_hash_diagnostics() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("diagnostic-source");
+    fs::create_dir_all(&source_root).expect("create diagnostic source root");
+    let source_path = source_root.join("selected.m4a");
+    let captured_bytes = b"stable source data";
+    let changed_bytes = b"broken source data";
+    assert_eq!(captured_bytes.len(), changed_bytes.len());
+    fs::write(&source_path, captured_bytes).expect("write source before capture");
+    let expected_sha256 = format!("{:x}", Sha256::digest(captured_bytes));
+    let observed_sha256 = format!("{:x}", Sha256::digest(changed_bytes));
+    let selected = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:diagnostic-source",
+        settings.max_file_bytes,
+    );
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let admitted = manager
+        .enqueue_local_batch(local_batch(
+            42,
+            42,
+            "changed-source-diagnostic",
+            vec![selected],
+        ))
+        .await
+        .expect("captured source should be admitted");
+    let job_id = admitted[0].job_id.clone();
+
+    // Mutate the same inode with the same size after proof capture and admission.
+    fs::write(&source_path, changed_bytes).expect("mutate the captured source");
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let failed = wait_for_stage(&manager, &job_id, JobStage::Failed).await;
+    let safe_message = "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry.";
+    assert_eq!(failed.error.as_deref(), Some(safe_message));
+    assert_eq!(failed.attempt, 1);
+    assert!(!failed.download_complete);
+    assert_eq!(backend.downloads.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.preparations.load(Ordering::Relaxed), 0);
+    assert_eq!(backend.adds.load(Ordering::Relaxed), 0);
+
+    let staging_dir = settings.staging_dir.join(&job_id);
+    let staged_copy = staging_dir.join("original.m4a");
+    assert!(
+        staging_dir.is_dir(),
+        "failed source staging should be retained"
+    );
+    assert_eq!(fs::read(&staged_copy).unwrap(), changed_bytes);
+    let record = read_diagnostic_record(&settings, &job_id, "source_download");
+    let error_chain = diagnostic_error_chain(&record);
+    assert!(error_chain.contains("expected proof SHA-256"));
+    assert!(error_chain.contains("observed copied SHA-256"));
+    assert!(error_chain.contains(&expected_sha256));
+    assert!(error_chain.contains(&observed_sha256));
+    assert!(!error_chain.contains(source_root.to_string_lossy().as_ref()));
+
+    let owner_status = manager
+        .local_job_status(42, std::slice::from_ref(&job_id))
+        .await
+        .expect("same owner can read failed job status");
+    assert_eq!(owner_status.len(), 1);
+    assert_eq!(owner_status[0].error.as_deref(), Some(safe_message));
+    assert!(
+        manager
+            .local_job_status(43, std::slice::from_ref(&job_id))
+            .await
+            .expect("different owner query is safe")
+            .is_empty()
+    );
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("local source diagnostic worker should stop")
+        .expect("local source diagnostic worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn music_query_failure_is_durable_but_user_status_stays_generic() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    backend.query_failure.store(true, Ordering::Release);
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+
+    let admission = manager
+        .enqueue(upload(991, "diagnostic-query-991"))
+        .await
+        .unwrap();
+    let failed = wait_for_stage(&manager, &admission.job_id, JobStage::Failed).await;
+    let safe_message = "Music status could not be read; retry is available.";
+    assert_eq!(failed.error.as_deref(), Some(safe_message));
+    assert!(failed.add_intent);
+    assert_eq!(failed.persistent_id.as_deref(), Some("persistent-id-1"));
+    assert_eq!(backend.queries.load(Ordering::Relaxed), 1);
+    assert!(server.wait_for_text(safe_message).await);
+    assert_eq!(
+        server.count_text_for_method("sendMessage", "synthetic Music query bridge failure"),
+        0
+    );
+    assert_eq!(
+        server.count_text_for_method("editMessageText", "synthetic Music query bridge failure"),
+        0
+    );
+
+    let record = read_diagnostic_record(&settings, &admission.job_id, "music_query");
+    let error_chain = diagnostic_error_chain(&record);
+    assert!(error_chain.contains("synthetic Music query bridge failure"));
+    assert!(!error_chain.contains(safe_message));
+    assert!(server.wait_for_text(safe_message).await);
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("query diagnostic worker should stop")
+        .expect("query diagnostic worker should join");
+    server.stop();
+}
+
+#[tokio::test]
+async fn diagnostic_persistence_failure_does_not_replace_local_source_failure() {
+    let fixture = TestDirectory::new();
+    let settings = fixture.settings();
+    let source_root = fixture.0.join("diagnostic-write-failure-source");
+    fs::create_dir_all(&source_root).expect("create diagnostic source root");
+    let source_path = source_root.join("selected.m4a");
+    let captured_bytes = b"stable source data";
+    let changed_bytes = b"broken source data";
+    assert_eq!(captured_bytes.len(), changed_bytes.len());
+    fs::write(&source_path, captured_bytes).expect("write source before capture");
+    let selected = capture_local_file(
+        &source_root,
+        "selected.m4a",
+        "torrent-hash:diagnostic-write-failure",
+        settings.max_file_bytes,
+    );
+    let server = TestHttpServer::start().await;
+    let backend = MockBackend::new(settings.archive_dir.clone());
+    let manager = open_manager(
+        settings.clone(),
+        &server,
+        backend.clone() as Arc<dyn MusicBackend>,
+    )
+    .await;
+    let admitted = manager
+        .enqueue_local_batch(local_batch(
+            42,
+            42,
+            "diagnostic-write-failure",
+            vec![selected],
+        ))
+        .await
+        .expect("captured source should be admitted");
+    let job_id = admitted[0].job_id.clone();
+
+    let diagnostics_dir = settings.state_dir.join("diagnostics");
+    fs::create_dir(&diagnostics_dir).expect("create diagnostics directory");
+    fs::set_permissions(&diagnostics_dir, fs::Permissions::from_mode(0o700))
+        .expect("diagnostics directory should be private");
+    let journal_path = diagnostics_dir.join("failures.json");
+    let corrupt_journal = b"preserve malformed diagnostics journal";
+    fs::write(&journal_path, corrupt_journal).expect("write malformed journal fixture");
+    fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600))
+        .expect("diagnostics journal should be private");
+
+    // The source proof remains the admitted version; diagnostics will fail to append.
+    fs::write(&source_path, changed_bytes).expect("mutate the captured source");
+    let (shutdown, receiver) = shutdown_channel();
+    let worker = manager.start(receiver);
+    let failed = wait_for_stage(&manager, &job_id, JobStage::Failed).await;
+    let safe_message = "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry.";
+    assert_eq!(failed.error.as_deref(), Some(safe_message));
+    assert!(!failed.download_complete);
+    let staged_copy = settings.staging_dir.join(&job_id).join("original.m4a");
+    assert_eq!(fs::read(&staged_copy).unwrap(), changed_bytes);
+    assert_eq!(fs::read(&journal_path).unwrap(), corrupt_journal);
+    let owner_status = manager
+        .local_job_status(42, std::slice::from_ref(&job_id))
+        .await
+        .expect("same owner can read failed status after diagnostic failure");
+    assert_eq!(owner_status.len(), 1);
+    assert_eq!(owner_status[0].error.as_deref(), Some(safe_message));
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("diagnostic failure worker should stop")
+        .expect("diagnostic failure worker should join");
     server.stop();
 }
 

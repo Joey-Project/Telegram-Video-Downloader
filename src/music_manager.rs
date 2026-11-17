@@ -18,12 +18,19 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::file_provider::{QueueFileProvider, platform_queue_file_provider};
+use crate::music_diagnostics::{
+    DiagnosticArtifact, DiagnosticEvidence, DiagnosticRecord, DiagnosticStage,
+};
 use crate::music_types::{
     ArchiveState, AudioBytes, JobStage, LocalMusicBatch, LocalMusicFile, LocalMusicJobRef,
     LocalMusicJobStatus, MusicBackend, MusicCancellation, MusicDownloadFailure, MusicSettings,
     MusicTrack, MusicUpload, PreparedAudio,
 };
 use crate::telegram::TelegramClient;
+
+#[path = "music_recovery.rs"]
+mod source_recovery;
+pub(crate) use source_recovery::run_cli as run_source_recovery_cli;
 
 const STATE_FILE: &str = "jobs.json";
 const OWNER_LOCK_FILE: &str = "owner.lock";
@@ -912,6 +919,25 @@ impl MusicStore {
     }
 }
 
+fn artifact_evidence(artifact: DiagnosticArtifact) -> Option<DiagnosticEvidence> {
+    Some(DiagnosticEvidence {
+        artifact: Some(artifact),
+        ..DiagnosticEvidence::default()
+    })
+}
+
+fn source_evidence(job: &StoredJob) -> Option<DiagnosticEvidence> {
+    Some(DiagnosticEvidence {
+        artifact: Some(DiagnosticArtifact::ImportSource),
+        expected_sha256_prefix: job
+            .local_source
+            .as_ref()
+            .map(|source| source.file.content_sha256().chars().take(16).collect()),
+        expected_size_bytes: Some(job.file_size()),
+        ..DiagnosticEvidence::default()
+    })
+}
+
 enum ImportDecision {
     Add,
     Reuse(String),
@@ -1307,7 +1333,14 @@ impl MusicManager {
             }
         };
         let job_dir = self.settings.staging_dir.join(job_id);
-        if ensure_private_directory(&job_dir, self.store.provider.as_ref()).is_err() {
+        if let Err(error) = ensure_private_directory(&job_dir, self.store.provider.as_ref()) {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::SourceDownload,
+                &error,
+                source_evidence(job),
+            )
+            .await;
             self.fail_job(job_id, "The private staging directory could not be opened.")
                 .await;
             return;
@@ -1336,7 +1369,14 @@ impl MusicManager {
                     return;
                 }
                 Ok(false) => {}
-                Err(_) => {
+                Err(error) => {
+                    self.record_diagnostic(
+                        job_id,
+                        DiagnosticStage::SourceValidation,
+                        &error,
+                        source_evidence(job),
+                    )
+                    .await;
                     self.fail_job(
                         job_id,
                         "The retained Telegram audio file is invalid; it was preserved for inspection.",
@@ -1397,6 +1437,13 @@ impl MusicManager {
                 });
                 let _ = self.update_status(job_id).await;
             } else {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::SourceDownload,
+                    &error,
+                    source_evidence(job),
+                )
+                .await;
                 let safe_message = if local_file.is_some() {
                     "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry."
                 } else {
@@ -1409,8 +1456,21 @@ impl MusicManager {
             }
             return;
         }
-        let copied = matches!(completed_download(&destination, file_size, true), Ok(true));
-        if !copied {
+        let verified_copy = completed_download(&destination, file_size, true).and_then(|copied| {
+            anyhow::ensure!(
+                copied,
+                "retained source copy is incomplete; expected_size={file_size}"
+            );
+            Ok(())
+        });
+        if let Err(error) = verified_copy {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::SourceValidation,
+                &error,
+                source_evidence(job),
+            )
+            .await;
             self.fail_job(
                 job_id,
                 if job.local_source.is_some() {
@@ -1457,12 +1517,18 @@ impl MusicManager {
             let original_for_verify = original.clone();
             let max_file_bytes = self.settings.max_file_bytes;
             let cancellation = cancellation.clone();
-            if run_blocking(move || {
+            if let Err(error) = run_blocking(move || {
                 source.verify_existing_snapshot(&original_for_verify, max_file_bytes, &cancellation)
             })
             .await
-            .is_err()
             {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::SourceValidation,
+                    &error,
+                    source_evidence(job),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "The selected torrent source is unavailable, not materialized, or changed; restore or download it in the torrent client and retry.",
@@ -1477,7 +1543,14 @@ impl MusicManager {
             .staging_dir
             .join(job_id)
             .join(format!("prepare-attempt-{prepare_attempt}"));
-        if ensure_private_directory(&work_dir, self.store.provider.as_ref()).is_err() {
+        if let Err(error) = ensure_private_directory(&work_dir, self.store.provider.as_ref()) {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::AudioPreparation,
+                &error,
+                source_evidence(job),
+            )
+            .await;
             self.fail_job(
                 job_id,
                 "The private audio preparation directory could not be opened.",
@@ -1503,20 +1576,30 @@ impl MusicManager {
         let cancellation = cancellation.clone();
         let prepared =
             run_blocking(move || backend.prepare(&original, &work_dir, &cancellation)).await;
-        let prepared = match prepared {
-            Ok(prepared)
-                if validate_prepared_audio(&prepared, MAX_CONFIGURED_FILE_BYTES).is_ok()
-                    && prepared.original.size == job.file_size()
-                    && job.local_source.as_ref().is_none_or(|source| {
-                        job.download_path.as_ref() == Some(&prepared.original.path)
-                            && source
-                                .file
-                                .matches_content(&prepared.original.sha256, prepared.original.size)
-                    }) =>
-            {
-                prepared
+        let prepared = prepared.and_then(|prepared| {
+            validate_prepared_audio(&prepared, MAX_CONFIGURED_FILE_BYTES)
+                .context("prepared audio validation failed")?;
+            anyhow::ensure!(
+                prepared.original.size == job.file_size(),
+                "prepared original size differs from selected source"
+            );
+            if let Some(source) = job.local_source.as_ref() {
+                anyhow::ensure!(
+                    job.download_path.as_ref() == Some(&prepared.original.path),
+                    "prepared original path differs from retained source"
+                );
+                anyhow::ensure!(
+                    source
+                        .file
+                        .matches_content(&prepared.original.sha256, prepared.original.size),
+                    "prepared original content differs from selected source proof"
+                );
             }
-            _ => {
+            Ok(prepared)
+        });
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 if self.job_cancel_requested(job_id) && !self.job_add_intent(job_id) {
                     let _ = self.store.set_job(job_id, |current| {
                         current.stage = JobStage::Cancelled;
@@ -1525,6 +1608,13 @@ impl MusicManager {
                     });
                     let _ = self.update_status(job_id).await;
                 } else {
+                    self.record_diagnostic(
+                        job_id,
+                        DiagnosticStage::AudioPreparation,
+                        &error,
+                        source_evidence(job),
+                    )
+                    .await;
                     self.fail_job(job_id, "Audio preparation failed; the original and any partial conversion are retained. Retry is available.")
                         .await;
                 }
@@ -1567,9 +1657,15 @@ impl MusicManager {
             format!("[retry {archive_attempt}] {basename}")
         };
         let backend = Arc::clone(&self.backend);
-        let archive = run_blocking(move || backend.archive(&prepared, &archive_name)).await;
+        let archive = run_blocking(move || backend.archive(&prepared, &archive_name))
+            .await
+            .and_then(|archive| {
+                validate_archive_state(&archive, &self.settings.archive_dir)
+                    .context("archive state validation failed")?;
+                Ok(archive)
+            });
         match archive {
-            Ok(archive) if validate_archive_state(&archive, &self.settings.archive_dir).is_ok() => {
+            Ok(archive) => {
                 let prepared = job.prepared.clone().expect("prepared audio");
                 let sha = match normalize_sha256(&prepared.original.sha256) {
                     Ok(sha) => sha,
@@ -1621,7 +1717,14 @@ impl MusicManager {
                     let _ = self.update_status(job_id).await;
                 }
             }
-            _ => {
+            Err(error) => {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::ArchiveUpload,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::ArchiveSource),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "The archive copy could not be created; retry is available.",
@@ -1733,7 +1836,14 @@ impl MusicManager {
 
         let backend = Arc::clone(&self.backend);
         let ready = run_blocking(move || backend.check_music_ready()).await;
-        if ready.is_err() {
+        if let Err(error) = ready {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::Import,
+                &error,
+                artifact_evidence(DiagnosticArtifact::ImportSource),
+            )
+            .await;
             self.fail_job(
                 job_id,
                 "Music is not ready or authorized; resolve that state and retry.",
@@ -1746,10 +1856,16 @@ impl MusicManager {
         }
         let backend = Arc::clone(&self.backend);
         let audio_for_source_check = prepared.clone();
-        if run_blocking(move || backend.check_import_source(&audio_for_source_check))
-            .await
-            .is_err()
+        if let Err(error) =
+            run_blocking(move || backend.check_import_source(&audio_for_source_check)).await
         {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::Import,
+                &error,
+                artifact_evidence(DiagnosticArtifact::PreparedCopy),
+            )
+            .await;
             self.fail_job(
                 job_id,
                 "The import source is not available; restore it and retry.",
@@ -1794,7 +1910,14 @@ impl MusicManager {
                     let _ = self.update_status(job_id).await;
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::Import,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::PreparedCopy),
+                )
+                .await;
                 let _ = self.store.set_job(job_id, |current| {
                     current.stage = JobStage::OutcomeUnknown;
                     current.error = Some(
@@ -1881,7 +2004,14 @@ impl MusicManager {
             Ok(track)
         }) {
             Ok(track) => track,
-            Err(_) => {
+            Err(error) => {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::MusicQuery,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::MusicLibraryCopy),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "Music status could not be read; retry is available.",
@@ -1922,10 +2052,14 @@ impl MusicManager {
         }
         let _ = self.update_status(job_id).await;
         let backend = Arc::clone(&self.backend);
-        if run_blocking(move || backend.verify_copy(&prepared, &track))
-            .await
-            .is_err()
-        {
+        if let Err(error) = run_blocking(move || backend.verify_copy(&prepared, &track)).await {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::MusicCopyVerification,
+                &error,
+                artifact_evidence(DiagnosticArtifact::MusicLibraryCopy),
+            )
+            .await;
             self.fail_job(
                 job_id,
                 "The independent Music copy could not be verified; retry is available.",
@@ -1968,7 +2102,14 @@ impl MusicManager {
             Ok(status)
         }) {
             Ok(status) => status,
-            Err(_) => {
+            Err(error) => {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::ArchiveUpload,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::ArchiveSource),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "Archive upload status could not be read; retry is available.",
@@ -2017,10 +2158,17 @@ impl MusicManager {
             let backend = Arc::clone(&self.backend);
             let prepared_for_verify = prepared.clone();
             let track_for_verify = track.clone();
-            if run_blocking(move || backend.verify_copy(&prepared_for_verify, &track_for_verify))
-                .await
-                .is_err()
+            if let Err(error) =
+                run_blocking(move || backend.verify_copy(&prepared_for_verify, &track_for_verify))
+                    .await
             {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::MusicCopyVerification,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::MusicLibraryCopy),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "The independent Music copy could not be verified; archive eviction was blocked.",
@@ -2077,7 +2225,14 @@ impl MusicManager {
                         let _ = self.update_status(job_id).await;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    self.record_diagnostic(
+                        job_id,
+                        DiagnosticStage::ArchiveUpload,
+                        &error,
+                        artifact_evidence(DiagnosticArtifact::ArchiveSource),
+                    )
+                    .await;
                     self.fail_job(
                         job_id,
                         "Archive eviction failed; the verified Music copy is retained.",
@@ -2089,10 +2244,17 @@ impl MusicManager {
             let backend = Arc::clone(&self.backend);
             let prepared_for_verify = prepared.clone();
             let track_for_verify = track.clone();
-            if run_blocking(move || backend.verify_copy(&prepared_for_verify, &track_for_verify))
-                .await
-                .is_err()
+            if let Err(error) =
+                run_blocking(move || backend.verify_copy(&prepared_for_verify, &track_for_verify))
+                    .await
             {
+                self.record_diagnostic(
+                    job_id,
+                    DiagnosticStage::MusicCopyVerification,
+                    &error,
+                    artifact_evidence(DiagnosticArtifact::MusicLibraryCopy),
+                )
+                .await;
                 self.fail_job(
                     job_id,
                     "The independent Music copy could not be verified; retry is available.",
@@ -2153,6 +2315,15 @@ impl MusicManager {
                 "completed cleanup proof no longer matches the content catalog"
             )),
         };
+        if let Err(error) = &cleanup_result {
+            self.record_diagnostic(
+                job_id,
+                DiagnosticStage::StagingCleanup,
+                error,
+                artifact_evidence(DiagnosticArtifact::PreparedCopy),
+            )
+            .await;
+        }
         if cleanup_result.is_ok() {
             if self
                 .store
@@ -2189,6 +2360,40 @@ impl MusicManager {
             tracing::warn!(job_id = %job_id, "Music staging cleanup failed; retry scheduled");
         }
         true
+    }
+
+    async fn record_diagnostic(
+        &self,
+        job_id: &str,
+        stage: DiagnosticStage,
+        error: &anyhow::Error,
+        evidence: Option<DiagnosticEvidence>,
+    ) {
+        let record = match DiagnosticRecord::capture(job_id, stage, error, evidence) {
+            Ok(record) => record,
+            Err(_) => {
+                tracing::warn!(
+                    job_id,
+                    ?stage,
+                    "Music diagnostic record could not be captured"
+                );
+                return;
+            }
+        };
+        let fallback = record.clone();
+        let state_dir = self.settings.state_dir.clone();
+        let provider = Arc::clone(&self.store.provider);
+        if run_blocking(move || {
+            crate::music_diagnostics::record_failure(&state_dir, provider.as_ref(), record)
+        })
+        .await
+        .is_err()
+        {
+            // The record is already bounded/redacted. Persistence is optional: preserve the
+            // primary job outcome and retain its safe cause in the existing process log.
+            tracing::warn!(job_id, ?stage, error_chain = ?fallback.error_chain,
+                "Music failure diagnostic persistence failed");
+        }
     }
 
     async fn fail_job(&self, job_id: &str, safe_message: &str) {
