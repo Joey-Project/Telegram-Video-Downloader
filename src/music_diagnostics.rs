@@ -557,10 +557,12 @@ fn bound_record(record: &mut DiagnosticRecord) -> Result<()> {
 }
 
 fn redact_error_text(text: &str) -> String {
-    let text = redact_sensitive_text(text);
+    // Redact filesystem paths before any URL or credential helper can split a
+    // space-containing path and leave a suffix such as `Collection/song.m4a`.
+    let text = redact_absolute_paths(text);
+    let text = redact_sensitive_text(&text);
     let text = redact_urls(&text);
     let text = redact_sensitive_fields(&text);
-    let text = redact_absolute_paths(&text);
     let text = redact_email_addresses(&text);
     truncate_utf8(text.trim(), MAX_CAUSE_BYTES).to_owned()
 }
@@ -645,29 +647,30 @@ fn redact_absolute_paths(text: &str) -> String {
         let at_boundary = index == 0
             || text[..index].chars().next_back().is_some_and(|character| {
                 character.is_ascii_whitespace()
-                    || matches!(character, '=' | ':' | '(' | '[' | '{' | '"' | '\'')
+                    || matches!(
+                        character,
+                        '=' | ':' | '(' | '[' | '{' | '"' | '\'' | ',' | ';' | '<' | '>'
+                    )
             });
-        if !at_boundary || !remaining.starts_with('/') {
+        let is_absolute_path = remaining.starts_with('/') || remaining.starts_with("~/");
+        if !at_boundary || !is_absolute_path {
             let character = remaining.chars().next().expect("index is in bounds");
             output.push(character);
             index += character.len_utf8();
             continue;
         }
-        let end = remaining
-            .char_indices()
-            .find(|(_, character)| {
-                character.is_ascii_whitespace()
-                    || matches!(character, ')' | ']' | '}' | '"' | '\'' | ',' | ';')
-            })
-            .map_or(text.len(), |(offset, _)| index + offset);
-        let candidate = &remaining[..end - index];
-        if candidate.contains('/') && candidate.len() > 1 {
-            output.push_str("<redacted path>");
-            index = end;
-        } else {
-            output.push('/');
-            index += 1;
+        if output
+            .chars()
+            .last()
+            .is_some_and(|character| matches!(character, '"' | '\''))
+        {
+            output.pop();
         }
+        // Filenames can contain spaces, punctuation and newlines. Once an
+        // absolute path begins, the rest of this anyhow cause is optional
+        // diagnostic text and is conservatively discarded as well.
+        output.push_str("<redacted path and remaining cause text>");
+        break;
     }
     output
 }
@@ -781,22 +784,20 @@ mod tests {
     fn capture_redacts_urls_paths_credentials_and_addresses_but_keeps_error_context() {
         const SYNTHETIC_ACCESS_TOKEN: &str = "codex_synth_v1_access_a"; // synthetic-token-fixtures: joey-private-v3 / access-a, active
         let error = anyhow!(
-            "Music copy verification failed at /Users/alice/Music/song.m4a; contact alice@example.test; token={SYNTHETIC_ACCESS_TOKEN}; account=12345; endpoint https://music.example/private?id=987"
+            "Music query failed; contact alice@example.test; token={SYNTHETIC_ACCESS_TOKEN}; account=12345; endpoint https://music.example/private?id=987"
         )
         .context("source copy could not be confirmed");
         let record = DiagnosticRecord::capture(
             "mjl1-abcdefabcdefabcdefabcdef",
-            DiagnosticStage::MusicCopyVerification,
+            DiagnosticStage::MusicQuery,
             &error,
             None,
         )
         .expect("safe job ID should be accepted");
         let encoded = serde_json::to_string(&record).expect("record should serialize");
         assert!(encoded.contains("source copy could not be confirmed"));
-        assert!(encoded.contains("Music copy verification failed"));
+        assert!(encoded.contains("Music query failed"));
         for forbidden in [
-            "/Users/alice",
-            "song.m4a",
             SYNTHETIC_ACCESS_TOKEN,
             "12345",
             "alice@example.test",
@@ -987,9 +988,57 @@ mod tests {
         );
         assert_eq!(
             redact_absolute_paths("failed at /private/tmp/secret/file"),
-            "failed at <redacted path>"
+            "failed at <redacted path and remaining cause text>"
         );
         let text = "ééé";
         assert_eq!(truncate_utf8(text, 3), "é");
+    }
+
+    #[test]
+    fn error_redaction_removes_complete_spaced_quoted_escaped_and_file_uri_paths() {
+        let native_error = anyhow!("source access failed").context(format!(
+            "inspect retained audio {}",
+            Path::new("/Users/alice/Music/Private Collection/song.m4a").display()
+        ));
+        let record = DiagnosticRecord::capture(
+            "mjl1-abcdefabcdefabcdefabcdef",
+            DiagnosticStage::SourceValidation,
+            &native_error,
+            None,
+        )
+        .expect("safe native error should be captured");
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(
+            encoded.contains("inspect retained audio <redacted path and remaining cause text>")
+        );
+        assert!(encoded.contains("source access failed"));
+        for private_component in ["/Users/alice", "Private Collection", "song.m4a"] {
+            assert!(
+                !encoded.contains(private_component),
+                "diagnostic exposed {private_component}"
+            );
+        }
+
+        for input in [
+            "inspect '/Users/alice/Music/Private Collection/song.m4a' then retry",
+            "inspect /Users/alice/Music/Private\\ Collection/song.m4a\nnext cause with details",
+            "inspect file:///Users/alice/Music/Private Collection/song.m4a; errno 13",
+        ] {
+            let redacted = redact_error_text(input);
+            assert!(redacted.starts_with("inspect "));
+            assert!(redacted.contains("<redacted path and remaining cause text>"));
+            for private_component in [
+                "/Users/alice",
+                "Private Collection",
+                "song.m4a",
+                "next cause",
+                "errno 13",
+            ] {
+                assert!(
+                    !redacted.contains(private_component),
+                    "redacted text exposed {private_component}: {redacted}"
+                );
+            }
+        }
     }
 }

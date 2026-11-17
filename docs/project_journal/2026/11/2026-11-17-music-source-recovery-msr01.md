@@ -30,6 +30,10 @@ superseded_by: ""
   stage, error chain and optional digest/size evidence. The writer rejects
   invalid or replaced control files and uses a nonblocking writer lock.
   Diagnostic errors never replace the primary failed-job state or user message.
+- Path redaction runs before other text transformations. Once an absolute or
+  home-relative path starts, it conservatively removes the remaining cause,
+  including spaces, punctuation and newlines. Separate anyhow causes preserve
+  useful error details without leaking a filename suffix to fallback logs.
 - `--music-recover-local-source` previews or explicitly applies one approved
   old/new digest and size for a failed local job without a prior add intent,
   Music ID, prepared audio or archive. It requires the same filesystem binding,
@@ -60,3 +64,7 @@ superseded_by: ""
 - Strict `cargo clippy --locked --workspace --all-targets -- -D warnings`,
   `cargo fmt --all --check`, diff whitespace and project-journal validation
   passed. No real Music imports or torrent mutations are part of these tests.
+- After the path-redaction repair, all 138 Music-related cases and strict
+  workspace/all-target Clippy passed again. Native-format path contexts, quoted
+  and escaped paths, file URIs and newline suffixes have dedicated coverage
+  (`music-recovery-path-final-tests-1794911597037442000.log`).
