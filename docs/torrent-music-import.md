@@ -67,6 +67,56 @@ payload is left alone. A replacement at the same path does not automatically
 replace the saved source proof; retry only after restoring a source that still
 matches that proof.
 
+## Diagnosing and recovering changed sources
+
+Source admission compares two complete SHA-256 passes on the same bound file
+handle. If the bytes differ, it retries that pair once; ongoing writes fail
+closed. Device/inode, size and rooted path checks still reject replacement or
+redirection. Harmless metadata-only changes do not invalidate stable content.
+Later snapshot copying independently verifies the admitted digest, so a file
+that changes after admission remains a failure rather than an automatic update.
+
+Pipeline failures retain bounded, redacted error chains and typed stages in
+`<music.state_dir>/diagnostics/failures.json`. The private journal retains at most
+512 events and 4 MiB. It redacts absolute paths, URLs and credential-like values; hash
+prefixes and expected/observed values can distinguish content changes from I/O
+or identity failures. Diagnostic persistence is best-effort and cannot replace
+the original job outcome. An unavailable or invalid journal is preserved, with
+a bounded redacted fallback in the bot log. User-facing errors remain generic.
+
+An operator can explicitly approve fresh bytes for one failed local-source job
+that has never attempted a Music add. Stop the bot first so its durable owner
+lock is free, independently verify the intended current file, then create an
+absolute-path, user-owned mode-0600 request file:
+
+```json
+{
+  "schema_version": 1,
+  "job_id": "FAILED_LOCAL_JOB_ID",
+  "expected_old_sha256": "OLD_64_HEX_DIGEST_FROM_JOB",
+  "expected_new_sha256": "APPROVED_CURRENT_64_HEX_DIGEST",
+  "expected_size": 12345,
+  "accept_source_change": true
+}
+```
+
+Preview before applying:
+
+```sh
+telegram-video-downloader --music-recover-local-source /absolute/config.toml /absolute/recovery.json
+telegram-video-downloader --music-recover-local-source /absolute/config.toml /absolute/recovery.json --apply
+```
+
+Both commands require the original object identity and size, then recapture and
+validate the explicitly approved current digest. Preview does not rewrite state.
+Apply atomically updates only the selected source proof and queues that job;
+attempts, retained staging,
+status references and other jobs remain intact. The commands do not start a
+worker, call Music or send Telegram messages. Restarting the normal signed bot
+processes the queued job through normal deduplication and import checks. Jobs
+with an add intent, Music ID, prepared audio or archive are outside this recovery
+boundary; do not delete that evidence or manually rewrite a proof to bypass it.
+
 ## Configuration
 
 The feature is disabled by default. Enable it in the existing private bot config:
