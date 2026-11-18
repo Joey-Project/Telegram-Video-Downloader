@@ -11,7 +11,7 @@ import {
 } from "../public/file/file-preview-identity.js";
 
 const LIBRARY_ID = "library-shared-path-id";
-const ROOT_A = `v1:${"a".repeat(64)}`;
+const ROOT_A = `v2:${"a".repeat(64)}`;
 const ROOT_B = `v1:${"b".repeat(64)}`;
 
 function snapshot(rootBinding: string) {
@@ -61,6 +61,19 @@ describe("file preview root identity", () => {
     const queuedMetadata = createFileQueuedAction("file_preview", metadata, "metadata-request", 1_800_000_000_002);
     expect(fileActionRequestBody(queuedMove).payload).toMatchObject({ library_id: LIBRARY_ID, root_binding: ROOT_A });
     expect(fileActionRequestBody(queuedMetadata).payload).toMatchObject({ library_id: LIBRARY_ID, root_binding: ROOT_A });
+  });
+
+  it("keeps accepting the legacy v1 binding and rejects a non-exact token", () => {
+    expect(buildFilePreviewPayloadFromRenderedOption({
+      ownerSnapshot: snapshot(ROOT_B),
+      libraryOption: option(ROOT_B),
+      fields: { item_ids: ["item-a"], target_relative_dir: "Films" },
+    })).toMatchObject({ library_id: LIBRARY_ID, root_binding: ROOT_B });
+    expect(buildFilePreviewPayloadFromRenderedOption({
+      ownerSnapshot: snapshot(`${ROOT_A}\n`),
+      libraryOption: option(`${ROOT_A}\n`),
+      fields: { item_ids: ["item-a"], target_relative_dir: "Films" },
+    })).toBeNull();
   });
 
   it("refuses to upgrade a displayed A identity or metadata draft to same-ID replacement B", () => {
@@ -178,6 +191,7 @@ describe("file preview root identity", () => {
     expect(fileOperationIdentityMatches(snapshot(ROOT_B), valid, LIBRARY_ID)).toBe(false);
     expect(fileOperationIdentityMatches(current, { kind: "file_preview", result: { library_id: LIBRARY_ID, preview: { items: [] } } }, LIBRARY_ID)).toBe(false);
     expect(fileOperationIdentityMatches(current, { kind: "file_preview", result: { library_id: LIBRARY_ID, root_binding: "bad" } }, LIBRARY_ID)).toBe(false);
+    expect(fileOperationIdentityMatches(current, { kind: "file_preview", result: { library_id: LIBRARY_ID, root_binding: `${ROOT_A}\n` } }, LIBRARY_ID)).toBe(false);
     expect(fileOperationIdentityMatches(current, {
       kind: "file_preview",
       library_id: LIBRARY_ID,

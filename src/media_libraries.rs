@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -28,35 +29,37 @@ pub struct MediaLibrary {
     #[serde(default)]
     pub default_category: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    root_device: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    root_inode: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     registration_nonce: Option<String>,
 }
 
 impl MediaLibrary {
-    /// Return a stable opaque token for this registration and its root directory object.
+    /// Return a stable opaque token for this registration's absolute root path.
     ///
-    /// New registrations also bind a persisted registration nonce, distinguishing a removed
-    /// registration from a later registration of the same path and directory object. Legacy
-    /// entries without a nonce retain the original token calculation. Child entries, timestamps,
-    /// display names, categories, and the selected default are not part of the token.
+    /// New registrations include a persisted nonce, distinguishing a removed registration from
+    /// a later registration of the same path. Legacy entries without a nonce remain path-bound.
+    /// Device/inode values, child entries, timestamps, display names, categories, and the selected
+    /// default are not part of the token.
     pub fn root_binding_token(&self) -> Option<String> {
-        let (device, inode) = self.root_device.zip(self.root_inode)?;
+        if !self.root.is_absolute() {
+            return None;
+        }
         let library_id = self.id.as_bytes();
+        let root = self.root.as_os_str().as_encoded_bytes();
         let mut digest = Sha256::new();
-        digest.update(b"telegram-video-downloader/media-library-root-binding/v1\0");
+        digest.update(b"telegram-video-downloader/media-library-root-binding/v2\0");
         digest.update((library_id.len() as u64).to_be_bytes());
         digest.update(library_id);
-        digest.update(device.to_be_bytes());
-        digest.update(inode.to_be_bytes());
+        digest.update((root.len() as u64).to_be_bytes());
+        digest.update(root);
         if let Some(nonce) = &self.registration_nonce {
             digest.update(b"registration-incarnation/v1\0");
+            digest.update((nonce.len() as u64).to_be_bytes());
             digest.update(nonce.as_bytes());
+        } else {
+            digest.update(b"legacy-registration-without-nonce\0");
         }
         let digest = digest.finalize();
-        Some(format!("v1:{}", hex_prefix(&digest, 64)))
+        Some(format!("v2:{}", hex_prefix(&digest, 64)))
     }
 }
 
@@ -257,6 +260,7 @@ pub(crate) struct MediaLibraryRegistryStore {
     fs: RootedFs,
     path: PathBuf,
     snapshot: MediaLibrarySnapshot,
+    root_bindings: HashMap<String, (u64, u64)>,
     applied_migration_defaults: Vec<String>,
     skipped_migration_defaults: Vec<String>,
     archived_migration_default_count: usize,
@@ -349,6 +353,7 @@ impl MediaLibraryRegistryStore {
             fs: rooted,
             path,
             snapshot,
+            root_bindings: HashMap::new(),
             applied_migration_defaults,
             skipped_migration_defaults,
             archived_migration_default_count,
@@ -384,42 +389,23 @@ impl MediaLibraryRegistryStore {
     }
 
     pub(crate) fn root_binding(&self, id: &str) -> Option<(u64, u64)> {
-        let library = self.library(id)?;
-        Some((library.root_device?, library.root_inode?))
+        self.root_bindings.get(id).copied()
     }
 
-    /// Adopt a previously unbound legacy root after QueueManager has opened and validated its
-    /// coordinated directory and queue state. A recorded binding is never silently replaced.
+    /// Bind the current process to the opened directory object for a registered root path.
+    /// This live tuple is intentionally never persisted; a later process resolves the registered
+    /// path again and establishes a fresh session binding.
     pub(crate) fn bind_root_identity(&mut self, id: &str, device: u64, inode: u64) -> Result<()> {
-        let library = self
-            .library(id)
-            .ok_or_else(|| anyhow!("unknown media library {id}"))?;
-        match (library.root_device, library.root_inode) {
-            (Some(existing_device), Some(existing_inode))
-                if (existing_device, existing_inode) == (device, inode) =>
-            {
-                return Ok(());
-            }
-            (Some(_), Some(_)) => {
-                bail!("media library root object identity changed; it remains unavailable")
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                bail!("media library root identity binding is incomplete")
-            }
-            (None, None) => {}
+        if self.library(id).is_none() {
+            bail!("unknown media library {id}");
         }
-
-        let mut next = self.snapshot.clone();
-        let library = next
-            .libraries
-            .iter_mut()
-            .find(|library| library.id == id)
-            .expect("library was found above");
-        library.root_device = Some(device);
-        library.root_inode = Some(inode);
-        validate_registry_shape(&next)?;
-        self.write_registry_snapshot(&next, None)?;
-        self.snapshot = next;
+        if let Some((existing_device, existing_inode)) = self.root_bindings.get(id) {
+            if (*existing_device, *existing_inode) != (device, inode) {
+                bail!("media library root object changed during this process session");
+            }
+            return Ok(());
+        }
+        self.root_bindings.insert(id.to_string(), (device, inode));
         Ok(())
     }
 
@@ -485,16 +471,11 @@ impl MediaLibraryRegistryStore {
             })
             .cloned()
         {
-            match (existing.root_device, existing.root_inode) {
-                (Some(device), Some(inode))
-                    if (device, inode) == (root_id.device(), root_id.inode()) => {}
-                (Some(_), Some(_)) => {
-                    bail!("registered media library path now names a different root object");
-                }
-                (None, None) => {}
-                (Some(_), None) | (None, Some(_)) => {
-                    bail!("registered media library root identity binding is incomplete");
-                }
+            if self
+                .root_binding(&existing.id)
+                .is_some_and(|binding| binding != (root_id.device(), root_id.inode()))
+            {
+                bail!("registered media library root changed during this process session");
             }
             if existing.name != name || existing.default_category != category {
                 bail!(
@@ -505,19 +486,11 @@ impl MediaLibraryRegistryStore {
 
             self.ensure_root_path_matches_identity(&canonical_root, root_id)?;
             let mut next = self.snapshot.clone();
-            let registered = next
-                .libraries
-                .iter_mut()
-                .find(|library| library.id == existing.id)
-                .expect("existing library remains registered");
-            registered.root_device = Some(root_id.device());
-            registered.root_inode = Some(root_id.inode());
             let default_changed = set_default
                 && (next.default_library_id != existing.id
                     || next.default_category != existing.default_category);
-            let binding_changed = (existing.root_device, existing.root_inode)
-                != (Some(root_id.device()), Some(root_id.inode()));
-            if !binding_changed && !default_changed {
+            if !default_changed {
+                self.bind_root_identity(&existing.id, root_id.device(), root_id.inode())?;
                 return Ok(existing);
             }
             if set_default {
@@ -534,6 +507,7 @@ impl MediaLibraryRegistryStore {
             validate_registry_shape(&next)?;
             self.write_registry_snapshot(&next, Some((&canonical_root, root_id)))?;
             self.snapshot = next;
+            self.bind_root_identity(&existing.id, root_id.device(), root_id.inode())?;
             return Ok(self
                 .library(&existing.id)
                 .expect("existing library remains registered")
@@ -560,9 +534,8 @@ impl MediaLibraryRegistryStore {
                     existing_path.display()
                 );
             }
-            if library
-                .root_device
-                .zip(library.root_inode)
+            if self
+                .root_binding(&library.id)
                 .is_some_and(|binding| binding == (root_id.device(), root_id.inode()))
                 || RootedFs::new(&existing_path)
                     .is_ok_and(|existing| existing.root_identity() == root_id)
@@ -577,8 +550,6 @@ impl MediaLibraryRegistryStore {
             name,
             root: canonical_root,
             default_category: category,
-            root_device: Some(root_id.device()),
-            root_inode: Some(root_id.inode()),
             registration_nonce: Some(new_registration_nonce()?),
         };
         if self.library(&library.id).is_some() {
@@ -591,6 +562,7 @@ impl MediaLibraryRegistryStore {
             next.default_category = library.default_category.clone();
         }
         self.commit_with_root_identity(next, &library.root, root_id)?;
+        self.bind_root_identity(&library.id, root_id.device(), root_id.inode())?;
         Ok(library)
     }
 
@@ -608,8 +580,8 @@ impl MediaLibraryRegistryStore {
 
     /// Validate a registration request before a caller creates the requested directory or
     /// initializes any queue state beneath it. Offline libraries remain overlap boundaries by
-    /// their stored absolute path, and their durable device/inode binding prevents re-registering
-    /// the same directory object at a relocated path.
+    /// their stored absolute path. Current-session directory bindings prevent re-registering an
+    /// already-opened directory object at a different path during the same process lifetime.
     pub(crate) fn preflight_add(
         &self,
         name: &str,
@@ -932,7 +904,9 @@ impl MediaLibraryRegistryStore {
         }
         let mut next = self.snapshot.clone();
         next.libraries.retain(|library| library.id != id);
-        self.commit(next)
+        let snapshot = self.commit(next)?;
+        self.root_bindings.remove(id);
+        Ok(snapshot)
     }
 
     fn commit(&mut self, mut next: MediaLibrarySnapshot) -> Result<MediaLibrarySnapshot> {
@@ -981,8 +955,8 @@ impl MediaLibraryRegistryStore {
         )?;
         if let Some((root_path, identity)) = root_identity {
             // This is deliberately the last pathname-based operation before the registry's
-            // atomic replacement. Persisted identity always comes from the prepared directory,
-            // never from a fresh identity read here.
+            // atomic replacement. The live tuple guards this registration operation only; it is
+            // not written into the registry.
             self.ensure_root_path_matches_identity(root_path, identity)?;
         }
         write_private_registry_bytes(&self.fs, &self.path, &bytes)
@@ -1077,9 +1051,6 @@ fn validate_registry_shape(snapshot: &MediaLibrarySnapshot) -> Result<()> {
     for library in &snapshot.libraries {
         if library.id.trim().is_empty() || !ids.insert(library.id.as_str()) {
             bail!("media library settings contains an empty or duplicate identifier");
-        }
-        if library.root_device.is_some() != library.root_inode.is_some() {
-            bail!("media library settings contains an incomplete root identity binding");
         }
         if library.registration_nonce.as_ref().is_some_and(|nonce| {
             nonce.len() != 32
@@ -1180,10 +1151,6 @@ fn library_from_existing_root(
         name,
         root: stored_root,
         default_category: category,
-        // The coordinated queue open adopts the legacy root's inode binding after the
-        // File Provider has supplied its authoritative directory descriptor.
-        root_device: None,
-        root_inode: None,
         registration_nonce: None,
     })
 }
@@ -1946,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn root_identity_binding_persists_and_rejects_replacement() {
+    fn root_identity_binding_is_session_scoped_and_rejects_replacement() {
         let directory = test_dir("root-binding");
         let root = directory.join("videos");
         fs::create_dir_all(&root).unwrap();
@@ -1967,15 +1934,38 @@ mod tests {
                 .is_err()
         );
 
-        let reopened = MediaLibraryRegistryStore::open(None, &root).unwrap();
-        assert_eq!(
-            reopened.root_binding(&library_id),
-            Some((identity.device(), identity.inode()))
+        let registry_path = registry.registry_path().to_path_buf();
+        let mut legacy_document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        let library = legacy_document["libraries"][0]
+            .as_object_mut()
+            .expect("registry library should be an object");
+        library.insert(
+            "root_device".to_string(),
+            serde_json::json!(identity.device()),
+        );
+        library.insert(
+            "root_inode".to_string(),
+            serde_json::json!(identity.inode()),
+        );
+        fs::write(
+            &registry_path,
+            serde_json::to_vec(&legacy_document).unwrap(),
+        )
+        .unwrap();
+
+        let mut reopened = MediaLibraryRegistryStore::open(None, &root).unwrap();
+        assert_eq!(reopened.root_binding(&library_id), None);
+        assert!(
+            reopened
+                .bind_root_identity(&library_id, identity.device() + 1, identity.inode() + 1)
+                .is_ok(),
+            "legacy serialized object identity must not constrain a new process session"
         );
     }
 
     #[test]
-    fn legacy_root_binding_token_tracks_persisted_object_identity_only() {
+    fn root_binding_token_tracks_registered_path_and_registration_nonce() {
         let directory = test_dir("root-binding-token");
         let root = directory.join("videos");
         let moved_original = directory.join("videos-original");
@@ -1983,12 +1973,6 @@ mod tests {
         fs::create_dir_all(&category).unwrap();
         let mut registry = MediaLibraryRegistryStore::open(None, &root).unwrap();
         let library_id = registry.snapshot().default_library_id;
-        assert_eq!(
-            registry.library(&library_id).unwrap().root_binding_token(),
-            None,
-            "legacy registrations stay explicitly unbound until QueueManager adopts identity"
-        );
-
         let identity = RootedFs::new(&root).unwrap().root_identity();
         registry
             .bind_root_identity(&library_id, identity.device(), identity.inode())
@@ -1999,7 +1983,7 @@ mod tests {
             .root_binding_token()
             .unwrap();
         assert_eq!(original_token.len(), 67);
-        assert!(original_token.starts_with("v1:"));
+        assert!(original_token.starts_with("v2:"));
         assert!(
             original_token[3..]
                 .bytes()
@@ -2042,13 +2026,24 @@ mod tests {
             (identity.device(), identity.inode()),
             "the live replacement must be a different directory object"
         );
-        let mut replacement_registration = reopened.library(&library_id).unwrap().clone();
-        replacement_registration.root_device = Some(replacement_identity.device());
-        replacement_registration.root_inode = Some(replacement_identity.inode());
-        assert_ne!(
-            replacement_registration.root_binding_token().as_deref(),
+        assert_eq!(
+            reopened
+                .library(&library_id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
             Some(original_token.as_str()),
-            "a registration rebound to a same-path replacement gets a different token"
+            "a same-path root replacement does not change registered path identity"
+        );
+        assert!(
+            registry
+                .bind_root_identity(
+                    &library_id,
+                    replacement_identity.device(),
+                    replacement_identity.inode()
+                )
+                .is_err(),
+            "replacement during the same process session is rejected"
         );
 
         fs::remove_dir(&root).unwrap();

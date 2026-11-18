@@ -1574,7 +1574,7 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
 
 fn valid_root_binding_token(value: &str) -> bool {
     value.len() == 67
-        && value.starts_with("v1:")
+        && (value.starts_with("v1:") || value.starts_with("v2:"))
         && value[3..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -3555,6 +3555,45 @@ mod tests {
             2 * 1024 * 1024
         );
         assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn path_binding_v2_preview_survives_replay_and_cloud_compaction() {
+        let binding = TEST_ROOT_BINDING.replacen("v1:", "v2:", 1);
+        let mut receipt = file_preview_with_request(
+            32,
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-path-bound",
+                "revision": "revision-path-bound",
+                "library_id": "ml-source-root",
+                "root_binding": binding,
+                "preview": {"items": "x".repeat(2 * 1024 * 1024)},
+            })),
+            json!("action:path-binding-preview"),
+        );
+        receipt.request.payload["root_binding"] = json!(binding);
+        let persisted = serde_json::to_vec(&receipt).expect("receipt should persist");
+        let reopened: InboxRecord =
+            serde_json::from_slice(&persisted).expect("receipt should replay");
+        let operations =
+            operation_snapshots(&[&reopened]).expect("compacted operations should fit");
+        assert_eq!(operations[0]["result"]["root_binding"], binding);
+        assert_eq!(operations[0]["details_incomplete"], true);
+        let previews = preview_snapshots(&[&reopened], 0);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["root_binding"], binding);
+
+        let mut unsupported = reopened;
+        let unsupported_binding = binding.replacen("v2:", "v3:", 1);
+        unsupported.request.payload["root_binding"] = json!(unsupported_binding);
+        unsupported.result.as_mut().unwrap()["root_binding"] = json!(unsupported_binding);
+        let unsupported_previews = preview_snapshots(&[&unsupported], 0);
+        assert_eq!(unsupported_previews.len(), 1);
+        assert_eq!(unsupported_previews[0]["preview_incomplete"], true);
+        assert_eq!(unsupported_previews[0]["omitted_count"], 1);
+        assert!(unsupported_previews[0].get("preview_id").is_none());
+        assert!(unsupported_previews[0].get("root_binding").is_none());
     }
 
     #[test]

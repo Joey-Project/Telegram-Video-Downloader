@@ -4,13 +4,20 @@ import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDraf
 const library = (overrides: Record<string, unknown> = {}) => ({
   id: "archive",
   root: "/Volumes/Archive",
-  root_binding: `v1:${"a".repeat(64)}`,
+  root_binding: `v2:${"a".repeat(64)}`,
   name: "Archive",
   default_category: "Films",
   ...overrides,
 });
 
 describe("settings library field drafts", () => {
+  it("accepts exact v1 and v2 registration bindings", () => {
+    for (const rootBinding of [`v1:${"b".repeat(64)}`, `v2:${"c".repeat(64)}`]) {
+      const drafts = new Map();
+      expect(setLibraryDraftField(drafts, library({ root_binding: rootBinding }), "name", "Draft")).toBe(true);
+    }
+  });
+
   it("lets clean fields follow snapshots while preserving only dirty fields", () => {
     const drafts = new Map();
     const initial = library();
@@ -57,14 +64,20 @@ describe("settings library field drafts", () => {
     setLibraryDraftField(drafts, original, "name", "Draft from a bound library");
     const legacy = library({ root_binding: undefined });
     const malformed = library({ root_binding: `v1:${"A".repeat(64)}` });
+    const wrongVersion = library({ root_binding: `v3:${"a".repeat(64)}` });
+    const trailingData = library({ root_binding: `${library().root_binding}\n` });
 
     expect(libraryDraftFieldValue(drafts, legacy, "name")).toBe("Archive");
     reconcileLibraryDrafts(drafts, [legacy]);
     expect(drafts.size).toBe(0);
     expect(setLibraryDraftField(drafts, legacy, "name", "Legacy draft")).toBe(false);
     expect(setLibraryDraftField(drafts, malformed, "name", "Malformed draft")).toBe(false);
+    expect(setLibraryDraftField(drafts, wrongVersion, "name", "Wrong version")).toBe(false);
+    expect(setLibraryDraftField(drafts, trailingData, "name", "Trailing data")).toBe(false);
     expect(libraryDraftFieldValue(drafts, legacy, "name")).toBe("Archive");
     expect(libraryDraftFieldValue(drafts, malformed, "name")).toBe("Archive");
+    expect(libraryDraftFieldValue(drafts, wrongVersion, "name")).toBe("Archive");
+    expect(libraryDraftFieldValue(drafts, trailingData, "name")).toBe("Archive");
     expect(drafts.size).toBe(0);
   });
 

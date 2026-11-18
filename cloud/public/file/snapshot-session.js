@@ -48,7 +48,7 @@ function hasInvalidRootBinding(entry) {
 }
 
 function validRootBinding(value) {
-  return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
+  return typeof value === "string" && /^v[12]:[0-9a-f]{64}(?![\s\S])/u.test(value);
 }
 
 function withCurrentLibraryIdentity(entry, current) {

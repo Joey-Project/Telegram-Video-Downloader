@@ -9,7 +9,7 @@ import { isIncompletePreview, isPreviewDetailsAvailable } from "../public/file/s
 const PREVIEW_ID = "file-preview-large";
 const REVISION = "file-preview-r1";
 const LIBRARY_ID = "main-library";
-const ROOT_BINDING = `v1:${"a".repeat(64)}`;
+const ROOT_BINDING = `v2:${"a".repeat(64)}`;
 
 function compactPreview(): Record<string, any> {
   return {
@@ -109,6 +109,24 @@ describe("compact file preview summaries", () => {
       preview: entry.result.preview,
       status: "awaiting_confirmation",
     })).toBe(false);
+  });
+
+  it("accepts both exact binding versions and rejects malformed tokens", () => {
+    for (const rootBinding of [`v1:${"b".repeat(64)}`, ROOT_BINDING]) {
+      const entry = operation();
+      entry.root_binding = rootBinding;
+      entry.result.root_binding = rootBinding;
+      entry.result.preview.root_binding = rootBinding;
+      expect(normalizeFilePreviewSummary(entry)?.rootBinding).toBe(rootBinding);
+    }
+
+    for (const rootBinding of [`v3:${"a".repeat(64)}`, `v2:${"A".repeat(64)}`, `${ROOT_BINDING}\n`]) {
+      const entry = operation();
+      entry.root_binding = rootBinding;
+      entry.result.root_binding = rootBinding;
+      entry.result.preview.root_binding = rootBinding;
+      expect(normalizeFilePreviewSummary(entry)).toBeNull();
+    }
   });
 
   it.each([

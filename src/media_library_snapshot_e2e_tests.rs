@@ -2042,7 +2042,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         .to_string();
     assert_eq!(old_binding, archive_binding);
     assert_eq!(old_binding.len(), 67);
-    assert!(old_binding.starts_with("v1:"));
+    assert!(old_binding.starts_with("v2:"));
     assert!(
         old_binding[3..]
             .bytes()
