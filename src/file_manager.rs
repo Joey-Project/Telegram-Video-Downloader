@@ -4110,11 +4110,6 @@ impl LibraryManager {
             target_name_semantics(&directory)
                 .context("filesystem name semantics unavailable for attachment matching")
         })?;
-        let requested_stem = if rename {
-            standard_media_stem(item)
-        } else {
-            primary_stem.to_string()
-        };
         let mut planned_sources = Vec::with_capacity(source_paths.len());
         let mut longest_filename_tail = 0;
         for source_rel in &source_paths {
@@ -4139,7 +4134,12 @@ impl LibraryManager {
             }
             planned_sources.push((source_abs, suffix));
         }
-        let target_stem = budgeted_group_stem(&requested_stem, longest_filename_tail, "", rename)?;
+        let requested_stem = if rename {
+            standard_media_stem(item, longest_filename_tail, "")?
+        } else {
+            primary_stem.to_string()
+        };
+        let target_stem = budgeted_group_stem(&requested_stem, longest_filename_tail, "", false)?;
         let base_target = target_dir.join(file_name_with_stem(&primary, &target_stem, "")?);
         let targets_for =
             |primary_target: &Path, keep_both_suffix: Option<&str>| -> Result<Vec<String>> {
@@ -4199,12 +4199,16 @@ impl LibraryManager {
             let mut found = false;
             for suffix in 2..=10_000 {
                 let keep_both_suffix = format!(" ({suffix})");
-                let candidate_stem = budgeted_group_stem(
-                    &requested_stem,
-                    longest_filename_tail,
-                    &keep_both_suffix,
-                    true,
-                )?;
+                let candidate_stem = if rename {
+                    standard_media_stem(item, longest_filename_tail, &keep_both_suffix)?
+                } else {
+                    budgeted_group_stem(
+                        &requested_stem,
+                        longest_filename_tail,
+                        &keep_both_suffix,
+                        true,
+                    )?
+                };
                 let name = file_name_with_stem(&primary, &candidate_stem, "")?;
                 candidate = parent.join(name);
                 targets = targets_for(&candidate, Some(&keep_both_suffix))?;
@@ -7676,42 +7680,34 @@ fn safe_file_stem(title: &str) -> String {
     }
 }
 
-fn standard_media_stem(item: &LibraryItem) -> String {
-    let mut pieces = Vec::new();
-    if let Some(collection) = &item.collection {
-        if !collection.title.trim().is_empty() {
-            pieces.push(safe_file_stem(collection.title.trim()));
-        }
-        if let Some(order) = collection
+fn standard_media_stem(
+    item: &LibraryItem,
+    longest_filename_tail: usize,
+    keep_both_suffix: &str,
+) -> Result<String> {
+    let stem_budget = MAX_FILENAME_COMPONENT_BYTES
+        .checked_sub(longest_filename_tail)
+        .and_then(|budget| budget.checked_sub(keep_both_suffix.len()))
+        .ok_or_else(|| {
+            anyhow!(
+                "attachment suffix, extension, and KeepBoth suffix exceed the {MAX_FILENAME_COMPONENT_BYTES}-byte filename component limit"
+            )
+        })?;
+    let collection_order = item.collection.as_ref().and_then(|collection| {
+        collection
             .order
             .filter(|order| *order > 0)
             .or_else(|| collection.part_id.as_deref().and_then(part_ordinal))
-        {
-            pieces.push(format!("P{order:02}"));
-        }
-    }
-    pieces.push(safe_file_stem(&item.title));
-    if let Some(source_id) = item.source_ids.first() {
-        let id = safe_file_stem(source_id);
-        if !id.is_empty() {
-            pieces.push(format!("[{id}]"));
-        }
-    }
-    let mut specs = Vec::new();
-    if let Some(height) = item.height.filter(|height| *height > 0) {
-        specs.push(format!("{height}p"));
-    }
-    if let Some(codec) = item
-        .codec
-        .as_deref()
-        .filter(|codec| !codec.trim().is_empty())
-    {
-        specs.push(safe_file_stem(&codec.to_ascii_lowercase()));
-    }
-    if !specs.is_empty() {
-        pieces.push(format!("[{}]", specs.join(" ")));
-    }
-    safe_file_stem(&pieces.join(" - "))
+    });
+    crate::media_naming::standard_media_stem(
+        &item.title,
+        collection_order,
+        item.source_ids.first().map(String::as_str),
+        item.height,
+        item.codec.as_deref(),
+        stem_budget,
+        keep_both_suffix,
+    )
 }
 
 fn part_ordinal(part_id: &str) -> Option<u32> {
@@ -20031,13 +20027,13 @@ mod tests {
             series_preview
                 .items
                 .iter()
-                .any(|item| item.target_path.contains("P01 - Episode One"))
+                .any(|item| item.target_path.contains("P001 - Episode One"))
         );
         assert!(
             series_preview
                 .items
                 .iter()
-                .any(|item| item.target_path.contains("P02 - Episode Two"))
+                .any(|item| item.target_path.contains("P002 - Episode Two"))
         );
 
         let already_inside = manager
@@ -20063,7 +20059,7 @@ mod tests {
             multi_preview
                 .items
                 .iter()
-                .any(|item| item.target_path.contains("P01 - solo cid11")),
+                .any(|item| item.target_path.contains("P001 - solo cid11")),
             "multi-part preview targets: {:#?}",
             multi_preview
                 .items
@@ -20075,7 +20071,7 @@ mod tests {
             multi_preview
                 .items
                 .iter()
-                .any(|item| item.target_path.contains("P02 - solo cid22")),
+                .any(|item| item.target_path.contains("P002 - solo cid22")),
             "multi-part preview targets: {:#?}",
             multi_preview
                 .items
@@ -20251,8 +20247,8 @@ mod tests {
                 item.target_path
             );
             assert!(
-                item.target_path.contains("P01 - Episode One")
-                    || item.target_path.contains("P02 - Episode Two"),
+                item.target_path.contains("P001 - Episode One")
+                    || item.target_path.contains("P002 - Episode Two"),
                 "multi-part number should remain in the renamed media stem: {}",
                 item.target_path
             );
@@ -22581,7 +22577,7 @@ mod tests {
             .expect("long episode subtitle should write");
 
         fs::create_dir(root.path().join("Moved")).expect("target directory should create");
-        fs::write(root.path().join("Moved/bbbbbbbb.mp4"), b"existing target")
+        fs::write(root.path().join("Moved/bbbbb….mp4"), b"existing target")
             .expect("keep-both conflict target should write");
 
         let source_paths = [
@@ -22635,17 +22631,17 @@ mod tests {
             (
                 clip_preview,
                 [
-                    "Moved/界.mp4".to_string(),
-                    "Moved/界.nfo".to_string(),
-                    format!("Moved/界.{clip_qualifier}.srt"),
+                    "Moved/….mp4".to_string(),
+                    "Moved/….nfo".to_string(),
+                    format!("Moved/….{clip_qualifier}.srt"),
                 ],
             ),
             (
                 episode_preview,
                 [
-                    "Moved/bbbb (2).mp4".to_string(),
-                    "Moved/bbbb (2).nfo".to_string(),
-                    format!("Moved/bbbb (2).{episode_qualifier}.srt"),
+                    "Moved/b… (2).mp4".to_string(),
+                    "Moved/b… (2).nfo".to_string(),
+                    format!("Moved/b… (2).{episode_qualifier}.srt"),
                 ],
             ),
         ] {
@@ -22667,7 +22663,7 @@ mod tests {
             }));
         }
         assert_eq!(
-            Path::new(&format!("Moved/bbbb (2).{episode_qualifier}.srt"))
+            Path::new(&format!("Moved/b… (2).{episode_qualifier}.srt"))
                 .file_name()
                 .unwrap()
                 .to_str()
@@ -22702,7 +22698,7 @@ mod tests {
             }
         }
         assert_eq!(
-            fs::read(root.path().join("Moved/bbbbbbbb.mp4")).unwrap(),
+            fs::read(root.path().join("Moved/bbbbb….mp4")).unwrap(),
             b"existing target",
             "KeepBoth must leave the existing destination untouched"
         );
@@ -22712,17 +22708,17 @@ mod tests {
             .expect("renamed media and long sidecars should remain scannable");
         for (media_path, expected_attachments) in [
             (
-                "Moved/界.mp4",
+                "Moved/….mp4",
                 [
-                    "Moved/界.nfo".to_string(),
-                    format!("Moved/界.{clip_qualifier}.srt"),
+                    "Moved/….nfo".to_string(),
+                    format!("Moved/….{clip_qualifier}.srt"),
                 ],
             ),
             (
-                "Moved/bbbb (2).mp4",
+                "Moved/b… (2).mp4",
                 [
-                    "Moved/bbbb (2).nfo".to_string(),
-                    format!("Moved/bbbb (2).{episode_qualifier}.srt"),
+                    "Moved/b… (2).nfo".to_string(),
+                    format!("Moved/b… (2).{episode_qualifier}.srt"),
                 ],
             ),
         ] {
@@ -23042,11 +23038,8 @@ mod tests {
             physical_identity: None,
             presence: Presence::Present,
         };
-        let stem = standard_media_stem(&item);
-        assert_eq!(
-            stem,
-            "Series - P03 - Episode_ One - [BV1abcdefgh] - [1080p h264]"
-        );
+        let stem = standard_media_stem(&item, 0, "").expect("standard stem should fit");
+        assert_eq!(stem, "P003 - Episode_ One - [BV1abcdefgh] - [1080p h264]");
         assert_eq!(part_ordinal("P3"), Some(3));
         assert_eq!(part_ordinal("Part-3"), None);
 
@@ -23054,13 +23047,21 @@ mod tests {
             collection: None,
             ..item
         };
-        assert!(!standard_media_stem(&independent).contains("P03"));
+        assert!(
+            !standard_media_stem(&independent, 0, "")
+                .expect("standalone stem should fit")
+                .contains("P003")
+        );
 
         let youtube = LibraryItem {
             source_ids: vec!["youtube:abcdefghijk".to_string()],
             ..independent
         };
-        assert!(standard_media_stem(&youtube).contains("[youtube_abcdefghijk]"));
+        assert!(
+            standard_media_stem(&youtube, 0, "")
+                .expect("source ID should fit")
+                .contains("[youtube_abcdefghijk]")
+        );
     }
 
     #[test]

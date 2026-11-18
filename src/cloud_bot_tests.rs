@@ -3259,7 +3259,8 @@ async fn explicit_library_download_survives_default_change_mock_telegram_e2e() {
         "{:?}",
         completed.error
     );
-    let destination = archive.join("Documentaries/Library fixture [abcdefghijk].mkv");
+    let destination =
+        archive.join("Documentaries/Library fixture - [youtube_abcdefghijk] - [720p h264].mkv");
     assert_eq!(
         fs::read(&destination).unwrap(),
         b"synthetic media fixture\n"
@@ -3275,7 +3276,7 @@ async fn explicit_library_download_survives_default_change_mock_telegram_e2e() {
         !config
             .downloads
             .video_dir
-            .join("Library fixture [abcdefghijk].mkv")
+            .join("Library fixture - [youtube_abcdefghijk] - [720p h264].mkv")
             .exists()
     );
 
@@ -3480,14 +3481,15 @@ async fn queued_download_relocates_and_resumes_without_cancel_reply_mock_e2e() {
     .await
     .expect("relocated task should download to its new frozen root");
     assert_eq!(
-        fs::read(archive.join("Library fixture [abcdefghijk].mkv")).unwrap(),
+        fs::read(archive.join("Library fixture - [youtube_abcdefghijk] - [720p h264].mkv"))
+            .unwrap(),
         b"synthetic media fixture\n"
     );
     assert!(
         !config
             .downloads
             .video_dir
-            .join("Library fixture [abcdefghijk].mkv")
+            .join("Library fixture - [youtube_abcdefghijk] - [720p h264].mkv")
             .exists()
     );
     assert_eq!(

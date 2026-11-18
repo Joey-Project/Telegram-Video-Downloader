@@ -2179,7 +2179,7 @@ impl BilibiliEpisodeGroupInventory {
     fn collection_directory_snapshot(&self) -> BilibiliCollectionDirectorySnapshot {
         let directory_is_scoped = self.source == BilibiliGroupSource::Collection
             || (self.source == BilibiliGroupSource::Season
-                && self.collection_output_layout_version == Some(1));
+                && is_flat_bilibili_collection_layout(self.collection_output_layout_version));
         let (true, Some(path)) = (directory_is_scoped, &self.storage_relative_output_folder) else {
             return BilibiliCollectionDirectorySnapshot::Untracked;
         };
@@ -2201,7 +2201,7 @@ fn establish_bilibili_group_collection_directory(
 ) -> Result<()> {
     if inventory.source != BilibiliGroupSource::Collection
         && !(inventory.source == BilibiliGroupSource::Season
-            && inventory.collection_output_layout_version == Some(1))
+            && is_flat_bilibili_collection_layout(inventory.collection_output_layout_version))
     {
         return Ok(());
     }
@@ -2475,7 +2475,7 @@ async fn resolve_bilibili_episode_group_inventory(
                 source,
                 BilibiliGroupSource::Collection | BilibiliGroupSource::Season
             ) {
-            Some(1)
+            Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
         } else {
             None
         },
@@ -2993,10 +2993,10 @@ pub async fn run_bilibili_episode_group(
         progress.as_ref(),
         "Resolving Bilibili group inventory (metadata only)".to_string(),
     );
-    let flat_collection_layout = expected_plan
-        .as_ref()
-        .is_none_or(|plan| plan.bilibili_collection_output_layout_version == Some(1));
-    let inventory =
+    let flat_collection_layout = expected_plan.as_ref().is_none_or(|plan| {
+        is_flat_bilibili_collection_layout(plan.bilibili_collection_output_layout_version)
+    });
+    let mut inventory =
         match resolve_bilibili_episode_group_inventory(config, url, flat_collection_layout).await {
             Ok(inventory) => inventory,
             Err(error) => {
@@ -3004,6 +3004,14 @@ pub async fn run_bilibili_episode_group(
                 return Err(error);
             }
         };
+    if let Some(version) = expected_plan
+        .as_ref()
+        .and_then(|plan| plan.bilibili_collection_output_layout_version)
+        .filter(|version| is_flat_bilibili_collection_layout(Some(*version)))
+        && is_flat_bilibili_collection_layout(inventory.collection_output_layout_version)
+    {
+        inventory.collection_output_layout_version = Some(version);
+    }
 
     let options = match bilibili_core::download_options(config) {
         Ok(options) => options,
@@ -3022,10 +3030,9 @@ pub async fn run_bilibili_episode_group(
         interrupt_previous_bilibili_group(&previous, progress.as_ref());
         return Err(error);
     }
-    let mut inventory = inventory;
     if inventory.source == BilibiliGroupSource::Collection
         || (inventory.source == BilibiliGroupSource::Season
-            && inventory.collection_output_layout_version == Some(1))
+            && is_flat_bilibili_collection_layout(inventory.collection_output_layout_version))
     {
         let establish_result = async {
             let guard = video_output_lock(
@@ -3134,7 +3141,9 @@ async fn run_bilibili_episode_group_with_inventory(
                 .as_deref()
                 .context("Bilibili collection inventory omitted its selected output directory")?,
         ),
-        BilibiliGroupSource::Season if inventory.collection_output_layout_version == Some(1) => {
+        BilibiliGroupSource::Season
+            if is_flat_bilibili_collection_layout(inventory.collection_output_layout_version) =>
+        {
             Some(
                 inventory
                     .storage_relative_output_folder
@@ -4318,7 +4327,8 @@ fn bilibili_season_legacy_scope_fallback_enabled(
     inventory: &BilibiliEpisodeGroupInventory,
 ) -> bool {
     inventory.source == BilibiliGroupSource::Season
-        && inventory.collection_output_layout_version == Some(1)
+        && inventory.collection_output_layout_version
+            == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V1)
         && inventory.storage_relative_output_folder.is_some()
 }
 
@@ -4415,7 +4425,7 @@ async fn build_bilibili_group_identity_index(
 ) -> Result<Arc<tokio::sync::Mutex<VideoIdentityIndex>>> {
     let is_collection = inventory.source == BilibiliGroupSource::Collection
         || (inventory.source == BilibiliGroupSource::Season
-            && inventory.collection_output_layout_version == Some(1));
+            && is_flat_bilibili_collection_layout(inventory.collection_output_layout_version));
     let root_path = if is_collection {
         config.video_storage_root().to_path_buf()
     } else {
@@ -4493,28 +4503,29 @@ async fn execute_bilibili_group_entry(
     let (url, selection) =
         bilibili_group_child_url_selection(inventory.source, entry, collection_page)?;
     let child_job = JobRequest::Bilibili { url, selection };
-    let expected_entry =
-        BilibiliWorkerExpectedEntry {
-            index: entry.download.index,
-            part_index: collection_page.unwrap_or(1),
-            title: entry.download.title.clone(),
-            stable_media_id: entry.stable_media_id.clone(),
-            bilibili_publication_namespace: publication_namespace,
-            confirmed_streams,
-            output_template: inventory.output_template.clone(),
-            collection_output_folder: if inventory.source == BilibiliGroupSource::Collection
-                || (inventory.source == BilibiliGroupSource::Season
-                    && inventory.collection_output_layout_version == Some(1))
-            {
-                Some(inventory.storage_relative_output_folder.clone().context(
+    let expected_entry = BilibiliWorkerExpectedEntry {
+        index: entry.download.index,
+        part_index: collection_page.unwrap_or(1),
+        title: entry.download.title.clone(),
+        stable_media_id: entry.stable_media_id.clone(),
+        bilibili_publication_namespace: publication_namespace,
+        confirmed_streams,
+        output_template: inventory.output_template.clone(),
+        collection_output_folder: if inventory.source == BilibiliGroupSource::Collection
+            || (inventory.source == BilibiliGroupSource::Season
+                && is_flat_bilibili_collection_layout(inventory.collection_output_layout_version))
+        {
+            Some(
+                inventory.storage_relative_output_folder.clone().context(
                     "Bilibili collection inventory omitted its selected output directory",
-                )?)
-            } else {
-                None
-            },
-            collection_output_layout_version: inventory.collection_output_layout_version,
-            collection_directory: inventory.collection_directory_snapshot(),
-        };
+                )?,
+            )
+        } else {
+            None
+        },
+        collection_output_layout_version: inventory.collection_output_layout_version,
+        collection_directory: inventory.collection_directory_snapshot(),
+    };
     let child_media_profile = bilibili_group_entry_media_profile(
         &bilibili_group_media_profile(&bilibili_core::download_options(config)?, config),
         expected_entry.confirmed_streams.as_ref(),
@@ -5961,8 +5972,9 @@ async fn inspect_job_plan_inner(
                     snapshot = group_snapshot;
                 }
             }
-            if snapshot.bilibili_collection_output_layout_version
-                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+            if snapshot
+                .bilibili_collection_output_layout_version
+                .is_some_and(|version| is_flat_bilibili_collection_layout(Some(version)))
                 && snapshot.bilibili_pgc_season_id != pgc_season_id
             {
                 bail!(
@@ -6060,7 +6072,7 @@ fn bilibili_collection_artifact_validation_snapshot(
     ) {
         return Ok(None);
     }
-    if inventory.collection_output_layout_version != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+    if !is_flat_bilibili_collection_layout(inventory.collection_output_layout_version)
         || inventory.output_template.is_none()
         || inventory.collection_directory_snapshot()
             == BilibiliCollectionDirectorySnapshot::Untracked
@@ -6180,6 +6192,50 @@ fn bilibili_plan_stable_media_id(
         .map(|epid| epid.to_string())
         .unwrap_or_else(|| "none".to_string());
     format!("{media_id}:cid:{cid}:epid:{epid}")
+}
+
+fn bilibili_download_filename_stems(
+    plan: &BilibiliDownloadPlan,
+    filename_plan: &PlanValidationSnapshot,
+    expected_entry: Option<&BilibiliWorkerExpectedEntry>,
+    collection_download: bool,
+) -> Result<BTreeMap<u32, String>> {
+    let mut stems = BTreeMap::new();
+    for entry in &plan.entries {
+        let stable_id =
+            bilibili_plan_stable_media_id(entry.bvid.as_deref(), entry.aid, entry.cid, entry.epid);
+        if let Some(expected) = expected_entry.filter(|expected| expected.index == entry.index)
+            && expected.stable_media_id != stable_id
+        {
+            bail!("Bilibili naming identity changed before mux output reservation");
+        }
+        let (source_id, height, codec) = bilibili_collection_filename_identity(
+            &stable_id,
+            expected_entry.filter(|expected| expected.index == entry.index),
+            Some(filename_plan),
+        );
+        let collection_order = if expected_entry
+            .filter(|expected| expected.index == entry.index)
+            .is_some_and(|expected| expected.collection_output_folder.is_some())
+            || collection_download
+            || plan.entries.len() > 1
+        {
+            Some(entry.index)
+        } else {
+            None
+        };
+        let stem = crate::media_naming::standard_media_stem(
+            &entry.title,
+            collection_order,
+            Some(&source_id),
+            height,
+            codec.as_deref(),
+            230,
+            "",
+        )?;
+        stems.insert(entry.index, stem);
+    }
+    Ok(stems)
 }
 
 pub async fn run_job_with_duplicate_action(
@@ -9002,10 +9058,22 @@ pub async fn run_bilibili_worker() -> Result<()> {
 // BBDown-rust renders output templates as an 80-byte filename component.
 const BILIBILI_COLLECTION_FOLDER_MAX_BYTES: usize = 80;
 const BILIBILI_COLLECTION_OWNER_MAX_BYTES: usize = 32;
-const BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION: u32 = 1;
+const BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V1: u32 = 1;
+const BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2: u32 = 2;
+const BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION: u32 = BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2;
+
+fn is_flat_bilibili_collection_layout(version: Option<u32>) -> bool {
+    matches!(
+        version,
+        Some(
+            BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V1
+                | BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2
+        )
+    )
+}
 
 fn validate_bilibili_collection_output_layout_version(version: Option<u32>) -> Result<()> {
-    if version.is_some_and(|version| version != BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION) {
+    if version.is_some_and(|version| !is_flat_bilibili_collection_layout(Some(version))) {
         bail!(
             "Bilibili collection output layout version {} is unsupported; replan this task before downloading",
             version.expect("unsupported version was checked")
@@ -9681,7 +9749,7 @@ async fn run_bilibili_job_locked(
         .as_ref()
         .filter(|plan| {
             plan.bilibili_collection_output_layout_version
-                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+                .is_some_and(|version| is_flat_bilibili_collection_layout(Some(version)))
         })
     {
         if !matches!(selection, Some(BilibiliSelection::All))
@@ -9702,7 +9770,13 @@ async fn run_bilibili_job_locked(
             worker_context.final_output_root,
             expected,
         )?;
-        let inventory = resolve_bilibili_episode_group_inventory(&scoped_config, url, true).await?;
+        let mut inventory =
+            resolve_bilibili_episode_group_inventory(&scoped_config, url, true).await?;
+        if let Some(version) = expected.bilibili_collection_output_layout_version
+            && is_flat_bilibili_collection_layout(Some(version))
+        {
+            inventory.collection_output_layout_version = Some(version);
+        }
         if !matches!(
             inventory.source,
             BilibiliGroupSource::Collection | BilibiliGroupSource::Season
@@ -9724,8 +9798,9 @@ async fn run_bilibili_job_locked(
                 differences.join(", ")
             );
         }
-        if inventory.collection_output_layout_version
-            != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+        if inventory
+            .collection_output_layout_version
+            .is_some_and(|version| !is_flat_bilibili_collection_layout(Some(version)))
         {
             bail!("Bilibili collection artifact plan has no supported flat output layout");
         }
@@ -10025,6 +10100,7 @@ async fn run_bilibili_job_locked(
     );
     let progress_reporter = BilibiliCoreProgress::new(progress.clone(), collection_progress);
     let peak_bytes = bilibili_download_peak_bytes(&core_plan, &options, mux_locally);
+    let filename_plan = bilibili_plan_validation_snapshot(&core_plan, &options);
     crate::disk_space::ensure_disk_space(
         root,
         peak_bytes,
@@ -10040,18 +10116,25 @@ async fn run_bilibili_job_locked(
     mark_bilibili_core_download_completed(root, Some(worker_context.request))?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
+        let filename_stems = bilibili_download_filename_stems(
+            &plan,
+            &filename_plan,
+            worker_context.request.expected_entry.as_ref(),
+            collection_download.is_some(),
+        )?;
         send_bilibili_worker_entry_stage(
             progress.as_ref(),
             worker_context.request.expected_entry.as_ref(),
             "mux",
         );
-        mux_bilibili_report_media(
+        mux_bilibili_report_media_with_names(
             config,
             root,
             &output_dir,
             &mut report,
             command_started_at,
             progress.clone(),
+            &filename_stems,
         )
         .await?;
         send_bilibili_worker_entry_stage(
@@ -10105,35 +10188,61 @@ async fn run_bilibili_job_locked(
     if let Some(metadata_warning) = metadata_warning {
         details.push(metadata_warning);
     }
-    let flat_collection_layout = worker_context
-        .request
-        .expected_plan
-        .as_ref()
-        .is_some_and(|plan| plan.bilibili_collection_output_layout_version == Some(1))
-        || worker_context
+    let flat_collection_layout =
+        worker_context
             .request
-            .expected_entry
+            .expected_plan
             .as_ref()
-            .is_some_and(|entry| entry.collection_output_layout_version == Some(1));
+            .is_some_and(|plan| {
+                is_flat_bilibili_collection_layout(plan.bilibili_collection_output_layout_version)
+            })
+            || worker_context
+                .request
+                .expected_entry
+                .as_ref()
+                .is_some_and(|entry| {
+                    is_flat_bilibili_collection_layout(entry.collection_output_layout_version)
+                });
     let allow_artifact_only_without_primary = artifact_collection_inventory.is_some()
         && worker_context.request.expected_entry.is_none()
         && artifact_only_mode;
     let artifact_output_template = artifact_collection_inventory
         .as_ref()
         .and_then(|inventory| inventory.output_template.as_deref());
+    let collection_layout_version = worker_context
+        .request
+        .expected_entry
+        .as_ref()
+        .and_then(|entry| entry.collection_output_layout_version)
+        .or_else(|| {
+            worker_context
+                .request
+                .expected_plan
+                .as_ref()
+                .and_then(|plan| plan.bilibili_collection_output_layout_version)
+        })
+        .or_else(|| {
+            artifact_collection_inventory
+                .as_ref()
+                .and_then(|inventory| inventory.collection_output_layout_version)
+        });
     let flat_remap = if flat_collection_layout
         && (collection_download.is_some()
             || worker_context.request.expected_entry.is_some()
             || artifact_collection_inventory.is_some())
     {
-        Some(flatten_bilibili_collection_staging_output(
+        Some(flatten_bilibili_collection_staging_output_with_layout(
             root,
             &output_dir,
             &plan,
             &mut report,
-            worker_context.request.expected_entry.as_ref(),
-            artifact_output_template,
-            allow_artifact_only_without_primary,
+            BilibiliCollectionFlattenContext {
+                expected_entry: worker_context.request.expected_entry.as_ref(),
+                expected_output_template: artifact_output_template,
+                allow_artifact_only_without_primary,
+                collection_layout_version,
+                filename_plan: worker_context.request.expected_plan.as_ref(),
+            },
         )?)
     } else {
         None
@@ -10616,6 +10725,14 @@ const BILIBILI_COLLECTION_FLAT_STEM_MAX_BYTES: usize = 156;
 const BILIBILI_COLLECTION_FLAT_LEAF_MAX_BYTES: usize = 240;
 const BILIBILI_COLLECTION_FLAT_VARIANT_MAX_BYTES: usize = 56;
 
+struct BilibiliCollectionFlattenContext<'a> {
+    expected_entry: Option<&'a BilibiliWorkerExpectedEntry>,
+    expected_output_template: Option<&'a str>,
+    allow_artifact_only_without_primary: bool,
+    collection_layout_version: Option<u32>,
+    filename_plan: Option<&'a PlanValidationSnapshot>,
+}
+
 fn flatten_bilibili_collection_staging_output(
     root: &RootedFs,
     output_dir: &Path,
@@ -10625,6 +10742,35 @@ fn flatten_bilibili_collection_staging_output(
     expected_output_template: Option<&str>,
     allow_artifact_only_without_primary: bool,
 ) -> Result<BTreeMap<PathBuf, PathBuf>> {
+    flatten_bilibili_collection_staging_output_with_layout(
+        root,
+        output_dir,
+        plan,
+        report,
+        BilibiliCollectionFlattenContext {
+            expected_entry,
+            expected_output_template,
+            allow_artifact_only_without_primary,
+            collection_layout_version: Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V1),
+            filename_plan: None,
+        },
+    )
+}
+
+fn flatten_bilibili_collection_staging_output_with_layout(
+    root: &RootedFs,
+    output_dir: &Path,
+    plan: &BilibiliDownloadPlan,
+    report: &mut BilibiliDownloadReport,
+    context: BilibiliCollectionFlattenContext<'_>,
+) -> Result<BTreeMap<PathBuf, PathBuf>> {
+    let BilibiliCollectionFlattenContext {
+        expected_entry,
+        expected_output_template,
+        allow_artifact_only_without_primary,
+        collection_layout_version,
+        filename_plan,
+    } = context;
     let selected_reports = report
         .entries
         .iter()
@@ -10779,7 +10925,22 @@ fn flatten_bilibili_collection_staging_output(
             .map(|(_, identity, _)| identity.clone())
             .context("Bilibili output identity disappeared while flattening")?;
         let stem =
-            bilibili_collection_flat_stem(group_index, part_index, &stable_media_id, &title)?;
+            if collection_layout_version == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2) {
+                let (source_id, height, codec) = bilibili_collection_filename_identity(
+                    &stable_media_id,
+                    expected_entry.filter(|expected| expected.index == *index),
+                    filename_plan,
+                );
+                bilibili_collection_flat_stem_v2(
+                    group_index,
+                    &source_id,
+                    &title,
+                    height,
+                    codec.as_deref(),
+                )?
+            } else {
+                bilibili_collection_flat_stem(group_index, part_index, &stable_media_id, &title)?
+            };
         let report_file_kinds = report_entry
             .files
             .iter()
@@ -11124,6 +11285,94 @@ fn bilibili_collection_flat_stem(
         .min(80);
     let title = sanitize_bilibili_collection_component(title, "Untitled", title_budget);
     Ok(format!("{prefix}-{title}"))
+}
+
+fn bilibili_collection_flat_stem_v2(
+    collection_order: u32,
+    source_id: &str,
+    title: &str,
+    height: Option<u32>,
+    codec: Option<&str>,
+) -> Result<String> {
+    // The flattened leaf reserves room for the longest supported sidecar variant, a
+    // maximum-length extension, and the publisher's largest KeepBoth suffix (2..=10,000).
+    let stem_budget = BILIBILI_COLLECTION_FLAT_STEM_MAX_BYTES;
+    crate::media_naming::standard_media_stem(
+        title,
+        Some(collection_order),
+        Some(source_id),
+        height,
+        codec,
+        stem_budget,
+        "",
+    )
+}
+
+fn bilibili_collection_filename_identity(
+    stable_media_id: &str,
+    expected_entry: Option<&BilibiliWorkerExpectedEntry>,
+    filename_plan: Option<&PlanValidationSnapshot>,
+) -> (String, Option<u32>, Option<String>) {
+    let source_id = stable_media_id
+        .split(":cid:")
+        .next()
+        .unwrap_or(stable_media_id);
+    let source_id = source_id
+        .strip_prefix("bvid:")
+        .map(str::to_string)
+        .or_else(|| source_id.strip_prefix("aid:").map(|id| format!("av{id}")))
+        .unwrap_or_else(|| source_id.to_string());
+    let prefix = format!("{stable_media_id}:video:");
+    let records = expected_entry
+        .and_then(|entry| entry.confirmed_streams.as_ref())
+        .map(|confirmed| confirmed.resolution_codecs.as_slice())
+        .or_else(|| filename_plan.map(|plan| plan.resolution_codecs.as_slice()));
+    let Some(records) = records else {
+        return (source_id, None, None);
+    };
+    let mut best_height = None;
+    let mut best_codec = None;
+    let mut codec_without_height = None;
+    for record in records
+        .iter()
+        .filter_map(|record| record.strip_prefix(&prefix))
+    {
+        let mut fields = record.split(':');
+        let _format_id = fields.next();
+        let resolution = fields.next();
+        let raw_codec = fields.next();
+        let height = resolution
+            .and_then(|value| value.split('x').nth(1))
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0);
+        let codec = raw_codec.and_then(normalize_video_codec_label);
+        match height {
+            Some(height) if best_height.is_none_or(|current| height > current) => {
+                best_height = Some(height);
+                best_codec = codec.map(str::to_string);
+            }
+            None if codec_without_height.is_none() => {
+                codec_without_height = codec.map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    (source_id, best_height, best_codec.or(codec_without_height))
+}
+
+fn normalize_video_codec_label(codec: &str) -> Option<&'static str> {
+    let codec = codec.to_ascii_lowercase();
+    if codec.starts_with("avc") || codec.starts_with("h264") {
+        Some("h264")
+    } else if codec.starts_with("hev") || codec.starts_with("h265") || codec.starts_with("hevc") {
+        Some("h265")
+    } else if codec.starts_with("av01") || codec.starts_with("av1") {
+        Some("av1")
+    } else if codec.starts_with("vp09") || codec.starts_with("vp9") {
+        Some("vp9")
+    } else {
+        None
+    }
 }
 
 fn bilibili_collection_flat_leaf(stem: &str, variant: &str, extension: &str) -> Result<String> {
@@ -11763,6 +12012,27 @@ async fn mux_bilibili_report_media(
     since: SystemTime,
     progress: Option<JobProgressSender>,
 ) -> Result<()> {
+    mux_bilibili_report_media_with_names(
+        config,
+        root,
+        cwd,
+        report,
+        since,
+        progress,
+        &BTreeMap::new(),
+    )
+    .await
+}
+
+async fn mux_bilibili_report_media_with_names(
+    config: &AppConfig,
+    root: &RootedFs,
+    cwd: &Path,
+    report: &mut BilibiliDownloadReport,
+    since: SystemTime,
+    progress: Option<JobProgressSender>,
+    filename_stems: &BTreeMap<u32, String>,
+) -> Result<()> {
     let report_title = report.title.clone();
     for entry in &mut report.entries {
         if entry.mux.is_some() {
@@ -11778,7 +12048,10 @@ async fn mux_bilibili_report_media(
         } else {
             entry.title.as_str()
         };
-        let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
+        let output_path = filename_stems.get(&entry.index).map_or_else(
+            || unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since),
+            |stem| unique_bilibili_mux_output_path_from_stem(&entry_dir, stem, "mp4", since),
+        );
         let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
         let merge_bytes = bound_inputs.iter().try_fold(0_u64, |total, input| {
             input
@@ -14185,6 +14458,272 @@ fn stem_without_unique_suffix(stem: &str) -> &str {
     }
 }
 
+#[derive(Debug, Default)]
+struct VerifiedYoutubeReportPaths {
+    primary_media_indices: Vec<usize>,
+    saved_location: bool,
+}
+
+fn verified_youtube_report_paths(
+    root: &RootedFs,
+    report: &JobReport,
+    source: &Path,
+) -> Result<VerifiedYoutubeReportPaths> {
+    let source = logical_download_root_path(root, source)?
+        .context("YouTube staged media is outside the configured download root")?;
+    let source_file = root
+        .open_bound_file(&source)?
+        .context("YouTube staged media disappeared before report-path validation")?;
+    let source_identity = source_file.identity();
+    let mut verified = VerifiedYoutubeReportPaths::default();
+    for (index, path) in report.primary_media_paths.iter().enumerate() {
+        if reported_youtube_path_matches_media(root, path, &source, source_identity)? {
+            verified.primary_media_indices.push(index);
+        }
+    }
+    verified.saved_location = reported_youtube_path_matches_media(
+        root,
+        Path::new(&report.saved_location),
+        &source,
+        source_identity,
+    )?;
+    Ok(verified)
+}
+
+fn reported_youtube_path_matches_media(
+    root: &RootedFs,
+    reported: &Path,
+    source: &Path,
+    source_identity: EntryIdentity,
+) -> Result<bool> {
+    let Some(reported) = logical_download_root_path(root, reported)? else {
+        return Ok(false);
+    };
+    if reported != source {
+        return Ok(false);
+    }
+    let reported_file = root.open_bound_file(&reported)?;
+    Ok(reported_file.is_some_and(|file| file.identity() == source_identity))
+}
+
+fn remap_youtube_report_paths(
+    report: &mut JobReport,
+    destination: &Path,
+    verified: VerifiedYoutubeReportPaths,
+) {
+    for index in verified.primary_media_indices {
+        if let Some(path) = report.primary_media_paths.get_mut(index) {
+            *path = destination.to_path_buf();
+        }
+    }
+    if verified.saved_location {
+        report.saved_location = destination.display().to_string();
+    }
+}
+
+fn normalize_youtube_staged_name(
+    root: &RootedFs,
+    staging_dir: &Path,
+    media_path: &Path,
+    staged_files: &[PathBuf],
+    requested_url: &str,
+    metadata: &YoutubeMetadata,
+) -> Result<(PathBuf, PathBuf)> {
+    let source_id = metadata
+        .id
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| youtube_id_from_url(requested_url))
+        .context("YouTube metadata and URL omitted a stable source ID")?;
+    let old_stem = media_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("YouTube media has a non-UTF-8 filename stem")?;
+    let extension = media_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(old_stem))
+        .context("YouTube media filename has no extension")?;
+    let mut owned = vec![media_path.to_path_buf()];
+    let mut longest_attachment_suffix = 0usize;
+    for path in staged_files {
+        if path == media_path || path.parent() != media_path.parent() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&format!("{old_stem}.")) else {
+            continue;
+        };
+        longest_attachment_suffix = longest_attachment_suffix.max(suffix.len() + 1);
+        owned.push(path.clone());
+    }
+    let (height, codec) = youtube_filename_stream_identity(metadata);
+    const MAX_COMPONENT_BYTES: usize = 255;
+    const MAX_KEEP_BOTH_SUFFIX_BYTES: usize = 8; // publisher candidates are (2) through (10000)
+    let stem_budget = MAX_COMPONENT_BYTES
+        .checked_sub(longest_attachment_suffix)
+        .and_then(|budget| budget.checked_sub(extension.len()))
+        .and_then(|budget| budget.checked_sub(MAX_KEEP_BOTH_SUFFIX_BYTES))
+        .context("YouTube attachments leave no room for protected naming fields")?;
+    let new_stem = crate::media_naming::standard_media_stem(
+        metadata.title.as_deref().unwrap_or(old_stem),
+        None,
+        Some(&format!("youtube:{source_id}")),
+        height,
+        codec.as_deref(),
+        stem_budget,
+        "",
+    )?;
+    let mut remapped = BTreeMap::new();
+    let mut pending = Vec::new();
+    for source in owned {
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("YouTube output has a non-UTF-8 filename")?;
+        let suffix = name
+            .strip_prefix(old_stem)
+            .context("YouTube attachment no longer matches its media stem")?;
+        let destination = source.with_file_name(format!("{new_stem}{suffix}"));
+        let source_entry = root.bind_entry(&source, false)?;
+        let identity = root
+            .bound_entry_identity(&source_entry)?
+            .with_context(|| format!("YouTube staged output disappeared: {}", source.display()))?;
+        if !identity.is_file() {
+            bail!(
+                "YouTube staged output is not a regular file: {}",
+                source.display()
+            );
+        }
+        if destination == source {
+            remapped.insert(source.clone(), destination);
+            pending.push((source, source_entry, identity));
+        } else {
+            let destination_entry = root.bind_entry(&destination, false)?;
+            if root.bound_entry_identity(&destination_entry)?.is_some() {
+                bail!(
+                    "YouTube normalized staging target already exists: {}",
+                    destination.display()
+                );
+            }
+            remapped.insert(source.clone(), destination);
+            pending.push((source, source_entry, identity));
+        }
+    }
+    let renamed_files = remapped
+        .iter()
+        .map(|(source, destination)| {
+            Ok((
+                source
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("YouTube source filename is not UTF-8")?
+                    .to_string(),
+                destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("YouTube destination filename is not UTF-8")?
+                    .to_string(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_parent_relative = rooted_relative_directory(
+        root,
+        media_path
+            .parent()
+            .context("YouTube media has no staged parent directory")?,
+    )?;
+    let old_primary_filename = media_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("YouTube media has a non-UTF-8 filename")?;
+    let new_primary_filename = format!("{new_stem}{extension}");
+    for (source, source_entry, identity) in &mut pending {
+        if !is_nfo_path(source) {
+            continue;
+        }
+        let original = root
+            .open_bound_file_if_identity(source_entry, *identity)?
+            .read_limited(NFO_LOCAL_REFERENCE_REWRITE_LIMIT)?;
+        persist_publication_nfo_copy(root, staging_dir, source, &original)?;
+        let (nfo_identity, rewritten, original_sha256) = read_nfo_local_reference_rewrite(
+            root,
+            source,
+            Some(*identity),
+            &renamed_files,
+            old_primary_filename,
+            &new_primary_filename,
+            &source_parent_relative,
+        )?;
+        if let Some(contents) = rewritten {
+            *identity = replace_bilibili_nfo_atomically(
+                root,
+                source,
+                nfo_identity,
+                &contents,
+                original_sha256,
+            )?;
+        }
+    }
+    for (source, source_entry, identity) in pending {
+        let destination = remapped
+            .get(&source)
+            .context("YouTube staged output disappeared from its rename map")?;
+        if destination == &source {
+            continue;
+        }
+        let destination_entry = root.bind_entry(destination, false)?;
+        root.rename_via_bound_parents_noreplace_if_identity(
+            &source_entry,
+            &destination_entry,
+            identity,
+        )?;
+    }
+    let destination = remapped
+        .get(media_path)
+        .cloned()
+        .context("YouTube media was absent from its staged rename plan")?;
+    Ok((media_path.to_path_buf(), destination))
+}
+
+fn youtube_filename_stream_identity(metadata: &YoutubeMetadata) -> (Option<u32>, Option<String>) {
+    let fallback = YoutubeFormat {
+        format_id: metadata.format_id.clone(),
+        filesize: metadata.filesize,
+        filesize_approx: metadata.filesize_approx,
+        width: metadata.width,
+        height: metadata.height,
+        fps: metadata.fps,
+        vcodec: metadata.vcodec.clone(),
+        acodec: metadata.acodec.clone(),
+        format_note: metadata.format_note.clone(),
+        resolution: metadata.resolution.clone(),
+        abr: metadata.abr,
+    };
+    let formats = if !metadata.requested_formats.is_empty() {
+        metadata.requested_formats.iter().collect::<Vec<_>>()
+    } else if !metadata.requested_downloads.is_empty() {
+        metadata.requested_downloads.iter().collect::<Vec<_>>()
+    } else {
+        vec![&fallback]
+    };
+    let video = formats
+        .into_iter()
+        .filter(|format| youtube_codec_present(format.vcodec.as_deref()))
+        .max_by_key(|format| format.height.unwrap_or_default());
+    let Some(video) = video else {
+        return (None, None);
+    };
+    let codec = video
+        .vcodec
+        .as_deref()
+        .and_then(normalize_video_codec_label)
+        .map(str::to_string);
+    (video.height.filter(|height| *height > 0), codec)
+}
+
 async fn run_youtube_job_locked(
     config: &AppConfig,
     url: &str,
@@ -14469,7 +15008,7 @@ async fn run_staged_video_job(
             staging_dir.display()
         );
     }
-    let staged_media = staged_files
+    let mut staged_media = staged_files
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .cloned()
@@ -14484,13 +15023,61 @@ async fn run_staged_video_job(
         && !staged_media.is_empty()
         && expected_plan.as_ref().is_some_and(|plan| {
             plan.bilibili_collection_output_layout_version
-                == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+                .is_some_and(|version| is_flat_bilibili_collection_layout(Some(version)))
         })
     {
         staging.preserve_for_recovery();
         bail!(
             "reviewed Bilibili artifact-only collection plan unexpectedly produced primary media; staged output was retained"
         );
+    }
+
+    if matches!(job, JobRequest::Youtube { .. })
+        && let Some((url, metadata)) = youtube_metadata.as_ref()
+    {
+        let has_stable_source_id = metadata
+            .id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+            || youtube_id_from_url(url).is_some();
+        if staged_media.len() == 1 && has_stable_source_id {
+            let verified_report_paths =
+                verified_youtube_report_paths(&root, &report, &staged_media[0])?;
+            let (source, destination) = normalize_youtube_staged_name(
+                &root,
+                &staging_dir,
+                &staged_media[0],
+                &staged_files,
+                url,
+                metadata,
+            )?;
+            for path in &mut staged_files {
+                if *path == source {
+                    *path = destination.clone();
+                } else if path.parent() == source.parent()
+                    && let (Some(source_stem), Some(destination_stem), Some(name)) = (
+                        source.file_stem().and_then(|stem| stem.to_str()),
+                        destination.file_stem().and_then(|stem| stem.to_str()),
+                        path.file_name().and_then(|name| name.to_str()),
+                    )
+                    && let Some(suffix) = name.strip_prefix(&format!("{source_stem}."))
+                {
+                    *path = path.with_file_name(format!("{destination_stem}.{suffix}"));
+                }
+            }
+            remap_youtube_report_paths(&mut report, &destination, verified_report_paths);
+            staged_media[0] = destination;
+        } else {
+            let reason = if staged_media.len() != 1 {
+                format!("{} media files were produced", staged_media.len())
+            } else {
+                "resolved metadata did not expose a stable source ID".to_string()
+            };
+            report.details = nonempty_join(vec![
+                report.details.clone(),
+                format!("Standard naming skipped; yt-dlp output names retained because {reason}."),
+            ]);
+        }
     }
 
     if matches!(job, JobRequest::Youtube { .. }) {
@@ -14740,6 +15327,11 @@ async fn prepare_bilibili_artifact_collection_execution_plan(
         );
     }
     let mut inventory = resolve_bilibili_episode_group_inventory(config, url, true).await?;
+    if let Some(version) = expected.bilibili_collection_output_layout_version
+        && is_flat_bilibili_collection_layout(Some(version))
+    {
+        inventory.collection_output_layout_version = Some(version);
+    }
     if !matches!(
         inventory.source,
         BilibiliGroupSource::Collection | BilibiliGroupSource::Season
@@ -14757,8 +15349,7 @@ async fn prepare_bilibili_artifact_collection_execution_plan(
             differences.join(", ")
         );
     }
-    if inventory.collection_output_layout_version != Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
-    {
+    if !is_flat_bilibili_collection_layout(inventory.collection_output_layout_version) {
         bail!("Bilibili collection artifact plan has no supported flat output layout");
     }
 
@@ -14796,7 +15387,7 @@ fn bilibili_collection_destination_context(
 ) -> Result<Option<BilibiliCollectionDestinationContext<'_>>> {
     let Some(expected_plan) = expected_plan.filter(|plan| {
         plan.bilibili_collection_output_layout_version
-            == Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION)
+            .is_some_and(|version| is_flat_bilibili_collection_layout(Some(version)))
     }) else {
         return Ok(None);
     };
@@ -26153,6 +26744,15 @@ fn unique_bilibili_mux_output_path(
     since: SystemTime,
 ) -> PathBuf {
     let stem = safe_file_stem(title);
+    unique_bilibili_mux_output_path_from_stem(root, &stem, extension, since)
+}
+
+fn unique_bilibili_mux_output_path_from_stem(
+    root: &Path,
+    stem: &str,
+    extension: &str,
+    since: SystemTime,
+) -> PathBuf {
     let mut candidate = root.join(format!("{stem}.{extension}"));
     let mut index = 2;
     while candidate.exists() || stale_output_sidecar_exists(&candidate, since) {
@@ -27789,7 +28389,10 @@ mod tests {
             bilibili_collection_artifact_validation_snapshot(&plan, &collection, &options, &config)
                 .expect("SDK and collection identities should agree")
                 .expect("true collection should get the flat artifact plan");
-        assert_eq!(snapshot.bilibili_collection_output_layout_version, Some(1));
+        assert_eq!(
+            snapshot.bilibili_collection_output_layout_version,
+            Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V1)
+        );
         assert_eq!(snapshot.stable_media_ids, vec![stable_media_id.clone()]);
         assert_eq!(
             snapshot.bilibili_group_entries[0].stable_media_id,
@@ -27894,7 +28497,7 @@ mod tests {
     async fn collection_layout_legacy_none_and_unknown_version_are_explicit() {
         assert!(validate_bilibili_collection_output_layout_version(None).is_ok());
         assert!(validate_bilibili_collection_output_layout_version(Some(1)).is_ok());
-        assert!(validate_bilibili_collection_output_layout_version(Some(2)).is_err());
+        assert!(validate_bilibili_collection_output_layout_version(Some(3)).is_err());
         assert!(
             bilibili_collection_destination_context(Some(&PlanValidationSnapshot::default()))
                 .expect("legacy plan has no collection destination context")
@@ -32546,6 +33149,186 @@ mod tests {
         assert_eq!(
             bilibili_resolved_download_summary(&plan, &options),
             "Entries: 1 entry\nEstimated media: 4.0 MiB\nVideo: FLV\nAudio: included in FLV"
+        );
+    }
+
+    #[test]
+    fn youtube_staged_rename_preserves_identity_and_attachment_stems() {
+        let directory = temp_test_dir("youtube-standard-name");
+        let media = directory.join("Old Title [abcdefghijk].mkv");
+        let subtitle = directory.join("Old Title [abcdefghijk].en.srt");
+        let cover = directory.join("Old Title [abcdefghijk].cover.jpg");
+        let nfo = directory.join("Old Title [abcdefghijk].nfo");
+        let original_nfo = "<movie><title>Full metadata title</title><localfilename>Old Title [abcdefghijk].mkv</localfilename><thumb>Old Title [abcdefghijk].cover.jpg</thumb><tvd_attachment role=\"cover\">Old Title [abcdefghijk].cover.jpg</tvd_attachment><unknown-field>preserve me</unknown-field></movie>";
+        fs::write(&media, "media").unwrap();
+        fs::write(&subtitle, "subtitle").unwrap();
+        fs::write(&cover, "cover").unwrap();
+        fs::write(&nfo, original_nfo).unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let metadata = YoutubeMetadata {
+            id: Some("abcdefghijk".to_string()),
+            title: Some("New Title".to_string()),
+            requested_formats: vec![YoutubeFormat {
+                height: Some(1080),
+                vcodec: Some("avc1.640028".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let reported_path = root
+            .root_path()
+            .join(media.strip_prefix(&directory).unwrap());
+        let mut report = JobReport {
+            saved_location: reported_path.display().to_string(),
+            details: String::new(),
+            primary_media_paths: vec![reported_path.clone()],
+            existing_bilibili_evidence: None,
+        };
+        let verified_report_paths = verified_youtube_report_paths(&root, &report, &media).unwrap();
+        let (old_media, new_media) = normalize_youtube_staged_name(
+            &root,
+            &directory,
+            &media,
+            &[media.clone(), subtitle.clone(), cover.clone(), nfo.clone()],
+            "https://youtu.be/abcdefghijk",
+            &metadata,
+        )
+        .unwrap();
+        remap_youtube_report_paths(&mut report, &new_media, verified_report_paths);
+        let expected_stem = "New Title - [youtube_abcdefghijk] - [1080p h264]";
+        assert_eq!(old_media, media);
+        assert_eq!(
+            new_media.file_name().unwrap().to_str().unwrap(),
+            format!("{expected_stem}.mkv")
+        );
+        assert!(new_media.is_file());
+        assert!(directory.join(format!("{expected_stem}.en.srt")).is_file());
+        assert!(
+            directory
+                .join(format!("{expected_stem}.cover.jpg"))
+                .is_file()
+        );
+        let renamed_nfo =
+            fs::read_to_string(directory.join(format!("{expected_stem}.nfo"))).unwrap();
+        assert!(renamed_nfo.contains("<title>Full metadata title</title>"));
+        assert!(renamed_nfo.contains("<unknown-field>preserve me</unknown-field>"));
+        assert!(renamed_nfo.contains(&format!(
+            "<localfilename>{expected_stem}.mkv</localfilename>"
+        )));
+        assert!(renamed_nfo.contains(&format!("<thumb>{expected_stem}.cover.jpg</thumb>")));
+        let original_nfo_path = Path::new(VIDEO_STAGING_PUBLICATION_NFO_DIR_NAME).join(format!(
+            "{:x}.nfo",
+            Sha256::digest(
+                nfo.strip_prefix(&directory)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .as_bytes()
+            )
+        ));
+        assert_eq!(
+            fs::read(directory.join(original_nfo_path)).unwrap(),
+            original_nfo.as_bytes()
+        );
+        assert!(!media.exists());
+        assert!(!subtitle.exists());
+        assert!(!cover.exists());
+        assert!(!nfo.exists());
+        assert_eq!(report.saved_location, new_media.display().to_string());
+        assert_eq!(report.primary_media_paths, vec![new_media]);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn bilibili_collection_v2_stem_uses_order_source_and_known_specs() {
+        let stable_id = "bvid:BV1abc:cid:2001:epid:none";
+        let expected = BilibiliWorkerExpectedEntry {
+            index: 12,
+            part_index: 4,
+            title: "Episode title".to_string(),
+            stable_media_id: stable_id.to_string(),
+            bilibili_publication_namespace: None,
+            output_template: None,
+            collection_output_folder: None,
+            collection_output_layout_version: Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2),
+            collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
+            confirmed_streams: Some(BilibiliGroupConfirmedStreams {
+                selected_format_ids: vec![format!("{stable_id}:video:80")],
+                exact_sizes: None,
+                resolution_codecs: vec![format!("{stable_id}:video:80:1920x1080:avc1.640028")],
+            }),
+        };
+        let (source_id, height, codec) =
+            bilibili_collection_filename_identity(stable_id, Some(&expected), None);
+        let stem = bilibili_collection_flat_stem_v2(
+            expected.index,
+            &source_id,
+            &expected.title,
+            height,
+            codec.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(stem, "P012 - Episode title - [BV1abc] - [1080p h264]");
+        assert!(!stem.contains("Episode title - Episode title"));
+        assert!(!stem.contains("P004"));
+        let second_stable_id = "bvid:BV1abc:cid:2002:epid:none";
+        let second_expected = BilibiliWorkerExpectedEntry {
+            index: 13,
+            part_index: 4,
+            title: "Second page".to_string(),
+            stable_media_id: second_stable_id.to_string(),
+            confirmed_streams: Some(BilibiliGroupConfirmedStreams {
+                selected_format_ids: vec![format!("{second_stable_id}:video:80")],
+                exact_sizes: None,
+                resolution_codecs: vec![format!(
+                    "{second_stable_id}:video:80:1920x1080:avc1.640028"
+                )],
+            }),
+            ..expected.clone()
+        };
+        let (second_source, second_height, second_codec) =
+            bilibili_collection_filename_identity(second_stable_id, Some(&second_expected), None);
+        assert_eq!(second_source, "BV1abc");
+        assert_ne!(expected.stable_media_id, second_expected.stable_media_id);
+        assert!(
+            bilibili_collection_flat_stem_v2(
+                second_expected.index,
+                &second_source,
+                &second_expected.title,
+                second_height,
+                second_codec.as_deref(),
+            )
+            .unwrap()
+            .starts_with("P013 - ")
+        );
+        assert_eq!(
+            bilibili_collection_flat_stem(12, 4, stable_id, "Episode title").unwrap(),
+            "E0012-P004-bvid-BV1abc-cid-2001-epid-none-Episode title"
+        );
+        let standalone_plan = BilibiliDownloadPlan {
+            title: "Standalone title".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 123,
+                bvid: Some("BV1abc".to_string()),
+                cid: 456,
+                title: "Standalone title".to_string(),
+                ..Default::default()
+            }],
+        };
+        let standalone_stable = bilibili_plan_stable_media_id(Some("BV1abc"), 123, 456, None);
+        let filename_snapshot = PlanValidationSnapshot {
+            resolution_codecs: vec![format!(
+                "{standalone_stable}:video:80:1920x1080:avc1.640028"
+            )],
+            ..Default::default()
+        };
+        let standalone_stems =
+            bilibili_download_filename_stems(&standalone_plan, &filename_snapshot, None, false)
+                .unwrap();
+        assert_eq!(
+            standalone_stems.get(&1).map(String::as_str),
+            Some("Standalone title - [BV1abc] - [1080p h264]")
         );
     }
 

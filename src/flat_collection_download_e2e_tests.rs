@@ -38,6 +38,99 @@ fn write_fixture(path: &Path, bytes: &[u8]) {
 }
 
 #[test]
+fn layout_v2_flattens_with_collection_order_source_specs_and_full_nfo_title() {
+    let output_root = temp_root("flat-collection-v2-name");
+    let _cleanup = TestDirectory(output_root.clone());
+    fs::create_dir_all(&output_root).expect("library root should be created");
+    let root = RootedFs::new(&output_root).expect("library root should bind");
+    let staging = create_video_staging_dir(&root).expect("private staging should be created");
+    let output_dir = staging.path().to_path_buf();
+    let collection_dir = output_dir.join("New Collection");
+    let entry_dir = collection_dir.join("entry-12");
+    fs::create_dir_all(&entry_dir).expect("nested SDK output should be created");
+    let media_path = entry_dir.join("sdk-output.mkv");
+    let nfo_path = entry_dir.join("sdk-output.nfo");
+    write_fixture(&media_path, b"media");
+    write_fixture(
+        &nfo_path,
+        b"<movie><title>Full source title</title><localfilename>sdk-output.mkv</localfilename></movie>",
+    );
+
+    let stable_media_id = bilibili_plan_stable_media_id(Some("BV1abc"), 123, 456, None);
+    let plan = BilibiliDownloadPlan {
+        title: "New Collection".to_string(),
+        entries: vec![BilibiliDownloadEntry {
+            index: 12,
+            aid: 123,
+            bvid: Some("BV1abc".to_string()),
+            cid: 456,
+            title: "Full source title".to_string(),
+            ..Default::default()
+        }],
+    };
+    let mut report = BilibiliDownloadReport {
+        title: "New Collection".to_string(),
+        output_dir: output_dir.clone(),
+        entries: vec![BilibiliEntryDownloadReport {
+            index: 12,
+            title: "Full source title".to_string(),
+            files: vec![
+                BilibiliDownloadedFile {
+                    kind: "video".to_string(),
+                    path: media_path.clone(),
+                },
+                BilibiliDownloadedFile {
+                    kind: "nfo".to_string(),
+                    path: nfo_path.clone(),
+                },
+            ],
+            mux: None,
+        }],
+    };
+    let expected = BilibiliWorkerExpectedEntry {
+        index: 12,
+        part_index: 4,
+        title: "Full source title".to_string(),
+        stable_media_id: stable_media_id.clone(),
+        bilibili_publication_namespace: None,
+        output_template: Some("New Collection".to_string()),
+        collection_output_folder: Some("New Collection".to_string()),
+        collection_output_layout_version: Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2),
+        collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
+        confirmed_streams: Some(BilibiliGroupConfirmedStreams {
+            selected_format_ids: vec![format!("{stable_media_id}:video:80")],
+            exact_sizes: None,
+            resolution_codecs: vec![format!("{stable_media_id}:video:80:1920x1080:avc1.640028")],
+        }),
+    };
+    let remapped = flatten_bilibili_collection_staging_output_with_layout(
+        &root,
+        &output_dir,
+        &plan,
+        &mut report,
+        BilibiliCollectionFlattenContext {
+            expected_entry: Some(&expected),
+            expected_output_template: None,
+            allow_artifact_only_without_primary: false,
+            collection_layout_version: Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2),
+            filename_plan: None,
+        },
+    )
+    .expect("V2 collection output should flatten before publication");
+    let expected_stem = "P012 - Full source title - [BV1abc] - [1080p h264]";
+    let flat_media = collection_dir.join(format!("{expected_stem}.mkv"));
+    let flat_nfo = collection_dir.join(format!("{expected_stem}.nfo"));
+    assert_eq!(remapped.get(&media_path), Some(&flat_media));
+    assert_eq!(remapped.get(&nfo_path), Some(&flat_nfo));
+    let flat_nfo_contents = fs::read_to_string(&flat_nfo).unwrap();
+    assert!(flat_nfo_contents.contains("<title>Full source title</title>"));
+    assert!(flat_nfo_contents.contains(&format!(
+        "<localfilename>{expected_stem}.mkv</localfilename>"
+    )));
+    assert!(flat_media.is_file());
+}
+
+#[test]
 fn flat_collection_keep_both_publishes_one_coherent_sidecar_group() {
     let output_root = temp_root("flat-collection-keep-both");
     let _cleanup = TestDirectory(output_root.clone());
