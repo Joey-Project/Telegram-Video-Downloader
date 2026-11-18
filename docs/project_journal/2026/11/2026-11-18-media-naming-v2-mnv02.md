@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-18
 updated: 2026-11-18
 branch: "codex/media-naming-v2"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/84"
 supersedes: []
 superseded_by: ""
 ---
