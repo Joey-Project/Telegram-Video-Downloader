@@ -120,7 +120,7 @@ describe("bounded library views", () => {
   });
 
   it("does not let snapshot refresh retain an old nested default over a fresh compact snapshot", () => {
-    const rootBinding = `v1:${"c".repeat(64)}`;
+    const rootBinding = `v2:${"c".repeat(64)}`;
     const previous = acceptOwnerSnapshot({
       settings: { applied: { default_library_id: "main", libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding }] } },
       library: {
@@ -165,7 +165,7 @@ describe("bounded library views", () => {
   });
 
   it("does not merge a live descriptor from a different root binding into the registered library", () => {
-    const currentBinding = `v1:${"b".repeat(64)}`;
+    const currentBinding = `v2:${"b".repeat(64)}`;
     const staleBinding = `v1:${"a".repeat(64)}`;
     const snapshot = {
       settings: {
@@ -322,7 +322,9 @@ describe("bounded library views", () => {
       ] },
     };
 
+    expect(isValidLibraryRootBinding(renderedSourceBinding)).toBe(true);
     expect(isValidLibraryRootBinding(renderedTargetBinding)).toBe(true);
+    expect(isValidLibraryRootBinding(`v2:${"a".repeat(64)}\n`)).toBe(false);
     expect(payload).toMatchObject({
       source_library_id: "source",
       target_library_id: "target",

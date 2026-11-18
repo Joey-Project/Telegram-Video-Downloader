@@ -3,6 +3,7 @@ import { buildLibraryMutationPayload, isValidLibraryRootBinding } from "../publi
 
 const bindingA = `v1:${"a".repeat(64)}`;
 const bindingB = `v1:${"b".repeat(64)}`;
+const bindingV2 = `v2:${"c".repeat(64)}`;
 
 describe("Settings library mutation payloads", () => {
   it("binds all four mutation payloads to the displayed registration identity", () => {
@@ -38,13 +39,22 @@ describe("Settings library mutation payloads", () => {
     expect(payload?.root_binding).not.toBe(currentSnapshotAfterReplacement.root_binding);
   });
 
+  it.each([bindingA, bindingV2])("accepts an exact versioned binding %s", (binding) => {
+    expect(isValidLibraryRootBinding(binding)).toBe(true);
+    expect(buildLibraryMutationPayload("library_remove", { id: "archive", root_binding: binding })).toEqual({
+      library_id: "archive",
+      root_binding: binding,
+    });
+  });
+
   it.each([
     ["missing", undefined],
     ["null", null],
-    ["wrong version", `v2:${"a".repeat(64)}`],
+    ["unsupported version", `v3:${"a".repeat(64)}`],
     ["uppercase", `v1:${"A".repeat(64)}`],
     ["short", `v1:${"a".repeat(63)}`],
     ["non-hex", `v1:${"a".repeat(63)}g`],
+    ["trailing newline", `${bindingA}\n`],
   ])("fails closed for a %s displayed binding", (_label, binding) => {
     expect(isValidLibraryRootBinding(binding)).toBe(false);
     expect(buildLibraryMutationPayload("library_remove", { id: "archive", root_binding: binding })).toBeNull();

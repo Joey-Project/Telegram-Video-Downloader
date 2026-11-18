@@ -9880,6 +9880,8 @@ mod danmaku_refresh_e2e_tests;
 mod media_library_e2e_tests;
 #[path = "media_library_snapshot_e2e_tests.rs"]
 mod media_library_snapshot_e2e_tests;
+#[path = "path_based_library_identity_tests.rs"]
+mod path_based_library_identity_tests;
 #[path = "staging_cleanup_e2e_tests.rs"]
 mod staging_cleanup_e2e_tests;
 

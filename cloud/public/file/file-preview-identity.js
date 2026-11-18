@@ -1,6 +1,6 @@
 import { registeredMediaLibrary } from "./library-view.js";
 
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 const MAX_LIBRARY_ID_BYTES = 128;
 const UTF8_ENCODER = new TextEncoder();
 

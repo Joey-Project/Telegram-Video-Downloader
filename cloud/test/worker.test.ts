@@ -58,6 +58,7 @@ const webhookToken = syntheticCredentials.webhookSecret.value;
 const botToken = syntheticCredentials.botToken.value;
 const workerUrl = "https://worker.test";
 const TEST_ROOT_BINDING = `v1:${"a".repeat(64)}`;
+const TEST_ROOT_BINDING_V2 = `v2:${"c".repeat(64)}`;
 const TEST_TARGET_ROOT_BINDING = `v1:${"b".repeat(64)}`;
 const testActionReplayWindows = new Map<string, number>();
 const textEncoder = new TextEncoder();
@@ -1613,7 +1614,7 @@ describe("applied media-library snapshot validation", () => {
     }))).toThrow("library.migration_discovery_warnings must contain at most 16 entries");
   });
 
-  it.each(["v1:abcd", `v1:${"A".repeat(64)}`, `v2:${"a".repeat(64)}`, 7])
+  it.each(["v1:abcd", `v1:${"A".repeat(64)}`, `v3:${"a".repeat(64)}`, `v1:${"a".repeat(64)}\n`, 7])
   ("rejects an explicitly malformed root binding %j", (binding) => {
     const snapshot = localSnapshot({
       settings: {
@@ -1653,6 +1654,30 @@ describe("applied media-library snapshot validation", () => {
       },
     });
     expect(validateSnapshot(legacy).settings.applied?.libraries[0]?.root_binding).toBeNull();
+
+    const modern = localSnapshot({
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          revision: "settings-root-binding-v2",
+          default_library_id: "main",
+          default_category: "",
+          libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", default_category: "", is_default: true, root_binding: TEST_ROOT_BINDING_V2 }],
+        },
+      },
+      library: {
+        revision: "library-root-binding-v2",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", root_binding: TEST_ROOT_BINDING_V2, availability: "available" }],
+      },
+    });
+    expect(validateSnapshot(modern).settings.applied?.libraries[0]?.root_binding).toBe(TEST_ROOT_BINDING_V2);
+    expect(validateSnapshot(modern).library).toMatchObject({
+      libraries: [{ root_binding: TEST_ROOT_BINDING_V2 }],
+    });
 
     const invalidLiveLibrary = structuredClone(legacy["library"]) as {
       libraries: Array<{ root_binding?: unknown }>;
@@ -2195,7 +2220,7 @@ describe("Mini App identity and actions", () => {
       {
         request_id: "00000000-0000-4000-8000-000000009325",
         kind: "legacy_import",
-        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING, text: "older links" },
+        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING_V2, text: "older links" },
       },
     ];
     for (const [index, action] of validActions.entries()) {
@@ -2216,7 +2241,7 @@ describe("Mini App identity and actions", () => {
     const backlog = await responseJson<{ requests: Array<{ kind: string; payload: Record<string, unknown> }> }>(await localRequests());
     for (const action of validActions) {
       const stored = backlog.requests.find((request) => request.kind === action.kind && request.payload.library_id === "library-test");
-      expect(stored?.payload.root_binding).toBe(TEST_ROOT_BINDING);
+      expect(stored?.payload.root_binding).toBe(action.payload.root_binding);
     }
   });
 
@@ -2720,7 +2745,7 @@ describe("Mini App identity and actions", () => {
 
   it("publishes only bounded staging preview identity while accepted actions wait for the desktop", async () => {
     const initData = await signInitData();
-    const identity = { library_id: "library-staging", root_binding: `v1:${"a".repeat(64)}` };
+    const identity = { library_id: "library-staging", root_binding: TEST_ROOT_BINDING_V2 };
     const preview = { preview_seq: 10, preview_id: "staging-preview-10", revision: "staging-revision-10" };
     const operations = ["scan", "preview", "confirm", "cancel"] as const;
     for (const [index, operation] of operations.entries()) {

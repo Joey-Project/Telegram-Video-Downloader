@@ -64,7 +64,7 @@ mod staging_cleanup_queue;
 
 fn validate_library_root_binding_token(binding: &str) -> Result<()> {
     if binding.len() != 67
-        || !binding.starts_with("v1:")
+        || !binding.starts_with("v2:")
         || !binding[3..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -817,14 +817,16 @@ impl QueueManager {
         // Open each registered library independently. An unplugged root is retained in the
         // settings snapshot and status map, while online roots continue serving their tasks.
         for library in &library_snapshot.libraries {
-            let root_binding = media_libraries.root_binding(&library.id);
             let opened = (|| -> Result<(DownloadStore, Option<Arc<QueueOwnerLock>>)> {
                 let root = coordinate_directory_root(file_provider.as_ref(), &library.root)?;
-                if root_binding.is_some_and(|binding| {
-                    binding != (root.root_identity().device(), root.root_identity().inode())
-                }) {
-                    bail!("media library root object identity changed; it remains unavailable");
-                }
+                let identity = root.root_identity();
+                // The configured absolute path is the cross-process registration. Bind its
+                // current directory object for this process before opening queue ownership.
+                media_libraries.bind_root_identity(
+                    &library.id,
+                    identity.device(),
+                    identity.inode(),
+                )?;
                 let store = DownloadStore::from_root(
                     root,
                     Arc::clone(&file_provider),
@@ -840,21 +842,6 @@ impl QueueManager {
 
             match opened {
                 Ok((store, owner_lock)) => {
-                    if let Err(error) = media_libraries.bind_root_identity(
-                        &library.id,
-                        store.root.root_identity().device(),
-                        store.root.root_identity().inode(),
-                    ) {
-                        video_statuses.insert(
-                            library.id.clone(),
-                            MediaLibraryStatus {
-                                available: false,
-                                available_space_bytes: None,
-                                diagnostic: Some(error.to_string()),
-                            },
-                        );
-                        continue;
-                    }
                     let available_space_bytes = store.root.available_space_bytes().ok();
                     video_statuses.insert(
                         library.id.clone(),
@@ -1226,13 +1213,13 @@ impl QueueManager {
                 if (device, inode) != (store_identity.device(), store_identity.inode()) =>
             {
                 bail!(
-                    "media library {} queue root no longer matches its persisted object identity",
+                    "media library {} queue root no longer matches its process-session identity",
                     library.id
                 );
             }
             Some(_) => {}
             None => {
-                // Legacy registries without an inode binding may be adopted only after a fresh
+                // A root opened after startup was unavailable is bound only after a fresh
                 // coordinated lookup confirms the already-open queue root. This check happens
                 // before refresh can recover or create queue state.
                 let current =
@@ -1254,9 +1241,9 @@ impl QueueManager {
             }
         }
 
-        // Refresh first re-coordinates the registered path and compares it with the persisted
-        // device/inode before opening an owner lock or touching queue indexes. It intentionally
-        // ignores child contents and mutable timestamps.
+        // Refresh first re-coordinates the registered path and compares it with this process's
+        // device/inode binding before opening an owner lock or touching queue indexes. It
+        // intentionally ignores child contents and mutable timestamps.
         self.refresh_video_library_unlocked(library.clone())?;
         self.require_video_library_available(&library.id)?;
         let current_binding = self
@@ -1266,7 +1253,7 @@ impl QueueManager {
             .root_binding(&library.id);
         if current_binding != Some((store_identity.device(), store_identity.inode())) {
             bail!(
-                "media library {} queue root no longer matches its persisted object identity",
+                "media library {} queue root no longer matches its process-session identity",
                 library.id
             );
         }
@@ -1287,8 +1274,9 @@ impl QueueManager {
     }
 
     /// Verify the registered queue owner before changing which library receives new tasks.
-    /// Root device/inode is the protected property; child entries, media contents, and timestamps
-    /// are intentionally not part of this check so ordinary directory churn remains valid.
+    /// Root device/inode protects an already-open process session; child entries, media contents,
+    /// and timestamps are intentionally not part of this check so ordinary directory churn remains
+    /// valid.
     fn validate_video_library_for_settings_mutation_unlocked(
         &self,
         library_id: &str,
@@ -1311,9 +1299,9 @@ impl QueueManager {
         if let Some(store) = existing_store {
             self.validate_video_library_for_task_unlocked(&store, &library)?;
         } else {
-            // Offline roots are retained in settings without a live store. Reopening is safe
-            // only because refresh validates any persisted root identity before queue recovery
-            // or owner-lock creation.
+            // Offline roots are retained in settings without a live store. Reopening first binds
+            // the current object at the registered path before queue recovery or owner-lock
+            // creation.
             self.refresh_video_library_unlocked(library.clone())?;
             self.require_video_library_available(library_id)?;
             let store = self
@@ -1348,7 +1336,7 @@ impl QueueManager {
         if binding != Some((identity.device(), identity.inode()))
             || store.root.root_identity() != identity
         {
-            bail!("media library {library_id} root no longer matches its persisted queue identity");
+            bail!("media library {library_id} root no longer matches its process-session identity");
         }
         Ok(())
     }
@@ -1406,7 +1394,7 @@ impl QueueManager {
         Ok(Some((library, store)))
     }
 
-    /// Revalidate the registration token against its persisted root object and the open queue
+    /// Revalidate the registration token against its path registration and the open queue
     /// store without refreshing or reconciling queue state.
     pub(crate) fn pgc_backfill_root_binding_valid(
         &self,
@@ -1462,7 +1450,7 @@ impl QueueManager {
     }
 
     /// Reopen registered roots that were offline at startup and refresh cached capacity/status.
-    /// A path whose current directory object differs from its persisted binding stays offline.
+    /// A path whose current directory object differs from this process's binding stays offline.
     pub fn refresh_video_libraries(&self) -> Result<()> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let libraries = self.registry_snapshot()?.libraries;
@@ -1521,7 +1509,7 @@ impl QueueManager {
             .root_binding(library_id);
         let identity = store.root.root_identity();
         if binding != Some((identity.device(), identity.inode())) {
-            bail!("media library {library_id} root does not match its persisted queue identity");
+            bail!("media library {library_id} root does not match its process-session identity");
         }
         if let Err(error) = store.root.validate_configured_root() {
             // A replacement can occur after the coordinated refresh but before the caller uses
@@ -1537,7 +1525,7 @@ impl QueueManager {
 
     /// Verify the caller's displayed registration token before refreshing the root, then return
     /// the already-open queue root only if the registered store is still available and bound to
-    /// the same persisted device/inode. The operation lock keeps the registration stable across
+    /// the same process-session device/inode. The operation lock keeps the registration stable across
     /// token validation, refresh, and handle selection; child entries and timestamps are not part
     /// of the binding.
     pub(crate) fn verified_video_library_root_with_binding(
@@ -1577,7 +1565,7 @@ impl QueueManager {
             .map_err(poisoned_lock)?
             .root_binding(library_id);
         if registry_identity != Some((identity.device(), identity.inode())) {
-            bail!("media library {library_id} root does not match its persisted queue identity");
+            bail!("media library {library_id} root does not match its process-session identity");
         }
         store
             .root
@@ -1587,7 +1575,7 @@ impl QueueManager {
     }
 
     /// Verify both displayed registration tokens before refreshing either queue root, then
-    /// return the two already-open roots only after each root still matches its persisted
+    /// return the two already-open roots only after each root still matches its process-session
     /// identity. Callers can initialize root-bound managers from these handles without looking
     /// either registration up again by pathname.
     pub(crate) fn verified_video_library_roots_with_bindings(
@@ -1649,14 +1637,14 @@ impl QueueManager {
         let source_root = source_store.store.root.clone();
         let target_root = target_store.store.root.clone();
 
-        for (library_id, root, persisted_identity) in [
+        for (library_id, root, session_identity) in [
             (source_library_id, &source_root, source_identity),
             (target_library_id, &target_root, target_identity),
         ] {
             let identity = root.root_identity();
-            if persisted_identity != Some((identity.device(), identity.inode())) {
+            if session_identity != Some((identity.device(), identity.inode())) {
                 bail!(
-                    "media library {library_id} root does not match its persisted queue identity"
+                    "media library {library_id} root does not match its process-session identity"
                 );
             }
             root.validate_configured_root()
@@ -1705,6 +1693,10 @@ impl QueueManager {
             )?;
             return Ok(());
         }
+        self.media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .bind_root_identity(&library.id, identity.device(), identity.inode())?;
 
         let existing = self
             .video_libraries
@@ -1751,10 +1743,6 @@ impl QueueManager {
                 store.ensure_index()?;
                 store.reconcile_index()?;
                 drop(operation_lock);
-                self.media_libraries
-                    .lock()
-                    .map_err(poisoned_lock)?
-                    .bind_root_identity(&library.id, identity.device(), identity.inode())?;
                 // A root that was unavailable during QueueManager::open was not included in
                 // startup recovery. Recover only this newly opened, independently owned store
                 // before publishing it as available. Existing stores may have live workers, and
@@ -2384,7 +2372,7 @@ impl QueueManager {
                 .flatten()
                 .ok_or_else(|| {
                     anyhow!(
-                        "cannot verify migration tokens: media library {library_id} has no persisted root identity"
+                        "cannot verify migration tokens: media library {library_id} has no process-session root binding"
                     )
                 })?;
             let store_identity = store.root.root_identity();
@@ -7342,7 +7330,7 @@ impl DownloadStore {
     }
 
     /// Read a single task through the persisted index without scanning the queue directory or
-    /// reconciling pending moves. Callers which need to validate a library's persisted root
+    /// reconciling pending moves. Callers which need to validate a library's process-session root
     /// identity first use this to avoid recovery/index writes against an unverified path.
     fn peek_task(&self, id: &str) -> Result<Option<(TaskRecord, TaskIndexEntry)>> {
         let index = self.read_index()?;

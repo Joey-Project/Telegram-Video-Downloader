@@ -11,7 +11,7 @@ const tracker: RecoveryPreviewRequest = {
   requestId: "00000000-0000-4000-8000-000000000001",
   seq: 42,
   libraryId: "main-library",
-  rootBinding: `v1:${"a".repeat(64)}`,
+  rootBinding: `v2:${"a".repeat(64)}`,
   status: "submitted",
   error: "Preview request accepted.",
 };
@@ -41,6 +41,13 @@ describe("metadata recovery preview state", () => {
       "requestId", "seq", "libraryId", "rootBinding", "status", "error",
     ]);
     expect(Object.isFrozen(readRecoveryPreviewRequest(storage))).toBe(true);
+  });
+
+  it("round-trips legacy v1 binding tokens", () => {
+    const { storage } = memoryStorage();
+    const legacy = { ...tracker, rootBinding: `v1:${"b".repeat(64)}` };
+    expect(writeRecoveryPreviewRequest(storage, legacy)).toBe(true);
+    expect(readRecoveryPreviewRequest(storage)).toEqual(legacy);
   });
 
   it("rejects missing, malformed, oversized, or extra persisted state without parsing oversized bytes", () => {
@@ -74,6 +81,8 @@ describe("metadata recovery preview state", () => {
       { ...tracker, libraryId: "bad\u0000id" },
       { ...tracker, libraryId: "é".repeat(65) },
       { ...tracker, rootBinding: `v1:${"A".repeat(64)}` },
+      { ...tracker, rootBinding: `v3:${"a".repeat(64)}` },
+      { ...tracker, rootBinding: `${tracker.rootBinding}\n` },
       { ...tracker, status: "completed" },
     ];
     for (const invalid of invalidTrackers) {

@@ -423,14 +423,14 @@ function parseAbsoluteLibraryRoot(value: unknown): string {
 function parseOptionalRootBinding(value: unknown, field: string): void {
   if (value === undefined || value === null) return;
   if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
-      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+      || !/^v[12]:[0-9a-f]{64}(?![\s\S])/u.test(value)) {
     throw new HttpError(400, `${field} must be an opaque root binding token`);
   }
 }
 
 function parseRequiredRootBinding(value: unknown): string {
   if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
-      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+      || !/^v[12]:[0-9a-f]{64}(?![\s\S])/u.test(value)) {
     throw new HttpError(400, "root_binding must be an opaque root identity token");
   }
   return value;

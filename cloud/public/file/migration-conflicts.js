@@ -1,7 +1,7 @@
 export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
 
 const POLICIES = new Set(["skip", "keep_both"]);
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);

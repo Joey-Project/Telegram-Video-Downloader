@@ -1,6 +1,6 @@
 import { escapeHtml } from "./preview-rendering.js";
 
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 const MAX_SUMMARY_ITEMS = 4;
 const MAX_SAMPLE_FILES_PER_ITEM = 2;
 const MAX_SAMPLE_METADATA_PATCHES = 4;

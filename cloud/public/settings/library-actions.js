@@ -1,4 +1,4 @@
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 const ROOT_BOUND_MUTATION_KINDS = new Set([
   "library_set_default",
   "library_set_category",

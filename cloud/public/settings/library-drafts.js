@@ -1,6 +1,6 @@
 const DRAFT_FIELDS = new Set(["name", "default_category"]);
 const LIBRARY_EDITOR_FORMS = "form[data-rename-form], form[data-category-form]";
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 
 function libraryKey(entry) {
   if (!entry || typeof entry !== "object") return null;

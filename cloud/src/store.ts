@@ -102,7 +102,7 @@ function stagingPendingIdentity(row: PendingSummaryRow): StagingPendingIdentity 
     && new TextEncoder().encode(value).byteLength <= limit;
   const previewIdLimit = row.kind === "danmaku_refresh" ? 96 : 128;
   if (!bounded(row.library_id, 128) || typeof row.root_binding !== "string"
-      || !/^v1:[0-9a-f]{64}$/u.test(row.root_binding)) return {};
+      || !/^v[12]:[0-9a-f]{64}(?![\s\S])/u.test(row.root_binding)) return {};
   const identity: StagingPendingIdentity = { operation, library_id: row.library_id, root_binding: row.root_binding };
   if (operation === "scan" || operation === "preview") return identity;
   if (!Number.isSafeInteger(row.preview_seq) || (row.preview_seq as number) <= 0

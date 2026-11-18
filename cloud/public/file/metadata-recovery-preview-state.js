@@ -4,7 +4,7 @@ const MAX_PERSISTED_BYTES = 8_192;
 const MAX_LIBRARY_ID_BYTES = 128;
 const MAX_ERROR_BYTES = 1_024;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 const PREVIEW_STATUSES = new Set([
   "queued",
   "submitted",

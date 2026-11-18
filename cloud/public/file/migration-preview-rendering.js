@@ -9,7 +9,7 @@ import { RECENT_OPERATION_SNAPSHOT_LIMIT, RECENT_SNAPSHOT_MAX_AGE_MS } from "./d
 
 const MAX_SUMMARY_SAMPLE_ITEMS = 4;
 const MAX_SUMMARY_PATH_CHARS = 240;
-const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
+const ROOT_BINDING_PATTERN = /^v[12]:[0-9a-f]{64}(?![\s\S])/u;
 export const MIGRATION_PREVIEW_PAGE_SIZE = 30;
 
 export function migrationPreviewDraftKey(id, revision) {

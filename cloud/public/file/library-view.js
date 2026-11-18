@@ -2,7 +2,7 @@ export const LIBRARY_PAGE_SIZE = 50;
 export const MAX_FOLDER_SUGGESTIONS = 100;
 
 function validRootBinding(value) {
-  return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
+  return typeof value === "string" && /^v[12]:[0-9a-f]{64}(?![\s\S])/u.test(value);
 }
 
 export function isValidLibraryRootBinding(value) {

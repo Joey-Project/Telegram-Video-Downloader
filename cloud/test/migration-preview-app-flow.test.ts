@@ -21,7 +21,7 @@ import { dismissUnknownFileAction, markUnknownFileAction } from "../public/file/
 
 type RememberedOutcome = { kind?: string; code?: string; error?: string };
 
-const SOURCE_BINDING = `v1:${"a".repeat(64)}`;
+const SOURCE_BINDING = `v2:${"a".repeat(64)}`;
 const TARGET_BINDING = `v1:${"b".repeat(64)}`;
 
 function fullPreview(id: string, revision: string, sourceLibraryId = "source") {
@@ -65,6 +65,25 @@ function previewOperation(id: string, revision: string, sourceLibraryId = "sourc
 }
 
 describe("migration preview app flow", () => {
+  it("accepts v1 and v2 preview bindings and rejects malformed tokens", () => {
+    const preview = fullPreview("preview-bindings", "revision-bindings");
+    expect(buildMigrationPreviewRefreshPayload(preview, {}, {
+      seq: 1,
+      id: "preview-bindings",
+      revision: "revision-bindings",
+    })).not.toBeNull();
+    expect(buildMigrationPreviewRefreshPayload({ ...preview, source_root_binding: `v3:${"c".repeat(64)}` }, {}, {
+      seq: 1,
+      id: "preview-bindings",
+      revision: "revision-bindings",
+    })).toBeNull();
+    expect(buildMigrationPreviewRefreshPayload({ ...preview, target_root_binding: `${TARGET_BINDING}\n` }, {}, {
+      seq: 1,
+      id: "preview-bindings",
+      revision: "revision-bindings",
+    })).toBeNull();
+  });
+
   it("retains all 100 published previews, deduplicates exact revisions, and renders their controls", () => {
     const previews = Array.from({ length: 99 }, (_, index) => ({
       ...previewOperation(`preview-${index}`, "revision-1"),
