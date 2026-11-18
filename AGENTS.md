@@ -2,6 +2,10 @@
 
 ## Local Preferences
 
+- Inherit the global Cargo build cache; do not override `CARGO_BUILD_BUILD_DIR` or
+  `build.build-dir`, or create per-task Rust caches. Separate target paths are
+  only for required release/install staging.
+
 - Telegram MTProto application credentials are stored at
   `/Users/joey/.config/telegram-video-downloader/mtproto.json` (`api_id`, `api_hash`).
   Keep this file private with mode `0600`; record only its path in repository docs,

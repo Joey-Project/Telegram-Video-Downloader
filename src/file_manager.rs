@@ -3695,7 +3695,13 @@ impl LibraryManager {
             }
         }
         let mut source_nfo_owners: HashMap<TargetReservationKey, Vec<&str>> = HashMap::new();
-        for source_item in &snapshot.items {
+        // Missing records are confirmed historical objects, not current NFO owners. Keep
+        // Unavailable records as possible owners because the scan did not prove their absence.
+        for source_item in snapshot
+            .items
+            .iter()
+            .filter(|item| item.presence != Presence::Missing)
+        {
             let source_media = self.absolute_path(&source_item.relative_path)?;
             let canonical_nfo = with_extension(&source_media, "nfo");
             let mut source_nfo_paths = vec![path_to_relative_string(
@@ -6810,7 +6816,7 @@ impl LibraryManager {
             .unwrap_or_else(|| physical_item_id_from_identity(item_identity, &media.relative_path));
         let title_from_name = title_from_path(&media.relative_path);
         let mut title = title_from_name;
-        let mut source_ids = ids_from_path(&media.relative_path);
+        let mut source_ids = extract_source_ids(&media.relative_path);
         let mut collection = None;
         let mut organization_status = None;
         let mut nfo_collection_metadata_present = false;
@@ -6819,6 +6825,7 @@ impl LibraryManager {
             .map(str::to_owned);
         let mut nfo_title_present = false;
         let mut nfo_source_id_present = false;
+        let mut sidecar_source_id_present = false;
         let mut sidecar_title_present = false;
         let mut metadata_status = if opened_presence == Presence::Missing {
             MetadataStatus::ProviderUnavailable
@@ -6853,6 +6860,7 @@ impl LibraryManager {
                                 nfo_title_present |= nfo_title.is_some();
                                 sidecar_title_present |= nfo_title.is_some();
                                 nfo_source_id_present |= !nfo_ids.is_empty();
+                                sidecar_source_id_present |= !nfo_ids.is_empty();
                                 source_ids.extend(nfo_ids);
                                 if let Some(value) = nfo_collection_title(&text)
                                     && !value.trim().is_empty()
@@ -6910,6 +6918,7 @@ impl LibraryManager {
                                 }
                                 sidecar_title_present = true;
                             }
+                            sidecar_source_id_present |= !json_ids.is_empty();
                             source_ids.extend(json_ids);
                             collection = collection.or(json_collection);
                             metadata_status = MetadataStatus::Partial;
@@ -6949,6 +6958,13 @@ impl LibraryManager {
             *scan.timed_out = true;
             push_scan_timeout_warning(scan.warnings);
             return Ok(None);
+        }
+        if authoritative_nfo_path.is_none()
+            && !sidecar_source_id_present
+            && source_ids.is_empty()
+            && let Some(video_id) = youtube_id_from_legacy_filename(&media.relative_path)
+        {
+            source_ids.push(format!("youtube:{video_id}"));
         }
         source_ids = normalize_source_ids(source_ids);
         if organization_status == Some(OrganizationStatus::Standalone)
@@ -9212,7 +9228,7 @@ fn excluded_entry(
     is_private_downloader_component(name, semantics)
 }
 
-fn is_primary_media(path: &str) -> bool {
+fn is_primary_video(path: &str) -> bool {
     let extension = Path::new(path)
         .extension()
         .and_then(OsStr::to_str)
@@ -9233,14 +9249,21 @@ fn is_primary_media(path: &str) -> bool {
             | "mpg"
             | "mpeg"
             | "3gp"
-            | "mp3"
-            | "m4a"
-            | "aac"
-            | "flac"
-            | "wav"
-            | "ogg"
-            | "opus"
-            | "wma"
+    )
+}
+
+fn is_primary_media(path: &str) -> bool {
+    if is_primary_video(path) {
+        return true;
+    }
+    let extension = Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "opus" | "wma"
     )
 }
 
@@ -10640,8 +10663,64 @@ fn deduplicate(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn ids_from_path(path: &str) -> Vec<String> {
-    extract_source_ids(path)
+    let mut ids = extract_source_ids(path);
+    if let Some(video_id) = youtube_id_from_legacy_filename(path) {
+        ids.push(format!("youtube:{video_id}"));
+    }
+    deduplicate(ids)
+}
+
+fn youtube_id_from_legacy_filename(path: &str) -> Option<String> {
+    let relative_path = Path::new(path);
+    if !relative_path
+        .parent()?
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .any(|component| component.eq_ignore_ascii_case("youtube"))
+    {
+        return None;
+    }
+
+    if !is_primary_video(path) {
+        return None;
+    }
+
+    let filename = relative_path.file_name()?.to_str()?;
+    let stem = filename.rsplit_once('.')?.0;
+    let bracket_start = stem.rfind('[')?;
+    if !stem.ends_with(']') {
+        return None;
+    }
+    let candidate = &stem[bracket_start + 1..stem.len() - 1];
+    if !is_youtube_video_id(candidate)
+        || !candidate.bytes().any(|byte| byte.is_ascii_alphabetic())
+        || candidate
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BV"))
+        || is_known_video_quality_label(candidate)
+        || !extract_source_ids(candidate).is_empty()
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn is_known_video_quality_label(candidate: &str) -> bool {
+    let candidate = candidate.to_ascii_lowercase();
+    let Some((resolution, frame_rate)) = candidate.split_once(['-', '_']) else {
+        return false;
+    };
+    if !matches!(
+        resolution,
+        "360p" | "480p" | "720p" | "1080p" | "1440p" | "2160p" | "4320p"
+    ) {
+        return false;
+    }
+    frame_rate.strip_suffix("fps").is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn normalize_source_ids(ids: Vec<String>) -> Vec<String> {
@@ -10699,18 +10778,31 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
         let tag = &content[element.open_start..element.open_end];
         let kind = xml_attribute(tag, "type")
             .unwrap_or_default()
+            .trim()
             .to_ascii_lowercase();
         let raw_id = xml_text_content(&content[element.open_end..element.close_start])
             .trim()
             .to_string();
         let canonical = match kind.as_str() {
-            "bilibili" | "bilibili-video" => raw_id,
-            "bilibili-aid" | "bilibili_aid" => {
-                if raw_id.to_ascii_lowercase().starts_with("av") {
+            "bilibili" | "bilibili-video" => {
+                if let Some(aid) = normalize_bilibili_aid(&raw_id) {
+                    aid
+                } else if raw_id
+                    .get(..2)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BV"))
+                {
                     raw_id
                 } else {
-                    format!("av{raw_id}")
+                    cursor = element.close_end;
+                    continue;
                 }
+            }
+            "bilibili-aid" | "bilibili_aid" => {
+                let Some(aid) = normalize_bilibili_aid(&raw_id) else {
+                    cursor = element.close_end;
+                    continue;
+                };
+                aid
             }
             "bilibili-cid" | "bilibili_cid" => {
                 if raw_id.to_ascii_lowercase().starts_with("cid") {
@@ -10738,6 +10830,21 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
         cursor = element.close_end;
     }
     deduplicate(ids)
+}
+
+fn normalize_bilibili_aid(raw_id: &str) -> Option<String> {
+    let value = raw_id.trim();
+    let digits = value
+        .strip_prefix("av")
+        .or_else(|| value.strip_prefix("AV"))
+        .or_else(|| value.strip_prefix("Av"))
+        .or_else(|| value.strip_prefix("aV"))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let aid = digits.parse::<u64>().ok()?;
+    (aid > 0).then(|| format!("av{aid}"))
 }
 
 fn nfo_source_id_types(content: &str) -> Result<HashSet<String>> {
@@ -13847,17 +13954,236 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bilibili_uniqueids_normalize_numeric_aids_as_bilibili_ids() {
+        let cases = [
+            (
+                r#"<movie><uniqueid type="bilibili">15911412</uniqueid></movie>"#,
+                "av15911412",
+            ),
+            (
+                r#"<movie><uniqueid type="bilibili">12345678901</uniqueid></movie>"#,
+                "av12345678901",
+            ),
+            (
+                "<movie><uniqueid type=' BILIBILI '> 15911413 </uniqueid></movie>",
+                "av15911413",
+            ),
+            (
+                r#"<movie><uniqueid type="bilibili-video">15911414</uniqueid></movie>"#,
+                "av15911414",
+            ),
+            (
+                r#"<movie><uniqueid type="bilibili-aid">15911415</uniqueid></movie>"#,
+                "av15911415",
+            ),
+            (
+                "<movie><uniqueid type='bilibili_aid'> AV15911416 </uniqueid></movie>",
+                "av15911416",
+            ),
+            (
+                r#"<movie><uniqueid type="Bilibili">av15911417</uniqueid></movie>"#,
+                "av15911417",
+            ),
+            (
+                r#"<movie><uniqueid type="bilibili">BV1AbCdEfG</uniqueid></movie>"#,
+                "BV1AbCdEfG",
+            ),
+            (
+                r#"<movie><uniqueid type="youtube">dQw4w9WgXcQ</uniqueid><uniqueid type="future-source">15911418</uniqueid></movie>"#,
+                "youtube:dQw4w9WgXcQ",
+            ),
+        ];
+
+        for (nfo, expected) in cases {
+            assert_eq!(nfo_source_ids(nfo), vec![expected], "{nfo}");
+        }
+
+        for invalid in ["0", "000", "18446744073709551616", "15911412x"] {
+            let nfo = format!(r#"<movie><uniqueid type="bilibili">{invalid}</uniqueid></movie>"#);
+            assert!(nfo_source_ids(&nfo).is_empty(), "{invalid}");
+        }
+        for invalid in ["0", "18446744073709551616", "av12x"] {
+            let nfo =
+                format!(r#"<movie><uniqueid type="bilibili-aid">{invalid}</uniqueid></movie>"#);
+            assert!(nfo_source_ids(&nfo).is_empty(), "{invalid}");
+        }
+        assert!(
+            nfo_source_ids(r#"<movie><uniqueid type="future-source">15911412</uniqueid></movie>"#)
+                .is_empty()
+        );
+        assert_eq!(
+            nfo_source_ids(
+                r#"<movie><uniqueid type="bilibili">15911419</uniqueid><uniqueid type="bilibili-aid">av15911419</uniqueid></movie>"#
+            ),
+            vec!["av15911419"]
+        );
+    }
+
+    #[test]
+    fn legacy_youtube_filename_id_requires_trailing_bracketed_video_id() {
+        assert_eq!(
+            ids_from_path("YouTube/Handmade kit [dQw4w9WgXcQ].webm"),
+            vec!["youtube:dQw4w9WgXcQ"]
+        );
+        for path in [
+            "YouTube/中文标题 [dQw4w9WgXcQ].webm",
+            "YouTube/日本語の作品 [dQw4w9WgXcQ].WEBM",
+            "YouTube/한국어 제목 [dQw4w9WgXcQ].mkv",
+            "YouTube/Русский заголовок [dQw4w9WgXcQ].mkv",
+            "YouTube/Titre français [dQw4w9WgXcQ].mkv",
+            "YouTube/Titolo italiano [dQw4w9WgXcQ].mkv",
+        ] {
+            assert_eq!(ids_from_path(path), vec!["youtube:dQw4w9WgXcQ"], "{path}");
+        }
+
+        for path in [
+            "YouTube/Title dQw4w9WgXcQ.webm",
+            "YouTube/Title [dQw4w9WgXcQ] extra.webm",
+            "YouTube/Title [12345678901].webm",
+            "YouTube/Title [1080p].webm",
+            "YouTube/Title [1080p-60fps].webm",
+            "YouTube/[dQw4w9WgXcQ]/Title.webm",
+            "YouTube/Title [dQw4w9WgXcQ].txt",
+            "Other/Title [dQw4w9WgXcQ].webm",
+            "Other/Title [Abcdefghijk].webm",
+        ] {
+            assert!(ids_from_path(path).is_empty(), "{path}");
+        }
+        assert_eq!(
+            ids_from_path("YouTube/Title [abcdefghijk].webm"),
+            vec!["youtube:abcdefghijk"]
+        );
+        assert_eq!(
+            ids_from_path("YouTube/Title [abcFPS12345].webm"),
+            vec!["youtube:abcFPS12345"]
+        );
+        assert_eq!(
+            ids_from_path("Bilibili/Clip [av15911412].webm"),
+            vec!["av15911412"]
+        );
+        assert_eq!(
+            ids_from_path("Bilibili/Clip [BV1AbCdEfG].webm"),
+            vec!["BV1AbCdEfG"]
+        );
+    }
+
+    #[test]
+    fn legacy_nfo_scan_completes_numeric_aids_and_keeps_youtube_filename_partial() {
+        let root = TemporaryRoot::new("legacy-source-identity");
+        let legacy_dir = root.path().join("Bilibili");
+        let youtube_dir = root.path().join("YouTube");
+        fs::create_dir_all(&legacy_dir).expect("legacy NFO fixture directory should create");
+        fs::create_dir_all(&youtube_dir).expect("YouTube fixture directory should create");
+
+        let nfo_styles = [
+            (r#"type="bilibili""#, "15911420"),
+            ("type='BILIBILI'", "15911421"),
+            ("type = ' bilibili '", "15911422"),
+            (r#"type="bilibili-video""#, "15911423"),
+            ("type='BILIBILI-VIDEO'", "15911424"),
+            (r#"type="bilibili-aid""#, "15911425"),
+            ("type='bilibili_aid'", "15911426"),
+            (r#"type="bilibili""#, "AV15911427"),
+        ];
+        for (index, (attribute, aid)) in nfo_styles.iter().enumerate() {
+            let media_name = format!("legacy-{index}.mp4");
+            fs::write(legacy_dir.join(&media_name), b"synthetic media fixture")
+                .expect("media fixture should write");
+            fs::write(
+                legacy_dir.join(format!("legacy-{index}.nfo")),
+                format!(
+                    "<movie><title>Legacy title {index}</title><uniqueid {attribute}>{aid}</uniqueid><future-field>preserved</future-field></movie>"
+                ),
+            )
+            .expect("NFO fixture should write");
+        }
+
+        let youtube_path = "Handmade kit [dQw4w9WgXcQ].webm";
+        fs::write(youtube_dir.join(youtube_path), b"synthetic media fixture")
+            .expect("YouTube media fixture should write");
+        fs::write(
+            youtube_dir.join("Conflicting source [dQw4w9WgXcQ].webm"),
+            b"synthetic media fixture",
+        )
+        .expect("conflicting-source media fixture should write");
+        fs::write(
+            youtube_dir.join("Conflicting source [dQw4w9WgXcQ].nfo"),
+            r#"<movie><title>Authoritative title</title><uniqueid type="youtube">oHg5SJYRHA0</uniqueid></movie>"#,
+        )
+        .expect("conflicting-source NFO fixture should write");
+        fs::write(
+            youtube_dir.join("Malformed source [dQw4w9WgXcQ].webm"),
+            b"synthetic media fixture",
+        )
+        .expect("malformed-source media fixture should write");
+        fs::write(
+            youtube_dir.join("Malformed source [dQw4w9WgXcQ].nfo"),
+            r#"<movie><title>Malformed metadata</title><uniqueid type="bilibili">not-an-id</uniqueid></movie>"#,
+        )
+        .expect("malformed-source NFO fixture should write");
+        fs::write(
+            youtube_dir.join("Generic title dQw4w9WgXcQ.webm"),
+            b"synthetic media fixture",
+        )
+        .expect("generic media fixture should write");
+        fs::create_dir(youtube_dir.join("[dQw4w9WgXcQ]"))
+            .expect("parent directory fixture should create");
+        fs::write(
+            youtube_dir.join("[dQw4w9WgXcQ]").join("Parent only.webm"),
+            b"synthetic media fixture",
+        )
+        .expect("parent-only media fixture should write");
+
+        let snapshot = manager(&root)
+            .scan(&[])
+            .expect("legacy metadata fixture scan should complete without network access");
+        for (index, (_, aid)) in nfo_styles.iter().enumerate() {
+            let item = item_at(&snapshot, &format!("Bilibili/legacy-{index}.mp4"));
+            assert_eq!(item.title, format!("Legacy title {index}"));
+            assert_eq!(
+                item.source_ids,
+                vec![format!("av{}", aid.trim_start_matches("AV"))]
+            );
+            assert_eq!(item.metadata_status, MetadataStatus::Complete);
+        }
+
+        let youtube_item = item_at(&snapshot, &format!("YouTube/{youtube_path}"));
+        assert_eq!(youtube_item.source_ids, vec!["youtube:dQw4w9WgXcQ"]);
+        assert_eq!(youtube_item.metadata_status, MetadataStatus::Partial);
+        let conflicting_item = item_at(&snapshot, "YouTube/Conflicting source [dQw4w9WgXcQ].webm");
+        assert_eq!(conflicting_item.source_ids, vec!["youtube:oHg5SJYRHA0"]);
+        assert_eq!(conflicting_item.metadata_status, MetadataStatus::Complete);
+        let malformed_item = item_at(&snapshot, "YouTube/Malformed source [dQw4w9WgXcQ].webm");
+        assert!(malformed_item.source_ids.is_empty());
+        assert_eq!(malformed_item.metadata_status, MetadataStatus::Partial);
+        assert_eq!(
+            item_at(&snapshot, "YouTube/Generic title dQw4w9WgXcQ.webm").metadata_status,
+            MetadataStatus::Unknown
+        );
+        assert!(
+            item_at(&snapshot, "YouTube/Generic title dQw4w9WgXcQ.webm")
+                .source_ids
+                .is_empty()
+        );
+        assert!(
+            item_at(&snapshot, "YouTube/[dQw4w9WgXcQ]/Parent only.webm")
+                .source_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn extracts_youtube_ids_from_supported_legacy_urls() {
         let ids = extract_source_ids(
             "Watch https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share#t=30). \
-             Rewatch https://youtu.be/PHH1wTDF-1M?si=share#t=10! \
-             Again `https://youtu.be/PHH1wTDF-1M?si=share#t=10`。）",
+             Rewatch https://youtu.be/oHg5SJYRHA0?si=share#t=10! \
+             Again `https://youtu.be/oHg5SJYRHA0?si=share#t=10`。）",
         );
         assert_eq!(
             ids,
             vec![
                 "youtube:dQw4w9WgXcQ".to_string(),
-                "youtube:PHH1wTDF-1M".to_string(),
+                "youtube:oHg5SJYRHA0".to_string(),
             ]
         );
     }
@@ -13865,13 +14191,13 @@ mod tests {
     #[test]
     fn youtube_url_extraction_preserves_bilibili_ids_and_later_tokens() {
         let ids = extract_source_ids(
-            "https://www.bilibili.com/video/BV1AbCdEfG https://youtu.be/PHH1wTDF-1M). cid12345678 av123456789",
+            "https://www.bilibili.com/video/BV1AbCdEfG https://youtu.be/dQw4w9WgXcQ). cid12345678 av123456789",
         );
         assert_eq!(
             ids,
             vec![
                 "BV1AbCdEfG".to_string(),
-                "youtube:PHH1wTDF-1M".to_string(),
+                "youtube:dQw4w9WgXcQ".to_string(),
                 "cid12345678".to_string(),
                 "av123456789".to_string(),
             ]
@@ -13883,12 +14209,12 @@ mod tests {
         let text = concat!(
             "https://youtube.com.evil/watch?v=dQw4w9WgXcQ ",
             "https://www.youtube.com.evil/watch?v=dQw4w9WgXcQ ",
-            "https://youtu.be.evil/PHH1wTDF-1M ",
+            "https://youtu.be.evil/dQw4w9WgXcQ ",
             "https://www.youtube.com/watch?v=short ",
             "https://www.youtube.com/watch?v=dQw4w9WgXcQx ",
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ%2F ",
-            "prefixhttps://youtu.be/PHH1wTDF-1M ",
-            "PHH1wTDF-1M",
+            "prefixhttps://youtu.be/dQw4w9WgXcQ ",
+            "dQw4w9WgXcQ",
         );
         assert!(extract_source_ids(text).is_empty());
     }
@@ -13906,10 +14232,10 @@ mod tests {
 
     #[test]
     fn legacy_import_creates_a_confirmation_hint_from_a_youtube_url() {
-        let report = parse_legacy_import("https://youtu.be/PHH1wTDF-1M");
+        let report = parse_legacy_import("https://youtu.be/dQw4w9WgXcQ");
         assert!(report.needs_confirmation);
         assert_eq!(report.hints.len(), 1);
-        assert_eq!(report.hints[0].source_ids, vec!["youtube:PHH1wTDF-1M"]);
+        assert_eq!(report.hints[0].source_ids, vec!["youtube:dQw4w9WgXcQ"]);
         assert!(report.warnings.is_empty());
     }
 
@@ -19170,6 +19496,120 @@ mod tests {
                 )
                 .is_err(),
             "two patches must be rejected when their filesystem target keys are shared"
+        );
+    }
+
+    #[test]
+    fn metadata_patch_ignores_missing_history_at_replaced_media_path() {
+        let root = TemporaryRoot::new("metadata-patch-replaced-history");
+        let media_path = root.path().join("clip.mp4");
+        let retained_old_path = root.path().join("retained-old-media.bin");
+        fs::write(&media_path, b"old-media-object").expect("old media fixture should write");
+        let manager = manager(&root);
+        let initial = manager
+            .scan(&[])
+            .expect("initial media scan should complete");
+        let old_id = item_at(&initial, "clip.mp4").id.clone();
+
+        fs::rename(&media_path, &retained_old_path)
+            .expect("old media object should remain allocated outside media discovery");
+        fs::write(&media_path, b"replacement-media-object")
+            .expect("replacement media fixture should write");
+        let replaced = manager
+            .scan(&[])
+            .expect("replacement media scan should retain old history");
+        let old_record = replaced
+            .items
+            .iter()
+            .find(|item| item.id == old_id)
+            .expect("old physical object should remain in library history");
+        assert_eq!(old_record.presence, Presence::Missing);
+        assert_eq!(old_record.relative_path, "clip.mp4");
+        let current = replaced
+            .items
+            .iter()
+            .find(|item| item.relative_path == "clip.mp4" && item.id != old_id)
+            .expect("replacement object should be present at the old path");
+        assert_eq!(current.presence, Presence::Present);
+        let current_id = current.id.clone();
+        let patch = MetadataPatch {
+            item_id: current_id.clone(),
+            title: Some("Replacement title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+            fill_missing_only: false,
+            organization_status: None,
+        };
+        let preview = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect("confirmed-absent history should not own the replacement NFO candidate");
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("metadata-only patch should execute for the replacement");
+        assert_eq!(result.status, BatchStatus::Complete);
+
+        let after = manager
+            .scan(&[])
+            .expect("post-patch scan should retain both physical records");
+        let current_after = after
+            .items
+            .iter()
+            .find(|item| item.id == current_id)
+            .expect("replacement record should remain indexed");
+        assert_eq!(current_after.presence, Presence::Present);
+        assert_eq!(current_after.title, "Replacement title");
+        let old_after = after
+            .items
+            .iter()
+            .find(|item| item.id == old_id)
+            .expect("missing historical record should remain indexed");
+        assert_eq!(old_after.presence, Presence::Missing);
+        assert_eq!(old_after.relative_path, "clip.mp4");
+    }
+
+    #[test]
+    fn metadata_patch_keeps_unavailable_nfo_candidate_owner_protected() {
+        let root = TemporaryRoot::new("metadata-patch-unavailable-owner");
+        fs::write(root.path().join("clip.mp4"), b"current-media-object")
+            .expect("current media fixture should write");
+        let manager = manager(&root);
+        let mut snapshot = manager
+            .scan(&[])
+            .expect("initial media scan should complete");
+        let current = item_at(&snapshot, "clip.mp4").clone();
+        let mut unavailable_owner = current.clone();
+        unavailable_owner.id = "unavailable-owner".to_string();
+        unavailable_owner.presence = Presence::Unavailable;
+        unavailable_owner.attachments.clear();
+        unavailable_owner.authoritative_nfo_path = None;
+        snapshot.items.push(unavailable_owner);
+        let patch = MetadataPatch {
+            item_id: current.id.clone(),
+            title: Some("Current title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+            fill_missing_only: false,
+            organization_status: None,
+        };
+
+        let error = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: &[],
+                    target_relative_dir: None,
+                    rename: false,
+                    conflict: ConflictPolicy::Skip,
+                    patches: &[patch],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect_err("an unavailable item remains a possible NFO owner");
+        assert!(
+            error
+                .to_string()
+                .contains("source sidecar candidate for another media item"),
+            "unexpected metadata preview error: {error:#}"
         );
     }
 

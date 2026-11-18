@@ -137,6 +137,54 @@ impl QueueFileProvider for PassthroughQueueFileProvider {
 struct MacQueueFileProvider;
 
 #[cfg(target_os = "macos")]
+std::thread_local! {
+    static ACTIVE_COORDINATION_PURPOSE: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Only nested synchronous accessors share a purpose. Unrelated operations,
+/// including operations on other threads, must still coordinate independently.
+#[cfg(target_os = "macos")]
+struct CoordinationPurpose {
+    id: String,
+    owns_context: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl CoordinationPurpose {
+    fn enter() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_PURPOSE: AtomicU64 = AtomicU64::new(1);
+        if let Some(id) = ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().clone()) {
+            return Self {
+                id,
+                owns_context: false,
+            };
+        }
+        let id = format!(
+            "io.github.telegram-local-downloader.file-access.{}.{}",
+            std::process::id(),
+            NEXT_PURPOSE.fetch_add(1, Ordering::Relaxed)
+        );
+        ACTIVE_COORDINATION_PURPOSE.with(|slot| *slot.borrow_mut() = Some(id.clone()));
+        Self {
+            id,
+            owns_context: true,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CoordinationPurpose {
+    fn drop(&mut self) {
+        if self.owns_context {
+            ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl QueueFileProvider for MacQueueFileProvider {
     fn coordinate_read(
         &self,
@@ -177,7 +225,7 @@ fn coordinate(
     use objc2::rc::{Retained, autoreleasepool};
     use objc2_foundation::{
         NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions,
-        NSFileCoordinatorWritingOptions, NSURL,
+        NSFileCoordinatorWritingOptions, NSString, NSURL,
     };
 
     // Bound Foundation's autoreleased temporaries to this synchronous operation.
@@ -190,6 +238,10 @@ fn coordinate(
             )
         })?;
         let coordinator = NSFileCoordinator::new();
+        // Apple documents that matching purpose identifiers prevent nested
+        // coordinators from blocking each other. Never share across top-level work.
+        let purpose = CoordinationPurpose::enter();
+        coordinator.setPurposeIdentifier(&NSString::from_str(&purpose.id));
         let accessor_result = RefCell::new(None);
         let accessor = RefCell::new(accessor);
         let block = StackBlock::new(|coordinated_url: NonNull<NSURL>| {
@@ -253,7 +305,9 @@ fn coordinate_move(
 
     use block2::StackBlock;
     use objc2::rc::{Retained, autoreleasepool};
-    use objc2_foundation::{NSError, NSFileCoordinator, NSFileCoordinatorWritingOptions, NSURL};
+    use objc2_foundation::{
+        NSError, NSFileCoordinator, NSFileCoordinatorWritingOptions, NSString, NSURL,
+    };
 
     // Bound Foundation's autoreleased temporaries to this synchronous operation.
     autoreleasepool(|_| {
@@ -264,6 +318,8 @@ fn coordinate_move(
             FileProviderAccessError::new(destination, "move", "destination is not a valid file URL")
         })?;
         let coordinator = NSFileCoordinator::new();
+        let purpose = CoordinationPurpose::enter();
+        coordinator.setPurposeIdentifier(&NSString::from_str(&purpose.id));
         let accessor_result = RefCell::new(None);
         let accessor = RefCell::new(accessor);
         let block = StackBlock::new(

@@ -11,7 +11,9 @@ use anyhow::anyhow;
 use objc2::rc::{Retained, Weak, autoreleasepool};
 use objc2::runtime::NSObject;
 
-use super::{MacQueueFileProvider, QueueFileProvider};
+use super::{
+    ACTIVE_COORDINATION_PURPOSE, CoordinationPurpose, MacQueueFileProvider, QueueFileProvider,
+};
 
 static TEMP_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -218,4 +220,86 @@ fn nested_coordination_drains_the_inner_pool_before_the_outer_pool() {
         );
         outer_observer.assert_drained("outer read");
     });
+}
+
+#[test]
+fn nested_read_write_move_shares_purpose_without_leaking_to_later_work() {
+    on_long_lived_rust_thread(|| {
+        let tree = TempTree::new("nested-read-write-move");
+        let media = tree.path().join("media.mp4");
+        let journal = tree.path().join("checkpoint.json");
+        let source = tree.path().join("before.nfo");
+        let target = tree.path().join("after.nfo");
+        fs::write(&media, b"media").unwrap();
+        fs::write(&journal, b"pending").unwrap();
+        fs::write(&source, b"metadata").unwrap();
+        let provider = MacQueueFileProvider;
+        let mut first_purpose = None;
+        provider
+            .coordinate_read(&media, &mut |_| {
+                let outer = ACTIVE_COORDINATION_PURPOSE
+                    .with(|slot| slot.borrow().clone())
+                    .unwrap();
+                first_purpose = Some(outer.clone());
+                provider.coordinate_write(&journal, &mut |path| {
+                    assert_eq!(
+                        ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().clone()),
+                        Some(outer.clone())
+                    );
+                    fs::write(path, b"checkpoint")?;
+                    provider.coordinate_move(&source, &target, &mut |from, to| {
+                        assert_eq!(
+                            ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().clone()),
+                            Some(outer.clone())
+                        );
+                        fs::rename(from, to)?;
+                        Ok(())
+                    })
+                })
+            })
+            .unwrap();
+        assert!(ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().is_none()));
+        provider
+            .coordinate_read(&media, &mut |_| {
+                assert_ne!(
+                    ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().clone()),
+                    first_purpose
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"checkpoint");
+        assert_eq!(fs::read(&target).unwrap(), b"metadata");
+        assert!(!source.exists());
+        assert!(ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().is_none()));
+    });
+}
+
+#[test]
+fn coordination_purpose_is_thread_local_and_clears_after_unwind() {
+    let previous = CoordinationPurpose::enter();
+    let previous_id = previous.id.clone();
+    let other_id = std::thread::spawn(|| CoordinationPurpose::enter().id.clone())
+        .join()
+        .unwrap();
+    assert_ne!(previous_id, other_id);
+    let failure = std::panic::catch_unwind(|| {
+        let nested = CoordinationPurpose::enter();
+        assert_eq!(nested.id, previous_id);
+        panic!("intentional accessor unwind");
+    });
+    assert!(failure.is_err());
+    assert_eq!(
+        ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().clone()),
+        Some(previous_id.clone())
+    );
+    drop(previous);
+    assert!(ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().is_none()));
+    let failure = std::panic::catch_unwind(|| {
+        let _outer = CoordinationPurpose::enter();
+        panic!("intentional outer unwind");
+    });
+    assert!(failure.is_err());
+    assert!(ACTIVE_COORDINATION_PURPOSE.with(|slot| slot.borrow().is_none()));
+    assert_ne!(CoordinationPurpose::enter().id, previous_id);
 }
