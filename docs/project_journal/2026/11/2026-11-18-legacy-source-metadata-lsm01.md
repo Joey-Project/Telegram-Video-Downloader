@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-18
 updated: 2026-11-18
 branch: "codex/migration-followup-fixes"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/83"
 supersedes: []
 superseded_by: ""
 ---
@@ -42,6 +42,9 @@ superseded_by: ""
 - All 198 file-manager tests pass. Coverage includes eight legacy NFO variants,
   invalid and ambiguous IDs, multilingual filenames, NFO precedence, historical
   replacement records, unavailable owners and existing shared-sidecar rejection.
+- The full macOS workspace/all-target test run passes, including mock Telegram
+  E2E and native codec fixtures: the bot harness reports 1,748 passed and 17
+  ignored. Workspace Clippy passes with warnings denied.
 - Real metadata-only recovery was read back through the existing reader.
   Independent inventories verified original media and unrelated NFOs unchanged,
   original XML fields preserved, and new NFO content matched observed source

@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-18
 updated: 2026-11-18
 branch: "codex/migration-followup-fixes"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/83"
 supersedes: []
 superseded_by: ""
 ---

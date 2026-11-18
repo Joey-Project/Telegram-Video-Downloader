@@ -21,8 +21,10 @@ path and identifier above remain unchanged. See
 [the Music automation procedure](macos-music-automation.md) for test-only signing,
 one-shot permission requests and sender verification. A test permission grant is
 not a production permission grant.
-The installer isolates both Cargo output directories, including when a global
-Cargo configuration redirects intermediate artifacts to a shared cache.
+The automatic installer build isolates both Cargo output directories. To follow
+this checkout's global Cargo cache convention, instead prebuild a release into
+a separate artifact target directory, inherit the global intermediate cache,
+and deploy that artifact with `--no-build` as shown below.
 
 Existing configuration, authentication files, working directory, environment,
 and log paths are preserved when installing over an existing LaunchAgent. They
@@ -81,6 +83,20 @@ scripts/launch_agent.sh install
 scripts/launch_agent.sh deploy --no-build --binary /path/to/release/telegram-video-downloader
 scripts/launch_agent.sh status
 ```
+
+For a release using the inherited global build cache, run from the verified
+source checkout:
+
+```sh
+migration_release_target="/path/to/private-release-artifacts"
+CARGO_TARGET_DIR="$migration_release_target" cargo build --locked --release -p telegram-video-downloader
+scripts/launch_agent.sh deploy --no-build --binary "$migration_release_target/release/telegram-video-downloader" --ready-timeout 600
+```
+
+Keep `CARGO_BUILD_BUILD_DIR` and `build.build-dir` inherited. The separate target
+directory is only for release/install artifacts. In `--no-build` mode the
+installer uses the installed converter as its input, then stages, signs and
+verifies it through the normal installation procedure.
 
 `plan` is read-only and emits only necessary paths, signature identity, and
 state locations. `--binary` selects an input artifact, never the
