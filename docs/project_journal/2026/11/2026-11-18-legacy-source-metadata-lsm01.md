@@ -4,7 +4,7 @@ title: Recover legacy media source metadata from local evidence
 status: completed
 created: 2026-11-18
 updated: 2026-11-18
-branch: "wip/cargo-cache-guidance"
+branch: "codex/migration-followup-fixes"
 pr: ""
 supersedes: []
 superseded_by: ""
@@ -39,10 +39,11 @@ superseded_by: ""
 
 ## Validation
 
-- All198 file-manager tests pass. Coverage includes eight legacy NFO variants,
+- All 198 file-manager tests pass. Coverage includes eight legacy NFO variants,
   invalid and ambiguous IDs, multilingual filenames, NFO precedence, historical
   replacement records, unavailable owners and existing shared-sidecar rejection.
 - Real metadata-only recovery was read back through the existing reader.
   Independent inventories verified original media and unrelated NFOs unchanged,
   original XML fields preserved, and new NFO content matched observed source
-  evidence. Runtime receipts and NFO backups remain private and uncommitted.
+  evidence. Runtime receipts remain private and uncommitted. Temporary NFO
+  before-images were removed after the accepted current state was revalidated.

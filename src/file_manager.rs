@@ -10663,6 +10663,7 @@ fn deduplicate(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn ids_from_path(path: &str) -> Vec<String> {
     let mut ids = extract_source_ids(path);
     if let Some(video_id) = youtube_id_from_legacy_filename(path) {

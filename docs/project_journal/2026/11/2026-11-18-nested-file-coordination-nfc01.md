@@ -4,7 +4,7 @@ title: Keep nested macOS file coordination within one operation purpose
 status: completed
 created: 2026-11-18
 updated: 2026-11-18
-branch: "wip/cargo-cache-guidance"
+branch: "codex/migration-followup-fixes"
 pr: ""
 supersedes: []
 superseded_by: ""
@@ -46,6 +46,6 @@ superseded_by: ""
 
 ## Operational scope
 
-- Migration receipts, NFO originals, filesystem inventories and incident stack
-  samples remain private and uncommitted. Library registrations and media paths
+- Migration receipts, filesystem inventories and incident stack samples remain
+  private and uncommitted. Library registrations and media paths
   are not part of this source change.
