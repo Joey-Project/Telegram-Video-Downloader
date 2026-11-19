@@ -10,6 +10,14 @@ explicitly confirm the selection. A torrent without supported audio remains an
 ordinary qBittorrent download. Configurations without Cloud ingress retain the
 native Telegram catalog and selection keyboard.
 
+The bot edits the same acknowledgement card as validated torrent metadata becomes
+available. Once the complete file inventory is verified, **添加所有音乐** schedules
+every supported music file in one action. Files still downloading wait until
+complete before entering Music. After the request is saved, the same card confirms
+the scheduled file count; this acknowledgement does not claim that Music has
+already imported those files. The Mini App remains available for choosing a subset
+or managing the task.
+
 The Mini App lists existing qBittorrent tasks with progress and exact-task
 pause/resume controls. Opening a task reads and validates
 the selected task; it does not submit another torrent, change its save location

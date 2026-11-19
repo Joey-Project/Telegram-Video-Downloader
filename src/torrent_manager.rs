@@ -518,7 +518,9 @@ impl TorrentManager {
             );
             if matches!(
                 &action,
-                TorrentAction::ImportSelected | TorrentAction::ReviewSelection { .. }
+                TorrentAction::ImportSelected
+                    | TorrentAction::AddAllMusic
+                    | TorrentAction::ReviewSelection { .. }
             ) {
                 ensure!(
                     task.selection_revision == inventory_revision,
@@ -528,6 +530,17 @@ impl TorrentManager {
                 ensure!(
                     task.inventory_revision == inventory_revision,
                     "torrent file list changed; refresh and confirm again"
+                );
+            }
+            if matches!(
+                &action,
+                TorrentAction::ImportSelected
+                    | TorrentAction::AddAllMusic
+                    | TorrentAction::RetryImports
+            ) {
+                ensure!(
+                    self.backend.music_imports_enabled(),
+                    "Music imports are disabled"
                 );
             }
             match action {
@@ -655,6 +668,73 @@ impl TorrentManager {
                             });
                     }
                     task.next_action_at = unix_seconds();
+                }
+                TorrentAction::AddAllMusic => {
+                    exit_review(task);
+                    let metainfo = task
+                        .metainfo
+                        .as_ref()
+                        .context("verified torrent files are not ready for music import")?;
+                    let remote = task
+                        .remote
+                        .as_ref()
+                        .context("verified torrent files are not ready for music import")?;
+                    ensure!(
+                        remote.matches_identity(&metainfo.identity),
+                        "torrent file inventory identity does not match metadata"
+                    );
+                    validate_remote_inventory(remote, metainfo)?;
+                    ensure!(
+                        same_metainfo_inventory(metainfo, remote),
+                        "verified torrent files are not ready for music import"
+                    );
+
+                    let mut supported_indexes = BTreeSet::new();
+                    for remote_file in &remote.files {
+                        if task_file(task, remote_file.index)?.supported_music {
+                            supported_indexes.insert(remote_file.index);
+                        }
+                    }
+                    ensure!(
+                        !supported_indexes.is_empty(),
+                        "torrent has no supported music files"
+                    );
+
+                    if task.selected_indexes != supported_indexes {
+                        task.selected_indexes = supported_indexes.clone();
+                        task.selection_revision = task.selection_revision.saturating_add(1);
+                    }
+                    let selection_revision = task.selection_revision;
+                    let inventory_revision = task.inventory_revision;
+                    let now = unix_seconds();
+                    for index in supported_indexes {
+                        let source_key = torrent_music_source_key(task, index)?;
+                        if let Some(request) = task.imports.get_mut(&index) {
+                            if request.music_job.is_none() && !request.enqueue_intent {
+                                request.confirmed_inventory_revision = inventory_revision;
+                                request.confirmed_selection_revision = selection_revision;
+                                request.error = None;
+                                request.next_retry_at = now;
+                            }
+                        } else {
+                            task.imports.insert(
+                                index,
+                                StoredImport {
+                                    source_key,
+                                    confirmed_inventory_revision: inventory_revision,
+                                    confirmed_selection_revision: selection_revision,
+                                    enqueue_intent: false,
+                                    batch_id: None,
+                                    music_job: None,
+                                    music_stage: Some(TorrentMusicStage::Pending),
+                                    error: None,
+                                    attempts: 0,
+                                    next_retry_at: now,
+                                },
+                            );
+                        }
+                    }
+                    task.next_action_at = now;
                 }
                 TorrentAction::RetryImports => {
                     let retry = task
@@ -3149,6 +3229,14 @@ fn task_file(task: &StoredTorrent, index: u32) -> Result<TorrentFileSnapshot> {
 fn task_snapshot(task: &StoredTorrent) -> TorrentSnapshot {
     let metainfo = task.metainfo.as_ref();
     let remote = task.remote.as_ref();
+    let inventory_verified = match (metainfo, remote) {
+        (Some(metainfo), Some(remote)) => {
+            remote.matches_identity(&metainfo.identity)
+                && validate_remote_inventory(remote, metainfo).is_ok()
+                && same_metainfo_inventory(metainfo, remote)
+        }
+        _ => false,
+    };
     let files: Vec<TorrentFileSnapshot> = if let Some(remote) = remote {
         remote
             .files
@@ -3219,6 +3307,7 @@ fn task_snapshot(task: &StoredTorrent) -> TorrentSnapshot {
         phase: task.phase.clone(),
         state: remote.map(|remote| remote.state.clone()),
         progress: remote.map(|remote| remote.progress).unwrap_or(0.0),
+        inventory_verified,
         cursor_folder_id: task.cursor_folder_id,
         cursor_page: task.cursor_page,
         review_selection: task.review_selection,

@@ -264,6 +264,7 @@ async fn handle_widget_inner(context: &BotContext, query: &WidgetQuery) -> Resul
         TorrentWidgetAction::ClearSelection => TorrentAction::ClearSelection,
         TorrentWidgetAction::ReviewSelection { page } => TorrentAction::ReviewSelection { page },
         TorrentWidgetAction::ImportSelected => TorrentAction::ImportSelected,
+        TorrentWidgetAction::AddAllMusic => TorrentAction::AddAllMusic,
         TorrentWidgetAction::RetryImports => TorrentAction::RetryImports,
     };
     let snapshot = tokio::time::timeout(
@@ -504,6 +505,7 @@ async fn handle_selection_callback(context: &BotContext, query: &CallbackQuery) 
         TorrentWidgetAction::ClearSelection => TorrentAction::ClearSelection,
         TorrentWidgetAction::ReviewSelection { page } => TorrentAction::ReviewSelection { page },
         TorrentWidgetAction::ImportSelected => TorrentAction::ImportSelected,
+        TorrentWidgetAction::AddAllMusic => TorrentAction::AddAllMusic,
         TorrentWidgetAction::RetryImports => TorrentAction::RetryImports,
     };
     let service = context

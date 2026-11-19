@@ -62,9 +62,18 @@ pub fn render_torrent_inline(snapshot: &TorrentSnapshot) -> Result<TorrentInline
     render_torrent_inline_with_miniapp(snapshot, None)
 }
 
+#[cfg(test)]
 pub(crate) fn render_torrent_inline_with_miniapp(
     snapshot: &TorrentSnapshot,
     miniapp_worker_url: Option<&str>,
+) -> Result<TorrentInlinePresentation> {
+    render_torrent_inline_with_options(snapshot, miniapp_worker_url, true)
+}
+
+pub(crate) fn render_torrent_inline_with_options(
+    snapshot: &TorrentSnapshot,
+    miniapp_worker_url: Option<&str>,
+    music_enabled: bool,
 ) -> Result<TorrentInlinePresentation> {
     ensure!(
         valid_task_id(&snapshot.task_id),
@@ -81,37 +90,41 @@ pub(crate) fn render_torrent_inline_with_miniapp(
             .iter()
             .fold(0_u64, |total, file| total.saturating_add(file.size));
         let text = format!(
-            "Torrent: {}\nStatus: {} · {} · {} / {}\nMusic: {} selected · {} imported",
+            "Torrent: {}\nStatus: {} · {} · {} / {}\n{}",
             bounded_text(&snapshot.name, BODY_TITLE_LIMIT_UTF16),
             phase_label(&snapshot.phase),
             progress_text(snapshot.progress),
             crate::human_bytes(downloaded),
             crate::human_bytes(total),
-            supported_selected_count(snapshot),
-            ImportCounts::from_snapshot(snapshot).complete,
+            music_status_line(snapshot, music_enabled),
         );
         ensure!(
             text.encode_utf16().count() <= TELEGRAM_MESSAGE_LIMIT_UTF16,
             "torrent summary exceeds Telegram's message limit"
         );
+        let mut inline_keyboard = vec![vec![InlineKeyboardButton {
+            text: "Manage torrent".to_string(),
+            callback_data: String::new(),
+            web_app: Some(WebAppInfo { url: app_url }),
+        }]];
+        if can_add_all_music(snapshot, music_enabled) {
+            inline_keyboard.push(vec![button("添加所有音乐", callback(snapshot, "a", true)?)]);
+        }
         return Ok(TorrentInlinePresentation {
             text,
-            reply_markup: InlineKeyboardMarkup {
-                inline_keyboard: vec![vec![InlineKeyboardButton {
-                    text: "Manage torrent".to_string(),
-                    callback_data: String::new(),
-                    web_app: Some(WebAppInfo { url: app_url }),
-                }]],
-            },
+            reply_markup: InlineKeyboardMarkup { inline_keyboard },
         });
     }
 
     let mut keyboard = Vec::new();
     let text = if snapshot.review_selection {
-        render_review(snapshot, &mut keyboard)?
+        render_review(snapshot, music_enabled, &mut keyboard)?
     } else {
-        render_browser(snapshot, &mut keyboard)?
+        render_browser(snapshot, music_enabled, &mut keyboard)?
     };
+    if can_add_all_music(snapshot, music_enabled) {
+        keyboard.push(vec![button("添加所有音乐", callback(snapshot, "a", true)?)]);
+    }
     ensure!(
         text.encode_utf16().count() <= TELEGRAM_MESSAGE_LIMIT_UTF16,
         "torrent card text exceeds Telegram's message limit"
@@ -145,6 +158,7 @@ pub(crate) fn miniapp_url(worker_url: &str, task_id: Option<&str>) -> Result<Str
 
 fn render_browser(
     snapshot: &TorrentSnapshot,
+    music_enabled: bool,
     keyboard: &mut Vec<Vec<InlineKeyboardButton>>,
 ) -> Result<String> {
     let current = folder_path(snapshot, snapshot.cursor_folder_id)?;
@@ -172,10 +186,17 @@ fn render_browser(
             .iter()
             .fold(0_u64, |total, file| total.saturating_add(file.size)),
     ));
-    lines.push(format!(
-        "Music: {selected_count} selected · {} imported · {} waiting · {} failed/cancelled · {} unknown",
-        counts.complete, counts.pending, counts.retryable(), counts.unknown
-    ));
+    lines.push(music_status_line(snapshot, music_enabled));
+    if music_enabled && snapshot.inventory_verified {
+        lines.push(format!(
+            "{} selected · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            selected_count,
+            counts.complete,
+            counts.pending,
+            counts.retryable(),
+            counts.unknown
+        ));
+    }
     let folder_label = if current.as_os_str().is_empty() {
         "All files".to_string()
     } else {
@@ -280,7 +301,7 @@ fn render_browser(
         page,
         page_count,
         selected_count,
-        counts.retryable(),
+        music_enabled,
         keyboard,
     )?;
     Ok(lines.join("\n"))
@@ -288,6 +309,7 @@ fn render_browser(
 
 fn render_review(
     snapshot: &TorrentSnapshot,
+    music_enabled: bool,
     keyboard: &mut Vec<Vec<InlineKeyboardButton>>,
 ) -> Result<String> {
     let mut files = snapshot
@@ -312,6 +334,7 @@ fn render_review(
             page + 1,
             page_count
         ),
+        music_status_line(snapshot, music_enabled),
     ];
 
     for file in files.iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
@@ -341,7 +364,7 @@ fn render_review(
             callback(snapshot, &format!("v:{}", page + 1), true)?,
         )]);
     }
-    if !files.is_empty() {
+    if music_enabled && !files.is_empty() {
         keyboard.push(vec![button(
             "Confirm import",
             callback(snapshot, "i", true)?,
@@ -360,9 +383,10 @@ fn add_browser_controls(
     page: usize,
     page_count: usize,
     selected_count: usize,
-    retryable_count: usize,
+    music_enabled: bool,
     keyboard: &mut Vec<Vec<InlineKeyboardButton>>,
 ) -> Result<()> {
+    let retryable_count = ImportCounts::from_snapshot(snapshot).retryable();
     let parent_id = if current.as_os_str().is_empty() {
         None
     } else {
@@ -438,7 +462,7 @@ fn add_browser_controls(
             callback(snapshot, "c", false)?,
         )]);
     }
-    if retryable_count > 0 {
+    if music_enabled && retryable_count > 0 {
         keyboard.push(vec![button(
             &format!("Retry {retryable_count} failed/cancelled"),
             callback(snapshot, "y", false)?,
@@ -509,6 +533,82 @@ fn supported_selected_count(snapshot: &TorrentSnapshot) -> usize {
         .iter()
         .filter(|file| file.supported_music && file.selected)
         .count()
+}
+
+fn supported_music_count(snapshot: &TorrentSnapshot) -> usize {
+    snapshot
+        .files
+        .iter()
+        .filter(|file| file.supported_music)
+        .count()
+}
+
+fn scheduled_music_count(snapshot: &TorrentSnapshot) -> usize {
+    snapshot
+        .files
+        .iter()
+        .filter(|file| file.supported_music && file.music_stage.is_some())
+        .count()
+}
+
+fn can_add_all_music(snapshot: &TorrentSnapshot, music_enabled: bool) -> bool {
+    let supported = supported_music_count(snapshot);
+    music_enabled
+        && snapshot.inventory_verified
+        && supported > 0
+        && scheduled_music_count(snapshot) < supported
+}
+
+fn music_status_line(snapshot: &TorrentSnapshot, music_enabled: bool) -> String {
+    if !snapshot.inventory_verified {
+        return if music_enabled {
+            "Music: waiting for a verified file inventory.".to_string()
+        } else {
+            "Music imports are disabled on this bot; file inventory is not verified.".to_string()
+        };
+    }
+    let supported = supported_music_count(snapshot);
+    if supported == 0 {
+        return if music_enabled {
+            "Music: no supported music files.".to_string()
+        } else {
+            "Music imports are disabled on this bot; no supported music files.".to_string()
+        };
+    }
+    if !music_enabled {
+        return format!(
+            "Music imports are disabled on this bot · {supported} supported music files."
+        );
+    }
+
+    let scheduled = scheduled_music_count(snapshot);
+    let counts = ImportCounts::from_snapshot(snapshot);
+    if scheduled == supported {
+        format!(
+            "已安排添加 {scheduled} 个音乐文件 · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            counts.complete,
+            counts.pending,
+            counts.retryable(),
+            counts.unknown
+        )
+    } else if scheduled > 0 {
+        format!(
+            "Music: {scheduled}/{supported} supported files arranged · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            counts.complete,
+            counts.pending,
+            counts.retryable(),
+            counts.unknown
+        )
+    } else {
+        format!(
+            "Music: {supported} supported files · {} selected · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            supported_selected_count(snapshot),
+            counts.complete,
+            counts.pending,
+            counts.retryable(),
+            counts.unknown
+        )
+    }
 }
 
 fn callback(snapshot: &TorrentSnapshot, action: &str, selection_revision: bool) -> Result<String> {
@@ -663,6 +763,7 @@ mod tests {
             phase: TorrentPhase::Downloading,
             state: None,
             progress: 0.5,
+            inventory_verified: false,
             cursor_folder_id: 0,
             cursor_page: 0,
             review_selection: false,

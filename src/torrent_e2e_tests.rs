@@ -65,6 +65,8 @@ struct MockHttpState {
     card_edits: AtomicUsize,
     last_keyboard_callbacks: Mutex<Vec<String>>,
     keyboards_by_message: Mutex<HashMap<i64, Vec<String>>>,
+    card_edit_messages: Mutex<Vec<i64>>,
+    card_edit_texts: Mutex<HashMap<i64, Vec<String>>>,
     send_messages: AtomicUsize,
     text_edits: AtomicUsize,
 }
@@ -110,6 +112,8 @@ impl MockHttpServer {
             card_edits: AtomicUsize::new(0),
             last_keyboard_callbacks: Mutex::new(Vec::new()),
             keyboards_by_message: Mutex::new(HashMap::new()),
+            card_edit_messages: Mutex::new(Vec::new()),
+            card_edit_texts: Mutex::new(HashMap::new()),
             send_messages: AtomicUsize::new(0),
             text_edits: AtomicUsize::new(0),
         });
@@ -465,6 +469,25 @@ async fn serve_one(mut stream: TcpStream, state: Arc<MockHttpState>) -> io::Resu
         let payload: serde_json::Value = serde_json::from_slice(&request.body)
             .expect("Telegram editMessageText payload should be JSON");
         let callbacks = keyboard_callbacks(&payload);
+        if let Some(message_id) = payload
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+        {
+            state
+                .card_edit_messages
+                .lock()
+                .expect("card edit message log should not be poisoned")
+                .push(message_id);
+            if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+                state
+                    .card_edit_texts
+                    .lock()
+                    .expect("card edit text log should not be poisoned")
+                    .entry(message_id)
+                    .or_default()
+                    .push(text.to_string());
+            }
+        }
         if callbacks.is_empty() {
             state.text_edits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1136,6 +1159,31 @@ async fn wait_for_card_edits(mock: &MockHttpServer) {
     })
     .await
     .expect("torrent inline card should edit its text and keyboard after delivery");
+}
+
+async fn wait_for_card_text_contains(
+    mock: &MockHttpServer,
+    message_id: i64,
+    expected: &str,
+) -> String {
+    tokio::time::timeout(MAX_TEST_WAIT, async {
+        loop {
+            if let Some(text) = mock
+                .state
+                .card_edit_texts
+                .lock()
+                .expect("card edit text log should not be poisoned")
+                .get(&message_id)
+                .and_then(|texts| texts.iter().find(|text| text.contains(expected)))
+                .cloned()
+            {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Telegram message {message_id} should be edited with {expected:?}"))
 }
 
 async fn wait_for_export_attempts(mock: &MockHttpServer, expected: usize) {
@@ -3103,6 +3151,229 @@ async fn telegram_magnet_waits_for_metadata_then_imports_selected_file_once_acro
         Arc::clone(&backend_dyn),
     )
     .await;
+    wait_until_reopenable_torrent(torrent_settings).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn telegram_magnet_add_all_music_persists_receipt_then_admits_once_after_completion() {
+    let root = unique_test_root();
+    fs::create_dir_all(&root).expect("test root should be created");
+    let default_save_path = root.join("qbit-default");
+    fs::create_dir_all(&default_save_path).expect("qBittorrent default path should exist");
+
+    let fixtures = vec![
+        TorrentFileFixture {
+            path: "Album/first.m4a".into(),
+            bytes: b"synthetic Add All Music payload".to_vec(),
+        },
+        TorrentFileFixture {
+            path: "Album/cover.jpg".into(),
+            bytes: b"synthetic unsupported cover".to_vec(),
+        },
+    ];
+    let (torrent_bytes, torrent_hash) = make_torrent(&fixtures);
+    let magnet_uri = format!("magnet:?xt=urn:btih:{torrent_hash}&dn=Album");
+    let mock = MockHttpServer::start_magnet(
+        torrent_bytes,
+        torrent_hash,
+        default_save_path,
+        fixtures.clone(),
+    )
+    .await;
+    let telegram = mock.telegram();
+    let music_settings = private_music_settings(&root);
+    let backend = FakeMusicBackend::new(
+        music_settings.archive_dir.clone(),
+        music_settings.staging_dir.clone(),
+        root.join("fake-music-library"),
+    );
+    let backend_dyn: Arc<dyn MusicBackend> = Arc::new(backend.clone());
+    let (music_shutdown_tx, music_shutdown_rx) = watch::channel(false);
+    let music = MusicService::with_backend(
+        music_settings.clone(),
+        telegram.clone(),
+        Arc::clone(&backend_dyn),
+        music_shutdown_rx,
+    );
+    music.start();
+
+    let torrent_settings = torrent_settings(mock.base_url.clone(), root.join("qbit-state"));
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = watch::channel(false);
+    let torrent = TorrentService::new(
+        torrent_settings.clone(),
+        telegram.clone(),
+        Some(Arc::clone(&music)),
+        music_settings.max_file_bytes,
+        torrent_shutdown_rx,
+    )
+    .expect("torrent service should use the loopback qBittorrent client");
+    torrent.start();
+
+    let mut config = AppConfig::for_test();
+    config.telegram.allowed_chat_ids = vec![CHAT_ID];
+    config.downloads.video_dir = root.join("video-queue");
+    config.downloads.pdf_dir = root.join("pdf-queue");
+    fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should exist");
+    fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should exist");
+    let context = build_context(telegram.clone(), config, Arc::clone(&torrent));
+    let mut offset = None;
+    let magnet_update = serde_json::json!({
+        "update_id": 7201,
+        "message": {
+            "message_id": 820,
+            "chat": {"id": CHAT_ID, "type": "private"},
+            "from": {"id": CHAT_ID},
+            "text": magnet_uri,
+        }
+    });
+    process_update(&context, magnet_update.clone(), &mut offset).await;
+
+    let pending = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.card_message_id == Some(CARD_MESSAGE_ID)
+                && snapshot.phase == TorrentPhase::DownloadingMetainfo
+        },
+        "magnet task waiting for verified inventory",
+    )
+    .await;
+    assert!(!pending.inventory_verified);
+    assert!(
+        keyboard_callbacks_for(&mock, CARD_MESSAGE_ID)
+            .iter()
+            .all(|callback| !callback.ends_with(":a")),
+        "metainfo-only content must not expose Add All Music"
+    );
+    wait_for_export_attempts(&mock, 2).await;
+    process_update(&context, magnet_update, &mut offset).await;
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.card_sends.load(Ordering::Acquire), 1);
+
+    let submitted_save_path = mock
+        .state
+        .submitted_save_path
+        .lock()
+        .expect("submitted save path should not be poisoned")
+        .clone()
+        .expect("magnet should have a task-scoped save path");
+    for file in &fixtures {
+        let source = submitted_save_path.join(&file.path);
+        fs::create_dir_all(source.parent().expect("fixture file should have a parent"))
+            .expect("create qBittorrent payload directory");
+        fs::write(&source, &file.bytes).expect("write qBittorrent payload");
+    }
+    mock.state.metadata_available.store(true, Ordering::Release);
+
+    let verified = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == pending.task_id
+                && snapshot.card_message_id == Some(CARD_MESSAGE_ID)
+                && snapshot.inventory_verified
+                && snapshot.files.len() == fixtures.len()
+        },
+        "fully validated magnet file inventory",
+    )
+    .await;
+    wait_for_card_edits(&mock).await;
+    assert!(verified.files[0].supported_music);
+    assert!(!verified.files[1].supported_music);
+    let add_all_callback = expected_callback(&verified.task_id, verified.selection_revision, "a");
+    wait_for_keyboard_callback(&mock, &add_all_callback, "Add All Music").await;
+    process_callback(
+        &context,
+        &mut offset,
+        CallbackUpdateFixture {
+            update_id: 7202,
+            query_id: "add-all-magnet-music",
+            sender_id: CHAT_ID,
+            message_id: CARD_MESSAGE_ID,
+            task_id: &verified.task_id,
+            revision: verified.selection_revision,
+            action: "a",
+        },
+    )
+    .await;
+
+    let scheduled = wait_for_snapshot(
+        &torrent,
+        CHAT_ID,
+        |snapshot| {
+            snapshot.task_id == verified.task_id
+                && snapshot
+                    .files
+                    .iter()
+                    .filter(|file| file.supported_music && file.music_stage.is_some())
+                    .count()
+                    == 1
+                && snapshot.files[0].selected
+                && snapshot.files[0].music_stage
+                    == Some(crate::torrent_types::TorrentMusicStage::Pending)
+        },
+        "durable Add All Music ledger request",
+    )
+    .await;
+    assert_eq!(scheduled.card_message_id, Some(CARD_MESSAGE_ID));
+    assert_eq!(
+        scheduled.import_count, 0,
+        "the receipt counts scheduled, not imported, tracks"
+    );
+    let confirmation =
+        wait_for_card_text_contains(&mock, CARD_MESSAGE_ID, "已安排添加 1 个音乐文件").await;
+    assert!(confirmation.contains("0 imported"));
+    assert_eq!(mock.state.card_sends.load(Ordering::Acquire), 1);
+    assert!(
+        mock.state
+            .card_edit_messages
+            .lock()
+            .expect("card edit message log should not be poisoned")
+            .contains(&CARD_MESSAGE_ID),
+        "the success receipt edits the existing Telegram acknowledgement"
+    );
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 0);
+    assert!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should not be poisoned")
+            .is_empty(),
+        "an incomplete qBittorrent file must wait before Music admission"
+    );
+
+    mock.state.complete.store(true, Ordering::Release);
+    let manager = torrent
+        .manager()
+        .await
+        .expect("torrent manager should remain open");
+    manager.process_task_once_for_test(&verified.task_id).await;
+    let _job_id = wait_for_music_cleanup(&backend).await;
+    assert_eq!(backend.add_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        backend
+            .prepared_sources
+            .lock()
+            .expect("prepared source log should not be poisoned")
+            .as_slice(),
+        &[fixtures[0].bytes.clone()]
+    );
+    assert_eq!(
+        fs::read(submitted_save_path.join(&fixtures[0].path))
+            .expect("qBittorrent source should remain available for seeding"),
+        fixtures[0].bytes
+    );
+    assert_eq!(mock.state.qbit_adds.load(Ordering::Acquire), 1);
+    assert_eq!(mock.state.card_sends.load(Ordering::Acquire), 1);
+
+    let _ = torrent_shutdown_tx.send(true);
+    let _ = music_shutdown_tx.send(true);
+    drop(manager);
+    drop(context);
+    drop(torrent);
+    drop(music);
+    wait_until_reopenable_music(music_settings, telegram, Arc::clone(&backend_dyn)).await;
     wait_until_reopenable_torrent(torrent_settings).await;
     let _ = fs::remove_dir_all(&root);
 }

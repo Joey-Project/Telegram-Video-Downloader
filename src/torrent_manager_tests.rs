@@ -17,6 +17,8 @@ mod batch_isolation;
 mod card_recovery;
 #[path = "torrent_metadata_retry_tests.rs"]
 mod metadata_retry;
+#[path = "torrent_receipt_music_tests.rs"]
+mod receipt_music;
 #[path = "torrent_refresh_recovery_tests.rs"]
 mod refresh_recovery;
 #[path = "torrent_worker_limit_tests.rs"]
@@ -39,6 +41,7 @@ struct TestBackendState {
     music_batches: Vec<(String, Vec<CompletedTorrentFile>)>,
     music_lookup_calls: usize,
     music_lookup_failures: usize,
+    music_imports_enabled: bool,
     complete_music_status: bool,
 }
 
@@ -92,6 +95,7 @@ impl TestBackend {
                 music_batches: Vec::new(),
                 music_lookup_calls: 0,
                 music_lookup_failures: 0,
+                music_imports_enabled: true,
                 complete_music_status: false,
             }),
             next_card_id: AtomicI64::new(100),
@@ -154,9 +158,17 @@ impl TestBackend {
     fn music_lookup_calls(&self) -> usize {
         self.state.lock().unwrap().music_lookup_calls
     }
+
+    fn set_music_imports_enabled(&self, enabled: bool) {
+        self.state.lock().unwrap().music_imports_enabled = enabled;
+    }
 }
 
 impl TorrentBackend for TestBackend {
+    fn music_imports_enabled(&self) -> bool {
+        self.state.lock().unwrap().music_imports_enabled
+    }
+
     fn download_torrent(
         &self,
         _upload: TorrentUpload,

@@ -398,6 +398,10 @@ pub struct TorrentSnapshot {
     pub phase: TorrentPhase,
     pub state: Option<String>,
     pub progress: f64,
+    /// True only when current qBittorrent files match verified metainfo identity, indexes, paths,
+    /// and sizes. Metainfo-only file lists are intentionally not considered ready.
+    #[serde(default)]
+    pub inventory_verified: bool,
     pub cursor_folder_id: u32,
     pub cursor_page: u32,
     pub review_selection: bool,
@@ -418,6 +422,7 @@ pub enum TorrentAction {
     SetFolder { folder_id: u32, selected: bool },
     ClearSelection,
     ImportSelected,
+    AddAllMusic,
     RetryImports,
 }
 
@@ -471,6 +476,11 @@ pub trait TorrentBackend: Send + Sync + 'static {
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64>;
 
     fn update_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, ()>;
+
+    /// Whether this bot can currently admit local Music imports.
+    fn music_imports_enabled(&self) -> bool {
+        true
+    }
 
     fn enqueue_music(
         &self,
