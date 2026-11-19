@@ -62,6 +62,8 @@ mod torrent_catalog;
 #[cfg(test)]
 mod torrent_cloud_bridge_tests;
 mod torrent_inline;
+#[cfg(test)]
+mod torrent_inline_tests;
 mod torrent_magnet;
 mod torrent_manager;
 mod torrent_metainfo;

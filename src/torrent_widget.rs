@@ -90,6 +90,7 @@ pub enum TorrentWidgetAction {
     ClearSelection,
     ReviewSelection { page: u32 },
     ImportSelected,
+    AddAllMusic,
     RetryImports,
 }
 
@@ -183,6 +184,7 @@ pub fn parse_widget_request(data: &str) -> Result<TorrentWidgetActionRequest, Wi
             page: parse_bounded_u32(fields[4])?,
         },
         ("i", 4) => TorrentWidgetAction::ImportSelected,
+        ("a", 4) => TorrentWidgetAction::AddAllMusic,
         ("y", 4) => TorrentWidgetAction::RetryImports,
         ("b", 6) => TorrentWidgetAction::Browse {
             folder_id: parse_bounded_u32(fields[4])?,

@@ -423,6 +423,10 @@ struct RuntimeTorrentBackend {
 }
 
 impl TorrentBackend for RuntimeTorrentBackend {
+    fn music_imports_enabled(&self) -> bool {
+        self.music.is_some()
+    }
+
     fn download_torrent(&self, upload: TorrentUpload) -> TorrentFuture<'_, Vec<u8>> {
         Box::pin(async move {
             self.telegram
@@ -492,9 +496,10 @@ impl TorrentBackend for RuntimeTorrentBackend {
 
     fn send_card(&self, snapshot: TorrentSnapshot) -> TorrentFuture<'_, i64> {
         Box::pin(async move {
-            let card = crate::torrent_inline::render_torrent_inline_with_miniapp(
+            let card = crate::torrent_inline::render_torrent_inline_with_options(
                 &snapshot,
                 self.miniapp_worker_url.as_deref(),
+                self.music.is_some(),
             )?;
             self.telegram
                 .send_message_with_inline_keyboard(snapshot.chat_id, card.text, card.reply_markup)
@@ -507,9 +512,10 @@ impl TorrentBackend for RuntimeTorrentBackend {
             let message_id = snapshot
                 .card_message_id
                 .context("torrent card is not registered")?;
-            let card = crate::torrent_inline::render_torrent_inline_with_miniapp(
+            let card = crate::torrent_inline::render_torrent_inline_with_options(
                 &snapshot,
                 self.miniapp_worker_url.as_deref(),
+                self.music.is_some(),
             )?;
             self.telegram
                 .edit_message_text_with_inline_keyboard(
@@ -835,6 +841,7 @@ mod tests {
             phase: TorrentPhase::SelectingFiles,
             state: Some("uploading".into()),
             progress: 1.0,
+            inventory_verified: false,
             cursor_folder_id: 0,
             cursor_page: 0,
             review_selection: false,
