@@ -6196,6 +6196,7 @@ fn bilibili_plan_stable_media_id(
 
 fn bilibili_download_filename_stems(
     plan: &BilibiliDownloadPlan,
+    report: &BilibiliDownloadReport,
     filename_plan: &PlanValidationSnapshot,
     expected_entry: Option<&BilibiliWorkerExpectedEntry>,
     collection_download: bool,
@@ -6224,13 +6225,32 @@ fn bilibili_download_filename_stems(
         } else {
             None
         };
+        let longest_attachment_suffix = report
+            .entries
+            .iter()
+            .find(|reported| reported.index == entry.index)
+            .into_iter()
+            .flat_map(|reported| &reported.files)
+            .filter_map(|file| unbound_bilibili_sidecar_suffix(&file.path))
+            .map(|suffix| suffix.len())
+            .max()
+            .unwrap_or_default();
+        let longest_published_tail = longest_attachment_suffix
+            .max(".mp4".len())
+            .max(".nfo".len());
+        let stem_budget = 255usize
+            .checked_sub(longest_published_tail)
+            .and_then(|budget| {
+                budget.checked_sub(crate::media_naming::keep_both_suffix_max_bytes())
+            })
+            .context("Bilibili attachments leave no room for protected naming fields")?;
         let stem = crate::media_naming::standard_media_stem(
             &entry.title,
             collection_order,
             Some(&source_id),
             height,
             codec.as_deref(),
-            230,
+            stem_budget,
             "",
         )?;
         stems.insert(entry.index, stem);
@@ -10118,6 +10138,7 @@ async fn run_bilibili_job_locked(
     if mux_locally {
         let filename_stems = bilibili_download_filename_stems(
             &plan,
+            &report,
             &filename_plan,
             worker_context.request.expected_entry.as_ref(),
             collection_download.is_some(),
@@ -14561,11 +14582,12 @@ fn normalize_youtube_staged_name(
     }
     let (height, codec) = youtube_filename_stream_identity(metadata);
     const MAX_COMPONENT_BYTES: usize = 255;
-    const MAX_KEEP_BOTH_SUFFIX_BYTES: usize = 8; // publisher candidates are (2) through (10000)
+    let longest_published_tail = longest_attachment_suffix
+        .max(extension.len())
+        .max(".nfo".len());
     let stem_budget = MAX_COMPONENT_BYTES
-        .checked_sub(longest_attachment_suffix)
-        .and_then(|budget| budget.checked_sub(extension.len()))
-        .and_then(|budget| budget.checked_sub(MAX_KEEP_BOTH_SUFFIX_BYTES))
+        .checked_sub(longest_published_tail)
+        .and_then(|budget| budget.checked_sub(crate::media_naming::keep_both_suffix_max_bytes()))
         .context("YouTube attachments leave no room for protected naming fields")?;
     let new_stem = crate::media_naming::standard_media_stem(
         metadata.title.as_deref().unwrap_or(old_stem),
@@ -21132,67 +21154,12 @@ fn video_file_identity_ids(path: &Path) -> Vec<String> {
 }
 
 fn standard_media_filename_identity(stem: &str) -> Option<(VideoProvider, &str)> {
-    let mut candidate = stem;
-    if let Some((without_keep_both, suffix)) = candidate.rsplit_once(" (")
-        && let Some(number) = suffix.strip_suffix(')')
-        && let Ok(number) = number.parse::<u32>()
-        && (2..=10_000).contains(&number)
-    {
-        candidate = without_keep_both;
+    let source_id = crate::media_naming::source_id_from_standard_stem(stem)?;
+    if let Some(id) = source_id.strip_prefix("youtube_") {
+        Some((VideoProvider::Youtube, id))
+    } else {
+        Some((VideoProvider::Bilibili, source_id))
     }
-
-    if let Some((without_specs, specs)) = candidate.rsplit_once(" - [")
-        && let Some(specs) = specs.strip_suffix(']')
-        && standard_media_specs(specs)
-    {
-        candidate = without_specs;
-    }
-
-    let (_, source_group) = candidate.rsplit_once(" - [")?;
-    let source_group = source_group.strip_suffix(']')?;
-    if let Some(id) = source_group.strip_prefix("youtube_")
-        && id.len() == 11
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Some((VideoProvider::Youtube, id));
-    }
-
-    if source_group.len() == 12
-        && source_group.starts_with("BV")
-        && source_group
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return Some((VideoProvider::Bilibili, source_group));
-    }
-    if let Some(aid) = source_group.strip_prefix("av")
-        && aid.parse::<u64>().is_ok_and(|aid| aid > 0)
-    {
-        return Some((VideoProvider::Bilibili, source_group));
-    }
-
-    None
-}
-
-fn standard_media_specs(specs: &str) -> bool {
-    let mut fields = specs.split(' ');
-    let Some(first) = fields.next() else {
-        return false;
-    };
-    let has_height = first
-        .strip_suffix('p')
-        .and_then(|height| height.parse::<u32>().ok())
-        .is_some_and(|height| height > 0);
-    let has_codec = matches!(first, "h264" | "h265" | "av1" | "vp9");
-    if !has_height && !has_codec {
-        return false;
-    }
-    let Some(second) = fields.next() else {
-        return true;
-    };
-    fields.next().is_none() && has_height && matches!(second, "h264" | "h265" | "av1" | "vp9")
 }
 
 fn trailing_delimited_identity(stem: &str, open: char, close: char) -> Option<&str> {
@@ -25391,7 +25358,7 @@ fn staged_move_plan(
             None => unique_primary_media_path_avoiding(
                 relative_destination(staging_dir, final_dir, staged_video),
                 &reserved,
-            ),
+            )?,
         };
         if reserved.contains(&preferred) {
             bail!(
@@ -25593,9 +25560,12 @@ fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> Pat
     unreachable!("unbounded loop returns once it finds a unique path")
 }
 
-fn unique_primary_media_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> PathBuf {
+fn unique_primary_media_path_avoiding(
+    candidate: PathBuf,
+    reserved: &BTreeSet<PathBuf>,
+) -> Result<PathBuf> {
     if !candidate.exists() && !reserved.contains(&candidate) && !output_sidecar_exists(&candidate) {
-        return candidate;
+        return Ok(candidate);
     }
     let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
     let stem = candidate
@@ -25605,17 +25575,21 @@ fn unique_primary_media_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<Pa
     let extension = candidate
         .extension()
         .and_then(|extension| extension.to_str());
-    for index in 2.. {
+    for index in 2..=crate::media_naming::KEEP_BOTH_MAX_INDEX {
         let file_name = match extension {
             Some(extension) => format!("{stem} ({index}).{extension}"),
             None => format!("{stem} ({index})"),
         };
         let next = parent.join(file_name);
         if !next.exists() && !reserved.contains(&next) && !output_sidecar_exists(&next) {
-            return next;
+            return Ok(next);
         }
     }
-    unreachable!("unbounded loop returns once it finds a unique path")
+    bail!(
+        "staged media publisher exhausted KeepBoth names through ({}) for {}",
+        crate::media_naming::KEEP_BOTH_MAX_INDEX,
+        candidate.display()
+    )
 }
 
 fn execute_move_plan(
@@ -33412,9 +33386,21 @@ mod tests {
             )],
             ..Default::default()
         };
-        let standalone_stems =
-            bilibili_download_filename_stems(&standalone_plan, &filename_snapshot, None, false)
-                .unwrap();
+        let standalone_report = BilibiliDownloadReport {
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let standalone_stems = bilibili_download_filename_stems(
+            &standalone_plan,
+            &standalone_report,
+            &filename_snapshot,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             standalone_stems.get(&1).map(String::as_str),
             Some("Standalone title - [BV1abc] - [1080p h264]")
@@ -38645,10 +38631,31 @@ mod tests {
             .expect("trailer nfo should write");
 
         let output =
-            unique_primary_media_path_avoiding(final_dir.join("Movie.mp4"), &BTreeSet::new());
+            unique_primary_media_path_avoiding(final_dir.join("Movie.mp4"), &BTreeSet::new())
+                .expect("available primary name should be returned");
 
         assert_eq!(output, final_dir.join("Movie.mp4"));
         let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn staged_primary_keep_both_names_stop_at_the_shared_maximum() {
+        let directory = temp_test_dir("keep-both-primary-exhausted");
+        fs::create_dir_all(&directory).expect("directory should create");
+        let candidate = directory.join("Movie.mp4");
+        let mut reserved = BTreeSet::from([candidate.clone()]);
+        for index in 2..=crate::media_naming::KEEP_BOTH_MAX_INDEX {
+            reserved.insert(directory.join(format!("Movie ({index}).mp4")));
+        }
+
+        let error = unique_primary_media_path_avoiding(candidate.clone(), &reserved)
+            .expect_err("publisher must stop after its documented KeepBoth range");
+
+        assert!(error.to_string().contains("exhausted KeepBoth names"));
+        assert!(error.to_string().contains("(10000)"));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        assert!(reserved.contains(&candidate));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -42595,6 +42602,190 @@ mod tests {
     #[tokio::test]
     async fn bilibili_mux_rejects_success_without_decoded_media_and_retains_raw_streams() {
         assert_failed_mux_playback_check_retains_inputs("exit 0", "mux-playback-empty").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_long_local_mux_name_keeps_sidecar_and_nfo_with_keep_both() {
+        let final_dir = temp_test_dir("bilibili-long-mux-name-keep-both");
+        fs::create_dir_all(&final_dir).expect("final directory should create");
+        let rooted = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging = create_video_staging_dir(&rooted).expect("staging directory should create");
+        let stage_dir = staging.path().to_path_buf();
+        let full_title = "Long Bilibili episode with full metadata ".repeat(18);
+        let subtitle_name = "subtitle-zh-01-new.ass";
+        fs::write(stage_dir.join("video.m4s"), "video-stream").expect("video stream should write");
+        fs::write(stage_dir.join("audio.m4s"), "audio-stream").expect("audio stream should write");
+        fs::write(stage_dir.join(subtitle_name), "subtitle attachment")
+            .expect("subtitle should write");
+
+        let plan = BilibiliDownloadPlan {
+            title: full_title.clone(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 123,
+                bvid: Some("BV1234567890".to_string()),
+                cid: 456,
+                title: full_title.clone(),
+                ..Default::default()
+            }],
+        };
+        let stable_id = bilibili_plan_stable_media_id(Some("BV1234567890"), 123, 456, None);
+        let filename_snapshot = PlanValidationSnapshot {
+            resolution_codecs: vec![format!("{stable_id}:video:80:1920x1080:avc1.640028")],
+            ..Default::default()
+        };
+        let mut report = BilibiliDownloadReport {
+            title: full_title.clone(),
+            output_dir: stage_dir.clone(),
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                title: full_title.clone(),
+                files: vec![
+                    BilibiliDownloadedFile {
+                        kind: "video".to_string(),
+                        path: PathBuf::from("video.m4s"),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "audio".to_string(),
+                        path: PathBuf::from("audio.m4s"),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "subtitle".to_string(),
+                        path: PathBuf::from(subtitle_name),
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let filename_stems =
+            bilibili_download_filename_stems(&plan, &report, &filename_snapshot, None, false)
+                .expect("actual report attachments should inform the mux budget");
+        let output_stem = filename_stems.get(&1).expect("entry stem should exist");
+        let suffix = unbound_bilibili_sidecar_suffix(Path::new(subtitle_name))
+            .expect("SDK subtitle filename should map to its publication suffix");
+        assert!(
+            output_stem.len()
+                + suffix.len().max(".mp4".len()).max(".nfo".len())
+                + crate::media_naming::keep_both_suffix_max_bytes()
+                <= 255,
+            "stem must reserve the longest actual attachment and KeepBoth tails"
+        );
+
+        let ffmpeg = final_dir.join("fake-ffmpeg.sh");
+        fs::write(
+            &ffmpeg,
+            "#!/bin/sh\noutput_fd=\nnext_fd=no\ncurrent_fd=\nprogress=no\nfor arg do\n    if test \"$next_fd\" = yes; then current_fd=$arg; next_fd=no; after_fd=yes; continue; fi\n    if test \"${after_fd:-no}\" = yes; then\n        if test \"$arg\" = fd:; then output_fd=$current_fd; fi\n        after_fd=no\n    fi\n    if test \"$arg\" = -fd; then next_fd=yes; fi\n    if test \"$arg\" = -progress; then progress=yes; fi\ndone\nif test \"$progress\" = yes; then printf 'frame=1\\nout_time_us=1000000\\nprogress=end\\n'; fi\nif test -n \"$output_fd\"; then eval \"printf 'muxed-media' >&$output_fd\"; fi\n",
+        )
+        .expect("mock ffmpeg should write");
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700))
+            .expect("mock ffmpeg should be executable");
+        let mut config = test_config();
+        config.tools.ffmpeg = ffmpeg;
+        config.bot.command_timeout_seconds = 10;
+        config.bot.command_idle_timeout_seconds = 10;
+        mux_bilibili_report_media_with_names(
+            &config,
+            &rooted,
+            &stage_dir,
+            &mut report,
+            UNIX_EPOCH,
+            None,
+            &filename_stems,
+        )
+        .await
+        .expect("mock local mux and playback verification should complete");
+        assert!(!stage_dir.join("video.m4s").exists());
+        assert!(!stage_dir.join("audio.m4s").exists());
+        let mux_output = report.entries[0]
+            .mux
+            .as_ref()
+            .expect("mux recovery record should be installed")
+            .output_path
+            .clone();
+        assert_eq!(
+            mux_output.file_stem().unwrap().to_str().unwrap(),
+            output_stem.as_str()
+        );
+        let nfo = mux_output.with_extension("nfo");
+        fs::write(
+            &nfo,
+            format!(
+                "<video><title>{full_title}</title><localfilename>{}.mp4</localfilename><unknown-field>preserve me</unknown-field></video>",
+                output_stem
+            ),
+        )
+        .expect("preexisting full-metadata NFO should write");
+        let conflict_media = final_dir.join(mux_output.file_name().unwrap());
+        let conflict_nfo = conflict_media.with_extension("nfo");
+        fs::write(&conflict_media, "old conflicting media")
+            .expect("original conflicting media should write");
+        fs::write(&conflict_nfo, "old conflicting NFO")
+            .expect("original conflicting NFO should write");
+
+        let staged_files = collect_regular_files(&stage_dir)
+            .expect("staged outputs should scan")
+            .into_iter()
+            .filter(|path| !is_staging_support_file(&stage_dir, path))
+            .collect::<Vec<_>>();
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV1234567890".to_string(),
+            },
+            existing_videos: vec![conflict_media.clone()],
+            skip_summary: None,
+            overwrite_confirmation: None,
+        };
+        let publication = move_staged_video_files_with_root_and_sources(
+            MoveExecutionContext {
+                root: &rooted,
+                staging: Some(&staging),
+                bilibili_group_receipt: None,
+                bilibili_collection_destination: None,
+                rewrite_local_nfo_references: true,
+            },
+            &stage_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("KeepBoth publication should remap staged sidecars");
+
+        let published = final_dir.join(format!("{output_stem} (2).mp4"));
+        let published_nfo = published.with_extension("nfo");
+        let published_subtitle = final_dir.join(format!("{output_stem} (2){suffix}"));
+        assert!(publication.primary_destinations.contains(&published));
+        assert_eq!(fs::read(&conflict_media).unwrap(), b"old conflicting media");
+        assert_eq!(fs::read(&conflict_nfo).unwrap(), b"old conflicting NFO");
+        assert_eq!(fs::read(&published).unwrap(), b"muxed-media");
+        assert_eq!(
+            fs::read(&published_subtitle).unwrap(),
+            b"subtitle attachment"
+        );
+        let published_nfo_contents = fs::read_to_string(&published_nfo).unwrap();
+        assert!(published_nfo_contents.contains(&format!("<title>{full_title}</title>")));
+        assert!(published_nfo_contents.contains("<unknown-field>preserve me</unknown-field>"));
+        assert!(published_nfo_contents.contains(&format!(
+            "<localfilename>{output_stem} (2).mp4</localfilename>"
+        )));
+        assert_eq!(
+            crate::media_naming::source_id_from_standard_stem(output_stem),
+            Some("BV1234567890")
+        );
+        for path in [&published, &published_nfo, &published_subtitle] {
+            assert!(
+                path.file_name().unwrap().as_encoded_bytes().len() <= 255,
+                "published filename component exceeds filesystem limit: {}",
+                path.display()
+            );
+        }
+        staging
+            .finish()
+            .expect("completed staging should be removed");
+        fs::remove_dir_all(final_dir).expect("test output should clean up");
     }
 
     #[cfg(unix)]

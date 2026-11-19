@@ -1957,7 +1957,7 @@ impl LibraryManager {
 
             if has_conflict && conflict == ConflictPolicy::KeepBoth {
                 let mut found = false;
-                for number in 2..=10_000 {
+                for number in 2..=crate::media_naming::KEEP_BOTH_MAX_INDEX {
                     let suffix = format!(" ({number})");
                     let (candidate_primary, candidate_targets) = candidate_for_stem(&suffix)?;
                     if !migration_targets_conflict(target, &candidate_targets, &mut reserved)? {
@@ -4220,7 +4220,7 @@ impl LibraryManager {
         if conflicts && conflict == ConflictPolicy::KeepBoth {
             let parent = base_target.parent().unwrap_or_else(|| Path::new(""));
             let mut found = false;
-            for suffix in 2..=10_000 {
+            for suffix in 2..=crate::media_naming::KEEP_BOTH_MAX_INDEX {
                 let keep_both_suffix = format!(" ({suffix})");
                 let candidate_stem = if rename {
                     standard_media_stem(item, longest_filename_tail, &keep_both_suffix)?
@@ -6843,7 +6843,7 @@ impl LibraryManager {
             .unwrap_or_else(|| physical_item_id_from_identity(item_identity, &media.relative_path));
         let title_from_name = title_from_path(&media.relative_path);
         let mut title = title_from_name;
-        let mut source_ids = extract_source_ids(&media.relative_path);
+        let mut source_ids = source_ids_from_media_filename(&media.relative_path);
         let mut collection = None;
         let mut organization_status = None;
         let mut nfo_collection_metadata_present = false;
@@ -10702,11 +10702,27 @@ fn deduplicate(values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 fn ids_from_path(path: &str) -> Vec<String> {
-    let mut ids = extract_source_ids(path);
+    let mut ids = source_ids_from_media_filename(path);
     if let Some(video_id) = youtube_id_from_legacy_filename(path) {
         ids.push(format!("youtube:{video_id}"));
     }
     deduplicate(ids)
+}
+
+fn source_ids_from_media_filename(path: &str) -> Vec<String> {
+    standard_source_id_from_media_path(path)
+        .map(|source_id| vec![source_id])
+        .unwrap_or_else(|| extract_source_ids(path))
+}
+
+fn standard_source_id_from_media_path(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let source_id = crate::media_naming::source_id_from_standard_stem(stem)?;
+    let source_id = source_id
+        .strip_prefix("youtube_")
+        .map(|youtube_id| format!("youtube:{youtube_id}"))
+        .unwrap_or_else(|| source_id.to_string());
+    normalize_source_ids(vec![source_id]).into_iter().next()
 }
 
 fn youtube_id_from_legacy_filename(path: &str) -> Option<String> {
@@ -12685,11 +12701,17 @@ fn matching_hint_indices_for_items(
     path_resolutions: &HashMap<String, HintPathResolution>,
     walk: &ScanWalk,
 ) -> Vec<Vec<usize>> {
-    let mut items_without_cid_by_id: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut items_with_cid_by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut items_without_cid_by_id: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut items_with_cid_by_id: HashMap<String, Vec<usize>> = HashMap::new();
     for (item_index, item) in items.iter().enumerate() {
-        let cids = item
-            .source_ids
+        // Re-index the filename's structured token explicitly so source-only hints
+        // recover it while authoritative sidecar aliases remain available from the item.
+        let mut source_ids = item.source_ids.clone();
+        if let Some(source_id) = standard_source_id_from_media_path(&item.relative_path) {
+            source_ids.push(source_id);
+        }
+        let source_ids = normalize_source_ids(source_ids);
+        let cids = source_ids
             .iter()
             .filter(|id| id.starts_with("cid"))
             .collect::<Vec<_>>();
@@ -12699,12 +12721,12 @@ fn matching_hint_indices_for_items(
             &mut items_with_cid_by_id
         };
         let ids = if cids.is_empty() {
-            item.source_ids.iter().collect::<Vec<_>>()
+            source_ids.iter().collect::<Vec<_>>()
         } else {
             cids
         };
         for id in ids {
-            index.entry(id.as_str()).or_default().push(item_index);
+            index.entry(id.clone()).or_default().push(item_index);
         }
     }
 
@@ -12760,8 +12782,8 @@ fn matching_hint_indices_for_items(
     matches
 }
 
-fn unique_indexed_candidate<'index, 'id>(
-    index: &HashMap<&'index str, Vec<usize>>,
+fn unique_indexed_candidate<'id>(
+    index: &HashMap<String, Vec<usize>>,
     ids: impl IntoIterator<Item = &'id str>,
 ) -> Option<usize> {
     let mut candidate = None;
@@ -14102,6 +14124,65 @@ mod tests {
             ids_from_path("Bilibili/Clip [BV1AbCdEfG].webm"),
             vec!["BV1AbCdEfG"]
         );
+    }
+
+    #[test]
+    fn standard_filename_source_id_matches_id_only_hint_during_real_scan() {
+        let root = TemporaryRoot::new("standard-filename-source-id-hint");
+        let relative_path =
+            "Human title BV1AbCdEfG - [youtube_dQw4w9WgXcQ] - [1080p mpeg4] (2).mkv";
+        assert_eq!(
+            ids_from_path(relative_path),
+            vec!["youtube:dQw4w9WgXcQ"],
+            "the structured source group must override marker-like title text"
+        );
+        fs::write(root.path().join(relative_path), b"media fixture")
+            .expect("structured filename fixture should write");
+        let manager = manager(&root);
+        let unhinted = manager
+            .scan(&[])
+            .expect("structured filename identity should not require queue history");
+        let unhinted_item = item_at(&unhinted, relative_path);
+        assert_eq!(unhinted_item.source_ids, vec!["youtube:dQw4w9WgXcQ"]);
+        assert!(unhinted_item.collection.is_none());
+
+        let expected_collection = CollectionMetadata {
+            id: Some("queue-collection-1".to_string()),
+            title: "Matched from source ID".to_string(),
+            kind: "queue_collection".to_string(),
+            order: Some(3),
+            part_id: None,
+        };
+        let hints = [
+            SourceHint {
+                source_ids: vec!["youtube:dQw4w9WgXcQ".to_string()],
+                title: None,
+                relative_path: None,
+                collection: Some(expected_collection.clone()),
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            },
+            SourceHint {
+                source_ids: vec!["BV1AbCdEfG".to_string()],
+                title: None,
+                relative_path: None,
+                collection: Some(CollectionMetadata {
+                    title: "Must not match title text".to_string(),
+                    ..expected_collection.clone()
+                }),
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            },
+        ];
+
+        let snapshot = manager
+            .scan(&hints)
+            .expect("structured filename should be discovered by a real library scan");
+        let item = item_at(&snapshot, relative_path);
+        assert_eq!(item.height, None, "the fixture is not probed as real media");
+        assert_eq!(item.codec, None, "the fixture is not probed as real media");
+        assert_eq!(item.source_ids, vec!["youtube:dQw4w9WgXcQ"]);
+        assert_eq!(item.collection.as_ref(), Some(&expected_collection));
     }
 
     #[test]

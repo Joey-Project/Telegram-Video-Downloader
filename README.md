@@ -44,6 +44,8 @@ order, known specifications, matching sidecar suffixes, extensions and KeepBoth
 suffixes retain their reserved space. Media and associated sidecars share one
 stem, including under KeepBoth. Review the complete paths before confirming a
 rename or organization operation.
+KeepBoth tries at most 10,000 primary filename candidates. Exhausting that range
+reports an error and retains the staged download for recovery.
 
 New Bilibili collection plans use the V2 naming recipe; resumed legacy plans keep
 their reviewed recipe. Bot-owned FFmpeg mux outputs and single-media YouTube
