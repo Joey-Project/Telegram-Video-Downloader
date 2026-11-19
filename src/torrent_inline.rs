@@ -40,6 +40,9 @@ impl ImportCounts {
     fn from_snapshot(snapshot: &TorrentSnapshot) -> Self {
         let mut counts = Self::default();
         for file in &snapshot.files {
+            if file.needs_reconfirm {
+                continue;
+            }
             match file.music_stage.as_ref() {
                 Some(TorrentMusicStage::Pending) => counts.pending += 1,
                 Some(TorrentMusicStage::Complete) => counts.complete += 1,
@@ -263,11 +266,7 @@ fn render_browser(
                         .unwrap_or_default()
                         .to_string_lossy();
                     let suffix = if file.supported_music {
-                        format!(
-                            "{} · {}",
-                            stage_label(file.music_stage.as_ref()),
-                            format_size(file.size)
-                        )
+                        format!("{} · {}", music_file_status(file), format_size(file.size))
                     } else {
                         format!("Not music · {}", format_size(file.size))
                     };
@@ -345,7 +344,7 @@ fn render_review(
             bounded_text(&relative, BODY_PATH_LIMIT_UTF16),
             format_size(file.size),
             progress_text(file.progress),
-            stage_label(file.music_stage.as_ref())
+            music_file_status(file)
         ));
     }
     if files.is_empty() {
@@ -547,8 +546,24 @@ fn scheduled_music_count(snapshot: &TorrentSnapshot) -> usize {
     snapshot
         .files
         .iter()
-        .filter(|file| file.supported_music && file.music_stage.is_some())
+        .filter(|file| file.supported_music && !file.needs_reconfirm && file.music_stage.is_some())
         .count()
+}
+
+fn reconfirmation_count(snapshot: &TorrentSnapshot) -> usize {
+    snapshot
+        .files
+        .iter()
+        .filter(|file| file.supported_music && file.needs_reconfirm)
+        .count()
+}
+
+fn music_file_status(file: &TorrentFileSnapshot) -> String {
+    if file.needs_reconfirm {
+        "Confirm again".to_string()
+    } else {
+        stage_label(file.music_stage.as_ref()).to_string()
+    }
 }
 
 fn can_add_all_music(snapshot: &TorrentSnapshot, music_enabled: bool) -> bool {
@@ -583,6 +598,11 @@ fn music_status_line(snapshot: &TorrentSnapshot, music_enabled: bool) -> String 
 
     let scheduled = scheduled_music_count(snapshot);
     let counts = ImportCounts::from_snapshot(snapshot);
+    let reconfirmation = match reconfirmation_count(snapshot) {
+        0 => String::new(),
+        1 => " · 1 file needs confirmation again".to_string(),
+        count => format!(" · {count} files need confirmation again"),
+    };
     if scheduled == supported {
         format!(
             "已安排添加 {scheduled} 个音乐文件 · {} imported · {} waiting · {} failed/cancelled · {} unknown",
@@ -593,7 +613,7 @@ fn music_status_line(snapshot: &TorrentSnapshot, music_enabled: bool) -> String 
         )
     } else if scheduled > 0 {
         format!(
-            "Music: {scheduled}/{supported} supported files arranged · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            "Music: {scheduled}/{supported} supported files arranged · {} imported · {} waiting · {} failed/cancelled · {} unknown{reconfirmation}",
             counts.complete,
             counts.pending,
             counts.retryable(),
@@ -601,7 +621,7 @@ fn music_status_line(snapshot: &TorrentSnapshot, music_enabled: bool) -> String 
         )
     } else {
         format!(
-            "Music: {supported} supported files · {} selected · {} imported · {} waiting · {} failed/cancelled · {} unknown",
+            "Music: {supported} supported files · {} selected · {} imported · {} waiting · {} failed/cancelled · {} unknown{reconfirmation}",
             supported_selected_count(snapshot),
             counts.complete,
             counts.pending,
@@ -830,17 +850,17 @@ mod tests {
             .flatten()
             .map(|button| button.callback_data.as_str())
             .collect::<Vec<_>>();
-        assert!(callbacks.iter().any(|value| value == &"t1:0123456789abcdef0123456789abcdef:0000000000000007:b:1:0"));
+        assert!(callbacks
+            .iter()
+            .any(|value| value == &"t1:0123456789abcdef0123456789abcdef:0000000000000007:b:1:0"));
         assert!(
             callbacks
                 .iter()
                 .any(|value| value == &"t1:0123456789abcdef0123456789abcdef:0000000000000009:v:0")
         );
-        assert!(
-            callbacks
-                .iter()
-                .any(|value| value == &"t1:0123456789abcdef0123456789abcdef:0000000000000007:d:1:1")
-        );
+        assert!(callbacks
+            .iter()
+            .any(|value| value == &"t1:0123456789abcdef0123456789abcdef:0000000000000007:d:1:1"));
         assert!(rendered.text.contains("sample.txt"));
         assert!(rendered.text.contains("Not music"));
         assert!(

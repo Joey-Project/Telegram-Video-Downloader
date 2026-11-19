@@ -25,6 +25,7 @@ superseded_by: ""
 - Extend the existing durable task-card lifecycle and direct Telegram edits, preserving the Mini App management entry and native selection controls.
 - Bind the single AddAllMusic callback to the current selection revision. Validate inventory, select all supported files and persist import intents in one store transaction; later selection changes invalidate older buttons.
 - Derive the scheduled-file receipt from the persisted import ledger, so progress updates and restart retain the confirmation without a second request lifecycle.
+- If a pending request needs fresh confirmation after a save-path or selection revision change, show it separately from scheduled imports and offer the all-music action again.
 - Offer the action only for a verified full inventory with supported audio and enabled Music imports. Keep scheduled and imported totals separate.
 
 ## Validation

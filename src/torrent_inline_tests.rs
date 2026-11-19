@@ -148,6 +148,39 @@ fn add_all_music_requires_verified_inventory_and_appears_alongside_mini_app() {
 }
 
 #[test]
+fn pending_imports_need_reconfirmation_and_remain_addable() {
+    let mut reconfirmation = snapshot(true, true);
+    for file in &mut reconfirmation.files[..2] {
+        file.selected = true;
+        file.music_stage = Some(TorrentMusicStage::Pending);
+        file.needs_reconfirm = true;
+    }
+
+    let native = render_torrent_inline(&reconfirmation).expect("render reconfirmation card");
+    let compact =
+        render_torrent_inline_with_miniapp(&reconfirmation, Some("https://worker.example.test"))
+            .expect("render compact reconfirmation card");
+
+    for presentation in [&native, &compact] {
+        assert!(
+            presentation
+                .text
+                .contains("2 files need confirmation again")
+        );
+        assert!(presentation.text.contains("0 waiting"));
+        assert!(
+            button(&buttons(presentation), "添加所有音乐").is_some(),
+            "stale pending requests must remain available for Add All reconfirmation"
+        );
+    }
+    assert!(native.text.contains("Confirm again"));
+    assert!(
+        !native.text.contains("已安排添加 2 个音乐文件"),
+        "requests with stale confirmation revisions must not be reported as scheduled"
+    );
+}
+
+#[test]
 fn disabled_music_status_hides_add_confirm_and_retry_controls() {
     let mut source = snapshot(true, true);
     source.selected_count = 2;
