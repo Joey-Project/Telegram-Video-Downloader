@@ -13679,13 +13679,17 @@ mod tests {
             .expect_err("a callback symlink must be rejected");
         assert!(format!("{symlink_error:#}").contains("not a directory"));
 
+        let permission_denial_is_expected = unsafe { libc::geteuid() } != 0;
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
             .expect("directory read permission should be removed");
-        let unreadable_error = open_rooted_directory_proof(&rooted, &unreadable)
-            .expect_err("an unreadable directory must remain an access error");
+        let unreadable_result = open_rooted_directory_proof(&rooted, &unreadable);
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
             .expect("directory access should be restored for fixture cleanup");
-        assert!(format!("{unreadable_error:#}").contains("Permission denied"));
+        if permission_denial_is_expected {
+            let unreadable_error =
+                unreadable_result.expect_err("an unreadable directory must remain an access error");
+            assert!(format!("{unreadable_error:#}").contains("Permission denied"));
+        }
     }
 
     #[test]

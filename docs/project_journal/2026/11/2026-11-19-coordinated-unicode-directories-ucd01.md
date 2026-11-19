@@ -30,6 +30,7 @@ superseded_by: ""
 ## Validation
 
 - Six focused helper regressions pass, covering canonical-equivalent Japanese paths, benign child-entry churn, different directory objects, out-of-root callbacks, symlink/unreadable paths, and object replacement or access-policy changes.
+- The permission-denial assertion applies only to non-root test users, since root can bypass ordinary directory permissions. The fixture restores its access mode before asserting; symlink rejection is always checked.
 - Two macOS temp-root provider regressions cover scan through preview and execution, unchanged synthetic media bytes/inode, NFO/cover references, preserved unrelated XML, and rejection of a different-directory callback before a media move.
 - The offline workspace/all-targets suite passed with two test threads: 1,774 bot tests passed and 17 were ignored, plus 27 and 8 converter-related tests passed. The final additional out-of-root assertion passed in the six-test helper rerun; production logic did not change afterward.
 - Workspace/all-targets Clippy passes with warnings denied. Workspace formatting and diff whitespace checks pass.
