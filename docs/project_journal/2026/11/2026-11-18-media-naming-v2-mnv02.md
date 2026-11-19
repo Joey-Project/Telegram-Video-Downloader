@@ -28,12 +28,14 @@ superseded_by: ""
 - Recognize structured YouTube, BV and AID filename identities without sidecars. Keep Bilibili filename-only evidence separate from CID/episode overwrite authority.
 - Share structured source parsing with library discovery and source-ID-only hint matching. Explicit source fields take precedence over marker-like title text; real NFO aliases and legacy YouTube directory-context rules remain available.
 - Size fresh local mux names from actual downloaded attachment tails before reserving output. Use one 10,000-candidate KeepBoth bound for publication, organization and parsing, with a derived maximum suffix budget. Exhaustion reports a recoverable failure.
+- Normalize known stream codec identifiers, including bare and qualified `hvc1`, so both providers retain the HEVC filename field.
 - Keep existing publication/recovery, content-stability, object-identity and access-policy protections. New-download naming happens before publication.
 
 ## Validation
 
 - Formatting and workspace/all-targets Clippy with warnings denied pass.
-- Full workspace tests pass with controlled concurrency (`--test-threads=2`): 1,766 bot tests passed with 17 ignored, plus native converter targets with 27 and 8 passing tests. The converter client without native dependencies passes 9 tests.
+- Before the final `hvc1` alias addition, full workspace tests pass with controlled concurrency (`--test-threads=2`): 1,766 bot tests passed with 17 ignored, plus native converter targets with 27 and 8 passing tests. The converter client without native dependencies passes 9 tests.
+- The final codec-alias change passes its Bilibili/YouTube metadata-to-stem regression, adjacent staged-rename and collection-V2 tests, formatting and workspace/all-targets Clippy with warnings denied.
 - Shared formatter and mock Telegram E2E tests cover multilingual graphemes, three-digit order, KeepBoth sidecars, unchanged media, complete NFO titles, V1/V2 publication and explicit-library download/relocation through verified filesystem aliases. Existing all-targets CI includes the new tests.
 - Additional regressions exercise actual NFO creation while renaming a 255-byte `.ts` source, and filename-only duplicate detection for both providers while preserving overwrite restrictions and legacy names.
 - Real library scans cover unhinted discovery and source-ID-only recovery. Mock FFmpeg mux-to-publication tests cover long subtitle tails, KeepBoth, NFO references and metadata preservation; reserved targets exercise bounded exhaustion.

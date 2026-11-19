@@ -11385,7 +11385,11 @@ fn normalize_video_codec_label(codec: &str) -> Option<&'static str> {
     let codec = codec.to_ascii_lowercase();
     if codec.starts_with("avc") || codec.starts_with("h264") {
         Some("h264")
-    } else if codec.starts_with("hev") || codec.starts_with("h265") || codec.starts_with("hevc") {
+    } else if codec.starts_with("hev")
+        || codec.starts_with("hvc1")
+        || codec.starts_with("h265")
+        || codec.starts_with("hevc")
+    {
         Some("h265")
     } else if codec.starts_with("av01") || codec.starts_with("av1") {
         Some("av1")
@@ -33405,6 +33409,63 @@ mod tests {
             standalone_stems.get(&1).map(String::as_str),
             Some("Standalone title - [BV1abc] - [1080p h264]")
         );
+    }
+
+    #[test]
+    fn hvc1_metadata_normalizes_to_hevc_in_bilibili_and_youtube_stems() {
+        let stable_id = "bvid:BV1abc:cid:2001:epid:none";
+        let expected = BilibiliWorkerExpectedEntry {
+            index: 1,
+            part_index: 1,
+            title: "Episode".to_string(),
+            stable_media_id: stable_id.to_string(),
+            bilibili_publication_namespace: None,
+            output_template: None,
+            collection_output_folder: None,
+            collection_output_layout_version: Some(BILIBILI_COLLECTION_OUTPUT_LAYOUT_VERSION_V2),
+            collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
+            confirmed_streams: Some(BilibiliGroupConfirmedStreams {
+                selected_format_ids: vec![format!("{stable_id}:video:80")],
+                exact_sizes: None,
+                resolution_codecs: vec![format!("{stable_id}:video:80:1920x1080:hvc1.1.6.L120.B0")],
+            }),
+        };
+        let (source_id, height, codec) =
+            bilibili_collection_filename_identity(stable_id, Some(&expected), None);
+        let bilibili_stem = bilibili_collection_flat_stem_v2(
+            expected.index,
+            &source_id,
+            &expected.title,
+            height,
+            codec.as_deref(),
+        )
+        .expect("Bilibili filename metadata should produce a standard stem");
+        assert_eq!(bilibili_stem, "P001 - Episode - [BV1abc] - [1080p h265]");
+
+        let youtube_metadata = YoutubeMetadata {
+            requested_formats: vec![YoutubeFormat {
+                height: Some(1080),
+                vcodec: Some("HVC1.1.6.L120.B0".to_string()),
+                ..YoutubeFormat::default()
+            }],
+            ..YoutubeMetadata::default()
+        };
+        let (youtube_height, youtube_codec) = youtube_filename_stream_identity(&youtube_metadata);
+        let youtube_stem = crate::media_naming::standard_media_stem(
+            "Episode",
+            None,
+            Some("youtube:abcdefghijk"),
+            youtube_height,
+            youtube_codec.as_deref(),
+            255,
+            "",
+        )
+        .expect("YouTube filename metadata should produce a standard stem");
+        assert_eq!(
+            youtube_stem,
+            "Episode - [youtube_abcdefghijk] - [1080p h265]"
+        );
+        assert_eq!(normalize_video_codec_label("hvc1"), Some("h265"));
     }
 
     #[test]
