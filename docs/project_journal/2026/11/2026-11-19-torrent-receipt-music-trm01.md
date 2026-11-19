@@ -5,7 +5,7 @@ status: completed
 created: 2026-11-19
 updated: 2026-11-19
 branch: "codex/torrent-receipt-add-all-music"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/86"
 supersedes: []
 superseded_by: ""
 ---
