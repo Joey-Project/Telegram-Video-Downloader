@@ -3703,10 +3703,12 @@ impl LibraryManager {
             .filter(|item| item.presence != Presence::Missing)
         {
             let source_media = self.absolute_path(&source_item.relative_path)?;
-            let canonical_nfo = with_extension(&source_media, "nfo");
-            let mut source_nfo_paths = vec![path_to_relative_string(
-                canonical_nfo.strip_prefix(self.root.logical_root_path())?,
-            )?];
+            let mut source_nfo_paths = Vec::new();
+            if let Some(canonical_nfo) =
+                inferred_canonical_nfo_relative_path(self.root.logical_root_path(), &source_media)?
+            {
+                source_nfo_paths.push(canonical_nfo);
+            }
             source_nfo_paths.extend(
                 source_item
                     .attachments
@@ -3825,29 +3827,35 @@ impl LibraryManager {
                 bail!("selected authoritative NFO is not attached to the scanned media item");
             }
             let synthesize_nfo = source_nfo_paths.is_empty();
-            if synthesize_nfo {
-                let source_nfo = with_extension(&source_media, "nfo");
-                source_nfo_paths.push(path_to_relative_string(
-                    source_nfo.strip_prefix(self.root.logical_root_path())?,
-                )?);
-            }
+            let source_nfo_paths: Vec<Option<String>> = if synthesize_nfo {
+                vec![inferred_canonical_nfo_relative_path(
+                    self.root.logical_root_path(),
+                    &source_media,
+                )?]
+            } else {
+                source_nfo_paths.into_iter().map(Some).collect()
+            };
             for source_nfo_relative in source_nfo_paths {
                 let is_authoritative_nfo = synthesize_nfo
-                    || item.authoritative_nfo_path.as_deref() == Some(&source_nfo_relative);
+                    || item.authoritative_nfo_path.as_deref() == source_nfo_relative.as_deref();
                 let target_nfo_relative = if synthesize_nfo {
                     let target_nfo = with_extension(&self.absolute_path(target_media)?, "nfo");
                     path_to_relative_string(
                         target_nfo.strip_prefix(self.root.logical_root_path())?,
                     )?
-                } else if let Some(move_item) = move_target {
+                } else if let (Some(move_item), Some(source_nfo_relative)) =
+                    (move_target, source_nfo_relative.as_deref())
+                {
                     move_item
                         .files
                         .iter()
                         .find(|file| file.source_path == source_nfo_relative)
                         .map(|file| file.target_path.clone())
                         .ok_or_else(|| anyhow!("attached NFO was omitted from the move plan"))?
+                } else if let Some(source_nfo_relative) = source_nfo_relative.as_deref() {
+                    source_nfo_relative.to_string()
                 } else {
-                    source_nfo_relative.clone()
+                    bail!("attached NFO source has no scanned path")
                 };
                 let target_nfo_key = reserved_targets.key_for(&self.root, &target_nfo_relative)?;
                 if source_nfo_owners
@@ -3874,9 +3882,16 @@ impl LibraryManager {
                         "multiple metadata patches resolve to the same NFO target: {target_nfo_relative}"
                     );
                 }
-                let source_nfo = self.absolute_path(&source_nfo_relative)?;
-                let existing =
-                    self.read_file_with_token_and_handle(&source_nfo, Some(SIDE_CAR_LIMIT))?;
+                let existing = if let Some(source_nfo_relative) = source_nfo_relative.as_deref() {
+                    let source_nfo = self.absolute_path(source_nfo_relative)?;
+                    self.read_file_with_token_and_handle(&source_nfo, Some(SIDE_CAR_LIMIT))?
+                } else {
+                    // `None` here is only the inferred canonical candidate that
+                    // exceeds the manager's filename-component policy. Any real
+                    // attached or authoritative NFO still uses the guarded read
+                    // above, where unreadable or changed files remain errors.
+                    None
+                };
                 let (expected_identity, expected_sha256, expected_mode, original) = match existing {
                     Some(BoundFileRead {
                         token,
@@ -3893,8 +3908,11 @@ impl LibraryManager {
                             Some(bytes),
                         )
                     }
-                    None if item.authoritative_nfo_path.as_deref()
-                        == Some(source_nfo_relative.as_str()) =>
+                    None if source_nfo_relative
+                        .as_deref()
+                        .is_some_and(|source_nfo_relative| {
+                            item.authoritative_nfo_path.as_deref() == Some(source_nfo_relative)
+                        }) =>
                     {
                         bail!("authoritative NFO disappeared before metadata preview")
                     }
@@ -4133,6 +4151,11 @@ impl LibraryManager {
                 longest_filename_tail = longest_filename_tail.max(tail_bytes);
             }
             planned_sources.push((source_abs, suffix));
+        }
+        if synthesized_nfo_target {
+            let synthetic_nfo = with_extension(&primary, "nfo");
+            longest_filename_tail =
+                longest_filename_tail.max(filename_tail_bytes(&synthetic_nfo, "")?);
         }
         let requested_stem = if rename {
             standard_media_stem(item, longest_filename_tail, "")?
@@ -7981,6 +8004,24 @@ fn keep_both_custom_attachment_name(source: &Path, keep_both_suffix: &str) -> Re
 
 fn with_extension(path: &Path, extension: &str) -> PathBuf {
     path.with_extension(extension)
+}
+
+fn inferred_canonical_nfo_relative_path(root: &Path, media_path: &Path) -> Result<Option<String>> {
+    let nfo_path = with_extension(media_path, "nfo");
+    let filename = nfo_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("inferred canonical NFO filename is not valid UTF-8"))?;
+    if filename.len() > MAX_FILENAME_COMPONENT_BYTES {
+        // A valid maximum-length media component can imply an NFO sibling
+        // outside this manager's 255-byte component policy, such as a
+        // 255-byte `.ts` name becoming 256 bytes as `.nfo`. Omit only this
+        // inferred candidate; scanned NFO attachments and the authoritative
+        // NFO path remain separately owned and validated.
+        return Ok(None);
+    }
+    let relative = nfo_path.strip_prefix(root)?;
+    Ok(Some(path_to_relative_string(relative)?))
 }
 
 fn safe_entry_identity(root: &RootedFs, path: &Path) -> Result<Option<EntryIdentity>> {
@@ -22545,6 +22586,153 @@ mod tests {
                 .iter()
                 .all(|file| root.path().join(&file.target_path).exists())
         );
+    }
+
+    #[test]
+    fn synthesized_nfo_extension_is_reserved_for_renamed_ts_media_and_keep_both() {
+        for (label, conflict) in [
+            ("synthetic-nfo-long-ts-rename", ConflictPolicy::Skip),
+            ("synthetic-nfo-long-ts-keep-both", ConflictPolicy::KeepBoth),
+        ] {
+            let keep_both = conflict == ConflictPolicy::KeepBoth;
+            let root = TemporaryRoot::new(label);
+            let source_stem = "x".repeat(MAX_FILENAME_COMPONENT_BYTES - ".ts".len());
+            let source_name = format!("{source_stem}.ts");
+            let source_path = root.path().join(&source_name);
+            fs::write(&source_path, b"fixture-video").expect("source media should write");
+            fs::create_dir(root.path().join("Moved")).expect("target directory should create");
+
+            let manager = manager(&root);
+            let initial = manager.scan(&[]).expect("source library should scan");
+            let item = item_at(&initial, &source_name);
+            assert_eq!(item.title, source_stem);
+            let item_id = item.id.clone();
+            let source_filename_tail = filename_tail_bytes(&source_path, "")
+                .expect("source media filename tail should be measured");
+            let legacy_stem = standard_media_stem(item, source_filename_tail, "")
+                .expect("legacy media stem should fit the .ts filename");
+            let synthetic_nfo_tail = filename_tail_bytes(&with_extension(&source_path, "nfo"), "")
+                .expect("synthetic NFO filename tail should be measured");
+            assert_eq!(synthetic_nfo_tail, ".nfo".len());
+            let bounded_stem = standard_media_stem(item, synthetic_nfo_tail, "")
+                .expect("NFO-aware media stem should fit");
+            assert!(bounded_stem.len() < legacy_stem.len());
+
+            let mut conflicting_targets = Vec::new();
+            if keep_both {
+                for stem in [&legacy_stem, &bounded_stem] {
+                    let component = file_name_with_stem(&source_path, stem, "")
+                        .expect("conflict fixture name should fit");
+                    let path = root.path().join("Moved").join(component);
+                    if conflicting_targets
+                        .iter()
+                        .any(|(existing, _, _, _)| existing == &path)
+                    {
+                        continue;
+                    }
+                    fs::write(&path, b"preserve this conflicting media")
+                        .expect("conflicting target should write");
+                    let metadata = fs::metadata(&path).expect("conflicting target should stat");
+                    let contents = fs::read(&path).expect("conflicting target should read");
+                    conflicting_targets.push((path, contents, metadata.dev(), metadata.ino()));
+                }
+            }
+
+            let full_nfo_title = "N".repeat(300);
+            let patch = MetadataPatch {
+                item_id: item_id.clone(),
+                title: Some(full_nfo_title.clone()),
+                source_ids: Vec::new(),
+                collection: None,
+                fill_missing_only: false,
+                organization_status: None,
+            };
+            let preview = manager
+                .preview_with_hints_and_patches(
+                    std::slice::from_ref(&item_id),
+                    Some("Moved"),
+                    true,
+                    conflict,
+                    &[],
+                    &[patch],
+                )
+                .expect("rename preview with a synthesized NFO should fit");
+            let move_item = preview
+                .items
+                .iter()
+                .find(|item| item.item_id == item_id)
+                .expect("selected media should have a move preview");
+            assert_eq!(move_item.outcome, MoveOutcome::Move);
+            assert_eq!(move_item.files.len(), 1);
+            let media_target = move_item
+                .files
+                .iter()
+                .find(|file| file.source_path == source_name)
+                .expect("primary media move should be present");
+            let media_component = Path::new(&media_target.target_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("media target should have a UTF-8 filename");
+            assert!(media_component.len() <= MAX_FILENAME_COMPONENT_BYTES);
+
+            let metadata_patch = preview
+                .metadata_patches
+                .iter()
+                .find(|metadata| metadata.item_id == item_id)
+                .expect("real metadata patch should synthesize an NFO");
+            let nfo_component = Path::new(&metadata_patch.nfo_path)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("NFO target should have a UTF-8 filename");
+            assert!(nfo_component.len() <= MAX_FILENAME_COMPONENT_BYTES);
+            assert_eq!(
+                Path::new(media_component).file_stem(),
+                Path::new(nfo_component).file_stem(),
+                "media and synthesized NFO must share the same stem"
+            );
+            assert!(
+                metadata_patch
+                    .changes
+                    .iter()
+                    .any(|change| { change.field == "title" && change.after == full_nfo_title })
+            );
+            assert!(
+                !root.path().join(&media_target.target_path).exists(),
+                "preview must not create the media target"
+            );
+            assert!(
+                !root.path().join(&metadata_patch.nfo_path).exists(),
+                "preview must not create the synthesized NFO"
+            );
+
+            if keep_both {
+                assert!(media_component.ends_with(" (2).ts"));
+            }
+            assert_eq!(fs::read(&source_path).unwrap(), b"fixture-video");
+            let source_identity = fs::metadata(&source_path).expect("source media should stat");
+            let result = manager
+                .execute_preview(&preview.id, &preview.revision)
+                .expect("confirmed long .ts rename should synthesize its NFO");
+            assert_eq!(result.status, BatchStatus::Complete);
+            let target_media = root.path().join(&media_target.target_path);
+            let target_nfo = root.path().join(&metadata_patch.nfo_path);
+            assert_eq!(fs::read(&target_media).unwrap(), b"fixture-video");
+            let target_identity = fs::metadata(&target_media).expect("target media should stat");
+            assert_eq!(target_identity.dev(), source_identity.dev());
+            assert_eq!(target_identity.ino(), source_identity.ino());
+            assert!(
+                fs::read_to_string(&target_nfo)
+                    .expect("synthesized NFO should read")
+                    .contains(&format!("<title>{full_nfo_title}</title>"))
+            );
+            assert!(!source_path.exists());
+            for (path, contents, device, inode) in &conflicting_targets {
+                assert_eq!(fs::read(path).unwrap().as_slice(), contents.as_slice());
+                let after = fs::metadata(path).expect("old conflict target should remain");
+                assert_eq!(after.dev(), *device);
+                assert_eq!(after.ino(), *inode);
+            }
+        }
     }
 
     #[test]

@@ -21023,7 +21023,19 @@ fn index_video_identities(
 }
 
 fn index_video_filename_identities(index: &mut VideoIdentityIndex, video: &Path) {
+    let standard_source_identity = video
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(standard_media_filename_identity);
     for id in video_file_identity_ids(video) {
+        let is_structured_source_marker =
+            standard_source_identity.is_some_and(|(provider, source_id)| match provider {
+                VideoProvider::Youtube => id == format!("youtube_{source_id}"),
+                VideoProvider::Bilibili => id == source_id,
+            });
+        if is_structured_source_marker {
+            continue;
+        }
         for provider in [VideoProvider::Bilibili, VideoProvider::Youtube] {
             let identity = VideoIdentity {
                 provider,
@@ -21034,6 +21046,19 @@ fn index_video_filename_identities(index: &mut VideoIdentityIndex, video: &Path)
             } else {
                 index.insert(identity, video);
             }
+        }
+    }
+    if let Some((provider, id)) = standard_source_identity {
+        let identity = VideoIdentity {
+            provider,
+            id: id.to_string(),
+        };
+        if provider == VideoProvider::Youtube {
+            index.insert_overwrite_evidence(identity, video);
+        } else {
+            // A Bilibili BV/AID in a filename proves a duplicate candidate only.
+            // Overwrite still requires CID/episode evidence from a metadata sidecar.
+            index.insert(identity, video);
         }
     }
 }
@@ -21104,6 +21129,70 @@ fn video_file_identity_ids(path: &Path) -> Vec<String> {
         }
     }
     ids
+}
+
+fn standard_media_filename_identity(stem: &str) -> Option<(VideoProvider, &str)> {
+    let mut candidate = stem;
+    if let Some((without_keep_both, suffix)) = candidate.rsplit_once(" (")
+        && let Some(number) = suffix.strip_suffix(')')
+        && let Ok(number) = number.parse::<u32>()
+        && (2..=10_000).contains(&number)
+    {
+        candidate = without_keep_both;
+    }
+
+    if let Some((without_specs, specs)) = candidate.rsplit_once(" - [")
+        && let Some(specs) = specs.strip_suffix(']')
+        && standard_media_specs(specs)
+    {
+        candidate = without_specs;
+    }
+
+    let (_, source_group) = candidate.rsplit_once(" - [")?;
+    let source_group = source_group.strip_suffix(']')?;
+    if let Some(id) = source_group.strip_prefix("youtube_")
+        && id.len() == 11
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Some((VideoProvider::Youtube, id));
+    }
+
+    if source_group.len() == 12
+        && source_group.starts_with("BV")
+        && source_group
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Some((VideoProvider::Bilibili, source_group));
+    }
+    if let Some(aid) = source_group.strip_prefix("av")
+        && aid.parse::<u64>().is_ok_and(|aid| aid > 0)
+    {
+        return Some((VideoProvider::Bilibili, source_group));
+    }
+
+    None
+}
+
+fn standard_media_specs(specs: &str) -> bool {
+    let mut fields = specs.split(' ');
+    let Some(first) = fields.next() else {
+        return false;
+    };
+    let has_height = first
+        .strip_suffix('p')
+        .and_then(|height| height.parse::<u32>().ok())
+        .is_some_and(|height| height > 0);
+    let has_codec = matches!(first, "h264" | "h265" | "av1" | "vp9");
+    if !has_height && !has_codec {
+        return false;
+    }
+    let Some(second) = fields.next() else {
+        return true;
+    };
+    fields.next().is_none() && has_height && matches!(second, "h264" | "h265" | "av1" | "vp9")
 }
 
 fn trailing_delimited_identity(stem: &str, open: char, close: char) -> Option<&str> {
@@ -35448,6 +35537,172 @@ mod tests {
         .expect("bilibili duplicate should be found");
         assert_eq!(bilibili_duplicate.existing_videos, vec![bilibili_path]);
 
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn youtube_standard_names_are_duplicate_and_overwrite_evidence_without_sidecars() {
+        let job = JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+        };
+        for (name, expected) in [
+            (
+                "Library fixture - [youtube_abcdefghijk] - [1080p h264].mkv",
+                "abcdefghijk",
+            ),
+            ("Library fixture - [youtube_abcdefghijk].mkv", "abcdefghijk"),
+            (
+                "Library fixture - [youtube_abcdefghijk] - [720p av1] (2).mkv",
+                "abcdefghijk",
+            ),
+            ("Legacy [abcdefghijk].mkv", "abcdefghijk"),
+            ("Legacy (abcdefghijk).mkv", "abcdefghijk"),
+        ] {
+            let mut config = test_config();
+            let video_dir = temp_test_dir("duplicate-youtube-standard-name");
+            fs::create_dir_all(&video_dir).expect("video dir should create");
+            config.downloads.video_dir = video_dir.clone();
+            let video_path = video_dir.join(name);
+            fs::write(&video_path, "video without NFO or sidecars")
+                .expect("video file should write");
+            assert!(!video_path.with_extension("nfo").exists());
+            assert!(!video_path.with_extension("info.json").exists());
+
+            let duplicate = find_video_duplicate_without_probe(&config, &job)
+                .expect("duplicate scan should succeed")
+                .expect("filename identity should find the existing video");
+            assert_eq!(duplicate.identity.id, expected, "filename: {name}");
+            assert_eq!(
+                duplicate.existing_videos,
+                vec![video_path],
+                "filename: {name}"
+            );
+            assert!(duplicate.allows_overwrite_for(&job), "filename: {name}");
+            let _ = fs::remove_dir_all(video_dir);
+        }
+    }
+
+    #[test]
+    fn youtube_standard_name_identity_requires_the_structured_suffix() {
+        for name in [
+            "Library fixture youtube_abcdefghijk - [1080p h264].mkv",
+            "Library fixture [youtube_abcdefghijk] notes - [1080p h264].mkv",
+            "Library fixture - [youtube_abcdefghij] - [1080p h264].mkv",
+            "Library fixture - [youtube_abcdefghijk2] - [1080p h264].mkv",
+            "Library fixture - [youtube_abcdefghijk] - [BV12TRrBcEP8].mkv",
+        ] {
+            let mut config = test_config();
+            let video_dir = temp_test_dir("duplicate-youtube-standard-name-negative");
+            fs::create_dir_all(&video_dir).expect("video dir should create");
+            config.downloads.video_dir = video_dir.clone();
+            fs::write(video_dir.join(name), "unrelated video").expect("video file should write");
+
+            let duplicate = find_video_duplicate_without_probe(
+                &config,
+                &JobRequest::Youtube {
+                    url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+                },
+            )
+            .expect("duplicate scan should succeed");
+            assert_eq!(
+                duplicate, None,
+                "filename must not identify a YouTube video: {name}"
+            );
+            let _ = fs::remove_dir_all(video_dir);
+        }
+    }
+
+    #[test]
+    fn bilibili_standard_names_are_duplicate_candidates_without_overwrite_authority() {
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            selection: None,
+        };
+        for name in [
+            "P001 - Episode title - [BV12TRrBcEP8] - [1080p h264].mkv",
+            "P002 - Episode title - [BV12TRrBcEP8].mkv",
+            "Legacy title [BV12TRrBcEP8].mkv",
+        ] {
+            let mut config = test_config();
+            let video_dir = temp_test_dir("duplicate-bilibili-standard-name");
+            fs::create_dir_all(&video_dir).expect("video dir should create");
+            config.downloads.video_dir = video_dir.clone();
+            let video_path = video_dir.join(name);
+            fs::write(&video_path, "video without NFO or sidecars")
+                .expect("video file should write");
+            assert!(!video_path.with_extension("nfo").exists());
+            assert!(!video_path.with_extension("info.json").exists());
+
+            let duplicate = find_video_duplicate_without_probe(&config, &job)
+                .expect("duplicate scan should succeed")
+                .expect("filename identity should find the existing Bilibili video");
+            assert_eq!(duplicate.identity.provider, VideoProvider::Bilibili);
+            assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
+            assert_eq!(duplicate.existing_videos, vec![video_path]);
+            assert!(
+                !duplicate.allows_overwrite_for(&job),
+                "a filename-only BV must not authorize overwrite"
+            );
+
+            let _ = fs::remove_dir_all(video_dir);
+        }
+    }
+
+    #[test]
+    fn bilibili_aid_standard_name_is_indexed_but_title_markers_are_not() {
+        let aid_name = "P003 - Episode title - [av123456] - [720p av1].mkv";
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-aid-standard-name");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let aid_path = video_dir.join(aid_name);
+        fs::write(&aid_path, "video without NFO or sidecars").expect("video should write");
+        let aid_duplicate = find_video_duplicate_for_identities(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                selection: None,
+            },
+            vec![VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "av123456".to_string(),
+            }],
+        )
+        .expect("AID filename scan should succeed")
+        .expect("writer's AID source form should be indexed");
+        assert_eq!(aid_duplicate.identity.id, "av123456");
+        assert!(!aid_duplicate.allows_overwrite_for(&JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            selection: None,
+        }));
+
+        for name in [
+            "Episode [BV12TRrBcEP8] notes - [1080p h264].mkv",
+            "Episode title - [BV123] - [1080p h264].mkv",
+            "Episode title - [youtube_abcdefghijk] - [1080p h264].mkv",
+            "Episode title - [av123x] - [1080p h264].mkv",
+            "Episode title - [av18446744073709551616] - [1080p h264].mkv",
+            "Episode title - [ep123456] - [720p h264].mkv",
+        ] {
+            let negative_dir = temp_test_dir("duplicate-bilibili-standard-name-negative");
+            fs::create_dir_all(&negative_dir).expect("negative dir should create");
+            let mut negative_config = test_config();
+            negative_config.downloads.video_dir = negative_dir.clone();
+            fs::write(negative_dir.join(name), "unrelated video").expect("video should write");
+            let duplicate = find_video_duplicate_without_probe(
+                &negative_config,
+                &JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                    selection: None,
+                },
+            )
+            .expect("negative duplicate scan should succeed");
+            assert_eq!(
+                duplicate, None,
+                "filename must not identify this Bilibili item: {name}"
+            );
+            let _ = fs::remove_dir_all(negative_dir);
+        }
         let _ = fs::remove_dir_all(video_dir);
     }
 
