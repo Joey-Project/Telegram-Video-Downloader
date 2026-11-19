@@ -25,6 +25,7 @@ mod library_migration;
 mod library_migration_bot;
 mod media_libraries;
 mod media_library_bot;
+mod media_naming;
 mod metadata_recovery;
 mod metadata_recovery_bot;
 #[cfg(test)]

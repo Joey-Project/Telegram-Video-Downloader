@@ -34,6 +34,26 @@ Downloading all subtitles, danmaku or covers for a collection uses the same flat
 layout, including season folders.
 Previously approved tasks keep their legacy output recipe when resumed.
 
+Standard organized filenames use `P001 - Episode title - [source-id] - [1080p h264]`
+inside the collection directory; the collection title is not repeated in each
+filename. Orders use at least three digits. Standalone filenames omit the order
+prefix, and unknown source or specification fields are omitted. NFO retains the
+full title and part identity. When a filename needs shortening, only its readable
+title is shortened with an ellipsis at a complete grapheme boundary. Source IDs,
+order, known specifications, matching sidecar suffixes, extensions and KeepBoth
+suffixes retain their reserved space. Media and associated sidecars share one
+stem, including under KeepBoth. Review the complete paths before confirming a
+rename or organization operation.
+KeepBoth tries at most 10,000 primary filename candidates. Exhausting that range
+reports an error and retains the staged download for recovery.
+
+New Bilibili collection plans use the V2 naming recipe; resumed legacy plans keep
+their reviewed recipe. Bot-owned FFmpeg mux outputs and single-media YouTube
+staging outputs use the shared formatter before publication. SDK-owned Bilibili
+primary outputs, multiple-media YouTube outputs, and outputs without a recoverable
+source identity retain their provider names so existing recovery behavior remains
+available. Use **Organize selected** to standardize those files later.
+
 To flatten an existing nested collection, open `/file`, select its videos, choose
 **Organize selected**, and choose the parent destination directory. The preview
 places known collection members directly in one collection folder, including
