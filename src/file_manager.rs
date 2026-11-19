@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
@@ -395,40 +395,169 @@ fn open_validated_target_directory(
     expected: EntryIdentity,
 ) -> Result<File> {
     let path = root.logical_root_path().join(relative);
-    let before = if relative.as_os_str().is_empty() {
-        root.root_identity()
-    } else {
-        root.entry_identity(&path)?
-            .ok_or_else(|| anyhow!("target parent directory disappeared"))?
-    };
-    if before != expected || !expected.is_dir() {
-        bail!("target parent directory identity changed");
+    let (directory, proof) = open_rooted_directory_proof(root, &path)?;
+    ensure!(
+        proof.identity == expected && expected.is_dir(),
+        "target parent directory identity changed while reading name semantics"
+    );
+    Ok(directory)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootedDirectoryProof {
+    identity: EntryIdentity,
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+fn rooted_directory_proof(file: &File) -> Result<RootedDirectoryProof> {
+    let metadata = file
+        .metadata()
+        .context("failed to inspect opened coordinated directory")?;
+    if !metadata.is_dir() {
+        bail!("coordinated path is not a directory");
     }
-    let directory = File::open(&path).with_context(|| {
+    Ok(RootedDirectoryProof {
+        identity: EntryIdentity::directory(metadata.dev(), metadata.ino()),
+        owner: metadata.uid(),
+        group: metadata.gid(),
+        mode: metadata.mode() & 0o7777,
+    })
+}
+
+fn open_rooted_directory_proof(
+    root: &RootedFs,
+    path: &Path,
+) -> Result<(File, RootedDirectoryProof)> {
+    let rooted_path = coordinated_path_under_root(root, path)?;
+    let relative = rooted_path
+        .strip_prefix(root.logical_root_path())
+        .context("coordinated directory lost its registered-root prefix")?;
+
+    if relative.as_os_str().is_empty() {
+        root.validate_configured_root()?;
+        let directory = open_directory_nofollow(root.root_path())?;
+        let proof = rooted_directory_proof(&directory)?;
+        ensure!(
+            proof.identity == root.root_identity(),
+            "registered root directory object changed while opening its descriptor"
+        );
+        root.validate_configured_root()?;
+        return Ok((directory, proof));
+    }
+
+    let entry = root.bind_entry(&rooted_path, false)?;
+    let expected = root
+        .bound_entry_identity(&entry)?
+        .ok_or_else(|| anyhow!("coordinated directory is missing"))?;
+    if !expected.is_dir() {
+        bail!("coordinated path is not a directory");
+    }
+    let bound = root.open_bound_directory(&entry, expected)?;
+    let bound_access = bound.access_policy()?;
+    let directory = open_directory_nofollow(&rooted_path)?;
+    let proof = rooted_directory_proof(&directory)?;
+    ensure!(
+        proof.identity == expected,
+        "coordinated directory object changed while opening its descriptor"
+    );
+    ensure!(
+        (proof.owner, proof.group, proof.mode) == bound_access,
+        "coordinated directory access policy changed while opening its descriptor"
+    );
+    ensure!(
+        bound.access_policy()? == bound_access,
+        "bound coordinated directory access policy changed during validation"
+    );
+    bound.validate_identity()?;
+    ensure!(
+        root.bound_entry_identity(&entry)? == Some(expected)
+            && root.entry_identity(&rooted_path)? == Some(expected),
+        "coordinated directory path changed while opening its descriptor"
+    );
+    root.validate_configured_root()?;
+    Ok((directory, proof))
+}
+
+fn open_directory_nofollow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options.open(path).with_context(|| {
         format!(
-            "failed to inspect target parent directory {}",
+            "failed to open directory without following symlinks: {}",
             path.display()
         )
-    })?;
-    let metadata = directory
-        .metadata()
-        .context("failed to inspect opened target parent directory")?;
-    if !metadata.is_dir()
-        || metadata.dev() != expected.device()
-        || metadata.ino() != expected.inode()
-    {
-        bail!("target parent directory changed while reading name semantics");
+    })
+}
+
+fn rooted_directory_proofs_match(left: RootedDirectoryProof, right: RootedDirectoryProof) -> bool {
+    left == right
+}
+
+/// Validate the provider's callback location and pass the original rooted spelling onward.
+/// Directory URLs may differ by Unicode normalization only when both no-follow bindings prove
+/// the same current directory object and owner/group/mode. File URLs may differ only in their
+/// parent spelling; the leaf remains byte-identical and later file identity/content checks still
+/// select the source object.
+fn coordinated_path_for_request(
+    root: &RootedFs,
+    requested: &Path,
+    coordinated: &Path,
+) -> Result<PathBuf> {
+    let requested = coordinated_path_under_root(root, requested)?;
+    let coordinated = coordinated_path_under_root(root, coordinated)?;
+    if requested == coordinated {
+        return Ok(requested);
     }
-    let after = if relative.as_os_str().is_empty() {
-        root.root_identity()
+
+    let requested_identity = if requested == root.logical_root_path() {
+        Some(root.root_identity())
     } else {
-        root.entry_identity(&path)?
-            .ok_or_else(|| anyhow!("target parent directory disappeared"))?
+        root.entry_identity(&requested)?
     };
-    if after != expected {
-        bail!("target parent directory changed while reading name semantics");
+    let coordinated_identity = if coordinated == root.logical_root_path() {
+        Some(root.root_identity())
+    } else {
+        root.entry_identity(&coordinated)?
+    };
+    if requested_identity.is_some_and(EntryIdentity::is_dir)
+        || coordinated_identity.is_some_and(EntryIdentity::is_dir)
+    {
+        let (_, requested_proof) = open_rooted_directory_proof(root, &requested)?;
+        let (_, coordinated_proof) = open_rooted_directory_proof(root, &coordinated)?;
+        ensure!(
+            rooted_directory_proofs_match(requested_proof, coordinated_proof),
+            "coordinated directory object or access policy differs from the requested directory"
+        );
+        return Ok(requested);
     }
-    Ok(directory)
+
+    let requested_leaf = requested
+        .file_name()
+        .ok_or_else(|| anyhow!("requested file path has no leaf name"))?;
+    let coordinated_leaf = coordinated
+        .file_name()
+        .ok_or_else(|| anyhow!("coordinated file path has no leaf name"))?;
+    ensure!(
+        requested_leaf == coordinated_leaf,
+        "coordinated file path leaf differs from the request"
+    );
+    let requested_parent = requested
+        .parent()
+        .ok_or_else(|| anyhow!("requested file path has no parent directory"))?;
+    let coordinated_parent = coordinated
+        .parent()
+        .ok_or_else(|| anyhow!("coordinated file path has no parent directory"))?;
+    let (_, requested_parent_proof) = open_rooted_directory_proof(root, requested_parent)?;
+    let (_, coordinated_parent_proof) = open_rooted_directory_proof(root, coordinated_parent)?;
+    ensure!(
+        rooted_directory_proofs_match(requested_parent_proof, coordinated_parent_proof),
+        "coordinated file parent object or access policy differs from the requested parent"
+    );
+    Ok(requested)
 }
 
 fn rooted_directory_name_semantics(
@@ -1373,7 +1502,7 @@ impl LibraryManager {
         let mut rooted = None;
         let mut bind_root = |accessor_path: &Path| -> Result<()> {
             let candidate = RootedFs::new(&root_path)?;
-            let coordinated = coordinated_path_under_root(&candidate, accessor_path)?;
+            let coordinated = coordinated_path_for_request(&candidate, &root_path, accessor_path)?;
             if coordinated != candidate.logical_root_path() {
                 bail!("coordinated media-library root changed during access");
             }
@@ -1399,7 +1528,7 @@ impl LibraryManager {
         let root_path = root.logical_root_path().to_path_buf();
         let mut root_seen = false;
         let mut bind_root = |accessor_path: &Path| -> Result<()> {
-            let coordinated = coordinated_path_under_root(&root, accessor_path)?;
+            let coordinated = coordinated_path_for_request(&root, &root_path, accessor_path)?;
             if coordinated != root_path {
                 bail!("coordinated media-library root changed during access");
             }
@@ -5665,8 +5794,8 @@ impl LibraryManager {
     ) -> Result<T> {
         let mut result = None;
         let mut accessor = |source_accessor: &Path, target_accessor: &Path| -> Result<()> {
-            let source_rooted = coordinated_path_under_root(&self.root, source_accessor)?;
-            let target_rooted = coordinated_path_under_root(&self.root, target_accessor)?;
+            let source_rooted = coordinated_path_for_request(&self.root, source, source_accessor)?;
+            let target_rooted = coordinated_path_for_request(&self.root, target, target_accessor)?;
             result = Some(action(&source_rooted, &target_rooted)?);
             Ok(())
         };
@@ -7119,7 +7248,7 @@ impl LibraryManager {
     ) -> Result<T> {
         let mut result = None;
         let mut accessor = |coordinated_path: &Path| -> Result<()> {
-            let rooted_path = coordinated_path_under_root(&self.root, coordinated_path)?;
+            let rooted_path = coordinated_path_for_request(&self.root, path, coordinated_path)?;
             result = Some(action(&rooted_path)?);
             Ok(())
         };
@@ -7465,7 +7594,7 @@ impl LibraryManager {
     ) -> Result<T> {
         let mut result = None;
         let mut accessor = |coordinated_path: &Path| -> Result<()> {
-            let rooted_path = coordinated_path_under_root(&self.root, coordinated_path)?;
+            let rooted_path = coordinated_path_for_request(&self.root, path, coordinated_path)?;
             result = Some(action(&rooted_path)?);
             Ok(())
         };
@@ -7587,7 +7716,7 @@ fn ensure_private_directory(
 ) -> Result<EntryIdentity> {
     let mut directory_identity = None;
     let mut accessor = |coordinated_path: &Path| -> Result<()> {
-        let rooted_path = coordinated_path_under_root(root, coordinated_path)?;
+        let rooted_path = coordinated_path_for_request(root, path, coordinated_path)?;
         if rooted_path != path {
             bail!("coordinated media-library path changed during creation");
         }
@@ -13458,6 +13587,135 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn round13_coordinated_directory_accepts_canonical_equivalent_japanese_paths() {
+        let root = TemporaryRoot::new("coordinated-directory-nfc-nfd");
+        let composed = root.path().join("ヴ");
+        let decomposed = root.path().join("ウ\u{3099}");
+        fs::create_dir_all(&composed).expect("Japanese directory should create");
+        assert_ne!(
+            composed, decomposed,
+            "fixture spellings must differ by normalization"
+        );
+
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+        let (requested_file, requested) = open_rooted_directory_proof(&rooted, &composed)
+            .expect("requested spelling should bind");
+        let (callback_file, callback) = open_rooted_directory_proof(&rooted, &decomposed)
+            .expect("canonical-equivalent callback spelling should bind");
+        assert!(rooted_directory_proofs_match(requested, callback));
+        assert_eq!(
+            coordinated_path_for_request(&rooted, &composed, &decomposed)
+                .expect("same directory callback should pass"),
+            composed
+        );
+        drop((requested_file, callback_file));
+    }
+
+    #[test]
+    fn round13_coordinated_directory_ignores_benign_child_entry_churn() {
+        let root = TemporaryRoot::new("coordinated-directory-child-churn");
+        let directory = root.path().join("media");
+        fs::create_dir_all(&directory).expect("media directory should create");
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+        let (_, before) = open_rooted_directory_proof(&rooted, &directory)
+            .expect("directory proof should open before child churn");
+
+        fs::write(directory.join("unrelated-child"), b"fixture")
+            .expect("ordinary child entry should create");
+        let (_, after) = open_rooted_directory_proof(&rooted, &directory)
+            .expect("directory proof should open after child churn");
+
+        assert_eq!(
+            before, after,
+            "child entries do not change object or access policy"
+        );
+    }
+
+    #[test]
+    fn round13_coordinated_directory_rejects_different_directory_objects() {
+        let root = TemporaryRoot::new("coordinated-directory-different-object");
+        let requested = root.path().join("requested");
+        let callback = root.path().join("callback");
+        fs::create_dir_all(&requested).expect("requested directory should create");
+        fs::create_dir_all(&callback).expect("callback directory should create");
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+
+        let error = coordinated_path_for_request(&rooted, &requested, &callback)
+            .expect_err("a different in-root directory must be rejected");
+        assert!(format!("{error:#}").contains("object or access policy differs"));
+    }
+
+    #[test]
+    fn round13_coordinated_directory_rejects_out_of_root_callback() {
+        let root = TemporaryRoot::new("coordinated-directory-rooted-callback");
+        let outside = TemporaryRoot::new("coordinated-directory-outside-callback");
+        let requested = root.path().join("requested");
+        let callback = outside.path().join("callback");
+        fs::create_dir_all(&requested).expect("requested directory should create");
+        fs::create_dir_all(&callback).expect("outside callback directory should create");
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+
+        let error = coordinated_path_for_request(&rooted, &requested, &callback)
+            .expect_err("a coordinator path outside the registered root must be rejected");
+        assert!(format!("{error:#}").contains("outside the configured media root"));
+    }
+
+    #[test]
+    fn round13_coordinated_directory_rejects_symlink_and_unreadable_paths() {
+        let root = TemporaryRoot::new("coordinated-directory-reject-paths");
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        let unreadable = root.path().join("unreadable");
+        fs::create_dir_all(&real).expect("real directory should create");
+        fs::create_dir_all(&unreadable).expect("unreadable directory should create");
+        symlink(&real, &link).expect("directory symlink should create");
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+
+        let symlink_error = coordinated_path_for_request(&rooted, &real, &link)
+            .expect_err("a callback symlink must be rejected");
+        assert!(format!("{symlink_error:#}").contains("not a directory"));
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("directory read permission should be removed");
+        let unreadable_error = open_rooted_directory_proof(&rooted, &unreadable)
+            .expect_err("an unreadable directory must remain an access error");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("directory access should be restored for fixture cleanup");
+        assert!(format!("{unreadable_error:#}").contains("Permission denied"));
+    }
+
+    #[test]
+    fn round13_coordinated_directory_rejects_current_object_or_access_policy_change() {
+        let root = TemporaryRoot::new("coordinated-directory-proof-change");
+        let directory = root.path().join("media");
+        fs::create_dir_all(&directory).expect("media directory should create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("baseline mode should set");
+        let rooted = RootedFs::new(root.path()).expect("registered fixture root should bind");
+        let (_, original) = open_rooted_directory_proof(&rooted, &directory)
+            .expect("original directory proof should open");
+
+        let displaced = root.path().join("media-displaced");
+        fs::rename(&directory, &displaced).expect("original directory should be displaced");
+        fs::create_dir(&directory).expect("replacement directory should create");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("replacement mode should match original");
+        let (_, replacement) = open_rooted_directory_proof(&rooted, &directory)
+            .expect("replacement directory proof should open");
+        assert_ne!(original.identity, replacement.identity);
+        assert!(!rooted_directory_proofs_match(original, replacement));
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750))
+            .expect("changed mode should set on the same object");
+        let (_, changed_access) = open_rooted_directory_proof(&rooted, &directory)
+            .expect("changed access-policy proof should open");
+        assert_eq!(replacement.identity, changed_access.identity);
+        assert_ne!(replacement.mode, changed_access.mode);
+        assert!(!rooted_directory_proofs_match(replacement, changed_access));
     }
 
     fn manager(root: &TemporaryRoot) -> LibraryManager {

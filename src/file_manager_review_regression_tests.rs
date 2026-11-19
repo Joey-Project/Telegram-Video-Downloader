@@ -212,6 +212,235 @@ fn review78_secondary_nfo_attachment_references_move_with_their_owners() {
     );
 }
 
+#[cfg(target_os = "macos")]
+struct Review78DirectoryCallbackRedirect {
+    requested_directory: PathBuf,
+    callback_directory: PathBuf,
+    redirected_reads: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Review78DirectoryCallbackRedirect {
+    fn new(requested_directory: PathBuf, callback_directory: PathBuf) -> Self {
+        Self {
+            requested_directory,
+            callback_directory,
+            redirected_reads: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn redirected_reads(&self) -> Vec<PathBuf> {
+        self.redirected_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl QueueFileProvider for Review78DirectoryCallbackRedirect {
+    fn coordinate_read(
+        &self,
+        path: &Path,
+        accessor: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if path == self.requested_directory {
+            self.redirected_reads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(self.callback_directory.clone());
+            accessor(&self.callback_directory)
+        } else {
+            accessor(path)
+        }
+    }
+
+    fn coordinate_write(
+        &self,
+        path: &Path,
+        accessor: &mut dyn FnMut(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        accessor(path)
+    }
+
+    fn coordinate_move(
+        &self,
+        source: &Path,
+        destination: &Path,
+        accessor: &mut dyn FnMut(&Path, &Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        accessor(source, destination)
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn review78_macos_unicode_directory_callback_alias_survives_scan_preview_execute() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TemporaryRoot::new("review78-unicode-directory-alias");
+    let source_dir = root.path().join("ヴ");
+    let callback_alias = root.path().join("ウ\u{3099}");
+    let destination = root.path().join("Organized");
+    fs::create_dir_all(&source_dir).expect("NFC Japanese source directory should create");
+    fs::create_dir_all(&destination).expect("destination should create");
+
+    let media_path = source_dir.join("episode.mkv");
+    let sidecar_path = source_dir.join("poster.jpg");
+    let nfo_path = source_dir.join("episode.nfo");
+    fs::write(&media_path, b"synthetic media bytes").expect("synthetic media should write");
+    fs::write(&sidecar_path, b"synthetic sidecar bytes").expect("sidecar should write");
+    fs::write(
+        &nfo_path,
+        concat!(
+            "<movie><title>Original synthetic title</title>",
+            "<uniqueid type=\"bilibili\">BV1Synthetic09</uniqueid>",
+            "<tvd_attachment role=\"cover\">poster.jpg</tvd_attachment>",
+            "<thumb>poster.jpg</thumb>",
+            "<futureField>preserve this metadata</futureField></movie>"
+        ),
+    )
+    .expect("synthetic NFO should write");
+    let original_media = fs::read(&media_path).expect("source media should read");
+    let original_sidecar = fs::read(&sidecar_path).expect("source sidecar should read");
+    let original_inode = fs::metadata(&media_path)
+        .expect("source media metadata should read")
+        .ino();
+
+    let provider = Arc::new(Review78DirectoryCallbackRedirect::new(
+        source_dir.clone(),
+        callback_alias.clone(),
+    ));
+    let manager = LibraryManager::open_with_provider(root.path(), provider.clone())
+        .expect("manager should open with directory callback redirect");
+    let snapshot = manager
+        .scan(&[])
+        .expect("NFD callback alias should resolve to the existing NFC directory");
+    assert!(
+        provider.redirected_reads().contains(&callback_alias),
+        "scan must exercise the directory callback with the NFD spelling"
+    );
+    let item = item_at(&snapshot, "ヴ/episode.mkv");
+    assert_eq!(item.authoritative_nfo_path.as_deref(), Some("ヴ/episode.nfo"));
+    assert!(item.attachments.iter().any(|attachment| {
+        attachment.relative_path == "ヴ/poster.jpg" && attachment.kind == "cover"
+    }));
+
+    let preview = manager
+        .preview(
+            std::slice::from_ref(&item.id),
+            "Organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("directory alias item should preview");
+    let target = |source: &str| {
+        preview.items[0]
+            .files
+            .iter()
+            .find(|file| file.source_path == source)
+            .unwrap_or_else(|| panic!("preview should include {source}"))
+            .target_path
+            .clone()
+    };
+    let media_target = target("ヴ/episode.mkv");
+    let sidecar_target = target("ヴ/poster.jpg");
+    let nfo_target = target("ヴ/episode.nfo");
+    assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+    let result = manager
+        .execute_preview(&preview.id, &preview.revision)
+        .expect("confirmed Unicode directory alias move should complete");
+    assert_eq!(result.status, BatchStatus::Complete);
+
+    let moved_media = root.path().join(&media_target);
+    assert_eq!(fs::read(&moved_media).unwrap(), original_media);
+    assert_eq!(fs::metadata(&moved_media).unwrap().ino(), original_inode);
+    assert_eq!(fs::read(root.path().join(&sidecar_target)).unwrap(), original_sidecar);
+    let sidecar_name = Path::new(&sidecar_target)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .expect("moved sidecar name should be UTF-8");
+    let moved_nfo = fs::read_to_string(root.path().join(&nfo_target))
+        .expect("moved NFO should read");
+    assert!(moved_nfo.contains(&format!(
+        "<tvd_attachment role=\"cover\">{sidecar_name}</tvd_attachment>"
+    )));
+    assert!(moved_nfo.contains(&format!("<thumb>{sidecar_name}</thumb>")));
+    assert!(moved_nfo.contains("<title>Original synthetic title</title>"));
+    assert!(moved_nfo.contains("<uniqueid type=\"bilibili\">BV1Synthetic09</uniqueid>"));
+    assert!(moved_nfo.contains("<futureField>preserve this metadata</futureField>"));
+    assert!(!source_dir.join("episode.mkv").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn review78_macos_unicode_directory_callback_redirect_to_other_directory_is_rejected() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TemporaryRoot::new("review78-unicode-directory-wrong-object");
+    let source_dir = root.path().join("ヴ");
+    let different_dir = root.path().join("別の場所");
+    let destination = root.path().join("Organized");
+    fs::create_dir_all(&source_dir).expect("source directory should create");
+    fs::create_dir_all(&different_dir).expect("different callback directory should create");
+    fs::create_dir_all(&destination).expect("destination should create");
+    let source_media = source_dir.join("episode.mkv");
+    let original_media = b"synthetic source media bytes";
+    fs::write(&source_media, original_media).expect("source media should write");
+    let original_hash = Sha256::digest(original_media);
+    let original_inode = fs::metadata(&source_media)
+        .expect("source media metadata should read")
+        .ino();
+    fs::write(different_dir.join("other.mkv"), b"different directory contents")
+        .expect("different directory fixture should write");
+
+    let provider = Arc::new(Review78DirectoryCallbackRedirect::new(
+        source_dir.clone(),
+        different_dir,
+    ));
+    let manager = LibraryManager::open_with_provider(root.path(), provider.clone())
+        .expect("manager should open with redirected directory callback");
+    let snapshot = manager
+        .scan(&[])
+        .expect("an unreadable directory should produce an incomplete snapshot");
+    assert!(
+        snapshot.warnings.iter().any(|warning| {
+            warning.contains("directory unreadable at ヴ") && warning.contains("object")
+        }),
+        "the redirected directory object mismatch should be visible in scan warnings: {:?}",
+        snapshot.warnings
+    );
+    assert_eq!(provider.redirected_reads().len(), 1);
+    assert!(snapshot.items.iter().all(|item| {
+        item.relative_path != "ヴ/episode.mkv" && item.relative_path != "ヴ/other.mkv"
+    }));
+    assert!(snapshot
+        .items
+        .iter()
+        .any(|item| item.relative_path == "別の場所/other.mkv"));
+
+    let item_ids = snapshot
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let preview = manager
+        .preview(&item_ids, "Organized", false, ConflictPolicy::KeepBoth)
+        .expect("only items from directories scanned under their own paths should preview");
+    assert!(preview.items.iter().all(|item| {
+        item.source_path != "ヴ/episode.mkv" && item.source_path != "ヴ/other.mkv"
+    }));
+    assert!(!preview.items.is_empty());
+
+    assert!(source_media.exists(), "original source path must remain present");
+    assert_eq!(fs::read(&source_media).unwrap(), original_media);
+    assert_eq!(Sha256::digest(fs::read(&source_media).unwrap()), original_hash);
+    assert_eq!(fs::metadata(&source_media).unwrap().ino(), original_inode);
+    assert!(!destination.join("episode.mkv").exists());
+    assert!(!destination.join("other.mkv").exists());
+}
+
 #[test]
 fn review78_generated_nfo_conflicts_are_planned_before_skip_or_keep_both() {
     let root = TemporaryRoot::new("review78-generated-nfo-destination-conflict");
