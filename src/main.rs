@@ -13,6 +13,7 @@ mod cloud_snapshot_budget;
 mod config;
 mod danmaku_refresh;
 mod danmaku_refresh_bot;
+mod danmaku_rendering;
 mod disk_space;
 mod downloader;
 mod episode_retry;

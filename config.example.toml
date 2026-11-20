@@ -79,6 +79,8 @@ enabled = true
 font_scale = 3.0
 opacity = 0.7
 display_area = 0.5
+# Group identical nearby scrolling comments in generated ASS (0 disables grouping).
+merge_window_ms = 1500
 
 [bilibili.auth]
 # Legacy bot-managed Web cookie state; BBDown-rust credentials live in credential_file.

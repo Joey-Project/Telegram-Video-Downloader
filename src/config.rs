@@ -164,6 +164,8 @@ pub struct BilibiliConfig {
 pub struct BilibiliDanmakuConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_bilibili_danmaku_merge_window_ms")]
+    pub merge_window_ms: u64,
     #[serde(default = "default_bilibili_danmaku_font_scale")]
     pub font_scale: f64,
     #[serde(default = "default_bilibili_danmaku_opacity")]
@@ -851,6 +853,7 @@ impl Default for BilibiliDanmakuConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            merge_window_ms: default_bilibili_danmaku_merge_window_ms(),
             font_scale: default_bilibili_danmaku_font_scale(),
             opacity: default_bilibili_danmaku_opacity(),
             display_area: default_bilibili_danmaku_display_area(),
@@ -860,6 +863,9 @@ impl Default for BilibiliDanmakuConfig {
 
 impl BilibiliDanmakuConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.merge_window_ms > 10_000 {
+            bail!("bilibili.danmaku.merge_window_ms must be between 0 and 10000");
+        }
         if !self.font_scale.is_finite() || self.font_scale <= 0.0 || self.font_scale > 10.0 {
             bail!("bilibili.danmaku.font_scale must be finite, greater than 0, and at most 10");
         }
@@ -1140,6 +1146,10 @@ fn default_bilibili_danmaku_font_scale() -> f64 {
     3.0
 }
 
+fn default_bilibili_danmaku_merge_window_ms() -> u64 {
+    1_500
+}
+
 fn default_bilibili_danmaku_opacity() -> f64 {
     0.7
 }
@@ -1273,6 +1283,7 @@ mod tests {
         assert!(config.bilibili.restricted_api_proxies.is_empty());
         assert_eq!(config.bilibili.danmaku_formats, vec!["xml", "ass"]);
         assert!(config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.merge_window_ms, 1_500);
         assert_eq!(config.bilibili.danmaku.font_scale, 3.0);
         assert_eq!(config.bilibili.danmaku.opacity, 0.7);
         assert_eq!(config.bilibili.danmaku.display_area, 0.5);
@@ -1868,6 +1879,7 @@ mod tests {
         .expect("disabled danmaku config should parse");
 
         assert!(!config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.merge_window_ms, 1_500);
         assert_eq!(config.bilibili.danmaku.font_scale, 3.0);
         assert_eq!(config.bilibili.danmaku.opacity, 0.7);
         assert_eq!(config.bilibili.danmaku.display_area, 0.5);
@@ -1883,6 +1895,7 @@ mod tests {
 
             [bilibili.danmaku]
             font_scale = 2.5
+            merge_window_ms = 2500
             opacity = 0.4
             display_area = 0.75
             "#,
@@ -1891,9 +1904,25 @@ mod tests {
         .expect("custom danmaku settings should parse");
 
         assert!(config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.merge_window_ms, 2_500);
         assert_eq!(config.bilibili.danmaku.font_scale, 2.5);
         assert_eq!(config.bilibili.danmaku.opacity, 0.4);
         assert_eq!(config.bilibili.danmaku.display_area, 0.75);
+    }
+
+    #[test]
+    fn accepts_disabled_and_maximum_bilibili_danmaku_merge_windows() {
+        for merge_window_ms in [0, 10_000] {
+            let config = AppConfig::from_toml_str(
+                &format!(
+                    "[telegram]\ntoken = \"token\"\nallow_all_chats = true\n\n[bilibili.danmaku]\nmerge_window_ms = {merge_window_ms}\n"
+                ),
+                PathBuf::from("."),
+            )
+            .expect("merge-window boundary should parse");
+
+            assert_eq!(config.bilibili.danmaku.merge_window_ms, merge_window_ms);
+        }
     }
 
     #[test]
@@ -1910,6 +1939,7 @@ mod tests {
             ("display_area", "inf"),
             ("display_area", "0"),
             ("display_area", "1.1"),
+            ("merge_window_ms", "10001"),
         ] {
             let toml = format!(
                 "[telegram]\ntoken = \"token\"\nallow_all_chats = true\n\n[bilibili.danmaku]\n{key} = {value}\n"
