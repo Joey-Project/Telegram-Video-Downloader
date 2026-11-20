@@ -82,9 +82,16 @@ struct Event<'a> {
     counter_font_size: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutVersion {
+    V1,
+    V2,
+    V3,
+}
+
 /// Render every accepted, plain-text comment in XML document order before time sorting.
 pub fn render_ass(xml: &str, options: &RenderOptions) -> Result<RenderedAss> {
-    render_ass_with_limit(xml, options, None, false)
+    render_ass_with_limit(xml, options, None, LayoutVersion::V3)
 }
 
 /// Render the first `source_comments` accepted comments in XML document order.
@@ -96,7 +103,7 @@ pub fn render_ass_prefix(
     options: &RenderOptions,
     source_comments: usize,
 ) -> Result<RenderedAss> {
-    render_ass_with_limit(xml, options, Some(source_comments), false)
+    render_ass_with_limit(xml, options, Some(source_comments), LayoutVersion::V3)
 }
 
 /// Render a source prefix using the original v1 sizing and track layout.
@@ -108,14 +115,26 @@ pub fn render_ass_prefix_v1(
     options: &RenderOptions,
     source_comments: usize,
 ) -> Result<RenderedAss> {
-    render_ass_with_limit(xml, options, Some(source_comments), true)
+    render_ass_with_limit(xml, options, Some(source_comments), LayoutVersion::V1)
+}
+
+/// Render a source prefix using v2's byte-compatible sizing and track layout.
+///
+/// This compatibility entry point preserves the pre-lookahead 40-pixel margin
+/// and greedy placement used to validate existing generated sidecars.
+pub fn render_ass_prefix_v2(
+    xml: &str,
+    options: &RenderOptions,
+    source_comments: usize,
+) -> Result<RenderedAss> {
+    render_ass_with_limit(xml, options, Some(source_comments), LayoutVersion::V2)
 }
 
 fn render_ass_with_limit(
     xml: &str,
     options: &RenderOptions,
     source_limit: Option<usize>,
-    legacy_layout: bool,
+    layout_version: LayoutVersion,
 ) -> Result<RenderedAss> {
     validate_options(options)?;
     ensure!(
@@ -142,16 +161,15 @@ fn render_ass_with_limit(
 
     let mut events = group_comments(&comments, options);
     for event in &mut events {
-        if legacy_layout {
-            size_event_v1(event, options);
-        } else {
-            layout::size_event_v2(event, options);
+        match layout_version {
+            LayoutVersion::V1 => size_event_v1(event, options),
+            LayoutVersion::V2 | LayoutVersion::V3 => layout::size_event_v2(event, options),
         }
     }
-    let ass = if legacy_layout {
-        render_events_v1(&events, options)?
-    } else {
-        render_events_v2(&events, options)?
+    let ass = match layout_version {
+        LayoutVersion::V1 => render_events_v1(&events, options)?,
+        LayoutVersion::V2 => render_events_v2(&events, options)?,
+        LayoutVersion::V3 => render_events_v3(&events, options)?,
     };
     Ok(RenderedAss {
         ass,
@@ -486,9 +504,22 @@ fn render_events_v1(events: &[Event<'_>], options: &RenderOptions) -> Result<Str
 }
 
 fn render_events_v2(events: &[Event<'_>], options: &RenderOptions) -> Result<String> {
+    let placements = layout::place_events(events, options);
+    render_events_with_placements(events, options, &placements)
+}
+
+fn render_events_v3(events: &[Event<'_>], options: &RenderOptions) -> Result<String> {
+    let placements = layout::place_events_v3(events, options);
+    render_events_with_placements(events, options, &placements)
+}
+
+fn render_events_with_placements(
+    events: &[Event<'_>],
+    options: &RenderOptions,
+    placements: &[layout::Placement],
+) -> Result<String> {
     let region_height = (PLAY_RES_Y as f64 * options.display_area).floor().max(1.0);
     let alpha = ((1.0 - options.opacity) * 255.0).round() as u8;
-    let placements = layout::place_events(events, options);
     let mut output = String::new();
     write_header(&mut output, options, alpha)?;
 
@@ -640,7 +671,7 @@ fn escape_ass_into(output: &mut String, text: &str) {
 mod tests {
     use super::{
         MAX_XML_BYTES, RenderOptions, estimated_text_width, group_comments, layout, parse_comments,
-        render_ass, render_ass_prefix, render_ass_prefix_v1,
+        render_ass, render_ass_prefix, render_ass_prefix_v1, render_ass_prefix_v2,
     };
 
     fn xml(comments: &[(&str, &str)]) -> String {
@@ -862,9 +893,61 @@ mod tests {
     }
 
     #[test]
+    fn later_comment_changes_the_earlier_placement_through_the_renderer() {
+        let tall = "long\n".repeat(10) + "long";
+        let comments = [
+            ("0,5,12,16777215", "x"),
+            ("0.1,5,25,16777215", "xyz"),
+            ("0.2,4,71,16777215", &tall),
+        ];
+        let options = RenderOptions::default();
+        let source = xml(&comments);
+        let older = render_ass_prefix_v2(&source, &options, comments.len()).unwrap();
+        let without_future = render_ass(&xml(&comments[..2]), &options).unwrap();
+        let with_future = render_ass(&source, &options).unwrap();
+        let old_lines = dialogues(&older.ass);
+        let new_lines = dialogues(&with_future.ass);
+
+        assert_eq!(dialogue_y(dialogues(&without_future.ass)[1]), 59);
+        assert_eq!(dialogue_y(old_lines[1]), 59);
+        assert_eq!(dialogue_y(new_lines[1]), 40);
+        assert_eq!(old_lines.len(), new_lines.len());
+        for (old, new) in old_lines.iter().zip(new_lines) {
+            let (old_start, old_end) = old.split_once("\\pos(").unwrap();
+            let (new_start, new_end) = new.split_once("\\pos(").unwrap();
+            assert_eq!(old_start, new_start);
+            assert_eq!(
+                old_end.split_once(')').unwrap().1,
+                new_end.split_once(')').unwrap().1
+            );
+        }
+    }
+
+    #[test]
     fn v1_prefix_retains_a_byte_exact_legacy_fixture() {
         let source = xml(&[("1,1,25,16777215", "legacy")]);
         let rendered = render_ass_prefix_v1(&source, &RenderOptions::default(), 1).unwrap();
+        let expected = concat!(
+            "[Script Info]\n",
+            "ScriptType: v4.00+\n",
+            "WrapStyle: 2\n",
+            "ScaledBorderAndShadow: yes\n",
+            "PlayResX: 1920\n",
+            "PlayResY: 1080\n\n",
+            "[V4+ Styles]\n",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n",
+            "Style: Danmaku,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1\n\n",
+            "[Events]\n",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            "Dialogue: 0,0:00:01.00,0:00:09.00,Danmaku,,0,0,0,,{\\an7\\move(2001,40,-81,40)\\fs25\\c&HFFFFFF&\\alpha&H00&\\clip(0,0,1920,1080)}legacy\n",
+        );
+        assert_eq!(rendered.ass, expected);
+    }
+
+    #[test]
+    fn v2_prefix_retains_a_byte_exact_greedy_fixture() {
+        let source = xml(&[("1,1,25,16777215", "legacy")]);
+        let rendered = render_ass_prefix_v2(&source, &RenderOptions::default(), 1).unwrap();
         let expected = concat!(
             "[Script Info]\n",
             "ScriptType: v4.00+\n",

@@ -17,6 +17,8 @@ use super::{
 };
 
 const MAX_ACTIVE_OCCUPANCY: usize = 256;
+const MAX_REFINEMENT_NEIGHBORS: usize = 256;
+const MAX_REFINEMENT_CONFLICTS: usize = 16;
 const CONFLICT_WEIGHT_SCALE: f64 = 1_000.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,16 @@ struct Motion {
     x_start: f64,
     x_end: f64,
     width: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Footprint {
+    start_cs: u64,
+    end_cs: u64,
+    latest_end_cs: u64,
+    motion: Motion,
+    height: usize,
+    bottom_aligned: bool,
 }
 
 impl Motion {
@@ -79,6 +91,12 @@ pub(super) fn size_event_v2(event: &mut Event<'_>, options: &RenderOptions) {
 
     let line_count = event.anchor.text.matches('\n').count() + 1;
     event.height = event.body_font_size * 1.25 * line_count as f64 + 4.0;
+}
+
+pub(super) fn place_events_v3(events: &[Event<'_>], options: &RenderOptions) -> Vec<Placement> {
+    let mut placements = place_events(events, options);
+    refine_placements(events, options, &mut placements);
+    placements
 }
 
 pub(super) fn place_events(events: &[Event<'_>], options: &RenderOptions) -> Vec<Placement> {
@@ -128,6 +146,177 @@ pub(super) fn place_events(events: &[Event<'_>], options: &RenderOptions) -> Vec
     }
 
     placements
+}
+
+/// Improve the greedy seed with bounded coordinate passes over a symmetric
+/// chronological neighborhood. Each event is compared with both earlier and
+/// later events whose exact ASS intervals and visible horizontal paths overlap.
+/// Crowded events keep the greedy seed. For smaller sets a move must strictly
+/// improve the pair score.
+fn refine_placements(events: &[Event<'_>], options: &RenderOptions, placements: &mut [Placement]) {
+    if events.len() < 2 {
+        return;
+    }
+
+    let region_height = (f64::from(super::PLAY_RES_Y) * options.display_area)
+        .floor()
+        .max(1.0) as usize;
+    let margin = (TOP_MARGIN as usize).min(region_height / 8);
+    let mut latest_end_cs = 0;
+    let footprints = events
+        .iter()
+        .map(|event| {
+            let (start_cs, end_cs) = event_times(event);
+            latest_end_cs = latest_end_cs.max(end_cs);
+            Footprint {
+                start_cs,
+                end_cs,
+                latest_end_cs,
+                motion: motion_for(event, start_cs, end_cs),
+                height: event.height.ceil().min(region_height as f64) as usize,
+                bottom_aligned: event.anchor.mode == 4,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut row_costs = vec![0_i64; region_height + 1];
+
+    for index in 0..events.len() {
+        refine_event(
+            index,
+            &footprints,
+            placements,
+            &mut row_costs,
+            region_height,
+            margin,
+        );
+    }
+    for index in (0..events.len()).rev() {
+        refine_event(
+            index,
+            &footprints,
+            placements,
+            &mut row_costs,
+            region_height,
+            margin,
+        );
+    }
+}
+
+fn refine_event(
+    index: usize,
+    footprints: &[Footprint],
+    placements: &mut [Placement],
+    row_costs: &mut [i64],
+    region_height: usize,
+    margin: usize,
+) {
+    let footprint = footprints[index];
+    let current_y = placements[index].anchor_y.max(0) as usize;
+    let current_rows = visible_rows(
+        current_y,
+        footprint.height,
+        region_height,
+        footprint.bottom_aligned,
+    );
+    let lower_bound = index.saturating_sub(MAX_REFINEMENT_NEIGHBORS);
+    // End times need not be chronological. The prefix maximum lets us skip
+    // expired neighbors while retaining earlier events with longer durations.
+    let expired = footprints[lower_bound..index]
+        .partition_point(|earlier| earlier.latest_end_cs <= footprint.start_cs);
+    let start_index = lower_bound + expired;
+    let end_index = index
+        .saturating_add(MAX_REFINEMENT_NEIGHBORS + 1)
+        .min(footprints.len());
+    let mut current_score = 0_i64;
+    let mut conflicts = 0;
+
+    for neighbor_index in start_index..end_index {
+        if neighbor_index == index {
+            continue;
+        }
+        let neighbor = footprints[neighbor_index];
+        if neighbor_index > index && neighbor.start_cs >= footprint.end_cs {
+            break;
+        }
+        if footprint.start_cs >= neighbor.end_cs || neighbor.start_cs >= footprint.end_cs {
+            continue;
+        }
+        let (left_motion, right_motion) = if neighbor_index < index {
+            (neighbor.motion, footprint.motion)
+        } else {
+            (footprint.motion, neighbor.motion)
+        };
+        let Some(overlap) = horizontal_overlap(left_motion, right_motion) else {
+            continue;
+        };
+        if conflicts == 0 {
+            row_costs.fill(0);
+        }
+        conflicts += 1;
+        // Keep the deterministic initial placement for very crowded paths.
+        // With many crossing paths there is little room to reposition and
+        // the rectangle model is less reliable as a measure of readability.
+        if conflicts > MAX_REFINEMENT_CONFLICTS {
+            return;
+        }
+        let weight = (overlap * CONFLICT_WEIGHT_SCALE).ceil() as i64;
+        let neighbor_rows = visible_rows(
+            placements[neighbor_index].anchor_y.max(0) as usize,
+            neighbor.height,
+            region_height,
+            neighbor.bottom_aligned,
+        );
+        row_costs[neighbor_rows.start] += weight;
+        row_costs[neighbor_rows.end] -= weight;
+        let overlap_start = current_rows.start.max(neighbor_rows.start);
+        let overlap_end = current_rows.end.min(neighbor_rows.end);
+        if overlap_start < overlap_end {
+            current_score += weight * (overlap_end - overlap_start) as i64;
+        }
+    }
+
+    if current_score == 0 {
+        return;
+    }
+
+    prefix_row_costs(row_costs);
+
+    let mut best_y = current_y;
+    let mut best_score = current_score;
+    let mut candidates = candidate_anchors(
+        footprint.height,
+        region_height,
+        margin,
+        footprint.bottom_aligned,
+    );
+    loop {
+        let candidate_y = if footprint.bottom_aligned {
+            candidates.next_back()
+        } else {
+            candidates.next()
+        };
+        let Some(candidate_y) = candidate_y else {
+            break;
+        };
+        let rows = visible_rows(
+            candidate_y,
+            footprint.height,
+            region_height,
+            footprint.bottom_aligned,
+        );
+        let score = score_rows(row_costs, rows);
+        if score < best_score {
+            best_y = candidate_y;
+            best_score = score;
+            if score == 0 {
+                break;
+            }
+        }
+    }
+
+    if best_y != current_y {
+        placements[index].anchor_y = best_y as i32;
+    }
 }
 
 fn candidate_anchors(
@@ -255,6 +444,22 @@ fn constrain_nonpositive(
     *minimum <= *maximum
 }
 
+/// Convert row-weight difference updates into a prefix integral so scoring a
+/// candidate footprint takes constant time.
+fn prefix_row_costs(row_costs: &mut [i64]) {
+    let mut row_weight = 0;
+    let mut area = 0;
+    for cost in row_costs.iter_mut() {
+        row_weight += *cost;
+        *cost = area;
+        area += row_weight;
+    }
+}
+
+fn score_rows(prefix_costs: &[i64], rows: Range<usize>) -> i64 {
+    prefix_costs[rows.end] - prefix_costs[rows.start]
+}
+
 fn choose_candidate(
     candidates: RangeInclusive<usize>,
     active: &VecDeque<Occupied>,
@@ -282,20 +487,13 @@ fn choose_candidate(
         }
     }
 
-    // Convert range updates to row weights and then to a prefix integral.
-    let mut row_weight = 0;
-    let mut area = 0;
-    for cost in row_costs.iter_mut() {
-        row_weight += *cost;
-        *cost = area;
-        area += row_weight;
-    }
+    prefix_row_costs(row_costs);
 
     let mut best_y = preferred_y;
     let mut best_score = i64::MAX;
     for y in candidates {
         let rows = visible_rows(y, height, region_height, bottom_aligned);
-        let score = row_costs[rows.end] - row_costs[rows.start];
+        let score = score_rows(row_costs, rows);
         if score < best_score || (score == best_score && bottom_aligned && y > best_y) {
             best_score = score;
             best_y = y;
@@ -307,10 +505,10 @@ fn choose_candidate(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ACTIVE_OCCUPANCY, Motion, Occupied, choose_candidate, horizontal_overlap, place_events,
-        size_event_v2,
+        MAX_ACTIVE_OCCUPANCY, Motion, Occupied, Placement, choose_candidate, horizontal_overlap,
+        place_events, refine_placements, size_event_v2,
     };
-    use crate::{Comment, RenderOptions, make_event};
+    use crate::{Comment, RenderOptions, event_times, make_event};
     use std::collections::VecDeque;
 
     #[test]
@@ -407,6 +605,104 @@ mod tests {
             choose_candidate(0..=40, &active, &mut scores, motion, 60, 100, false),
             40
         );
+    }
+
+    #[test]
+    fn lookahead_moves_prior_scroll_for_later_fixed_and_uses_four_and_eight_second_intervals() {
+        let options = RenderOptions::default();
+        let comments = [
+            Comment {
+                original_index: 0,
+                start_seconds: 0.0,
+                mode: 1,
+                font_size: 25.0,
+                color: 0xFF_FF_FF,
+                text: "long scroll".into(),
+            },
+            Comment {
+                original_index: 1,
+                start_seconds: 5.0,
+                mode: 4,
+                font_size: 25.0,
+                color: 0xFF_FF_FF,
+                text: "later fixed".into(),
+            },
+        ];
+        let mut events = comments.iter().map(make_event).collect::<Vec<_>>();
+        for event in &mut events {
+            size_event_v2(event, &options);
+        }
+        events[0].width = 1_200.0;
+        events[1].width = 120.0;
+        assert_eq!(event_times(&events[0]), (0, 800));
+        assert_eq!(event_times(&events[1]), (500, 900));
+
+        let initial = vec![Placement { anchor_y: 40 }, Placement { anchor_y: 76 }];
+        let mut placements = initial.clone();
+        refine_placements(&events, &options, &mut placements);
+        assert_eq!(
+            placements[0].anchor_y, 76,
+            "the earlier scroll should move to a zero-overlap row for its later fixed event"
+        );
+        assert_eq!(placements[1], initial[1]);
+
+        let duration_comments = [
+            Comment {
+                original_index: 0,
+                start_seconds: 0.0,
+                mode: 4,
+                font_size: 25.0,
+                color: 0xFF_FF_FF,
+                text: "short fixed".into(),
+            },
+            Comment {
+                original_index: 1,
+                start_seconds: 5.0,
+                mode: 1,
+                font_size: 25.0,
+                color: 0xFF_FF_FF,
+                text: "later scroll".into(),
+            },
+        ];
+        let mut duration_events = duration_comments.iter().map(make_event).collect::<Vec<_>>();
+        for event in &mut duration_events {
+            size_event_v2(event, &options);
+        }
+        duration_events[0].width = 120.0;
+        duration_events[1].width = 1_200.0;
+        assert_eq!(event_times(&duration_events[0]), (0, 400));
+        assert_eq!(event_times(&duration_events[1]), (500, 1_300));
+
+        let initial = vec![Placement { anchor_y: 76 }, Placement { anchor_y: 40 }];
+        let mut placements = initial.clone();
+        refine_placements(&duration_events, &options, &mut placements);
+        assert_eq!(
+            placements, initial,
+            "the fixed event ends before the later scroll begins"
+        );
+    }
+
+    #[test]
+    fn lookahead_preserves_the_seed_when_too_many_paths_cross() {
+        let options = RenderOptions::default();
+        let comments = (0..super::MAX_REFINEMENT_CONFLICTS + 2)
+            .map(|index| Comment {
+                original_index: index,
+                start_seconds: 0.0,
+                mode: 5,
+                font_size: 25.0,
+                color: 0xFF_FF_FF,
+                text: format!("comment {index}"),
+            })
+            .collect::<Vec<_>>();
+        let mut events = comments.iter().map(make_event).collect::<Vec<_>>();
+        for event in &mut events {
+            size_event_v2(event, &options);
+        }
+        let initial = vec![Placement { anchor_y: 40 }; events.len()];
+        let mut placements = initial.clone();
+        refine_placements(&events, &options, &mut placements);
+        assert_eq!(placements, initial);
     }
 
     #[test]

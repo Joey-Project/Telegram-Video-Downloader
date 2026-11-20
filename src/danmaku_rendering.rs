@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use danmaku_renderer::{
     RenderOptions, RenderedAss, render_ass, render_ass_prefix, render_ass_prefix_v1,
+    render_ass_prefix_v2,
 };
 
 use crate::config::BilibiliDanmakuConfig;
@@ -11,13 +12,30 @@ const MARKER_FAMILY: &str = "; TelegramVideoDownloader Danmaku XML ";
 enum LayoutVersion {
     V1,
     V2,
+    V3,
 }
 
 impl LayoutVersion {
+    const CURRENT: Self = Self::V3;
+
     fn marker_suffix(self) -> &'static str {
         match self {
             Self::V1 => "v1: ",
             Self::V2 => "v2: ",
+            Self::V3 => "v3: ",
+        }
+    }
+
+    fn render_prefix(
+        self,
+        xml: &str,
+        options: &RenderOptions,
+        source_comments: usize,
+    ) -> Result<RenderedAss> {
+        match self {
+            Self::V1 => render_ass_prefix_v1(xml, options, source_comments),
+            Self::V2 => render_ass_prefix_v2(xml, options, source_comments),
+            Self::V3 => render_ass_prefix(xml, options, source_comments),
         }
     }
 }
@@ -35,7 +53,7 @@ pub(crate) fn render_grouped_ass(xml: &str, settings: &BilibiliDanmakuConfig) ->
         display_area: settings.display_area,
         merge_window_ms: settings.merge_window_ms,
     };
-    stamp(render_ass(xml, &options)?, &options, LayoutVersion::V2)
+    stamp(render_ass(xml, &options)?, &options, LayoutVersion::CURRENT)
 }
 
 fn stamp(
@@ -78,11 +96,11 @@ pub(crate) fn grouped_ass_matches(ass: &str, xml: &str) -> Option<bool> {
 pub(crate) fn grouped_ass_can_upgrade(ass: &str, xml: &str, replacement: &str) -> Option<bool> {
     let marker = grouped_marker(ass)?;
     Some(parse_marker(marker).is_some_and(|(version, profile)| {
-        version == LayoutVersion::V1
+        version != LayoutVersion::CURRENT
             && grouped_marker(replacement)
                 .and_then(parse_marker)
                 .is_some_and(|(new_version, new_profile)| {
-                    new_version == LayoutVersion::V2 && new_profile == profile
+                    new_version == LayoutVersion::CURRENT && new_profile == profile
                 })
             && reproduces_ass(ass, xml, version, &profile)
     }))
@@ -94,17 +112,14 @@ fn grouped_marker(ass: &str) -> Option<&str> {
 }
 
 fn reproduces_ass(ass: &str, xml: &str, version: LayoutVersion, profile: &SourceProfile) -> bool {
-    let renderer = match version {
-        LayoutVersion::V1 => render_ass_prefix_v1,
-        LayoutVersion::V2 => render_ass_prefix,
-    };
-    renderer(xml, &profile.options, profile.source_comments)
+    version
+        .render_prefix(xml, &profile.options, profile.source_comments)
         .and_then(|rendered| stamp(rendered, &profile.options, version))
         .is_ok_and(|expected| expected == ass)
 }
 
 fn parse_marker(marker: &str) -> Option<(LayoutVersion, SourceProfile)> {
-    let (version, fields) = [LayoutVersion::V1, LayoutVersion::V2]
+    let (version, fields) = [LayoutVersion::V1, LayoutVersion::V2, LayoutVersion::V3]
         .into_iter()
         .find_map(|version| {
             marker
@@ -154,65 +169,75 @@ four</d>"#;
         merge_window_ms: 1_500,
     };
 
-    fn old_v1(xml: &str, source_comments: usize, options: &RenderOptions) -> Result<String> {
+    fn old_ass(
+        version: LayoutVersion,
+        xml: &str,
+        source_comments: usize,
+        options: &RenderOptions,
+    ) -> Result<String> {
         stamp(
-            render_ass_prefix_v1(xml, options, source_comments)?,
+            version.render_prefix(xml, options, source_comments)?,
             options,
-            LayoutVersion::V1,
+            version,
         )
     }
 
     #[test]
-    fn recognizes_unmodified_v1_prefixes_for_refresh_after_xml_is_extended() -> Result<()> {
+    fn recognizes_older_prefixes_for_refresh_after_xml_is_extended() -> Result<()> {
         let xml = format!("<i>{FIRST_COMMENT}{NEXT_COMMENT}</i>");
-        let old = old_v1(&xml, 1, &PROFILE)?;
         let new = render_grouped_ass(&xml, &BilibiliDanmakuConfig::default())?;
 
-        assert_eq!(grouped_ass_matches(&old, &xml), Some(true));
         assert_eq!(grouped_ass_matches(&new, &xml), Some(true));
-        assert_eq!(grouped_ass_can_upgrade(&old, &xml, &new), Some(false));
-        assert_eq!(
-            grouped_ass_matches(&old.replace("\\Nfour", "\\Nedited"), &xml),
-            Some(false)
-        );
+        for version in [LayoutVersion::V1, LayoutVersion::V2] {
+            let old = old_ass(version, &xml, 1, &PROFILE)?;
+            assert_eq!(grouped_ass_matches(&old, &xml), Some(true));
+            assert_eq!(grouped_ass_can_upgrade(&old, &xml, &new), Some(false));
+            assert_eq!(
+                grouped_ass_matches(&old.replace("\\Nfour", "\\Nedited"), &xml),
+                Some(false)
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn download_replaces_complete_v1_sidecar_once_and_preserves_user_edits() -> Result<()> {
+    fn download_upgrades_complete_older_sidecars_and_preserves_user_edits() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let xml_path = directory.path().join("video.xml");
         let ass_path = directory.path().join("video.ass");
         let root = RootedFs::new(directory.path())?;
         let xml = format!("<i>{FIRST_COMMENT}{NEXT_COMMENT}</i>");
-        let old = old_v1(&xml, 2, &PROFILE)?;
         let config = BilibiliDanmakuConfig::default();
         std::fs::write(&xml_path, &xml)?;
-        std::fs::write(&ass_path, &old)?;
 
         let render =
             || crate::bilibili_danmaku::render_grouped_file(&root, &xml_path, &ass_path, &config);
-        render()?;
-        let new = std::fs::read_to_string(&ass_path)?;
-        assert!(new.contains("Danmaku XML v2: source_comments=2"));
-        assert_eq!(grouped_ass_matches(&new, &xml), Some(true));
-        render()?;
-        assert_eq!(std::fs::read_to_string(&ass_path)?, new);
-        assert_eq!(std::fs::read_to_string(&xml_path)?, xml);
+        for version in [LayoutVersion::V1, LayoutVersion::V2] {
+            let old = old_ass(version, &xml, 2, &PROFILE)?;
+            std::fs::write(&ass_path, &old)?;
+            render()?;
+            let new = std::fs::read_to_string(&ass_path)?;
+            assert!(new.contains("Danmaku XML v3: source_comments=2"));
+            assert_eq!(grouped_ass_matches(&new, &xml), Some(true));
+            render()?;
+            assert_eq!(std::fs::read_to_string(&ass_path)?, new);
+            assert_eq!(std::fs::read_to_string(&xml_path)?, xml);
 
-        let changed_profile = old_v1(
-            &xml,
-            2,
-            &RenderOptions {
-                opacity: 0.8,
-                ..PROFILE
-            },
-        )?;
-        assert_eq!(grouped_ass_matches(&changed_profile, &xml), Some(true));
-        for rejected in [format!("{old}; user edit\n"), changed_profile] {
-            std::fs::write(&ass_path, &rejected)?;
-            assert!(render().is_err());
-            assert_eq!(std::fs::read_to_string(&ass_path)?, rejected);
+            let changed_profile = old_ass(
+                version,
+                &xml,
+                2,
+                &RenderOptions {
+                    opacity: 0.8,
+                    ..PROFILE
+                },
+            )?;
+            assert_eq!(grouped_ass_matches(&changed_profile, &xml), Some(true));
+            for rejected in [format!("{old}; user edit\n"), changed_profile] {
+                std::fs::write(&ass_path, &rejected)?;
+                assert!(render().is_err());
+                assert_eq!(std::fs::read_to_string(&ass_path)?, rejected);
+            }
         }
         Ok(())
     }
