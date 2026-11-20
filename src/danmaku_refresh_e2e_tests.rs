@@ -1460,7 +1460,7 @@ async fn danmaku_refresh_uses_only_selected_nfo_owned_custom_xml_e2e() {
     assert_eq!(result["summary"]["added_comments"], 1);
     let canonical_ass_path = selected_media.with_file_name("episode-one.danmaku.ass");
     let canonical_ass = fs::read_to_string(&canonical_ass_path).unwrap();
-    assert!(canonical_ass.contains("TelegramVideoDownloader Danmaku XML v1:"));
+    assert!(canonical_ass.contains("TelegramVideoDownloader Danmaku XML v3:"));
 
     let merged_custom_xml = String::from_utf8(fs::read(&custom_xml_path).unwrap()).unwrap();
     for comment in [

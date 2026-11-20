@@ -28457,7 +28457,7 @@ mod tests {
         style_bilibili_danmaku_report(&config, &root, &report).unwrap();
         let grouped = fs::read(&ass).unwrap();
         let grouped_text = String::from_utf8(grouped.clone()).unwrap();
-        assert!(grouped_text.contains("Danmaku XML v1: source_comments=2"));
+        assert!(grouped_text.contains("Danmaku XML v3: source_comments=2"));
         assert_eq!(grouped_text.matches("Dialogue: ").count(), 1);
         assert!(grouped_text.contains("same comment"));
         assert!(grouped_text.contains("(2)"));
@@ -28518,7 +28518,7 @@ mod tests {
         assert!(styled.contains("Danmaku v1: font_scale=3"));
         assert!(styled.contains("\\fs75"));
         assert!(styled.contains("\\clip(0,0,1920,540)"));
-        assert!(!styled.contains("Danmaku XML v1:"));
+        assert!(!styled.contains("TelegramVideoDownloader Danmaku XML "));
         let _ = fs::remove_dir_all(directory);
     }
 

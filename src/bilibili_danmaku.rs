@@ -75,13 +75,16 @@ pub(crate) fn render_grouped_file(
         return Ok(());
     }
 
-    if crate::danmaku_rendering::grouped_ass_matches(ass, xml).is_some() {
-        bail!("reported grouped ASS does not match its XML source and current settings");
+    match crate::danmaku_rendering::grouped_ass_can_upgrade(ass, xml, &grouped) {
+        Some(true) => {}
+        Some(false) => {
+            bail!("reported grouped ASS does not match its XML source and current settings");
+        }
+        None => {
+            // Keep upstream ASS recognition and conflicting-profile checks before replacement.
+            let _ = restyle_ass(ass, settings)?;
+        }
     }
-
-    // Preserve the legacy adapter's fail-closed recognition for upstream ASS and its
-    // conflicting-profile behavior before replacing the payload with grouped XML output.
-    let _ = restyle_ass(ass, settings)?;
 
     let temp = ass_path.with_file_name(format!(
         ".tvd-danmaku-{}-{}.tmp",
