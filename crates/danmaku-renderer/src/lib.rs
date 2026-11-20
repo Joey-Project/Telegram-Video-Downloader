@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use roxmltree::{Document, Node};
 
+mod layout;
+
 const PLAY_RES_X: u32 = 1920;
 const PLAY_RES_Y: u32 = 1080;
 const DEFAULT_FONT_SIZE: f64 = 42.0;
@@ -82,7 +84,7 @@ struct Event<'a> {
 
 /// Render every accepted, plain-text comment in XML document order before time sorting.
 pub fn render_ass(xml: &str, options: &RenderOptions) -> Result<RenderedAss> {
-    render_ass_with_limit(xml, options, None)
+    render_ass_with_limit(xml, options, None, false)
 }
 
 /// Render the first `source_comments` accepted comments in XML document order.
@@ -94,13 +96,26 @@ pub fn render_ass_prefix(
     options: &RenderOptions,
     source_comments: usize,
 ) -> Result<RenderedAss> {
-    render_ass_with_limit(xml, options, Some(source_comments))
+    render_ass_with_limit(xml, options, Some(source_comments), false)
+}
+
+/// Render a source prefix using the original v1 sizing and track layout.
+///
+/// This compatibility entry point is used to validate refreshes of existing
+/// grouped sidecars, whose bytes must continue to match the original renderer.
+pub fn render_ass_prefix_v1(
+    xml: &str,
+    options: &RenderOptions,
+    source_comments: usize,
+) -> Result<RenderedAss> {
+    render_ass_with_limit(xml, options, Some(source_comments), true)
 }
 
 fn render_ass_with_limit(
     xml: &str,
     options: &RenderOptions,
     source_limit: Option<usize>,
+    legacy_layout: bool,
 ) -> Result<RenderedAss> {
     validate_options(options)?;
     ensure!(
@@ -127,9 +142,17 @@ fn render_ass_with_limit(
 
     let mut events = group_comments(&comments, options);
     for event in &mut events {
-        size_event(event, options);
+        if legacy_layout {
+            size_event_v1(event, options);
+        } else {
+            layout::size_event_v2(event, options);
+        }
     }
-    let ass = render_events(&events, options)?;
+    let ass = if legacy_layout {
+        render_events_v1(&events, options)?
+    } else {
+        render_events_v2(&events, options)?
+    };
     Ok(RenderedAss {
         ass,
         source_comments,
@@ -309,7 +332,7 @@ fn make_event(comment: &Comment) -> Event<'_> {
     }
 }
 
-fn size_event(event: &mut Event<'_>, options: &RenderOptions) {
+fn size_event_v1(event: &mut Event<'_>, options: &RenderOptions) {
     event.body_font_size =
         (event.anchor.font_size * options.font_scale * count_growth(event.count))
             .round()
@@ -392,7 +415,7 @@ fn is_combining_mark(code: u32) -> bool {
     )
 }
 
-fn render_events(events: &[Event<'_>], options: &RenderOptions) -> Result<String> {
+fn render_events_v1(events: &[Event<'_>], options: &RenderOptions) -> Result<String> {
     let region_height = (PLAY_RES_Y as f64 * options.display_area).floor().max(1.0);
     let margin = TOP_MARGIN.min(region_height / 8.0).floor();
     let max_height = events.iter().map(|event| event.height).fold(1.0, f64::max);
@@ -408,16 +431,6 @@ fn render_events(events: &[Event<'_>], options: &RenderOptions) -> Result<String
     let mut fixed_top_index = 0usize;
     let mut fixed_bottom_index = 0usize;
     for event in events {
-        let duration = if matches!(event.anchor.mode, 4 | 5) {
-            FIXED_DURATION_SECONDS
-        } else {
-            SCROLL_DURATION_SECONDS
-        };
-        let start = ass_timestamp(event.anchor.start_seconds);
-        let end = ass_timestamp(event.anchor.start_seconds + duration);
-        let color = ass_color(event.anchor.color);
-        let body_font = event.body_font_size;
-        let counter_font = event.counter_font_size;
         let (alignment, movement) = match event.anchor.mode {
             4 => {
                 let lane = fixed_bottom_index % fixed_lanes;
@@ -461,21 +474,85 @@ fn render_events(events: &[Event<'_>], options: &RenderOptions) -> Result<String
             }
         };
 
-        write!(
-            output,
-            "Dialogue: 0,{start},{end},Danmaku,,0,0,0,,{{{alignment}{movement}\\fs{body_font:.0}\\c{color}\\alpha&H{alpha:02X}&\\clip(0,0,{PLAY_RES_X},{region_height:.0})}}"
+        write_dialogue(
+            &mut output,
+            event,
+            (alignment, &movement),
+            alpha,
+            region_height,
         )?;
-        escape_ass_into(&mut output, &event.anchor.text);
-        if event.count > 1 {
-            write!(output, "{{\\fs{counter_font:.0}}} ({})", event.count)?;
-        }
-        output.push('\n');
-        ensure!(
-            output.len() <= MAX_OUTPUT_BYTES,
-            "rendered ASS exceeds the {MAX_OUTPUT_BYTES}-byte limit"
-        );
     }
     Ok(output)
+}
+
+fn render_events_v2(events: &[Event<'_>], options: &RenderOptions) -> Result<String> {
+    let region_height = (PLAY_RES_Y as f64 * options.display_area).floor().max(1.0);
+    let alpha = ((1.0 - options.opacity) * 255.0).round() as u8;
+    let placements = layout::place_events(events, options);
+    let mut output = String::new();
+    write_header(&mut output, options, alpha)?;
+
+    for (event, placement) in events.iter().zip(placements) {
+        let y = f64::from(placement.anchor_y);
+        let (alignment, movement) = match event.anchor.mode {
+            4 => ("\\an2", format!("\\pos({},{y:.0})", PLAY_RES_X / 2)),
+            5 => ("\\an8", format!("\\pos({},{y:.0})", PLAY_RES_X / 2)),
+            6 => (
+                "\\an7",
+                format!(
+                    "\\move({:.0},{y:.0},{:.0},{y:.0})",
+                    -event.width,
+                    f64::from(PLAY_RES_X) + event.width
+                ),
+            ),
+            _ => (
+                "\\an7",
+                format!(
+                    "\\move({:.0},{y:.0},{:.0},{y:.0})",
+                    f64::from(PLAY_RES_X) + event.width,
+                    -event.width
+                ),
+            ),
+        };
+
+        write_dialogue(
+            &mut output,
+            event,
+            (alignment, &movement),
+            alpha,
+            region_height,
+        )?;
+    }
+    Ok(output)
+}
+
+fn write_dialogue(
+    output: &mut String,
+    event: &Event<'_>,
+    (alignment, movement): (&str, &str),
+    alpha: u8,
+    region_height: f64,
+) -> Result<()> {
+    let (start_cs, end_cs) = event_times(event);
+    let start = ass_timestamp(start_cs);
+    let end = ass_timestamp(end_cs);
+    let color = ass_color(event.anchor.color);
+    let body_font = event.body_font_size;
+    let counter_font = event.counter_font_size;
+    write!(
+        output,
+        "Dialogue: 0,{start},{end},Danmaku,,0,0,0,,{{{alignment}{movement}\\fs{body_font:.0}\\c{color}\\alpha&H{alpha:02X}&\\clip(0,0,{PLAY_RES_X},{region_height:.0})}}"
+    )?;
+    escape_ass_into(output, &event.anchor.text);
+    if event.count > 1 {
+        write!(output, "{{\\fs{counter_font:.0}}} ({})", event.count)?;
+    }
+    output.push('\n');
+    ensure!(
+        output.len() <= MAX_OUTPUT_BYTES,
+        "rendered ASS exceeds the {MAX_OUTPUT_BYTES}-byte limit"
+    );
+    Ok(())
 }
 
 fn write_header(output: &mut String, options: &RenderOptions, alpha: u8) -> Result<()> {
@@ -503,13 +580,28 @@ fn write_header(output: &mut String, options: &RenderOptions, alpha: u8) -> Resu
     Ok(())
 }
 
-fn ass_timestamp(seconds: f64) -> String {
+fn event_times(event: &Event<'_>) -> (u64, u64) {
+    let duration = if matches!(event.anchor.mode, 4 | 5) {
+        FIXED_DURATION_SECONDS
+    } else {
+        SCROLL_DURATION_SECONDS
+    };
+    (
+        ass_centiseconds(event.anchor.start_seconds),
+        ass_centiseconds(event.anchor.start_seconds + duration),
+    )
+}
+
+fn ass_centiseconds(seconds: f64) -> u64 {
     let safe_seconds = if seconds.is_finite() {
         seconds.clamp(0.0, 3_599_999.0)
     } else {
         0.0
     };
-    let centiseconds = Duration::from_secs_f64(safe_seconds + 0.005).as_millis() / 10;
+    (Duration::from_secs_f64(safe_seconds + 0.005).as_millis() / 10) as u64
+}
+
+fn ass_timestamp(centiseconds: u64) -> String {
     let total_seconds = centiseconds / 100;
     let centisecond = centiseconds % 100;
     let second = total_seconds % 60;
@@ -546,7 +638,10 @@ fn escape_ass_into(output: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_XML_BYTES, RenderOptions, render_ass, render_ass_prefix};
+    use super::{
+        MAX_XML_BYTES, RenderOptions, estimated_text_width, group_comments, layout, parse_comments,
+        render_ass, render_ass_prefix, render_ass_prefix_v1,
+    };
 
     fn xml(comments: &[(&str, &str)]) -> String {
         let body = comments
@@ -560,6 +655,25 @@ mod tests {
         ass.lines()
             .filter(|line| line.starts_with("Dialogue: "))
             .collect()
+    }
+
+    fn dialogue_y(line: &str) -> i32 {
+        let marker = if line.contains("\\move(") {
+            "\\move("
+        } else {
+            "\\pos("
+        };
+        line.split_once(marker)
+            .unwrap()
+            .1
+            .split_once(',')
+            .unwrap()
+            .1
+            .split([',', ')'])
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
     }
 
     #[test]
@@ -664,6 +778,108 @@ mod tests {
         assert!(font(&many_line) <= (42.0_f64 * 1.3).ceil() as u32);
         assert!(many_line.contains("{\\fs33} (300)"));
         assert!(many_line.contains("\\move("));
+    }
+
+    #[test]
+    fn multiline_outlier_only_occupies_its_rows_while_visible() {
+        let source = xml(&[
+            (
+                "1,1,96,16777215",
+                "first line\nsecond line\nthird line\nfourth line",
+            ),
+            ("20,1,25,16777215", "shorta"),
+            ("20,1,25,16777215", "shortb"),
+            ("20,1,25,16777215", "shortc"),
+        ]);
+        let options = RenderOptions {
+            font_scale: 4.0,
+            ..RenderOptions::default()
+        };
+        let rendered = render_ass(&source, &options).unwrap();
+        let v1 = render_ass_prefix_v1(&source, &options, 4).unwrap();
+        let v2_lines = dialogues(&rendered.ass);
+        let v1_lines = dialogues(&v1.ass);
+        let v2_short_y = v2_lines[1..]
+            .iter()
+            .map(|line| dialogue_y(line))
+            .collect::<Vec<_>>();
+        let v1_short_y = v1_lines[1..]
+            .iter()
+            .map(|line| dialogue_y(line))
+            .collect::<Vec<_>>();
+
+        assert!(v2_short_y.windows(2).all(|pair| pair[0] != pair[1]));
+        assert!(v2_short_y.iter().all(|&y| y < 500));
+        assert!(v1_short_y.iter().all(|&y| y == 40));
+    }
+
+    #[test]
+    fn multiline_group_width_uses_longest_line_and_final_suffix() {
+        let source = xml(&[
+            ("1,1,42,16777215", "MMMM\nx"),
+            ("1.2,1,42,65280", "MMMM\nx"),
+        ]);
+        let options = RenderOptions::default();
+        let comments = parse_comments(&source).unwrap();
+        let mut events = group_comments(&comments, &options);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].count, 2);
+        layout::size_event_v2(&mut events[0], &options);
+
+        let expected = estimated_text_width("x", events[0].body_font_size)
+            + estimated_text_width("(2)", events[0].counter_font_size)
+            + events[0].body_font_size * 0.3;
+        assert_eq!(events[0].width, expected.round_ties_even());
+        assert!(events[0].width > estimated_text_width("MMMM", events[0].body_font_size));
+    }
+
+    #[test]
+    fn allocator_separates_catch_up_opposing_and_fixed_events() {
+        let wide_text = "漢".repeat(72);
+        let catchup = xml(&[("0,1,42,16777215", "a"), ("2,1,42,16777215", &wide_text)]);
+        let catchup_render = render_ass(&catchup, &RenderOptions::default()).unwrap();
+        let catchup_lines = dialogues(&catchup_render.ass);
+        assert_ne!(dialogue_y(catchup_lines[0]), dialogue_y(catchup_lines[1]));
+
+        let mixed = xml(&[
+            ("1,1,42,16777215", "alpha"),
+            ("1,6,42,16777215", "bravo"),
+            ("1,5,42,16777215", "charlie"),
+            ("1,4,42,16777215", "delta"),
+        ]);
+        let mixed_render = render_ass(&mixed, &RenderOptions::default()).unwrap();
+        let lines = dialogues(&mixed_render.ass);
+        let anchors = lines
+            .iter()
+            .map(|line| dialogue_y(line))
+            .collect::<Vec<_>>();
+        let unique = anchors
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), anchors.len());
+        assert!(lines[3].contains("\\an2\\pos(960,1040)"));
+    }
+
+    #[test]
+    fn v1_prefix_retains_a_byte_exact_legacy_fixture() {
+        let source = xml(&[("1,1,25,16777215", "legacy")]);
+        let rendered = render_ass_prefix_v1(&source, &RenderOptions::default(), 1).unwrap();
+        let expected = concat!(
+            "[Script Info]\n",
+            "ScriptType: v4.00+\n",
+            "WrapStyle: 2\n",
+            "ScaledBorderAndShadow: yes\n",
+            "PlayResX: 1920\n",
+            "PlayResY: 1080\n\n",
+            "[V4+ Styles]\n",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n",
+            "Style: Danmaku,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1\n\n",
+            "[Events]\n",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            "Dialogue: 0,0:00:01.00,0:00:09.00,Danmaku,,0,0,0,,{\\an7\\move(2001,40,-81,40)\\fs25\\c&HFFFFFF&\\alpha&H00&\\clip(0,0,1920,1080)}legacy\n",
+        );
+        assert_eq!(rendered.ass, expected);
     }
 
     #[test]
