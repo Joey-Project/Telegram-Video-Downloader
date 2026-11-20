@@ -2287,8 +2287,16 @@ fn bilibili_group_media_profile(
     options: &bbdown_core::DownloadOptions,
     config: &AppConfig,
 ) -> String {
+    let merge_window = if bilibili_danmaku_grouping_configured(config) {
+        format!(
+            ";danmaku_merge_window_ms={}",
+            config.bilibili.danmaku.merge_window_ms
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "v3;mode={:?};video_quality={:?};audio_quality={:?};audio_language={:?};danmaku_enabled={};danmaku_formats={:?};danmaku_font_scale={};danmaku_opacity={};danmaku_display_area={};write_nfo={};keep_sidecars={}",
+        "v3;mode={:?};video_quality={:?};audio_quality={:?};audio_language={:?};danmaku_enabled={};danmaku_formats={:?};danmaku_font_scale={};danmaku_opacity={};danmaku_display_area={}{};write_nfo={};keep_sidecars={}",
         options.mode,
         options.stream_selection.video_quality,
         options.stream_selection.audio_quality,
@@ -2298,9 +2306,22 @@ fn bilibili_group_media_profile(
         config.bilibili.danmaku.font_scale,
         config.bilibili.danmaku.opacity,
         config.bilibili.danmaku.display_area,
+        merge_window,
         config.video.write_nfo,
         config.video.keep_sidecars,
     )
+}
+
+fn bilibili_danmaku_grouping_configured(config: &AppConfig) -> bool {
+    let formats = &config.bilibili.danmaku_formats;
+    config.bilibili.danmaku.enabled
+        && config.bilibili.danmaku.merge_window_ms > 0
+        && formats
+            .iter()
+            .any(|format| format.eq_ignore_ascii_case("xml"))
+        && formats
+            .iter()
+            .any(|format| format.eq_ignore_ascii_case("ass"))
 }
 
 async fn resolve_bilibili_episode_group_inventory(
@@ -13539,14 +13560,96 @@ fn style_bilibili_danmaku_report(
     if !config.bilibili.danmaku.enabled {
         return Ok(());
     }
-    for file in report.entries.iter().flat_map(|entry| &entry.files) {
-        if file.kind == "danmaku_ass" {
-            let path = resolve_command_output_path(&bilibili_core::output_dir(config), &file.path);
-            crate::bilibili_danmaku::style_file(root, &path, &config.bilibili.danmaku)
-                .with_context(|| format!("failed to style downloaded ASS {}", path.display()))?;
+
+    let grouping_configured = bilibili_danmaku_grouping_configured(config);
+    for report_entry in &report.entries {
+        let mut xml_paths = BTreeMap::<PathBuf, usize>::new();
+        if grouping_configured {
+            for file in &report_entry.files {
+                if file.kind == "danmaku"
+                    && let Some(relative) = reported_path_relative_to_root(root, &file.path)
+                {
+                    *xml_paths.entry(relative).or_default() += 1;
+                }
+            }
+        }
+
+        for file in &report_entry.files {
+            if file.kind != "danmaku_ass" {
+                continue;
+            }
+            let relative = reported_path_relative_to_root(root, &file.path).with_context(|| {
+                format!(
+                    "reported Bilibili ASS path is outside the output root: {}",
+                    file.path.display()
+                )
+            })?;
+            let path = root.logical_root_path().join(&relative);
+            let paired_xml_path = if grouping_configured
+                && relative
+                    .extension()
+                    .is_some_and(|extension| extension == "ass")
+            {
+                let xml_relative = relative.with_extension("xml");
+                match xml_paths.get(&xml_relative).copied() {
+                    Some(1) => Some(root.logical_root_path().join(xml_relative)),
+                    Some(_) => bail!(
+                        "Bilibili report entry {} has ambiguous danmaku XML for {}",
+                        report_entry.index,
+                        file.path.display()
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(xml_path) = paired_xml_path {
+                crate::bilibili_danmaku::render_grouped_file(
+                    root,
+                    &xml_path,
+                    &path,
+                    &config.bilibili.danmaku,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to render grouped ASS {} from reported XML {}",
+                        path.display(),
+                        xml_path.display()
+                    )
+                })?;
+            } else {
+                crate::bilibili_danmaku::style_file(root, &path, &config.bilibili.danmaku)
+                    .with_context(|| {
+                        format!("failed to style downloaded ASS {}", path.display())
+                    })?;
+            }
         }
     }
     Ok(())
+}
+
+fn reported_path_relative_to_root(root: &RootedFs, reported: &Path) -> Option<PathBuf> {
+    let relative = if reported.is_absolute() {
+        reported
+            .strip_prefix(root.logical_root_path())
+            .or_else(|_| reported.strip_prefix(root.root_path()))
+            .ok()?
+    } else {
+        reported
+    };
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    normalized.file_name()?;
+    Some(normalized)
 }
 
 fn bilibili_file_kind(kind: &DownloadFileKind) -> &'static str {
@@ -28263,7 +28366,7 @@ mod tests {
         let mut config = test_config();
         config.downloads.video_dir = directory.clone();
         let ass = directory.join("episode.ass");
-        let xml = directory.join("episode.xml");
+        let xml = directory.join("other.xml");
         let subtitle = directory.join("subtitle.ass");
         let input = include_str!("../tests/fixtures/bilibili-danmaku.ass");
         fs::write(&ass, input).unwrap();
@@ -28310,6 +28413,116 @@ mod tests {
     }
 
     #[test]
+    fn matching_reported_xml_replaces_ass_with_grouped_output_idempotently() {
+        let directory = temp_test_dir("danmaku-grouped-report");
+        fs::create_dir_all(&directory).unwrap();
+        let mut config = test_config();
+        config.downloads.video_dir = directory.clone();
+        let ass = directory.join("episode.ass");
+        let xml = directory.join("episode.xml");
+        let subtitle = directory.join("subtitle.ass");
+        let source_ass = include_str!("../tests/fixtures/bilibili-danmaku.ass").to_string();
+        let source_xml = concat!(
+            "<i>\n",
+            "<d p=\"1.0,1,25,16777215\">same comment</d>\n",
+            "<d p=\"1.4,1,25,16777215\">same comment</d>\n",
+            "</i>\n"
+        );
+        fs::write(&ass, &source_ass).unwrap();
+        fs::write(&xml, source_xml).unwrap();
+        fs::write(&subtitle, "unrelated subtitle").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let report = BilibiliDownloadReport {
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                files: vec![
+                    BilibiliDownloadedFile {
+                        kind: "danmaku_ass".into(),
+                        path: PathBuf::from("episode.ass"),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "danmaku".into(),
+                        path: xml.clone(),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "subtitle".into(),
+                        path: subtitle.clone(),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        let grouped = fs::read(&ass).unwrap();
+        let grouped_text = String::from_utf8(grouped.clone()).unwrap();
+        assert!(grouped_text.contains("Danmaku XML v1: source_comments=2"));
+        assert_eq!(grouped_text.matches("Dialogue: ").count(), 1);
+        assert!(grouped_text.contains("same comment"));
+        assert!(grouped_text.contains("(2)"));
+        assert!(!grouped_text.contains("Right to left"));
+
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        assert_eq!(fs::read(&ass).unwrap(), grouped);
+        assert_eq!(fs::read_to_string(&xml).unwrap(), source_xml);
+        assert_eq!(fs::read_to_string(&subtitle).unwrap(), "unrelated subtitle");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+
+        fs::write(&ass, "unrecognized paired ASS").unwrap();
+        assert!(style_bilibili_danmaku_report(&config, &root, &report).is_err());
+        assert_eq!(fs::read_to_string(&ass).unwrap(), "unrecognized paired ASS");
+
+        fs::write(&ass, &source_ass).unwrap();
+        fs::write(&xml, "<i><d p=\"broken\">malformed</i>").unwrap();
+        assert!(style_bilibili_danmaku_report(&config, &root, &report).is_err());
+        assert_eq!(fs::read_to_string(&ass).unwrap(), source_ass);
+        assert_eq!(
+            fs::read_to_string(&xml).unwrap(),
+            "<i><d p=\"broken\">malformed</i>"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn disabled_grouping_keeps_legacy_ass_restyle_for_reported_pairs() {
+        let directory = temp_test_dir("danmaku-grouping-disabled");
+        fs::create_dir_all(&directory).unwrap();
+        let mut config = test_config();
+        config.downloads.video_dir = directory.clone();
+        config.bilibili.danmaku.merge_window_ms = 0;
+        let ass = directory.join("episode.ass");
+        let xml = directory.join("episode.xml");
+        fs::write(&ass, include_str!("../tests/fixtures/bilibili-danmaku.ass")).unwrap();
+        fs::write(&xml, "<i><d p=\"1,1,25,16777215\">same comment</d></i>").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let report = BilibiliDownloadReport {
+            entries: vec![BilibiliEntryDownloadReport {
+                files: vec![
+                    BilibiliDownloadedFile {
+                        kind: "danmaku_ass".into(),
+                        path: ass.clone(),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "danmaku".into(),
+                        path: PathBuf::from("episode.xml"),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        let styled = fs::read_to_string(&ass).unwrap();
+        assert!(styled.contains("Danmaku v1: font_scale=3"));
+        assert!(styled.contains("\\fs75"));
+        assert!(styled.contains("\\clip(0,0,1920,540)"));
+        assert!(!styled.contains("Danmaku XML v1:"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn group_artifact_requirement_changes_block_plan_reuse() {
         let original = test_config();
         let inventory = test_group_inventory(2);
@@ -28326,6 +28539,8 @@ mod tests {
         opacity.bilibili.danmaku.opacity = 1.0;
         let mut display_area = original.clone();
         display_area.bilibili.danmaku.display_area = 1.0;
+        let mut merge_window = original.clone();
+        merge_window.bilibili.danmaku.merge_window_ms = 500;
         let mut nfo = original.clone();
         nfo.video.write_nfo = !nfo.video.write_nfo;
         let mut sidecars = original.clone();
@@ -28337,6 +28552,7 @@ mod tests {
             ("danmaku font scale", font_scale),
             ("danmaku opacity", opacity),
             ("danmaku display area", display_area),
+            ("danmaku merge window", merge_window),
             ("NFO output", nfo),
             ("sidecar retention", sidecars),
         ] {
@@ -28357,6 +28573,38 @@ mod tests {
                 "setting: {setting}"
             );
         }
+
+        let options =
+            bilibili_core::download_options(&original).expect("test Bilibili options should parse");
+        let mut no_grouping = original.clone();
+        no_grouping.bilibili.danmaku.merge_window_ms = 0;
+        let legacy_profile = format!(
+            "v3;mode={:?};video_quality={:?};audio_quality={:?};audio_language={:?};danmaku_enabled={};danmaku_formats={:?};danmaku_font_scale={};danmaku_opacity={};danmaku_display_area={};write_nfo={};keep_sidecars={}",
+            options.mode,
+            options.stream_selection.video_quality,
+            options.stream_selection.audio_quality,
+            options.stream_selection.audio_language,
+            no_grouping.bilibili.danmaku.enabled,
+            no_grouping.bilibili.danmaku_formats,
+            no_grouping.bilibili.danmaku.font_scale,
+            no_grouping.bilibili.danmaku.opacity,
+            no_grouping.bilibili.danmaku.display_area,
+            no_grouping.video.write_nfo,
+            no_grouping.video.keep_sidecars,
+        );
+        assert_eq!(
+            bilibili_group_media_profile(&options, &no_grouping),
+            legacy_profile
+        );
+
+        let mut xml_only = original.clone();
+        xml_only.bilibili.danmaku_formats = vec!["xml".to_string()];
+        let xml_only_profile = bilibili_group_media_profile(&options, &xml_only);
+        xml_only.bilibili.danmaku.merge_window_ms = 500;
+        assert_eq!(
+            bilibili_group_media_profile(&options, &xml_only),
+            xml_only_profile
+        );
     }
 
     #[test]

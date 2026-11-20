@@ -1705,6 +1705,10 @@ fn is_xml_name_byte(byte: u8) -> bool {
 }
 
 fn render_and_style_ass(xml: &str, settings: &BilibiliDanmakuConfig) -> Result<String> {
+    if settings.enabled && settings.merge_window_ms > 0 {
+        return crate::danmaku_rendering::render_grouped_ass(xml, settings)
+            .context("danmaku XML could not be rendered as grouped ASS");
+    }
     let rendered = bbdown_core::render_danmaku_ass(xml)
         .map_err(|_| anyhow!("danmaku XML could not be rendered as ASS"))?;
     if settings.enabled {
@@ -1721,6 +1725,9 @@ fn ass_is_generated_prefix(ass: &[u8], xml: &str) -> Result<bool> {
         Ok(ass) => ass,
         Err(_) => return Ok(false),
     };
+    if let Some(matches) = crate::danmaku_rendering::grouped_ass_matches(ass, xml) {
+        return Ok(matches);
+    }
     let rendered = bbdown_core::render_danmaku_ass(xml)
         .map_err(|_| anyhow!("existing XML cannot be rendered"))?;
     if let Some(settings) = style_settings_from_ass(ass) {
@@ -1878,6 +1885,7 @@ fn style_settings_from_ass(ass: &str) -> Option<BilibiliDanmakuConfig> {
         font_scale: font_scale?,
         opacity: opacity?,
         display_area: display_area?,
+        merge_window_ms: 0,
     };
     (settings.font_scale.is_finite()
         && settings.font_scale > 0.0
@@ -2479,6 +2487,7 @@ mod tests {
             font_scale: 1.0,
             opacity: 0.8,
             display_area: 0.75,
+            merge_window_ms: 0,
         };
         let old_ass = render_and_style_ass(old_xml, &settings)?;
         assert!(ass_is_generated_prefix(old_ass.as_bytes(), updated_xml)?);
@@ -2493,20 +2502,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn grouped_ass_rejects_manual_edits_and_unrecognized_marker_versions() -> Result<()> {
+        let xml = xml(&[("1.0", "repeat"), ("1.5", "repeat")]);
+        let ass = render_and_style_ass(&xml, &BilibiliDanmakuConfig::default())?;
+        assert!(ass_is_generated_prefix(ass.as_bytes(), &xml)?);
+        for altered in [
+            ass.replace("(2)", "(3)"),
+            ass.replace("source_comments=2", "source_comments=99"),
+            ass.replace("Danmaku XML v1:", "Danmaku XML v2:"),
+            format!("{ass}; user metadata\n"),
+        ] {
+            assert_ne!(altered, ass);
+            assert!(!ass_is_generated_prefix(altered.as_bytes(), &xml)?);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn xml_first_interruption_keeps_comments_and_fresh_preview_repairs_ass() -> Result<()> {
+    async fn xml_first_interruption_preserves_comments_and_repairs_grouped_ass() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let media_path = directory.path().join("episode.mp4");
         let xml_path = directory.path().join("episode.xml");
         let ass_path = directory.path().join("episode.ass");
         let media_bytes = b"synthetic media bytes";
         let old_xml = "<i><chatserver>x</chatserver><d p=\"10.0,1,25,16777215,1700000000,0,user,0\">old comment</d></i>";
-        let remote_xml = "<i><chatid>12345</chatid><d p=\"1.0,1,96,16777215,1600000000,0,user,0\">new large comment</d></i>";
+        let remote_xml = "<i><chatid>12345</chatid><d p=\"1.0,1,96,16777215,1600000000,0,user,0\">new large comment</d><d p=\"10.4,1,25,16777215,1700000000,0,user,0\">old comment</d></i>";
         let style = BilibiliDanmakuConfig {
             enabled: true,
             font_scale: 1.0,
             opacity: 0.8,
             display_area: 0.75,
+            merge_window_ms: 1500,
         };
         let old_ass = render_and_style_ass(old_xml, &style)?;
         std::fs::write(&media_path, media_bytes)?;
@@ -2593,9 +2620,10 @@ mod tests {
         assert_eq!(retry_result.summary.added_comments, 0);
         let repaired_xml = std::fs::read_to_string(&xml_path)?;
         let repaired_ass = std::fs::read_to_string(&ass_path)?;
-        assert_eq!(repaired_xml.matches("old comment").count(), 1);
+        assert_eq!(repaired_xml.matches("old comment").count(), 2);
         assert_eq!(repaired_xml.matches("new large comment").count(), 1);
-        assert!(repaired_ass.contains("old comment"));
+        assert_eq!(repaired_ass.matches("old comment").count(), 1);
+        assert!(repaired_ass.contains("(2)"));
         assert!(repaired_ass.contains("new large comment"));
         assert_ne!(repaired_ass, old_ass);
         assert_eq!(std::fs::read(&media_path)?, media_bytes);

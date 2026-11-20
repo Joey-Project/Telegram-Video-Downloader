@@ -206,6 +206,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "danmaku-renderer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "roxmltree",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1565,6 +1573,7 @@ dependencies = [
  "anyhow",
  "bbdown-core",
  "block2",
+ "danmaku-renderer",
  "flac-alac-converter",
  "flate2",
  "futures-util",

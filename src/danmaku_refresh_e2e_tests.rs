@@ -277,7 +277,11 @@ async fn danmaku_refresh_selected_cancel_confirm_repeat_and_restart_preserve_com
         ("1.0", "retained after provider deletion"),
         ("2.0", "already present"),
     ]);
-    let remote_xml = danmaku_xml(&[("2.0", "already present"), ("3.0", "new comment")]);
+    let remote_xml = danmaku_xml(&[
+        ("2.0", "already present"),
+        ("2.5", "already present"),
+        ("3.0", "new comment"),
+    ]);
     let fetcher = test_fetcher(remote_xml);
     let mut harness = danmaku_refresh_harness(
         "danmaku-refresh-selected",
@@ -365,7 +369,7 @@ async fn danmaku_refresh_selected_cancel_confirm_repeat_and_restart_preserve_com
         .as_ref()
         .expect("confirmation should return a summary");
     assert_eq!(result["media_files_changed"], false);
-    assert_eq!(result["summary"]["added_comments"], 1);
+    assert_eq!(result["summary"]["added_comments"], 2);
     let merged = String::from_utf8(read_sidecar(
         &harness.fixture.archive_root,
         "Series Alpha/episode.mp4",
@@ -383,9 +387,12 @@ async fn danmaku_refresh_selected_cancel_confirm_repeat_and_restart_preserve_com
     }
     assert_eq!(
         merged.matches("already present").count(),
-        1,
-        "remote duplicate should deduplicate"
+        2,
+        "an exact remote duplicate is deduplicated while the nearby repeat remains in XML"
     );
+    let grouped_ass = fs::read_to_string(media.with_extension("ass")).unwrap();
+    assert_eq!(grouped_ass.matches("already present").count(), 1);
+    assert!(grouped_ass.contains("(2)"));
     assert_eq!(
         fs::read(&media).unwrap(),
         original_media,
@@ -435,8 +442,12 @@ async fn danmaku_refresh_selected_cancel_confirm_repeat_and_restart_preserve_com
         "Series Alpha/episode.mp4",
     ))
     .expect("repeated refresh XML should be UTF-8");
-    assert_eq!(repeated_xml.matches("already present").count(), 1);
+    assert_eq!(repeated_xml.matches("already present").count(), 2);
     assert_eq!(repeated_xml.matches("new comment").count(), 1);
+    assert_eq!(
+        fs::read_to_string(media.with_extension("ass")).unwrap(),
+        grouped_ass
+    );
     assert!(
         take_cloud_test_telegram_requests(
             harness
@@ -1449,7 +1460,7 @@ async fn danmaku_refresh_uses_only_selected_nfo_owned_custom_xml_e2e() {
     assert_eq!(result["summary"]["added_comments"], 1);
     let canonical_ass_path = selected_media.with_file_name("episode-one.danmaku.ass");
     let canonical_ass = fs::read_to_string(&canonical_ass_path).unwrap();
-    assert!(canonical_ass.contains("TelegramVideoDownloader Danmaku v1:"));
+    assert!(canonical_ass.contains("TelegramVideoDownloader Danmaku XML v1:"));
 
     let merged_custom_xml = String::from_utf8(fs::read(&custom_xml_path).unwrap()).unwrap();
     for comment in [

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::config::BilibiliDanmakuConfig;
-use crate::safe_fs::RootedFs;
+use crate::safe_fs::{BoundEntry, EntryIdentity, RootedFs};
 
 const WIDTH: f64 = 1920.0;
 const HEIGHT: f64 = 1080.0;
@@ -43,6 +43,104 @@ pub(crate) fn style_file(
         styled.as_bytes(),
         0o644,
     )?;
+    Ok(())
+}
+
+/// Replace a reported ASS sidecar with output rendered from its exact reported XML partner.
+/// The XML is never rewritten, and both source payloads are revalidated before atomic exchange.
+pub(crate) fn render_grouped_file(
+    root: &RootedFs,
+    xml_path: &Path,
+    ass_path: &Path,
+    settings: &BilibiliDanmakuConfig,
+) -> Result<()> {
+    let (xml_entry, xml_identity, xml_bytes) =
+        read_reported_file(root, xml_path, danmaku_renderer::MAX_XML_BYTES)
+            .context("failed to read reported danmaku XML")?;
+    let xml = std::str::from_utf8(&xml_bytes).context("reported danmaku XML is not UTF-8")?;
+    let (ass_entry, ass_identity, ass_bytes) =
+        read_reported_file(root, ass_path, READ_LIMIT).context("failed to read reported ASS")?;
+    let ass = std::str::from_utf8(&ass_bytes).context("reported ASS is not UTF-8")?;
+    let grouped = crate::danmaku_rendering::render_grouped_ass(xml, settings)?;
+
+    if ass.as_bytes() == grouped.as_bytes() {
+        revalidate_reported_file(
+            root,
+            &xml_entry,
+            xml_identity,
+            &xml_bytes,
+            danmaku_renderer::MAX_XML_BYTES,
+        )?;
+        revalidate_reported_file(root, &ass_entry, ass_identity, &ass_bytes, READ_LIMIT)?;
+        return Ok(());
+    }
+
+    if crate::danmaku_rendering::grouped_ass_matches(ass, xml).is_some() {
+        bail!("reported grouped ASS does not match its XML source and current settings");
+    }
+
+    // Preserve the legacy adapter's fail-closed recognition for upstream ASS and its
+    // conflicting-profile behavior before replacing the payload with grouped XML output.
+    let _ = restyle_ass(ass, settings)?;
+
+    let temp = ass_path.with_file_name(format!(
+        ".tvd-danmaku-{}-{}.tmp",
+        std::process::id(),
+        TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    root.replace_bound_file_atomically_if_identity_with_checkpoint(
+        &ass_entry,
+        ass_identity,
+        &temp,
+        grouped.as_bytes(),
+        0o644,
+        READ_LIMIT,
+        &mut |_, _, _| {
+            revalidate_reported_file(
+                root,
+                &xml_entry,
+                xml_identity,
+                &xml_bytes,
+                danmaku_renderer::MAX_XML_BYTES,
+            )?;
+            revalidate_reported_file(root, &ass_entry, ass_identity, &ass_bytes, READ_LIMIT)
+        },
+    )?;
+    Ok(())
+}
+
+fn read_reported_file(
+    root: &RootedFs,
+    path: &Path,
+    limit: usize,
+) -> Result<(BoundEntry, EntryIdentity, Vec<u8>)> {
+    let entry = root.bind_entry(path, false)?;
+    let identity = root
+        .bound_entry_identity(&entry)?
+        .context("reported danmaku sidecar is missing")?;
+    let file = root.open_bound_file_if_identity(&entry, identity)?;
+    let bytes = file.read_limited(limit)?;
+    Ok((entry, identity, bytes))
+}
+
+fn revalidate_reported_file(
+    root: &RootedFs,
+    entry: &BoundEntry,
+    identity: EntryIdentity,
+    expected_bytes: &[u8],
+    limit: usize,
+) -> Result<()> {
+    ensure!(
+        root.bound_entry_identity(entry)? == Some(identity),
+        "reported danmaku sidecar identity changed: {}",
+        entry.path().display()
+    );
+    let file = root.open_bound_file_if_identity(entry, identity)?;
+    ensure!(
+        file.read_limited(limit)? == expected_bytes,
+        "reported danmaku sidecar content changed: {}",
+        entry.path().display()
+    );
     Ok(())
 }
 
