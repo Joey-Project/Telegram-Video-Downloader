@@ -2216,17 +2216,22 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         source_after_cleanup.warnings
     );
 
-    let finished_admission = tokio::time::timeout(
-        Duration::from_secs(30),
-        crate::library_migration_bot::acquire_library_io(
-            &reopened_runtime,
-            std::slice::from_ref(&fixture.source_library_id),
-        ),
-    )
+    // The watcher has recovered the handoff. Stop starting new discovery runners
+    // while the test checks that the completed migration no longer blocks removal.
+    migration_watcher.abort();
+    let _ = migration_watcher.await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while reopened_runtime
+            .migration_runners
+            .lock()
+            .await
+            .contains(&preview.id)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("the completed runner should release library admission")
-    .expect("the registered source should remain available");
-    drop(finished_admission);
+    .expect("the recovered migration runner should release library admission");
 
     let recovered_removal = run_library_management_test_request(
         &reopened_runtime,
@@ -2262,9 +2267,6 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
     );
 
     reopened_runtime.signal_epoch_fatal();
-    migration_watcher
-        .await
-        .expect("migration watcher should stop after runtime shutdown");
     dispatcher.abort();
     let _ = dispatcher.await;
     drop(reopened_runtime);

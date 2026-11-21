@@ -639,6 +639,8 @@ struct CloudBotRuntime {
     library_unavailable: Arc<Mutex<BTreeMap<String, String>>>,
     migrations: Arc<Mutex<BTreeMap<String, library_migration::MigrationStatus>>>,
     migration_discovery_warnings: Arc<Mutex<library_migration::MigrationDiscoveryWarnings>>,
+    migration_history_reconciliation:
+        Arc<Mutex<media_library_bot::MigrationHistoryReconciliationState>>,
     migration_runners: Arc<Mutex<HashSet<String>>>,
     library_io_gates: library_migration_bot::LibraryIoGateRegistry,
     #[cfg(test)]
@@ -1061,23 +1063,28 @@ where
         (result, publication_guard)
     })
     .await;
-    let (worker, _publication_guard) = match worker {
+    let (worker, publication_guard) = match worker {
         Ok((result, publication_guard)) => (Ok(result), Some(publication_guard)),
         Err(error) => (Err(error).with_context(|| failure_context), None),
     };
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
-    match worker {
+    let mut reconcile_migration_history_metadata = false;
+    let result = match worker {
         Ok(Ok((value, snapshot_update))) => {
             match snapshot_update {
                 CloudLibrarySnapshotUpdate::Publish(snapshot) => {
                     if let Some(library_id) = selected_library_id.as_ref() {
-                        runtime
+                        let generation = (snapshot.revision.clone(), snapshot.scanned_at);
+                        let previous_generation = runtime
                             .library_snapshots
                             .lock()
                             .await
-                            .insert(library_id.clone(), snapshot.clone());
+                            .insert(library_id.clone(), snapshot.clone())
+                            .map(|previous| (previous.revision, previous.scanned_at));
+                        reconcile_migration_history_metadata =
+                            previous_generation.as_ref() != Some(&generation);
                         runtime.library_unavailable.lock().await.remove(library_id);
                         if library_id == &default_library_id {
                             *runtime.library_snapshot.lock().await = Some(snapshot);
@@ -1090,6 +1097,15 @@ where
                             *runtime.library_scan_warning.lock().await = warning;
                         }
                     } else {
+                        let generation = (snapshot.revision.clone(), snapshot.scanned_at);
+                        reconcile_migration_history_metadata = runtime
+                            .library_snapshot
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_none_or(|previous| {
+                                (previous.revision.clone(), previous.scanned_at) != generation
+                            });
                         *runtime.library_snapshot.lock().await = Some(snapshot);
                         *runtime.library_scan_warning.lock().await = None;
                     }
@@ -1152,7 +1168,13 @@ where
             runtime.state_notify.notify_one();
             Err(error)
         }
+    };
+    drop(publication_guard);
+    drop(io_lease);
+    if reconcile_migration_history_metadata && !runtime.epoch_fatal.is_signaled() {
+        media_library_bot::request_migration_history_metadata_reconciliation(runtime).await;
     }
+    result
 }
 
 fn bounded_cloud_library_warning(warning: &str) -> String {
@@ -2104,7 +2126,10 @@ struct CloudPublicationTrigger {
     hourly_check: bool,
     full_library_scan_due: bool,
     background_recheck: bool,
+    // Re-evaluate semantic changes without forcing a state already acknowledged by Cloud.
     retry_after_rejection: bool,
+    // Preserve the bounded retry probe for irreducible 413 responses.
+    retry_after_payload_too_large: bool,
     refreshes: Vec<SnapshotRefreshRequest>,
     watched_operation: bool,
     settings_auth_changed: bool,
@@ -2113,7 +2138,7 @@ struct CloudPublicationTrigger {
 impl CloudPublicationTrigger {
     fn is_forced(&self) -> bool {
         self.bootstrap
-            || self.retry_after_rejection
+            || self.retry_after_payload_too_large
             || !self.refreshes.is_empty()
             || self.settings_auth_changed
     }
@@ -2123,6 +2148,7 @@ impl CloudPublicationTrigger {
             || self.hourly_check
             || self.full_library_scan_due
             || self.background_recheck
+            || self.retry_after_rejection
             || self.watched_operation
     }
 }
@@ -2194,6 +2220,7 @@ async fn run_cloud_bot(
         migration_discovery_warnings: Arc::new(Mutex::new(
             library_migration::MigrationDiscoveryWarnings::default(),
         )),
+        migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
         #[cfg(test)]
@@ -2337,7 +2364,11 @@ fn cloud_library_full_scan_due(
             }))
 }
 
-async fn next_cloud_library_full_scan_deadline(runtime: &CloudBotRuntime) -> Result<Instant> {
+async fn next_cloud_library_full_scan_deadline(
+    runtime: &CloudBotRuntime,
+    library_scan_retry_not_before: &HashMap<String, Instant>,
+    scan_pass_retry_not_before: Option<Instant>,
+) -> Result<Instant> {
     let queue = Arc::clone(&runtime.bot.queue);
     let libraries = tokio::task::spawn_blocking(move || queue.registry_snapshot())
         .await
@@ -2353,21 +2384,31 @@ async fn next_cloud_library_full_scan_deadline(runtime: &CloudBotRuntime) -> Res
         .collect::<HashSet<_>>();
     let now = now_seconds();
     let interval = CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs();
-    let next_due_at = libraries
+    let now_instant = Instant::now();
+    let next_library_deadline = libraries
         .iter()
         .map(|library| {
-            if !cached_ids.contains(&library.id) {
+            let due_at = if !cached_ids.contains(&library.id) {
                 now
             } else {
                 last_successful_scans
                     .get(&library.id)
                     .map(|last| last.saturating_add(interval))
                     .unwrap_or(now)
-            }
+            };
+            let deadline = now_instant + Duration::from_secs(due_at.saturating_sub(now));
+            library_scan_retry_not_before
+                .get(&library.id)
+                .copied()
+                .map_or(deadline, |retry| deadline.max(retry))
         })
         .min()
-        .unwrap_or_else(|| now.saturating_add(interval));
-    Ok(Instant::now() + Duration::from_secs(next_due_at.saturating_sub(now)))
+        .unwrap_or_else(|| now_instant + Duration::from_secs(interval));
+    Ok(
+        scan_pass_retry_not_before.map_or(next_library_deadline, |retry| {
+            next_library_deadline.max(retry)
+        }),
+    )
 }
 
 async fn has_pending_snapshot_refreshes(runtime: &CloudBotRuntime) -> bool {
@@ -2378,6 +2419,20 @@ async fn has_pending_snapshot_refreshes(runtime: &CloudBotRuntime) -> bool {
 }
 
 async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
+    let mut library_scan_retry_not_before = HashMap::new();
+    scan_due_cloud_libraries_with_retries(
+        runtime,
+        &mut library_scan_retry_not_before,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn scan_due_cloud_libraries_with_retries(
+    runtime: &CloudBotRuntime,
+    library_scan_retry_not_before: &mut HashMap<String, Instant>,
+    retry_interval: Duration,
+) -> Result<()> {
     let queue = Arc::clone(&runtime.bot.queue);
     let (settings, availability) = tokio::task::spawn_blocking(move || {
         Ok::<_, anyhow::Error>((queue.registry_snapshot()?, queue.video_library_statuses()?))
@@ -2386,6 +2441,7 @@ async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
     .context("media-library availability worker failed before due full scans")??;
     let mut last_successful_scans = last_successful_cloud_library_scans(runtime).await?;
     let now = now_seconds();
+    let retry_delay = retry_interval.max(Duration::from_millis(1));
 
     for library in settings.libraries {
         if has_pending_snapshot_refreshes(runtime).await {
@@ -2403,11 +2459,38 @@ async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
             last_successful_scans.get(&library.id).copied(),
             now,
             cached_snapshot_present,
-            available,
+            true,
         ) {
+            library_scan_retry_not_before.remove(&library.id);
             continue;
         }
-        let (scoped_runtime, _) = media_library_bot::scoped_runtime(runtime, Some(&library.id))?;
+        if library_scan_retry_not_before
+            .get(&library.id)
+            .is_some_and(|retry| Instant::now() < *retry)
+        {
+            continue;
+        }
+        library_scan_retry_not_before.remove(&library.id);
+        if !available {
+            library_scan_retry_not_before.insert(library.id, Instant::now() + retry_delay);
+            continue;
+        }
+        let (scoped_runtime, _) = match media_library_bot::scoped_runtime(
+            runtime,
+            Some(&library.id),
+        ) {
+            Ok(scoped_runtime) => scoped_runtime,
+            Err(error) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
+                debug!(
+                    library_id = %library.id,
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "automatic media-library scan could not prepare this library; its complete-scan time remains due"
+                );
+                continue;
+            }
+        };
         #[cfg(test)]
         let test_refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
         let result = run_cloud_library_operation_with_snapshot_update_and_policy(
@@ -2441,14 +2524,19 @@ async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
         match result {
             Ok(true) => {
                 last_successful_scans.insert(library.id.clone(), now_seconds());
+                library_scan_retry_not_before.remove(&library.id);
             }
             Ok(false) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
                 debug!(
                     library_id = %library.id,
                     "automatic media-library scan was busy or incomplete; its complete-scan time remains due"
                 );
             }
             Err(error) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
                 debug!(
                     library_id = %library.id,
                     error = %redact_sensitive_text(&format!("{error:#}")),
@@ -2523,7 +2611,9 @@ async fn cloud_state_reporter_with_retry_policy(
     let mut permanently_rejected_fingerprint: Option<Vec<u8>> = None;
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
     let mut failure_retry_not_before: Option<Instant> = None;
-    let mut scan_retry_not_before: Option<Instant> = None;
+    let mut failure_retry_is_payload_too_large = false;
+    let mut library_scan_retry_not_before: HashMap<String, Instant> = HashMap::new();
+    let mut scan_pass_retry_not_before: Option<Instant> = None;
     let mut pending: Option<PendingCloudState> = None;
     let mut background_recheck_after_pending_success = false;
     let mut retry_backoff =
@@ -2536,16 +2626,19 @@ async fn cloud_state_reporter_with_retry_policy(
         if pending.is_some() {
             // Keep a pending snapshot immutable for same-version retries, but do not let
             // upload backoff suspend local availability checks or due full scans.
-            let mut scan_deadline = match next_cloud_library_full_scan_deadline(&runtime).await {
+            let scan_deadline = match next_cloud_library_full_scan_deadline(
+                &runtime,
+                &library_scan_retry_not_before,
+                scan_pass_retry_not_before,
+            )
+            .await
+            {
                 Ok(deadline) => deadline,
                 Err(error) => {
                     warn!(error = %format!("{error:#}"), "could not schedule daily media-library scans while a cloud snapshot is pending");
                     maintenance_deadline
                 }
             };
-            if let Some(retry) = scan_retry_not_before {
-                scan_deadline = scan_deadline.max(retry);
-            }
             let hourly_check = Instant::now() >= maintenance_deadline;
             let full_library_scan_due = !hourly_check && Instant::now() >= scan_deadline;
             if hourly_check || full_library_scan_due {
@@ -2556,15 +2649,26 @@ async fn cloud_state_reporter_with_retry_policy(
                     warn!(error = %format!("{error:#}"), "media-library availability refresh failed while a snapshot upload was pending");
                 }
                 if !has_pending_snapshot_refreshes(&runtime).await
-                    && scan_retry_not_before.is_none_or(|retry| Instant::now() >= retry)
-                    && let Err(error) = scan_due_cloud_libraries(&runtime).await
+                    && scan_pass_retry_not_before.is_none_or(|retry| Instant::now() >= retry)
                 {
-                    warn!(error = %format!("{error:#}"), "daily media-library scan pass failed while a snapshot upload was pending");
+                    match scan_due_cloud_libraries_with_retries(
+                        &runtime,
+                        &mut library_scan_retry_not_before,
+                        background_check_interval,
+                    )
+                    .await
+                    {
+                        Ok(()) => scan_pass_retry_not_before = None,
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "daily media-library scan pass failed while a snapshot upload was pending");
+                            scan_pass_retry_not_before =
+                                Some(Instant::now() + background_check_interval);
+                        }
+                    }
                 }
                 if hourly_check {
                     maintenance_deadline = Instant::now() + background_check_interval;
                 }
-                scan_retry_not_before = Some(maintenance_deadline);
                 background_recheck_after_pending_success = true;
             }
         }
@@ -2581,7 +2685,12 @@ async fn cloud_state_reporter_with_retry_policy(
                     ..CloudPublicationTrigger::default()
                 }
             } else {
-                let mut scan_deadline = match next_cloud_library_full_scan_deadline(&runtime).await
+                let scan_deadline = match next_cloud_library_full_scan_deadline(
+                    &runtime,
+                    &library_scan_retry_not_before,
+                    scan_pass_retry_not_before,
+                )
+                .await
                 {
                     Ok(deadline) => deadline,
                     Err(error) => {
@@ -2589,9 +2698,6 @@ async fn cloud_state_reporter_with_retry_policy(
                         maintenance_deadline
                     }
                 };
-                if let Some(retry) = scan_retry_not_before {
-                    scan_deadline = scan_deadline.max(retry);
-                }
                 if Instant::now() >= maintenance_deadline {
                     CloudPublicationTrigger {
                         hourly_check: true,
@@ -2626,7 +2732,8 @@ async fn cloud_state_reporter_with_retry_policy(
                                 std::future::pending::<()>().await;
                             }
                         } => CloudPublicationTrigger {
-                            retry_after_rejection: true,
+                            retry_after_rejection: !failure_retry_is_payload_too_large,
+                            retry_after_payload_too_large: failure_retry_is_payload_too_large,
                             ..CloudPublicationTrigger::default()
                         },
                     }
@@ -2644,10 +2751,13 @@ async fn cloud_state_reporter_with_retry_policy(
                 trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
                 trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
             }
+            if trigger.retry_after_rejection || trigger.retry_after_payload_too_large {
+                failure_retry_not_before = None;
+                failure_retry_is_payload_too_large = false;
+            }
 
             let bootstrap_attempt = trigger.bootstrap;
             let mut failed_refreshes = HashSet::new();
-            let mut background_scan_check_ran = false;
             if (trigger.hourly_check || !trigger.refreshes.is_empty())
                 && let Err(error) = sync_cloud_backlog_if_idle_due(&runtime).await
             {
@@ -2666,9 +2776,21 @@ async fn cloud_state_reporter_with_retry_policy(
             {
                 let arrived_refreshes = take_live_snapshot_refreshes(&runtime).await;
                 if arrived_refreshes.is_empty() {
-                    background_scan_check_ran = true;
-                    if let Err(error) = scan_due_cloud_libraries(&runtime).await {
-                        warn!(error = %format!("{error:#}"), "daily media-library scan pass failed");
+                    if scan_pass_retry_not_before.is_none_or(|retry| Instant::now() >= retry) {
+                        match scan_due_cloud_libraries_with_retries(
+                            &runtime,
+                            &mut library_scan_retry_not_before,
+                            background_check_interval,
+                        )
+                        .await
+                        {
+                            Ok(()) => scan_pass_retry_not_before = None,
+                            Err(error) => {
+                                warn!(error = %format!("{error:#}"), "daily media-library scan pass failed");
+                                scan_pass_retry_not_before =
+                                    Some(Instant::now() + background_check_interval);
+                            }
+                        }
                     }
                 } else {
                     failed_refreshes
@@ -2684,9 +2806,6 @@ async fn cloud_state_reporter_with_retry_policy(
             }
             if trigger.hourly_check {
                 maintenance_deadline = Instant::now() + background_check_interval;
-            }
-            if background_scan_check_ran {
-                scan_retry_not_before = Some(maintenance_deadline);
             }
             prune_publication_trigger(&runtime, &mut trigger, &failed_refreshes).await;
             if !trigger.is_admitted() {
@@ -2722,7 +2841,8 @@ async fn cloud_state_reporter_with_retry_policy(
                         && published_watch_fingerprint.as_ref() != Some(&watch_fingerprint);
                     let background_change = (trigger.hourly_check
                         || trigger.full_library_scan_due
-                        || trigger.background_recheck)
+                        || trigger.background_recheck
+                        || trigger.retry_after_rejection)
                         && published_background_fingerprint.as_ref()
                             != Some(&background_fingerprint);
                     let forced = trigger.is_forced();
@@ -2844,6 +2964,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 published_oversized_source_fingerprint = rejected_fingerprint.clone();
                 bootstrap_due = false;
                 failure_retry_not_before = None;
+                failure_retry_is_payload_too_large = false;
                 if let Err(error) = record_successful_cloud_publication_at(
                     &runtime,
                     reported_at,
@@ -2954,6 +3075,7 @@ async fn cloud_state_reporter_with_retry_policy(
                             // successful-publication expiry, which must advance only on ACK.
                             failure_retry_not_before =
                                 Some(Instant::now() + background_check_interval);
+                            failure_retry_is_payload_too_large = true;
                             fail_pending_snapshot_refreshes(
                                 &runtime,
                                 &rejected,
@@ -2970,6 +3092,7 @@ async fn cloud_state_reporter_with_retry_policy(
                             published_oversized_source_fingerprint = None;
                             failure_retry_not_before =
                                 Some(Instant::now() + background_check_interval);
+                            failure_retry_is_payload_too_large = true;
                             fail_pending_snapshot_refreshes(
                                 &runtime,
                                 &rejected,
@@ -2986,6 +3109,7 @@ async fn cloud_state_reporter_with_retry_policy(
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
                         failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                        failure_retry_is_payload_too_large = true;
                         fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
                             .await;
                     }
@@ -2997,6 +3121,7 @@ async fn cloud_state_reporter_with_retry_policy(
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
                         failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                        failure_retry_is_payload_too_large = true;
                         fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
                             .await;
                     }
@@ -3090,6 +3215,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 // Permanent server rejection is an admission cooldown, not a successful
                 // snapshot refresh. Explicit user refreshes still wake the reporter directly.
                 failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                failure_retry_is_payload_too_large = false;
                 pending = None;
                 fail_snapshot_refresh_requests(&runtime, &failed_trigger, "publish_rejected").await;
             }

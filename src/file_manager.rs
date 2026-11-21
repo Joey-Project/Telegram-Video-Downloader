@@ -9697,9 +9697,17 @@ fn merge_collection_metadata(
     let Some(current) = current else {
         return;
     };
-    if let (Some(current_id), Some(previous_id)) = (&current.id, &previous.id)
-        && current_id != previous_id
-    {
+    let same_collection = match (&current.id, &previous.id) {
+        (Some(current_id), Some(previous_id)) => current_id == previous_id,
+        _ => {
+            !current.title.trim().is_empty()
+                && current.title.trim() == previous.title.trim()
+                && (current.kind == previous.kind
+                    || current.kind.trim().is_empty()
+                    || current.kind == "nfo_set")
+        }
+    };
+    if !same_collection {
         return;
     }
     if current.id.is_none() {
@@ -18130,6 +18138,31 @@ mod tests {
                 .and_then(|collection| collection.id.as_deref()),
             Some("playlist-9")
         );
+
+        for (set_name, same_collection) in [("New playlist", false), ("Historical playlist", true)]
+        {
+            fs::write(
+                target_root.path().join("clip.nfo"),
+                format!("<movie><title>Current target NFO</title><set><name>{set_name}</name></set></movie>"),
+            )
+            .expect("edited target NFO should write");
+            let snapshot = target.scan(&[]).expect("edited target NFO should scan");
+            let collection = item_at(&snapshot, "clip.mp4").collection.as_ref().unwrap();
+            assert_eq!(collection.title, set_name);
+            assert_eq!(
+                collection.id.as_deref(),
+                same_collection.then_some("playlist-9")
+            );
+            assert_eq!(collection.order, same_collection.then_some(9));
+            assert_eq!(
+                collection.kind,
+                if same_collection {
+                    "youtube_playlist"
+                } else {
+                    "nfo_set"
+                },
+            );
+        }
     }
 
     #[test]

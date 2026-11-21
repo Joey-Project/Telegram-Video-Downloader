@@ -30,7 +30,10 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("initial"));
+    let initial_library = empty_cloud_test_library_snapshot("initial");
+    seed_mocked_cloud_library_snapshot(&runtime, &initial_library)
+        .await
+        .expect("the initial fixture should have a recent complete-scan receipt");
     let viewer_id = "22222222-2222-4222-8222-222222222222".to_string();
     apply_viewer_interest(
         &runtime,
@@ -58,7 +61,10 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
         "a retry may refresh reported_at while preserving idempotent content"
     );
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("updated"));
+    let updated_library = empty_cloud_test_library_snapshot("updated");
+    replace_mocked_cloud_library_snapshot(&runtime, &updated_library)
+        .await
+        .expect("the updated fixture should remain registered");
     let refresh = SnapshotRefreshRequest {
         viewer_id,
         request_id: "33333333-3333-4333-8333-333333333333".to_string(),
@@ -335,7 +341,10 @@ async fn cloud_state_retry_backoff_grows_resets_and_ignores_notifications_while_
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("initial"));
+    let initial_library = empty_cloud_test_library_snapshot("initial");
+    seed_mocked_cloud_library_snapshot(&runtime, &initial_library)
+        .await
+        .expect("the initial fixture should have a recent complete-scan receipt");
     let retry_base = Duration::from_millis(120);
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
@@ -378,7 +387,10 @@ async fn cloud_state_retry_backoff_grows_resets_and_ignores_notifications_while_
     assert!(first_retry_delay >= (retry_base / 2).as_millis() as u64);
     assert!(second_retry_delay >= retry_base.as_millis() as u64);
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("updated"));
+    let updated_library = empty_cloud_test_library_snapshot("updated");
+    replace_mocked_cloud_library_snapshot(&runtime, &updated_library)
+        .await
+        .expect("the updated fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000030")
         .await
         .expect("explicit refresh should admit the later cached revision");
@@ -1131,6 +1143,117 @@ async fn irreducible_413_is_paced_but_explicit_refresh_bypasses_failure_cooldown
 }
 
 #[tokio::test]
+async fn permanent_rejection_retry_skips_last_ack_but_explicit_refresh_still_publishes() {
+    let root = temp_cloud_bot_dir("state-reporter-rejection-return-to-ack");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([422, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let last_ack = empty_cloud_test_library_snapshot("last-ack");
+    seed_mocked_cloud_library_snapshot(&runtime, &last_ack)
+        .await
+        .expect("the acknowledged fixture should have a recent complete-scan receipt");
+    let baseline = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("baseline state should build")
+        .expect("local baseline should exist");
+    let watch_fingerprint = baseline
+        .watch_fingerprint()
+        .expect("baseline watch fingerprint should build");
+    let background_fingerprint = baseline
+        .background_fingerprint()
+        .expect("baseline semantic fingerprint should build");
+    let last_ack_at = now_millis();
+    inbox
+        .record_successful_publication_at_with_background(
+            last_ack_at,
+            &watch_fingerprint,
+            Some(&background_fingerprint),
+        )
+        .expect("last acknowledged state should persist");
+
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+    ));
+    let rejected = empty_cloud_test_library_snapshot("permanently-rejected");
+    replace_mocked_cloud_library_snapshot(&runtime, &rejected)
+        .await
+        .expect("the rejected fixture should remain registered");
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000003801")
+        .await
+        .expect("explicit refresh should submit the changed state");
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(posts[0]["status"], 422);
+    assert_eq!(posts[0]["revision"], "permanently-rejected");
+
+    replace_mocked_cloud_library_snapshot(&runtime, &last_ack)
+        .await
+        .expect("the acknowledged fixture should be restored");
+    runtime.state_notify.notify_one();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        1,
+        "automatic retry should skip state equal to the last successful acknowledgement"
+    );
+    assert_eq!(
+        last_successful_cloud_publication_at(&runtime)
+            .await
+            .expect("last acknowledged timestamp should remain readable"),
+        Some(last_ack_at),
+        "skipping the automatic retry must not advance the successful-publication clock"
+    );
+
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000003802")
+        .await
+        .expect("an explicit refresh should still force the acknowledged state");
+    let posts = wait_for_state_posts(&cloud_state, 2).await;
+    assert_eq!(posts[1]["status"], 200);
+    assert_eq!(posts[1]["revision"], "last-ack");
+    assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_zero_or_few_items()
 {
     let root = temp_cloud_bot_dir("state-reporter-library-metadata-budget");
@@ -1163,7 +1286,10 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(metadata_budget_library_snapshot(0));
+    let initial_library = metadata_budget_library_snapshot(0);
+    seed_mocked_cloud_library_snapshot(&runtime, &initial_library)
+        .await
+        .expect("the initial fixture should have a recent complete-scan receipt");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000001")
         .await
         .expect("first explicit refresh should admit the baseline metadata fixture");
@@ -1208,7 +1334,9 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
                     physical_identity: None,
                 })
                 .collect();
-            *runtime.library_snapshot.lock().await = Some(snapshot);
+            replace_mocked_cloud_library_snapshot(&runtime, &snapshot)
+                .await
+                .expect("the metadata fixture should remain registered");
             enqueue_test_operations_refresh(
                 &runtime,
                 &format!("33333333-3333-4333-8333-{:012x}", item_count + 1),
@@ -1288,9 +1416,10 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
         expected_posts += 2;
     }
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot(
-        "after-library-metadata-compaction",
-    ));
+    let after_compaction = empty_cloud_test_library_snapshot("after-library-metadata-compaction");
+    replace_mocked_cloud_library_snapshot(&runtime, &after_compaction)
+        .await
+        .expect("the post-compaction fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000001000")
         .await
         .expect("explicit refresh should publish the post-compaction revision");
@@ -1512,7 +1641,9 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         physical_identity: None,
     });
     let original_library = library.clone();
-    *runtime.library_snapshot.lock().await = Some(original_library.clone());
+    seed_mocked_cloud_library_snapshot(&runtime, &original_library)
+        .await
+        .expect("the oversized fixture should have a recent complete-scan receipt");
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
         runtime.clone(),
         Duration::from_secs(300),
@@ -1556,7 +1687,9 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         presence: Presence::Present,
         physical_identity: None,
     });
-    *runtime.library_snapshot.lock().await = Some(changed_library);
+    replace_mocked_cloud_library_snapshot(&runtime, &changed_library)
+        .await
+        .expect("the changed fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000004")
         .await
         .expect("explicit refresh should publish the changed local source");
@@ -1565,7 +1698,9 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
     assert_eq!(posts[2]["revision"], "changed-source");
     assert_eq!(posts[2]["library_item_count"], 1);
 
-    *runtime.library_snapshot.lock().await = Some(original_library.clone());
+    replace_mocked_cloud_library_snapshot(&runtime, &original_library)
+        .await
+        .expect("the original fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000005")
         .await
         .expect("explicit refresh should restore the retained full local source");

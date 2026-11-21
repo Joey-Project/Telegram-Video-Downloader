@@ -1923,6 +1923,7 @@ pub(super) fn make_runtime(
         migration_discovery_warnings: Arc::new(Mutex::new(
             library_migration::MigrationDiscoveryWarnings::default(),
         )),
+        migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
         test_management_admission_waiting: Arc::new(Notify::new()),
@@ -10841,6 +10842,132 @@ async fn due_full_scan_preserves_previous_state_on_failure_and_advances_after_su
         Some(completed.scanned_at)
     );
 
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn busy_library_retry_does_not_delay_another_library_full_scan_deadline() {
+    let root = temp_cloud_bot_dir("per-library-due-scan-retry");
+    let video_root = root.join("videos");
+    let pdf_root = root.join("pdfs");
+    let completed_root = root.join("completed");
+    let upcoming_root = root.join("upcoming");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = pdf_root;
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir(&completed_root).expect("completed library root should create");
+    fs::create_dir(&upcoming_root).expect("upcoming library root should create");
+    fs::write(
+        completed_root.join("completed.mp4"),
+        b"completed scan fixture",
+    )
+    .expect("completed library media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let completed_library_id = queue
+        .register_video_library("Completed", &completed_root, None, false, false)
+        .expect("completed test library should register")
+        .id;
+    let upcoming_library_id = queue
+        .register_video_library("Upcoming", &upcoming_root, None, false, false)
+        .expect("upcoming test library should register")
+        .id;
+    queue
+        .refresh_video_libraries()
+        .expect("all test libraries should be available");
+    let (busy_library_id, _) = cloud_test_default_library_binding(&queue);
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
+    let active_library_ids = queue
+        .registry_snapshot()
+        .expect("registered libraries should load")
+        .libraries
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<Vec<_>>();
+    let now = now_seconds();
+    let full_scan_interval = super::CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs();
+    let due_scan_at = now.saturating_sub(full_scan_interval);
+    let upcoming_scan_at = now.saturating_sub(full_scan_interval.saturating_sub(300));
+    for (library_id, scanned_at) in [
+        (&busy_library_id, due_scan_at),
+        (&completed_library_id, due_scan_at),
+        (&upcoming_library_id, upcoming_scan_at),
+    ] {
+        inbox
+            .record_successful_library_scan_at(library_id, scanned_at, &active_library_ids)
+            .expect("per-library scan receipt should persist");
+    }
+
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let mut busy_snapshot = empty_cloud_test_library_snapshot("busy-before-hourly-check");
+    busy_snapshot.scanned_at = due_scan_at;
+    let mut completed_snapshot = empty_cloud_test_library_snapshot("completed-before-hourly-check");
+    completed_snapshot.scanned_at = due_scan_at;
+    let mut upcoming_snapshot = empty_cloud_test_library_snapshot("upcoming-before-deadline");
+    upcoming_snapshot.scanned_at = upcoming_scan_at;
+    {
+        let mut snapshots = runtime.library_snapshots.lock().await;
+        snapshots.insert(busy_library_id.clone(), busy_snapshot.clone());
+        snapshots.insert(completed_library_id.clone(), completed_snapshot);
+        snapshots.insert(upcoming_library_id.clone(), upcoming_snapshot);
+    }
+    *runtime.library_snapshot.lock().await = Some(busy_snapshot);
+
+    let output_lease =
+        downloader::hold_video_outputs_for_migration(std::slice::from_ref(&video_root))
+            .await
+            .expect("default library output should be held busy");
+    let mut library_scan_retry_not_before = HashMap::new();
+    super::scan_due_cloud_libraries_with_retries(
+        &runtime,
+        &mut library_scan_retry_not_before,
+        Duration::from_secs(60 * 60),
+    )
+    .await
+    .expect("the hourly scan pass should continue past one busy library");
+    let busy_retry = *library_scan_retry_not_before
+        .get(&busy_library_id)
+        .expect("the busy library should get its own retry deadline");
+    assert!(
+        !library_scan_retry_not_before.contains_key(&completed_library_id),
+        "the completed library should not inherit the unrelated busy retry"
+    );
+    assert!(
+        !library_scan_retry_not_before.contains_key(&upcoming_library_id),
+        "the upcoming library should keep its own full-scan deadline"
+    );
+    let receipts = inbox
+        .last_successful_library_scans()
+        .expect("per-library scan receipts should remain readable");
+    assert_eq!(receipts.get(&busy_library_id), Some(&due_scan_at));
+    assert!(receipts[&completed_library_id] > due_scan_at);
+    assert_eq!(receipts.get(&upcoming_library_id), Some(&upcoming_scan_at));
+    let next_deadline = super::next_cloud_library_full_scan_deadline(
+        &runtime,
+        &library_scan_retry_not_before,
+        None,
+    )
+    .await
+    .expect("the next per-library scan deadline should be calculable");
+    assert!(
+        next_deadline < busy_retry,
+        "the upcoming library should become due before the unrelated busy-library retry"
+    );
+
+    drop(output_lease);
     drop(runtime);
     drop(inbox);
     drop(queue);

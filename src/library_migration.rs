@@ -433,6 +433,12 @@ pub(crate) struct MigrationStatus {
     pub(crate) task_transfers: Vec<MigrationTaskTransferStatus>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalCopyRecordFinalization {
+    pub(crate) status: MigrationStatus,
+    pub(crate) copy_record_pending: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MigrationDeliveryState {
@@ -2843,6 +2849,109 @@ impl MigrationEngine {
         Ok(Some(status_from_job(&job)))
     }
 
+    /// Reconciles one pending copy-record transfer for a stopped or completed job. A saved
+    /// primary cleanup intent is not sufficient to remove media here: if the exact source
+    /// object is still present, the intent is cleared and both independently identified copies
+    /// are retained. If the source is absent, a complete scan must prove its physical identity
+    /// is gone before the verified target adopts the stable source ID.
+    pub(crate) fn finalize_one_terminal_copy_record_transfer_with_output_lease(
+        &self,
+        migration_id: &str,
+        lease: &crate::downloader::VideoMigrationGuard,
+    ) -> Result<TerminalCopyRecordFinalization> {
+        self.source.migration_validate_output_lease(lease)?;
+        self.target.migration_validate_output_lease(lease)?;
+
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            bail!("copy-record terminal recovery requires a completed or stopped migration");
+        }
+
+        let Some(group_index) = job.groups.iter().position(terminal_copy_record_pending) else {
+            return Ok(TerminalCopyRecordFinalization {
+                status: status_from_job(&job),
+                copy_record_pending: false,
+            });
+        };
+        let group = job
+            .groups
+            .get_mut(group_index)
+            .ok_or_else(|| anyhow!("pending terminal migration group disappeared"))?;
+        let primary_index = group
+            .files
+            .iter()
+            .position(|file| {
+                file.plan.source_path == group.plan.source_path
+                    && file.plan.target_path == group.plan.target_path
+            })
+            .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
+        let primary = group.files[primary_index].clone();
+        let expected_source_identity = primary.plan.proof.entry_identity();
+        match self
+            .source
+            .migration_path_identity(&primary.plan.source_path)?
+        {
+            Some(identity) if identity == expected_source_identity => {
+                ensure!(
+                    !primary.source_removed,
+                    "migration primary is present despite its durable source_removed checkpoint"
+                );
+                ensure!(
+                    self.source.migration_file_identity_matches(
+                        &primary.plan.source_path,
+                        &primary.plan.proof,
+                    )?,
+                    "migration primary no longer matches its durable cleanup proof"
+                );
+                if primary.source_cleanup_intent {
+                    group.files[primary_index].source_cleanup_intent = false;
+                    self.save_job(&job)?;
+                }
+            }
+            Some(_) => {
+                bail!("migration primary source path was replaced during terminal recovery")
+            }
+            None => {
+                ensure!(
+                    primary.source_cleanup_intent || primary.source_removed,
+                    "missing migration primary has no durable cleanup proof"
+                );
+                self.verify_primary_source_absent_after_cleanup_intent(&primary, Some(lease))?;
+                group.files[primary_index].source_removed = true;
+                group.files[primary_index].source_cleanup_intent = false;
+                self.commit_copy_record_transfer_after_primary_unlink(group)?;
+                if group.files.iter().all(|file| file.source_removed) {
+                    group.status = MigrationItemPhase::Complete;
+                    group.error = None;
+                    group.failure_kind = None;
+                }
+                self.save_job(&job)?;
+            }
+        }
+        Ok(TerminalCopyRecordFinalization {
+            status: status_from_job(&job),
+            copy_record_pending: job.groups.iter().any(terminal_copy_record_pending),
+        })
+    }
+
+    pub(crate) fn terminal_copy_record_finalization_pending(
+        &self,
+        migration_id: &str,
+    ) -> Result<bool> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        Ok(matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) && job.groups.iter().any(terminal_copy_record_pending))
+    }
+
     pub(crate) fn record_finalization_warning(
         &self,
         migration_id: &str,
@@ -3178,13 +3287,6 @@ impl MigrationEngine {
                     .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
                 if !primary.published {
                     bail!("migration primary target is not published before identity preflight");
-                }
-
-                // Older checkpoints may have written the source ID to the target before
-                // source cleanup. Normalize those safely back to a distinct target ID first.
-                if group.plan.record_transfer_committed && !primary.source_removed {
-                    group.plan.record_transfer_committed = false;
-                    group.plan.record_transfer_prepared = false;
                 }
 
                 if !group.plan.record_transfer_prepared {
@@ -4622,7 +4724,22 @@ fn terminal_finalization_pending(job: &JobDocument) -> bool {
         && job.preview.set_target_default_on_success
         && !job.default_update_resolved
         && !job.default_update_applied;
-    handoff_cleanup_pending || default_update_pending
+    let copy_record_pending = job.groups.iter().any(terminal_copy_record_pending);
+    handoff_cleanup_pending || default_update_pending || copy_record_pending
+}
+
+fn terminal_copy_record_pending(group: &GroupCheckpoint) -> bool {
+    if group.plan.record_transfer.is_none()
+        || !group.plan.record_transfer_prepared
+        || group.plan.record_transfer_committed
+    {
+        return false;
+    }
+    group.files.iter().any(|file| {
+        file.plan.source_path == group.plan.source_path
+            && file.plan.target_path == group.plan.target_path
+            && (file.source_cleanup_intent || file.source_removed)
+    })
 }
 
 fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {

@@ -2148,6 +2148,191 @@ fn source_unlink_after_durable_intent_reconciles_after_restart() {
     );
 }
 
+#[tokio::test]
+async fn stopped_terminal_recovery_keeps_source_when_only_unlink_intent_was_saved() {
+    let fixture = Fixture::new("stopped-terminal-intent-source-present");
+    let source_item_id = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load")
+        .groups[0]
+        .plan
+        .item_id
+        .clone();
+    fixture.drive_to_source_cleanup();
+    fixture
+        .engine
+        .step(&fixture.migration_id)
+        .expect("identity preflight should persist before source cleanup");
+    fixture
+        .engine
+        .step(&fixture.migration_id)
+        .expect("primary unlink intent should persist before unlink");
+    let prepared = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load");
+    assert!(prepared.groups[0].files[0].source_cleanup_intent);
+    assert!(!prepared.groups[0].files[0].source_removed);
+    assert!(fixture.source_path.exists());
+
+    let stopped = fixture
+        .engine
+        .control(&fixture.migration_id, MigrationControl::StopRemaining)
+        .expect("migration should stop without unlinking its source");
+    assert_eq!(stopped.status, MigrationRunStatus::Stopped);
+    assert!(stopped.terminal_finalization_pending);
+
+    let output_lease = crate::downloader::hold_video_outputs_for_migration(&[
+        fixture.engine.source.migration_root_path().to_path_buf(),
+        fixture.engine.target.migration_root_path().to_path_buf(),
+    ])
+    .await
+    .expect("both migration roots should acquire output leases");
+    let finalized = fixture
+        .engine
+        .finalize_one_terminal_copy_record_transfer_with_output_lease(
+            &fixture.migration_id,
+            &output_lease,
+        )
+        .expect("terminal recovery should settle an intent while preserving its source");
+    assert_eq!(finalized.status.status, MigrationRunStatus::Stopped);
+    assert!(!finalized.status.terminal_finalization_pending);
+    assert!(!finalized.copy_record_pending);
+    drop(output_lease);
+    assert!(fixture.source_path.exists());
+    assert!(fixture.target_path().exists());
+
+    let recovered = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("stopped job should remain durable");
+    assert!(!recovered.groups[0].files[0].source_cleanup_intent);
+    assert!(!recovered.groups[0].files[0].source_removed);
+    assert!(!recovered.groups[0].plan.record_transfer_committed);
+    let source = fixture
+        .engine
+        .source
+        .migration_scan()
+        .expect("source library should scan after safe stop recovery");
+    let target = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("target library should scan after safe stop recovery");
+    let source_id = source
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("source copy should still be present")
+        .id
+        .clone();
+    let target_id = target
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("published target copy should still be present")
+        .id
+        .clone();
+    assert_eq!(source_id, source_item_id);
+    assert_ne!(source_id, target_id);
+}
+
+#[tokio::test]
+async fn stopped_terminal_recovery_adopts_id_after_durable_unlink_intent() {
+    let fixture = Fixture::new("stopped-terminal-intent-source-absent");
+    let source_job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load");
+    let source_item_id = source_job.groups[0].plan.item_id.clone();
+    fixture.drive_to_source_cleanup();
+    fixture
+        .engine
+        .step(&fixture.migration_id)
+        .expect("identity preflight should persist before source cleanup");
+    fixture
+        .engine
+        .step(&fixture.migration_id)
+        .expect("primary unlink intent should persist before unlink");
+    let cleanup_checkpoint = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("cleanup checkpoint should load");
+    let primary = &cleanup_checkpoint.groups[0].files[0];
+    assert!(primary.source_cleanup_intent);
+    fixture
+        .engine
+        .source
+        .migration_remove_source(&primary.plan.source_path, &primary.plan.proof)
+        .expect("exact primary source should unlink after its durable intent");
+    drop(cleanup_checkpoint); // Simulate a crash before source_removed/adoption is checkpointed.
+
+    let stopped = fixture
+        .engine
+        .control(&fixture.migration_id, MigrationControl::StopRemaining)
+        .expect("job should stop while terminal identity recovery remains pending");
+    assert_eq!(stopped.status, MigrationRunStatus::Stopped);
+    assert!(stopped.terminal_finalization_pending);
+    assert!(!fixture.source_path.exists());
+
+    let output_lease = crate::downloader::hold_video_outputs_for_migration(&[
+        fixture.engine.source.migration_root_path().to_path_buf(),
+        fixture.engine.target.migration_root_path().to_path_buf(),
+    ])
+    .await
+    .expect("both migration roots should acquire output leases");
+    let finalized = fixture
+        .engine
+        .finalize_one_terminal_copy_record_transfer_with_output_lease(
+            &fixture.migration_id,
+            &output_lease,
+        )
+        .expect("terminal recovery should verify absence and finish identity adoption");
+    assert_eq!(finalized.status.status, MigrationRunStatus::Stopped);
+    assert!(!finalized.status.terminal_finalization_pending);
+    assert!(!finalized.copy_record_pending);
+    drop(output_lease);
+
+    let recovered = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("recovered stopped job should remain durable");
+    assert!(!recovered.groups[0].files[0].source_cleanup_intent);
+    assert!(recovered.groups[0].files[0].source_removed);
+    assert!(recovered.groups[0].plan.record_transfer_committed);
+    assert_eq!(recovered.groups[0].status, MigrationItemPhase::Complete);
+
+    let target = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("target should scan after terminal identity adoption");
+    assert_eq!(
+        target
+            .items
+            .iter()
+            .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+            .expect("adopted target should be present")
+            .id,
+        source_item_id
+    );
+    let source = fixture
+        .engine
+        .source
+        .migration_scan()
+        .expect("source should expose moved history after terminal identity adoption");
+    assert_eq!(
+        source
+            .items
+            .iter()
+            .find(|item| item.id == source_item_id)
+            .expect("source record should remain as history")
+            .presence,
+        Presence::Missing
+    );
+}
+
 #[test]
 fn pause_and_resume_after_publication_keeps_the_saved_target_proof() {
     let fixture = Fixture::new("pause-resume-published");

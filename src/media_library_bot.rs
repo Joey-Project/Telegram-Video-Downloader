@@ -11,6 +11,12 @@ const CLOUD_MIGRATION_HISTORY_LIMIT: usize = 32;
 const MAX_MIGRATION_PROVENANCE_CHAIN_HOPS: usize = 64;
 const MAX_MIGRATION_HISTORY_METADATA_CANDIDATES: usize = 5_000;
 
+#[derive(Default)]
+pub(super) struct MigrationHistoryReconciliationState {
+    running: bool,
+    pending: bool,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LibraryItemLocation {
     library_id: String,
@@ -449,11 +455,82 @@ pub(super) async fn refresh_library(
     refresh_libraries_selected(runtime, Some(vec![selected_id])).await
 }
 
+fn has_reconcilable_migration_history(
+    migrations: &BTreeMap<String, crate::library_migration::MigrationStatus>,
+) -> bool {
+    migrations.values().any(|status| {
+        status.items.iter().any(|item| {
+            item.status == crate::library_migration::MigrationItemPhase::Complete
+                && item
+                    .target_item_id
+                    .as_deref()
+                    .is_some_and(|target_item_id| !target_item_id.is_empty())
+        })
+    })
+}
+
+/// Schedule bounded history cleanup after a receipt or a scanned snapshot changes.
+/// Requests arriving during a run collapse into one follow-up pass, while the actual
+/// reconciler retains its exact identity, generation, and publication-gate checks.
+pub(super) async fn request_migration_history_metadata_reconciliation(runtime: &CloudBotRuntime) {
+    if runtime.epoch_fatal.is_signaled() {
+        return;
+    }
+    let migrations = runtime.migrations.lock().await;
+    let has_receipts = has_reconcilable_migration_history(&*migrations);
+    drop(migrations);
+    if !has_receipts {
+        return;
+    }
+
+    {
+        let mut state = runtime.migration_history_reconciliation.lock().await;
+        if state.running {
+            state.pending = true;
+            return;
+        }
+        state.running = true;
+    }
+
+    let worker = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            if !worker.epoch_fatal.is_signaled() {
+                match reconcile_migration_history_metadata(&worker).await {
+                    Ok(()) => worker.state_notify.notify_one(),
+                    Err(error) => warn!(
+                        error = %redact_sensitive_text(&format!("{error:#}")),
+                        "verified migration history metadata reconciliation failed"
+                    ),
+                }
+            }
+
+            let mut state = worker.migration_history_reconciliation.lock().await;
+            if state.pending && !worker.epoch_fatal.is_signaled() {
+                state.pending = false;
+                drop(state);
+                continue;
+            }
+            state.pending = false;
+            state.running = false;
+            break;
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) async fn migration_history_reconciliation_running(runtime: &CloudBotRuntime) -> bool {
+    runtime
+        .migration_history_reconciliation
+        .lock()
+        .await
+        .running
+}
+
 async fn refresh_libraries_selected(
     runtime: &CloudBotRuntime,
     selected_library_ids: Option<Vec<String>>,
 ) -> Result<()> {
-    let full_refresh = selected_library_ids.is_none();
     let propagate_scan_errors = selected_library_ids.is_some();
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; media-library refresh is stopped");
@@ -541,12 +618,6 @@ async fn refresh_libraries_selected(
         .await
         .get(&default_id)
         .cloned();
-    if full_refresh && let Err(error) = reconcile_migration_history_metadata(runtime).await {
-        warn!(
-            error = %redact_sensitive_text(&format!("{error:#}")),
-            "verified migration history metadata reconciliation failed"
-        );
-    }
     runtime.state_notify.notify_one();
     Ok(())
 }

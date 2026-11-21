@@ -45,8 +45,8 @@ superseded_by: ""
 
 - The 24-hour mock transport exercise makes one startup and 24 hourly inbox
   reads, with zero periodic snapshot manifests or chunk uploads.
-- Nineteen focused Rust tests cover scan timing and upload recovery,
-  migration stops, replay and round trips, and verified historical metadata
-  repair in temporary libraries.
+- Focused Rust tests cover independent library deadlines and upload
+  recovery. Temporary libraries exercise stopped moves, checkpoint replay,
+  round trips, and metadata reconciliation after an older receipt arrives.
 - Worker type checking, 457 Worker integration tests, 128 Mini App UI tests,
   four torrent widget tests, and dry-run packaging pass.
