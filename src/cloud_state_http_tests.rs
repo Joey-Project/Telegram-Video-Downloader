@@ -1242,13 +1242,21 @@ async fn permanent_rejection_retry_skips_last_ack_but_explicit_refresh_still_pub
         "skipping the automatic retry must not advance the successful-publication clock"
     );
 
+    replace_mocked_cloud_library_snapshot(&runtime, &rejected)
+        .await
+        .expect("the rejected state should be able to reappear");
+    let posts = wait_for_state_posts(&cloud_state, 2).await;
+    assert_eq!(posts[1]["status"], 200);
+    assert_eq!(posts[1]["revision"], "permanently-rejected");
+    assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000003802")
         .await
         .expect("an explicit refresh should still force the acknowledged state");
-    let posts = wait_for_state_posts(&cloud_state, 2).await;
-    assert_eq!(posts[1]["status"], 200);
-    assert_eq!(posts[1]["revision"], "last-ack");
-    assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+    let posts = wait_for_state_posts(&cloud_state, 3).await;
+    assert_eq!(posts[2]["status"], 200);
+    assert_eq!(posts[2]["revision"], "permanently-rejected");
+    assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
 
     reporter.abort();
     let _ = reporter.await;
@@ -1313,14 +1321,16 @@ async fn permanent_rejection_retries_unacknowledged_state_after_cooldown() {
         )
         .expect("last acknowledged state should persist");
 
-    let retry_interval = Duration::from_millis(500);
+    let retry_interval = Duration::from_secs(2);
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
         retry_interval,
         Duration::from_millis(20),
         Duration::from_millis(100),
     ));
-    let unacknowledged = empty_cloud_test_library_snapshot("unacknowledged");
+    // Make the regular hourly check fall before the independent rejection cooldown.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let mut unacknowledged = empty_cloud_test_library_snapshot("unacknowledged");
     replace_mocked_cloud_library_snapshot(&runtime, &unacknowledged)
         .await
         .expect("the unacknowledged fixture should remain registered");
@@ -1331,8 +1341,12 @@ async fn permanent_rejection_retries_unacknowledged_state_after_cooldown() {
     let first = wait_for_state_posts(&cloud_state, 1).await;
     assert_eq!(first[0]["status"], 422);
     assert_eq!(first[0]["revision"], "unacknowledged");
+    unacknowledged.scanned_at += 1;
+    replace_mocked_cloud_library_snapshot(&runtime, &unacknowledged)
+        .await
+        .expect("the unchanged media state should be observed at a newer scan time");
     let second = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(15),
         wait_for_state_posts(&cloud_state, 2),
     )
     .await
@@ -1341,13 +1355,14 @@ async fn permanent_rejection_retries_unacknowledged_state_after_cooldown() {
     assert_eq!(second[1]["revision"], "unacknowledged");
     assert!(second[1]["state_version"].as_u64() > second[0]["state_version"].as_u64());
     assert_eq!(
-        second[1]["stable_content_hash"], second[0]["stable_content_hash"],
-        "the cooldown retry should preserve the same unacknowledged semantic content"
+        second[1]["library_items_hash"], second[0]["library_items_hash"],
+        "the cooldown retry should preserve the same unacknowledged media content"
     );
+    assert_eq!(second[1]["library_scanned_at"], unacknowledged.scanned_at);
     assert!(
         second[1]["reported_at"].as_u64().unwrap_or_default()
             >= second[0]["reported_at"].as_u64().unwrap_or_default()
-                + (retry_interval / 2).as_millis() as u64,
+                + retry_interval.as_millis() as u64,
         "the retry should honor the permanent-rejection cooldown"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;

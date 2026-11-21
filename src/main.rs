@@ -2774,6 +2774,7 @@ async fn cloud_state_reporter_with_retry_policy(
             if trigger.retry_after_rejection || trigger.retry_after_payload_too_large {
                 failure_retry_not_before = None;
                 failure_retry_is_payload_too_large = false;
+                permanently_rejected_background_fingerprint = None;
             }
 
             let bootstrap_attempt = trigger.bootstrap;
