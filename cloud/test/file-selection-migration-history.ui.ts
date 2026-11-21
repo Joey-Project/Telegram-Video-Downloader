@@ -361,13 +361,19 @@ afterEach(async () => {
 });
 
 describe("mobile library selection and moved history", () => {
-  it("explains skipped rows, keeps ordinary missing items, and opens a moved target", async () => {
+  it("defaults to available rows, preserves explicit history filters, and opens a moved target", async () => {
     const { sockets } = await mountLibraryApp(ownerSnapshot);
     expect(sockets).toHaveLength(1);
     expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(SOURCE_LIBRARY_ID);
-    expect(element<HTMLElement>("#library-count").textContent).toBe("105");
-    expect(element<HTMLElement>("#library-summary").textContent).toContain("105 current entries");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("102");
+    expect(element<HTMLElement>("#library-summary").textContent).toContain("102 available items");
     expect(element<HTMLElement>("#library-summary").textContent).toContain("1 moved entry in history");
+    expect(element<HTMLOptionElement>('#status-filter option[value=""]').textContent).toBe("Available");
+    expect(document.querySelectorAll('#status-filter option[value="present"]')).toHaveLength(0);
+    expect(document.querySelector('#library-list [data-item-row="ordinary-missing-item"]')).toBeNull();
+    expect(document.querySelector('#library-list [data-item-row="history-unavailable-item"]')).toBeNull();
+    expect(document.querySelector('#library-list [data-item-row="history-unknown-item"]')).toBeNull();
+    expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
     expect(element<HTMLOptionElement>('#status-filter option[value="moved"]').textContent).toBe("Moved history (1)");
 
     // Selection survives pagination, and rows that are not present never enter the selection.
@@ -384,34 +390,34 @@ describe("mobile library selection and moved history", () => {
     expect(element<HTMLElement>("#selection-count").textContent).toBe("0 items selected");
     expect(document.querySelector(".group-selection-cap-note")).toBeNull();
     setInputValue("#search-input", "History");
-    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(4);
+    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(1);
+    expect(document.querySelector('#library-list [data-item-row="history-present-item"]')).not.toBeNull();
     expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
-    expect(document.querySelector('#library-list [data-item-row="ordinary-missing-item"]')).not.toBeNull();
-
-    for (const itemId of [
-      "ordinary-missing-item",
-      "history-unavailable-item",
-      "history-unknown-item",
-    ]) {
-      expectReasonLinked(element<HTMLElement>(`#library-list [data-item-row="${itemId}"]`));
-    }
-    const historyGroup = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-group]")]
-      .find((checkbox) => checkbox.closest("summary")?.textContent?.includes("History"));
-    expect(historyGroup).toBeDefined();
-    const groupCount = historyGroup!.closest("summary")?.querySelector<HTMLElement>(".group-selection-count");
-    expect(groupCount?.textContent).toMatch(/0[^0-9]*selected/iu);
-    expect(groupCount?.textContent).toMatch(/1[^0-9]*selectable/iu);
-    expect(groupCount?.textContent).toMatch(/3[^0-9]*skipped/iu);
-    historyGroup!.click();
-    expect(element<HTMLElement>("#selection-count").textContent).toBe("1 item selected");
-    const selectedHistoryIds = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-item]:checked")]
-      .map((checkbox) => checkbox.dataset.selectItem);
-    expect(selectedHistoryIds).toEqual(["history-present-item"]);
-    const updatedGroupCount = [...document.querySelectorAll<HTMLElement>("#library-list .group-selection-count")]
+    const historyGroupCount = [...document.querySelectorAll<HTMLElement>("#library-list .group-selection-count")]
       .find((count) => count.closest("summary")?.textContent?.includes("History"));
-    expect(updatedGroupCount?.textContent).toMatch(/1[^0-9]*selected/iu);
-    expect(updatedGroupCount?.textContent).toMatch(/1[^0-9]*selectable/iu);
-    expect(updatedGroupCount?.textContent).toMatch(/3[^0-9]*skipped/iu);
+    expect(historyGroupCount?.textContent).toContain("1 available to select");
+    expect(historyGroupCount?.textContent).not.toContain("skipped");
+
+    setInputValue("#status-filter", "missing");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("1");
+    expect(element<HTMLElement>("#library-summary").textContent).toContain("1 missing item");
+    expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(1);
+    const missingRow = element<HTMLElement>('#library-list [data-item-row="ordinary-missing-item"]');
+    expectReasonLinked(missingRow);
+    const missingGroupCount = element<HTMLElement>("#library-list .group-selection-count");
+    expect(missingGroupCount.textContent).toContain("0 available to select");
+    expect(missingGroupCount.textContent).toContain("1 not available to select");
+    expect(element<HTMLElement>("#needs-count").textContent).toBe("1");
+    click('[data-view="needs"]');
+    expect(document.querySelector('#needs-list [data-item-row="ordinary-missing-item"]')).not.toBeNull();
+
+    click('[data-view="library"]');
+    setInputValue("#status-filter", "unavailable");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("1");
+    expect(document.querySelector('#library-list [data-item-row="history-unavailable-item"]')).not.toBeNull();
+    setInputValue("#status-filter", "unknown");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("1");
+    expect(document.querySelector('#library-list [data-item-row="history-unknown-item"]')).not.toBeNull();
 
     setInputValue("#status-filter", "moved");
     expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(1);
@@ -426,7 +432,9 @@ describe("mobile library selection and moved history", () => {
     setInputValue("#status-filter", "");
     click('[data-view="needs"]');
     expect(document.querySelector('#needs-list [data-item-row="source-moved-item"]')).toBeNull();
-    expect(document.querySelector('#needs-list [data-item-row="ordinary-missing-item"]')).not.toBeNull();
+    expect(document.querySelector('#needs-list [data-item-row="ordinary-missing-item"]')).toBeNull();
+    expect(element<HTMLElement>("#needs-count").textContent).toBe("0");
+    expect(element<HTMLElement>("#needs-empty h2").textContent).toBe("No matching items need organizing");
 
     click('[data-view="library"]');
     setInputValue("#search-input", "History moved source");
@@ -465,15 +473,53 @@ describe("mobile library selection and moved history", () => {
     }));
 
     const summary = element<HTMLElement>("#library-summary").textContent ?? "";
-    expect(summary).toContain("0 current entries in view");
-    expect(summary).not.toContain("2 current entries");
+    expect(summary).toContain("0 retained available items");
+    expect(summary).not.toContain("2 available items");
     expect(summary).toContain("The cloud view retains 1 of 3 media items; 2 item details are omitted. Search, filters, and pagination cover only the retained rows.");
-    expect(element<HTMLElement>("#library-count").textContent).toBe("2");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("0");
     expect(element<HTMLElement>("#library-empty h2").textContent).toBe("No current or unresolved rows in the retained view");
     expect(element<HTMLElement>("#library-empty p").textContent).toContain("2 item details are omitted from the cloud list and remain unclassified.");
     expect(document.querySelector('#library-list [data-item-row="source-moved-item"]')).toBeNull();
 
     setInputValue("#status-filter", "moved");
     expect(element<HTMLElement>('#library-list [data-item-row="source-moved-item"]')).not.toBeNull();
+  });
+
+  it("keeps the available default and matching counts when switching media libraries", async () => {
+    await mountLibraryApp(ownerSnapshot);
+    const librarySelect = element<HTMLElement>("#library-select") as HTMLElement & { value: string };
+    const statusFilter = element<HTMLElement>("#status-filter") as HTMLElement & { value: string };
+    expect(statusFilter.value).toBe("");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("102");
+
+    librarySelect.value = TARGET_LIBRARY_ID;
+    librarySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(statusFilter.value).toBe("");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("1");
+    expect(document.querySelector('#library-list [data-item-row="archive-moved-item"]')).not.toBeNull();
+
+    librarySelect.value = SOURCE_LIBRARY_ID;
+    librarySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(statusFilter.value).toBe("");
+    expect(element<HTMLElement>("#library-count").textContent).toBe("102");
+  });
+
+  it("keeps snapshot publication age separate from the last library scan", async () => {
+    const oldScanAt = Math.floor(Date.now() / 1_000) - 24 * 60 * 60;
+    const formattedScanTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(oldScanAt * 1_000));
+    const snapshot = {
+      ...ownerSnapshot,
+      reported_at: Date.now(),
+      stale: false,
+      library: { ...ownerSnapshot.library, scanned_at: oldScanAt },
+    };
+    await mountLibraryApp(snapshot);
+
+    expect(element<HTMLElement>("#sync-title").textContent).toBe("Saved library snapshot");
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain("Snapshot published Just now");
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain(`Last scan ${formattedScanTime}`);
+    expect(element<HTMLElement>("#sync-title").textContent).not.toContain("offline");
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
   });
 });

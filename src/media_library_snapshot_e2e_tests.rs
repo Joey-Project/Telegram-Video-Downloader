@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::media_library_e2e_tests::{create_migration_fixture, scan_file_item_id};
 use super::*;
 use crate::file_provider::{FileProviderAccessError, QueueFileProvider};
-use crate::library::{PhysicalItemIdentity, Presence};
+use crate::library::{CollectionMetadata, HintOrigin, PhysicalItemIdentity, Presence, SourceHint};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -16,13 +15,18 @@ async fn wait_for_snapshot_migration_completion(
     runtime: &CloudBotRuntime,
     migration_id: &str,
 ) -> crate::library_migration::MigrationStatus {
+    use crate::library_migration::MigrationRunStatus;
+
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let status = runtime.migrations.lock().await.get(migration_id).cloned();
-            if let Some(status) = status
-                && status.status == crate::library_migration::MigrationRunStatus::Completed
-            {
-                return status;
+            if let Some(status) = runtime.migrations.lock().await.get(migration_id).cloned() {
+                match status.status {
+                    MigrationRunStatus::Completed => return status,
+                    MigrationRunStatus::Failed
+                    | MigrationRunStatus::Partial
+                    | MigrationRunStatus::Stopped => panic!("mock migration failed: {status:?}"),
+                    _ => {}
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -47,6 +51,64 @@ async fn wait_for_snapshot_migration_runner_idle(runtime: &CloudBotRuntime, migr
     })
     .await
     .expect("mock migration runner should settle before scanning");
+}
+
+async fn wait_for_snapshot_history_reconciliation_idle(runtime: &CloudBotRuntime) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !crate::media_library_bot::migration_history_reconciliation_running(runtime).await {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if !crate::media_library_bot::migration_history_reconciliation_running(runtime)
+                    .await
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("history reconciliation should release its runtime before simulated restart");
+}
+
+fn strip_legacy_target_queue_metadata(target_root: &Path, item_id: &str) {
+    let index_path = target_root
+        .join(".telegram-video-downloader-library")
+        .join("index.json");
+    let mut index: Value = serde_json::from_slice(
+        &fs::read(&index_path).expect("target library index should read after shutdown"),
+    )
+    .expect("target library index should parse");
+    let record = index["records"]
+        .get_mut(item_id)
+        .and_then(Value::as_object_mut)
+        .expect("verified target record should remain in the index");
+    assert_eq!(record["item"]["id"], item_id);
+    let birth_seconds = record["birth_seconds"].clone();
+    let birth_nanoseconds = record["birth_nanoseconds"].clone();
+    let device = record["device"].clone();
+    let inode = record["inode"].clone();
+    assert!(
+        record.remove("queue_metadata").is_some(),
+        "fixture should have target queue metadata to remove"
+    );
+    fs::write(
+        &index_path,
+        serde_json::to_vec_pretty(&index).expect("legacy target index should serialize"),
+    )
+    .expect("legacy target index should persist");
+
+    let rewritten: Value =
+        serde_json::from_slice(&fs::read(&index_path).expect("rewritten target index should read"))
+            .expect("rewritten target index should parse");
+    let record = &rewritten["records"][item_id];
+    assert_eq!(record["item"]["id"], item_id);
+    assert_eq!(record["birth_seconds"], birth_seconds);
+    assert_eq!(record["birth_nanoseconds"], birth_nanoseconds);
+    assert_eq!(record["device"], device);
+    assert_eq!(record["inode"], inode);
+    assert!(record.get("queue_metadata").is_none());
 }
 
 async fn rescan_snapshot_library(runtime: &CloudBotRuntime, seq: u64, library_id: &str) -> Value {
@@ -658,6 +720,158 @@ async fn cloud_snapshot_compacts_large_migration_task_details_with_stable_aggreg
 }
 
 #[tokio::test]
+async fn due_scan_defers_while_a_video_output_lease_is_held() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) =
+        create_migration_fixture("due-scan-busy-output", crate::cloud::TEST_DATABASE_EPOCH);
+    queue
+        .refresh_video_libraries()
+        .expect("fixture library bindings should refresh");
+    fs::write(fixture.video_root.join("new.mp4"), b"new media").unwrap();
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    let output_lease =
+        downloader::hold_video_outputs_for_migration(std::slice::from_ref(&fixture.video_root))
+            .await
+            .expect("fixture should hold the actual video output lease");
+    let deferred =
+        tokio::time::timeout(Duration::from_secs(5), scan_due_cloud_libraries(&runtime)).await;
+    drop(output_lease);
+    deferred
+        .expect("automatic scan should defer rather than wait for a busy output lease")
+        .expect("the maintenance pass should otherwise succeed");
+    assert!(
+        !inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .contains_key(&fixture.source_library_id),
+        "a deferred scan must leave the busy library due"
+    );
+
+    scan_due_cloud_libraries(&runtime).await.unwrap();
+    let refreshed = runtime.library_snapshots.lock().await;
+    let snapshot = refreshed
+        .get(&fixture.source_library_id)
+        .expect("released library should scan");
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.relative_path == "new.mp4" && item.presence == Presence::Present)
+    );
+    drop(refreshed);
+    assert!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .contains_key(&fixture.source_library_id)
+    );
+
+    let _ = shutdown.send(());
+    let _ = server.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
+async fn round_trip_migration_reuses_the_original_record() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) =
+        create_migration_fixture("round-trip-record", crate::cloud::TEST_DATABASE_EPOCH);
+    let media = b"synthetic round-trip video bytes";
+    let sidecar = b"<movie><title>Round trip</title></movie>";
+    fs::write(fixture.video_root.join("clip.mp4"), media).unwrap();
+    fs::write(fixture.video_root.join("clip.nfo"), sidecar).unwrap();
+
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let original_id =
+        scan_file_item_id(&runtime, 9_001, &fixture.source_library_id, "clip.mp4").await;
+
+    for (sequence, source, target) in [
+        (
+            9_002,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+        ),
+        (
+            9_005,
+            &fixture.target_library_id,
+            &fixture.source_library_id,
+        ),
+    ] {
+        let migration =
+            start_selected_snapshot_migration(&runtime, sequence, source, target, &original_id)
+                .await;
+        let status = wait_for_snapshot_migration_completion(&runtime, &migration).await;
+        assert_eq!(status.success_count, 1);
+        wait_for_snapshot_migration_runner_idle(&runtime, &migration).await;
+        assert_eq!(
+            scan_file_item_id(&runtime, sequence + 2, target, "clip.mp4").await,
+            original_id
+        );
+    }
+
+    rescan_snapshot_library(&runtime, 9_008, &fixture.target_library_id).await;
+    let snapshot = build_cloud_state_snapshot(&runtime).await.unwrap().unwrap();
+    let source = snapshot_library_items(&snapshot.library, &fixture.source_library_id);
+    let archive = snapshot_library_items(&snapshot.library, &fixture.target_library_id);
+    assert_eq!(
+        source.len(),
+        1,
+        "returning the tracked copy should reuse its old row"
+    );
+    let restored = snapshot_item(&source, &original_id);
+    assert_eq!(restored["presence"], "present");
+    assert_eq!(restored["title"], "Round trip");
+    assert!(restored.get("moved_to").is_none());
+    assert_eq!(
+        snapshot_item(&archive, &original_id)["moved_to"]["library_id"],
+        fixture.source_library_id
+    );
+    assert_eq!(
+        fs::read(fixture.video_root.join("clip.mp4")).unwrap(),
+        media
+    );
+    assert_eq!(
+        fs::read(fixture.video_root.join("clip.nfo")).unwrap(),
+        sidecar
+    );
+    assert!(!fixture.archive_root.join("clip.mp4").exists());
+    assert!(!fixture.archive_root.join("clip.nfo").exists());
+
+    fs::remove_file(fixture.video_root.join("clip.nfo")).unwrap();
+    let refreshed = rescan_snapshot_library(&runtime, 9_009, &fixture.source_library_id).await;
+    let refreshed = snapshot_item(refreshed["items"].as_array().unwrap(), &original_id);
+    assert_ne!(
+        refreshed["title"], "Round trip",
+        "copying a sidecar title must not promote it into persistent queue metadata"
+    );
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    let _ = shutdown.send(());
+    let _ = server.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
 async fn moved_history_follows_verified_migration_targets_after_restart_and_degrades_safely() {
     let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) = create_migration_fixture(
@@ -701,6 +915,11 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     .await;
     let first_status = wait_for_snapshot_migration_completion(&runtime, &first_migration_id).await;
     assert_eq!(first_status.success_count, 1);
+    assert_eq!(
+        first_status.items[0].target_item_id.as_deref(),
+        Some(original_source_id.as_str()),
+        "the completed job must durably record the preserved item identity"
+    );
     wait_for_snapshot_migration_runner_idle(&runtime, &first_migration_id).await;
     assert!(!fixture.video_root.join("clip.mp4").exists());
     assert!(!fixture.video_root.join("clip.nfo").exists());
@@ -716,6 +935,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     runtime.signal_epoch_fatal();
     dispatcher.abort();
     let _ = dispatcher.await;
+    wait_for_snapshot_history_reconciliation_idle(&runtime).await;
     drop(runtime);
     drop(inbox);
     drop(queue);
@@ -845,7 +1065,19 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .as_str()
         .expect("migrated target should have a stable item identity")
         .to_string();
-    assert_ne!(first_target_id, original_source_id);
+    assert_eq!(
+        first_target_id, original_source_id,
+        "a verified cross-library move should retain the original item ID across restart"
+    );
+    assert_eq!(first_target_item["title"], "Moved history fixture");
+    assert!(
+        first_target_item["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attachment| attachment["relative_path"] == "clip.nfo"),
+        "the migrated record should still expose its moved NFO"
+    );
     let first_target_identity_before_rename = cached_item_physical_identity(
         &reopened_runtime,
         &fixture.target_library_id,
@@ -1088,6 +1320,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     reopened_runtime.signal_epoch_fatal();
     reopened_dispatcher.abort();
     let _ = reopened_dispatcher.await;
+    wait_for_snapshot_history_reconciliation_idle(&reopened_runtime).await;
     drop(reopened_runtime);
     drop(reopened_inbox);
     drop(reopened_queue);
@@ -1138,11 +1371,11 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         })
         .expect("final target scan should identify the current migrated media")["id"]
         .as_str()
-        .expect("final target should have its own item identity")
+        .expect("final target should expose the original item identity")
         .to_string();
     let final_target_identity =
         cached_item_physical_identity(&final_runtime, &final_library.id, &final_target_id).await;
-    assert_ne!(final_target_id, first_target_id);
+    assert_eq!(final_target_id, original_source_id);
     assert_eq!(
         second_status.items[0].target_physical_identity,
         Some(final_target_identity),
@@ -1467,6 +1700,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     final_runtime.signal_epoch_fatal();
     final_dispatcher.abort();
     let _ = final_dispatcher.await;
+    wait_for_snapshot_history_reconciliation_idle(&final_runtime).await;
     drop(final_runtime);
     drop(final_inbox);
     drop(final_queue);
@@ -1644,6 +1878,177 @@ impl QueueFileProvider for FailOnceOnPathProvider {
     ) -> Result<()> {
         accessor(source, destination)
     }
+}
+
+#[tokio::test]
+async fn completed_receipt_discovered_after_snapshots_reconciles_moved_history() {
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) =
+        create_migration_fixture("receipt-after-snapshots", crate::cloud::TEST_DATABASE_EPOCH);
+    fs::write(
+        fixture.video_root.join("clip.mp4"),
+        b"receipt rendezvous media",
+    )
+    .expect("source media should write");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let source_manager =
+        crate::open_cloud_library_manager(&runtime.bot, Arc::clone(&runtime.inbox), None)
+            .expect("source library manager should open");
+    source_manager
+        .scan(&[SourceHint {
+            source_ids: vec!["abcdefghijk".to_string()],
+            title: Some("Historical receipt queue title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: Some(CollectionMetadata {
+                id: Some("receipt-playlist".to_string()),
+                title: "Historical receipt playlist".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: Some(7),
+                part_id: None,
+            }),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        }])
+        .expect("source queue metadata should be persisted before migration");
+    drop(source_manager);
+    let source_scan = rescan_snapshot_library(&runtime, 9_131, &fixture.source_library_id).await;
+    let source_id = source_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("source scan should identify the present media")["id"]
+        .as_str()
+        .expect("source item should have a persistent identity")
+        .to_string();
+    let migration_id = start_selected_snapshot_migration(
+        &runtime,
+        9_132,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+        &source_id,
+    )
+    .await;
+    let completed = wait_for_snapshot_migration_completion(&runtime, &migration_id).await;
+    assert_eq!(
+        completed.status,
+        crate::library_migration::MigrationRunStatus::Completed
+    );
+    assert!(
+        completed.items[0]
+            .target_physical_identity
+            .is_some_and(|identity| identity.has_complete_birth()),
+        "the durable receipt should already carry complete target proof before restart"
+    );
+    let target_id = completed.items[0]
+        .target_item_id
+        .clone()
+        .expect("completed migration should record its verified target identity");
+    wait_for_snapshot_migration_runner_idle(&runtime, &migration_id).await;
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    wait_for_snapshot_history_reconciliation_idle(&runtime).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    strip_legacy_target_queue_metadata(&fixture.archive_root, &target_id);
+
+    let reopened_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reload after simulated restart"),
+    );
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reload after simulated restart"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+
+    rescan_snapshot_library(&reopened_runtime, 9_140, &fixture.source_library_id).await;
+    rescan_snapshot_library(&reopened_runtime, 9_141, &fixture.target_library_id).await;
+    {
+        let snapshots = reopened_runtime.library_snapshots.lock().await;
+        let target_item = snapshots[&fixture.target_library_id]
+            .items
+            .iter()
+            .find(|item| item.id == target_id)
+            .expect("target scan should find the migrated item before receipt discovery");
+        assert_ne!(target_item.title, "Historical receipt queue title");
+        assert!(
+            !target_item
+                .source_ids
+                .contains(&"youtube:abcdefghijk".to_string())
+        );
+        assert_ne!(
+            target_item
+                .collection
+                .as_ref()
+                .and_then(|collection| collection.id.as_deref()),
+            Some("receipt-playlist")
+        );
+    }
+    assert_eq!(
+        reopened_runtime.migrations.lock().await.len(),
+        0,
+        "the restarted runtime should have snapshots before loading its receipt"
+    );
+    crate::library_migration_bot::discover_for_test(&reopened_runtime)
+        .await
+        .expect("discovery should load the completed durable receipt");
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &migration_id).await;
+
+    let reconciled = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(snapshot) = build_cloud_state_snapshot(&reopened_runtime)
+                .await
+                .expect("cloud snapshot should build")
+                && snapshot_library_items(&snapshot.library, &fixture.target_library_id)
+                    .iter()
+                    .any(|item| {
+                        item["id"] == target_id
+                            && item["title"] == "Historical receipt queue title"
+                            && item["source_ids"]
+                                .as_array()
+                                .is_some_and(|ids| ids.iter().any(|id| id == "youtube:abcdefghijk"))
+                            && item["collection"]["id"] == "receipt-playlist"
+                    })
+                && snapshot_library_items(&snapshot.library, &fixture.source_library_id)
+                    .iter()
+                    .any(|item| {
+                        item["id"] == source_id
+                            && item["moved_to"]["library_id"] == fixture.target_library_id
+                            && item["moved_to"]["item_id"] == target_id
+                    })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconciled.is_ok(),
+        "a completed receipt arriving after both snapshots must publish verified moved history"
+    );
+
+    reopened_runtime.signal_epoch_fatal();
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    wait_for_snapshot_history_reconciliation_idle(&reopened_runtime).await;
+    stop_fake_telegram_api(shutdown, server).await;
 }
 
 #[tokio::test]
@@ -2150,9 +2555,8 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     .await;
     assert_eq!(restore_source_default.status, InboxStatus::Completed);
 
-    // Hold a real scan after it has opened and read the old root but before it publishes its
-    // snapshot. The remove dispatch is polled until it blocks on the same gate, so this ordering
-    // remains deterministic under a slow CI worker.
+    // Hold a real scan after it has read the old root but before it publishes its snapshot.
+    // Removing the registration must invalidate this in-flight scan's cache publication.
     let (scan_read_tx, scan_read_rx) = oneshot::channel();
     let (release_scan_tx, release_scan_rx) = std::sync::mpsc::channel();
     let scan_runtime = archive_runtime.clone();
@@ -2178,7 +2582,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     scan_read_rx
         .await
         .expect("scan should reach the pre-publication checkpoint");
-    assert!(runtime.library_scan_publication_gate.try_lock().is_err());
+    assert!(runtime.library_scan_publication_gate.try_lock().is_ok());
 
     let request = CloudRequest {
         seq: 8_106,
@@ -2187,47 +2591,14 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         created_at: now_millis(),
         extra: serde_json::Map::new(),
     };
-    let remove_runtime = runtime.clone();
-    let (remove_pending_tx, remove_pending_rx) = oneshot::channel();
-    let remove_task = tokio::spawn(async move {
-        let mut dispatch_future = Box::pin(media_library_bot::dispatch(&remove_runtime, &request));
-        let mut pending_sender = Some(remove_pending_tx);
-        futures_util::future::poll_fn(move |context| {
-            let polled = dispatch_future.as_mut().poll(context);
-            if let Some(sender) = pending_sender.take() {
-                let _ = sender.send(polled.is_pending());
-            }
-            polled
-        })
-        .await
-    });
-    assert!(
-        remove_pending_rx
-            .await
-            .expect("remove should report its first poll state"),
-        "removal must wait behind the scan publication gate"
-    );
-    assert!(
-        queue
-            .registry_snapshot()
-            .expect("registry should remain readable while removal waits")
-            .libraries
-            .iter()
-            .any(|library| library.id == archive.id),
-        "the scan must retain the old registration until its snapshot is published"
-    );
-    release_scan_tx
-        .send(())
-        .expect("scan should be released for publication");
-    scan_task
-        .await
-        .expect("scan worker should join")
-        .expect("scan should publish successfully");
-    let remove_outcome = remove_task
-        .await
-        .expect("remove dispatch should join")
-        .expect("remove request should be handled")
-        .expect("remove should complete after the scan releases the gate");
+    let remove_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        media_library_bot::dispatch(&runtime, &request),
+    )
+    .await
+    .expect("removal should not wait for the held scan")
+    .expect("remove request should be handled")
+    .expect("remove should complete while the scan is waiting to publish");
     assert_eq!(remove_outcome.status, InboxStatus::Completed);
     assert!(
         !runtime
@@ -2290,6 +2661,17 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         .and_then(|view| view["root_binding"].as_str())
         .expect("replacement root should have a binding token");
     assert_ne!(new_binding, old_binding);
+    release_scan_tx
+        .send(())
+        .expect("scan should be released after the library ID is reused");
+    let scan_error = scan_task
+        .await
+        .expect("scan worker should join")
+        .expect_err("the prior registration's scan must not publish under the reused ID");
+    assert!(
+        scan_error.to_string().contains("registration changed"),
+        "{scan_error:#}"
+    );
     assert!(
         !runtime
             .library_snapshots

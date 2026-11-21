@@ -2433,7 +2433,7 @@ function renderGroupedItems(container, items, page, scope, selectionEnabled = tr
       ? `<span class="group-selection-cap-note" aria-live="polite">${state.groupSelectionLimitNotice.omittedCount} additional present item${state.groupSelectionLimitNotice.omittedCount === 1 ? "" : "s"} skipped by the ${MAX_SELECTED_ITEMS}-item selection limit. Deselect selected items to add more.</span>`
       : "";
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" aria-describedby="${groupCountId}" data-select-group="${escapeHtml(groupKey)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${groupCounts.selectableCount ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count group-selection-count" id="${groupCountId}" aria-live="polite">${groupCounts.selectedCount} selected · ${groupCounts.selectableCount} selectable · ${groupCounts.skippedUnavailableCount} skipped (not present)${groupCounts.readOnlyCount ? ` · ${groupCounts.readOnlyCount} present but read-only` : ""} on this page</span>${capNotice}</summary>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" aria-describedby="${groupCountId}" data-select-group="${escapeHtml(groupKey)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${groupCounts.selectableCount ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count group-selection-count" id="${groupCountId}" aria-live="polite">${groupCounts.selectedCount} selected · ${groupCounts.selectableCount} available to select${groupCounts.skippedUnavailableCount ? ` · ${groupCounts.skippedUnavailableCount} not available to select` : ""}${groupCounts.readOnlyCount ? ` · ${groupCounts.readOnlyCount} present but read-only` : ""} on this page</span>${capNotice}</summary>
       <div class="collection-items">${entries.map((item) => itemRow(item, selectionEnabled, scope)).join("")}</div>
     </details>`;
   }).join("");
@@ -2454,6 +2454,9 @@ function renderLibrary() {
   renderLibrarySelector();
   const library = activeLibrarySnapshot();
   const canOperate = libraryCanOperate();
+  const statusFilter = byId("status-filter").value;
+  const statusRows = filterLibraryItems(libraryItems(), { status: statusFilter });
+  const needsTotal = statusRows.filter(needsOrganizing).length;
   const movedCount = libraryItems().filter((item) => movedToTarget(item) !== null).length;
   const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
   let prunedSelection = false;
@@ -2481,18 +2484,23 @@ function renderLibrary() {
   const omissionNotice = mediaSnapshotOmissionNotice(activeLibrary().descriptor, library);
   const firstScanPending = synced && (library?.ready === false || Number(library?.scanned_at) === 0);
   const retainedRowsMissing = mediaInfo.omittedCount > 0 && mediaInfo.retainedCount === 0;
-  const currentAndUnresolvedCount = Math.max(0, mediaInfo.totalCount - movedCount);
-  const currentEntriesSummaryCount = mediaInfo.omittedCount > 0
-    ? Math.max(0, mediaInfo.retainedCount - movedCount)
-    : currentAndUnresolvedCount;
-  const currentEntriesSummaryLabel = mediaInfo.omittedCount > 0 ? "current entries in view" : "current entries";
+  const statusSummaryWord = statusFilter === "moved"
+    ? "moved history"
+    : statusFilter === "missing" ? "missing"
+      : statusFilter === "unavailable" ? "unavailable"
+        : statusFilter === "unknown" ? "unknown-status"
+          : "available";
+  const statusSummaryLabel = (count) => statusFilter === "moved"
+    ? `moved history entr${count === 1 ? "y" : "ies"}`
+    : `${statusSummaryWord} item${count === 1 ? "" : "s"}`;
+  const statusSummary = `${statusRows.length.toLocaleString()} ${mediaInfo.omittedCount > 0 ? "retained " : ""}${statusSummaryLabel(statusRows.length)}`;
+  const needsStatusSummary = `${needsTotal.toLocaleString()} ${mediaInfo.omittedCount > 0 ? "retained " : ""}${statusSummaryLabel(needsTotal)} ${needsTotal === 1 ? "needs" : "need"} attention`;
   const localOffline = mediaLibraryAvailability(activeLibrary().descriptor) === "offline";
   const savedLibraryView = activeLibrary().descriptor?.snapshot_stale === true;
   byId("library-empty").classList.toggle("hidden", !synced || firstScanPending || libraryItems().length > 0 && items.length > 0);
   list.classList.toggle("hidden", !synced || !library || firstScanPending || items.length === 0);
   const emptyHeading = byId("library-empty").querySelector("h2");
   const emptyCopy = byId("library-empty").querySelector("p");
-  const statusFilter = byId("status-filter").value;
   const movedStatusOption = byId("status-filter").querySelector('option[value="moved"]');
   if (movedStatusOption) movedStatusOption.textContent = movedCount > 0
     ? `Moved history (${movedCount.toLocaleString()})`
@@ -2530,6 +2538,12 @@ function renderLibrary() {
     } else if (!hasExtraFilters && movedCount === libraryItems().length) {
       emptyHeading.textContent = "No current or unresolved rows in the retained view";
       emptyCopy.textContent = `${movedCount.toLocaleString()} verified moved entr${movedCount === 1 ? "y is" : "ies are"} hidden from the default view. Choose “Moved history” in File status to review them.${omittedDetailsCopy}`;
+    } else if (!hasExtraFilters) {
+      emptyHeading.textContent = "No available rows in the retained view";
+      const movedHistoryHint = movedCount > 0
+        ? ` ${movedCount.toLocaleString()} verified moved entr${movedCount === 1 ? "y is" : "ies are"} available under “Moved history”.`
+        : "";
+      emptyCopy.textContent = `The retained rows are missing, unavailable, or have an unknown status. Choose File status to review them.${movedHistoryHint}${omittedDetailsCopy}`;
     } else {
       emptyHeading.textContent = "No matching retained rows";
       const movedHistoryHint = movedCount > 0
@@ -2548,18 +2562,17 @@ function renderLibrary() {
     list.innerHTML = "";
     byId("library-empty").classList.add("hidden");
   }
-  byId("library-count").textContent = synced && !firstScanPending ? String(currentAndUnresolvedCount) : "—";
+  byId("library-count").textContent = synced && !firstScanPending ? String(statusRows.length) : "—";
   byId("library-summary").textContent = firstScanPending
     ? "Your computer is connected, but the first scan has not completed."
     : state.snapshot?.synced
-    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${matchingRowsSummary} · ${pageSummary} · ${currentEntriesSummaryCount.toLocaleString()} ${currentEntriesSummaryLabel}${movedHistorySummary ? ` · ${movedHistorySummary}` : ""}${omissionNotice ? ` · ${omissionNotice}` : ""}${selectionSummary ? ` · ${selectionSummary}` : ""}`
+    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${matchingRowsSummary} · ${pageSummary} · ${statusSummary}${omissionNotice ? ` · ${omissionNotice}` : ""}${movedHistorySummary ? ` · ${movedHistorySummary}` : ""}${selectionSummary ? ` · ${selectionSummary}` : ""}`
     : "A first scan has not completed yet.";
-  const needsTotal = libraryItems().filter(needsOrganizing).length;
   byId("needs-count").textContent = synced && !firstScanPending ? String(needsTotal) : "—";
   byId("needs-summary").textContent = firstScanPending
     ? "Needs organizing will appear after the first scan completes."
     : state.snapshot?.synced
-    ? `${needsItems.length.toLocaleString()} matching retained item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)} filtered retained rows` : "no matches"} · ${needsTotal.toLocaleString()} retained rows need attention${omissionNotice ? ` · ${omissionNotice}` : ""}`
+    ? `${needsItems.length.toLocaleString()} matching retained item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)} filtered retained rows` : "no matches"} · ${needsStatusSummary}${omissionNotice ? ` · ${omissionNotice}` : ""}`
     : "Needs organizing will appear after the first scan.";
   byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
   byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
@@ -4902,7 +4915,7 @@ function bindEvents() {
       const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
       state.groupSelectionLimitNotice = omittedCount > 0 ? { scope, groupKey: groupIdentity, page: groupPage, omittedCount } : null;
       renderLibrary();
-      if (omittedCount > 0) showToast(`${selectionLimitMessage(omittedCount)} Group skipped counts are for files that are not present.`);
+      if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
       return;
     }
     const checkbox = event.target.closest("[data-select-item]");

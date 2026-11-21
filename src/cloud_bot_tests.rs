@@ -1923,8 +1923,10 @@ pub(super) fn make_runtime(
         migration_discovery_warnings: Arc::new(Mutex::new(
             library_migration::MigrationDiscoveryWarnings::default(),
         )),
+        migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        library_snapshot_operation_gates: Arc::new(Mutex::new(BTreeMap::new())),
         test_management_admission_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_acquired: Arc::new(Notify::new()),
@@ -8354,8 +8356,10 @@ async fn coalesced_queue_progress_publishes_final_state_without_library_rescan()
         .expect("progress task should persist");
     let queue_changes = queue.state_change_notify();
     queue_changes.notified().await;
-    *runtime.library_snapshot.lock().await =
-        Some(empty_cloud_test_library_snapshot("stable-library-revision"));
+    let stable_library = empty_cloud_test_library_snapshot("stable-library-revision");
+    seed_mocked_cloud_library_snapshot(&runtime, &stable_library)
+        .await
+        .expect("the mocked fixture should have a recent complete-scan receipt");
 
     let publication_watcher = tokio::spawn(cloud_library_publication_watcher(runtime.clone()));
     let queue_state_watcher = tokio::spawn(cloud_queue_state_watcher_with_debounce(
@@ -9188,7 +9192,7 @@ fn scan_order_test_snapshot(revision: &str) -> LibrarySnapshot {
 }
 
 #[tokio::test]
-async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
+async fn per_library_operations_keep_snapshot_and_warning_ordered() {
     let root = temp_cloud_bot_dir("library-publication-order");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -9197,6 +9201,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, _) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -9230,7 +9235,14 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     .await
     .expect("older scan start barrier should complete");
 
-    let older_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let older_holds_library_operation_gate = runtime
+        .library_snapshot_operation_gates
+        .lock()
+        .await
+        .get(&library_id)
+        .is_some_and(|gate| gate.try_lock().is_err());
+    let publication_gate_stays_available_during_scan =
+        runtime.library_scan_publication_gate.try_lock().is_ok();
     let newer_runtime = runtime.clone();
     let mut newer_future = Box::pin(async move {
         run_cloud_library_operation(&newer_runtime, "newer fixture scan failed", move |_, _| {
@@ -9238,7 +9250,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         })
         .await
     });
-    let newer_waits_on_gate = std::future::poll_fn(|context| {
+    let newer_waits_on_library_operation_gate = std::future::poll_fn(|context| {
         Poll::Ready(Future::poll(newer_future.as_mut(), context).is_pending())
     })
     .await;
@@ -9258,8 +9270,10 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .expect("newer scan task should join")
         .expect("newer scan should publish");
     assert!(
-        older_holds_publication_gate && newer_waits_on_gate,
-        "the older scan should hold the gate and a newer operation should poll to Pending"
+        older_holds_library_operation_gate
+            && publication_gate_stays_available_during_scan
+            && newer_waits_on_library_operation_gate,
+        "same-library operations should serialize per library without holding the global commit gate during scanning"
     );
     assert_eq!(
         runtime
@@ -9292,7 +9306,14 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     .await
     .expect("failing scan start barrier should complete");
 
-    let failing_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let failing_holds_library_operation_gate = runtime
+        .library_snapshot_operation_gates
+        .lock()
+        .await
+        .get(&library_id)
+        .is_some_and(|gate| gate.try_lock().is_err());
+    let publication_gate_stays_available_during_failure =
+        runtime.library_scan_publication_gate.try_lock().is_ok();
     let recovery_runtime = runtime.clone();
     let mut recovery_future = Box::pin(async move {
         run_cloud_library_operation(
@@ -9302,7 +9323,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         )
         .await
     });
-    let recovery_waits_on_gate = std::future::poll_fn(|context| {
+    let recovery_waits_on_library_operation_gate = std::future::poll_fn(|context| {
         Poll::Ready(Future::poll(recovery_future.as_mut(), context).is_pending())
     })
     .await;
@@ -9325,8 +9346,10 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .expect("recovery task should join")
         .expect("recovery scan should publish");
     assert!(
-        failing_holds_publication_gate && recovery_waits_on_gate,
-        "the failing scan should hold the gate and recovery should poll to Pending"
+        failing_holds_library_operation_gate
+            && publication_gate_stays_available_during_failure
+            && recovery_waits_on_library_operation_gate,
+        "same-library recovery should wait per library while a failed scan leaves the global commit gate free"
     );
     assert_eq!(
         runtime
@@ -10573,6 +10596,440 @@ async fn preview_cancel_rejects_completed_confirmation_after_history_eviction_an
     drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
+async fn cloud_hourly_maintenance_skips_unchanged_state_and_publishes_changed_content() {
+    let root = temp_cloud_bot_dir("hourly-semantic-snapshot");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (default_library_id, _) = cloud_test_default_library_binding(&queue);
+    inbox
+        .record_successful_library_scan_at(
+            &default_library_id,
+            now_seconds(),
+            std::slice::from_ref(&default_library_id),
+        )
+        .expect("recent full scan time should prevent a daily scan during this test");
+
+    let snapshot = empty_cloud_test_library_snapshot("hourly-baseline");
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(default_library_id.clone(), snapshot.clone());
+
+    let expiry = Duration::from_millis(300);
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        expiry,
+        Duration::from_millis(5),
+        Duration::from_millis(100),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !cloud_state
+                .state_posts
+                .lock()
+                .expect("fake state-post lock should not poison")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bootstrap snapshot should publish");
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        1,
+        "an hourly availability check with unchanged semantic state must not write Cloud state"
+    );
+
+    let mut changed = snapshot;
+    changed.revision = "hourly-content-changed".to_string();
+    changed.scanned_at = now_seconds();
+    changed.items.push(LibraryItem {
+        id: "new-item".to_string(),
+        title: "New clip".to_string(),
+        relative_path: "New clip.mp4".to_string(),
+        bytes: 42,
+        width: None,
+        height: None,
+        codec: None,
+        source_ids: Vec::new(),
+        collection: None,
+        organization_status: None,
+        attachments: Vec::new(),
+        authoritative_nfo_path: None,
+        confidence: Confidence::High,
+        metadata_status: MetadataStatus::Complete,
+        integrity_status: IntegrityStatus::Unverified,
+        physical_identity: None,
+        presence: Presence::Present,
+    });
+    *runtime.library_snapshot.lock().await = Some(changed.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(default_library_id, changed);
+    runtime.state_notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        1,
+        "ordinary queue notifications do not turn idle background changes into unrequested writes"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cloud_state
+                .state_posts
+                .lock()
+                .expect("fake state-post lock should not poison")
+                .len()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the next hourly check should publish changed media content");
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        2,
+        "one changed background snapshot should produce one Cloud write"
+    );
+
+    reporter.abort();
+    let _ = reporter.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn due_full_scan_preserves_previous_state_on_failure_and_advances_after_success() {
+    let root = temp_cloud_bot_dir("failed-due-full-scan");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    queue
+        .refresh_video_libraries()
+        .expect("registered test library should be available");
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (library_id, _) = cloud_test_default_library_binding(&queue);
+    let last_successful_scan =
+        now_seconds().saturating_sub(super::CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs());
+    inbox
+        .record_successful_library_scan_at(
+            &library_id,
+            last_successful_scan,
+            std::slice::from_ref(&library_id),
+        )
+        .expect("old complete scan time should persist");
+
+    let previous = empty_cloud_test_library_snapshot("last-complete-snapshot");
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    *runtime.library_snapshot.lock().await = Some(previous.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(library_id.clone(), previous.clone());
+    *runtime
+        .test_library_refresh_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some("injected incomplete scan".to_string());
+
+    super::scan_due_cloud_libraries(&runtime)
+        .await
+        .expect("a failed library scan should defer and allow the hourly pass to continue");
+    assert!(
+        runtime
+            .test_library_refresh_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the due scan should have attempted the available library"
+    );
+    assert_eq!(
+        runtime
+            .library_snapshots
+            .lock()
+            .await
+            .get(&library_id)
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("last-complete-snapshot")
+    );
+    assert_eq!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .get(&library_id)
+            .copied(),
+        Some(last_successful_scan)
+    );
+    assert!(super::cloud_library_full_scan_due(
+        Some(last_successful_scan),
+        now_seconds(),
+        true,
+        true,
+    ));
+
+    fs::write(
+        runtime.bot.config.downloads.video_dir.join("new-clip.mp4"),
+        b"new local fixture media",
+    )
+    .expect("new media should write");
+    super::scan_due_cloud_libraries(&runtime)
+        .await
+        .expect("the still-due library should successfully scan on the next pass");
+    let completed = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&library_id)
+        .cloned()
+        .expect("a successful complete scan should publish its local snapshot");
+    assert!(completed.scanned_at > last_successful_scan);
+    assert!(completed.items.iter().any(|item| {
+        item.relative_path == "new-clip.mp4" && item.presence == Presence::Present
+    }));
+    assert_eq!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .get(&library_id)
+            .copied(),
+        Some(completed.scanned_at)
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn busy_library_retry_does_not_delay_another_library_full_scan_deadline() {
+    let root = temp_cloud_bot_dir("per-library-due-scan-retry");
+    let video_root = root.join("videos");
+    let pdf_root = root.join("pdfs");
+    let completed_root = root.join("completed");
+    let upcoming_root = root.join("upcoming");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = pdf_root;
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir(&completed_root).expect("completed library root should create");
+    fs::create_dir(&upcoming_root).expect("upcoming library root should create");
+    fs::write(
+        completed_root.join("completed.mp4"),
+        b"completed scan fixture",
+    )
+    .expect("completed library media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let completed_library_id = queue
+        .register_video_library("Completed", &completed_root, None, false, false)
+        .expect("completed test library should register")
+        .id;
+    let upcoming_library_id = queue
+        .register_video_library("Upcoming", &upcoming_root, None, false, false)
+        .expect("upcoming test library should register")
+        .id;
+    queue
+        .refresh_video_libraries()
+        .expect("all test libraries should be available");
+    let (busy_library_id, _) = cloud_test_default_library_binding(&queue);
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
+    let active_library_ids = queue
+        .registry_snapshot()
+        .expect("registered libraries should load")
+        .libraries
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<Vec<_>>();
+    let now = now_seconds();
+    let full_scan_interval = super::CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs();
+    let due_scan_at = now.saturating_sub(full_scan_interval);
+    let upcoming_scan_at = now.saturating_sub(full_scan_interval.saturating_sub(300));
+    for (library_id, scanned_at) in [
+        (&busy_library_id, due_scan_at),
+        (&completed_library_id, due_scan_at),
+        (&upcoming_library_id, upcoming_scan_at),
+    ] {
+        inbox
+            .record_successful_library_scan_at(library_id, scanned_at, &active_library_ids)
+            .expect("per-library scan receipt should persist");
+    }
+
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let mut busy_snapshot = empty_cloud_test_library_snapshot("busy-before-hourly-check");
+    busy_snapshot.scanned_at = due_scan_at;
+    let mut completed_snapshot = empty_cloud_test_library_snapshot("completed-before-hourly-check");
+    completed_snapshot.scanned_at = due_scan_at;
+    let mut upcoming_snapshot = empty_cloud_test_library_snapshot("upcoming-before-deadline");
+    upcoming_snapshot.scanned_at = upcoming_scan_at;
+    {
+        let mut snapshots = runtime.library_snapshots.lock().await;
+        snapshots.insert(busy_library_id.clone(), busy_snapshot.clone());
+        snapshots.insert(completed_library_id.clone(), completed_snapshot);
+        snapshots.insert(upcoming_library_id.clone(), upcoming_snapshot);
+    }
+    *runtime.library_snapshot.lock().await = Some(busy_snapshot);
+
+    let output_lease =
+        downloader::hold_video_outputs_for_migration(std::slice::from_ref(&video_root))
+            .await
+            .expect("default library output should be held busy");
+    let (manual_runtime, _) = media_library_bot::scoped_runtime(&runtime, Some(&busy_library_id))
+        .expect("default library scan runtime should be scoped");
+    let manual_library_id = busy_library_id.clone();
+    let manual_scan = tokio::spawn(async move {
+        media_library_bot::refresh_library(&manual_runtime, Some(&manual_library_id)).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation_gate = runtime
+                .library_snapshot_operation_gates
+                .lock()
+                .await
+                .get(&busy_library_id)
+                .cloned();
+            if operation_gate.is_some_and(|gate| gate.try_lock().is_err()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("manual scan should reach the busy library's output lock");
+    assert!(
+        runtime.library_scan_publication_gate.try_lock().is_ok(),
+        "a manual scan waiting for one root must not hold the global snapshot commit gate"
+    );
+    let mut library_scan_retry_not_before = HashMap::new();
+    super::scan_due_cloud_libraries_with_retries(
+        &runtime,
+        &mut library_scan_retry_not_before,
+        Duration::from_secs(60 * 60),
+    )
+    .await
+    .expect("the hourly scan pass should continue past one busy library");
+    let busy_retry = *library_scan_retry_not_before
+        .get(&busy_library_id)
+        .expect("the busy library should get its own retry deadline");
+    assert!(
+        !library_scan_retry_not_before.contains_key(&completed_library_id),
+        "the completed library should not inherit the unrelated busy retry"
+    );
+    assert!(
+        !library_scan_retry_not_before.contains_key(&upcoming_library_id),
+        "the upcoming library should keep its own full-scan deadline"
+    );
+    let receipts = inbox
+        .last_successful_library_scans()
+        .expect("per-library scan receipts should remain readable");
+    assert_eq!(receipts.get(&busy_library_id), Some(&due_scan_at));
+    assert!(receipts[&completed_library_id] > due_scan_at);
+    assert_eq!(receipts.get(&upcoming_library_id), Some(&upcoming_scan_at));
+    let next_deadline = super::next_cloud_library_full_scan_deadline(
+        &runtime,
+        &library_scan_retry_not_before,
+        None,
+    )
+    .await
+    .expect("the next per-library scan deadline should be calculable");
+    assert!(
+        next_deadline < busy_retry,
+        "the upcoming library should become due before the unrelated busy-library retry"
+    );
+
+    drop(output_lease);
+    manual_scan
+        .await
+        .expect("manual scan task should join")
+        .expect("manual scan should finish after the output lease is released");
+    assert!(
+        inbox
+            .last_successful_library_scans()
+            .expect("scan receipts should remain readable after the manual scan")
+            .get(&busy_library_id)
+            .is_some_and(|scanned_at| *scanned_at > due_scan_at),
+        "the same-library manual scan should publish after the output lease is released"
+    );
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[path = "cloud_liveness_tests.rs"]

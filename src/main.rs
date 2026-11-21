@@ -98,7 +98,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::bilibili_attempt::{
     BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
@@ -127,8 +127,8 @@ use crate::downloader::{
     validate_existing_bilibili_report_for_completion,
 };
 use crate::file_manager::{
-    LibraryManager, PreviewBuildRequest, metadata_title_within_limits, release_preview_anchors,
-    release_preview_anchors_for_revision,
+    LibraryManager, MigrationScanResult, PreviewBuildRequest, metadata_title_within_limits,
+    release_preview_anchors, release_preview_anchors_for_revision,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
@@ -180,8 +180,9 @@ const CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES: usize = 8 * 1024;
 const CLOUD_TASK_SUMMARIES_LIMIT_BYTES: usize = 1024 * 1024;
 const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
 const CLOUD_PUBLICATION_COALESCE: Duration = Duration::from_millis(80);
-const CLOUD_IDLE_PUBLICATION_EXPIRY: Duration = Duration::from_secs(60 * 60);
+const CLOUD_BACKGROUND_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CLOUD_IDLE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CLOUD_LIBRARY_FULL_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CLOUD_WEBSOCKET_IDLE_PING_INTERVAL: Duration = Duration::from_secs(60);
 const CLOUD_WEBSOCKET_PONG_TIMEOUT: Duration = Duration::from_secs(20);
 const CLOUD_REFRESH_RESULT_RETENTION_MILLIS: u64 = 5 * 60 * 1000;
@@ -638,8 +639,11 @@ struct CloudBotRuntime {
     library_unavailable: Arc<Mutex<BTreeMap<String, String>>>,
     migrations: Arc<Mutex<BTreeMap<String, library_migration::MigrationStatus>>>,
     migration_discovery_warnings: Arc<Mutex<library_migration::MigrationDiscoveryWarnings>>,
+    migration_history_reconciliation:
+        Arc<Mutex<media_library_bot::MigrationHistoryReconciliationState>>,
     migration_runners: Arc<Mutex<HashSet<String>>>,
     library_io_gates: library_migration_bot::LibraryIoGateRegistry,
+    library_snapshot_operation_gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     #[cfg(test)]
     test_migration_runner_gate_waiting: Arc<Notify>,
     #[cfg(test)]
@@ -875,6 +879,7 @@ impl CloudStateRetryBackoff {
 enum CloudLibrarySnapshotUpdate {
     Publish(LibrarySnapshot),
     PreserveWithWarning(String),
+    Keep,
 }
 
 #[derive(Clone, Copy)]
@@ -886,12 +891,13 @@ enum CloudLibraryFailurePolicy {
 #[derive(Clone, Copy)]
 enum CloudLibraryAdmission {
     TryManagement,
+    TryManagementAndLibraryOperation,
     WaitManagement,
 }
 
-/// Serializes each library scan through publishing its snapshot or failure warning.
-/// The scan itself runs on a blocking thread, but the async guard stays held until the
-/// result is visible to the cloud state reporter.
+/// Serializes one library's work through its cache commit without blocking other roots.
+/// The per-library guard stays with the blocking worker if its async caller is cancelled;
+/// the global publication gate is held only while the completed result is committed.
 async fn run_cloud_library_operation<T>(
     runtime: &CloudBotRuntime,
     failure_context: &'static str,
@@ -994,6 +1000,8 @@ where
         media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
     });
     let selected_library_id = selected_library.map(|library| library.id.clone());
+    let selected_library_root_binding =
+        selected_library.and_then(crate::media_libraries::MediaLibrary::root_binding_token);
     let selected_queue_library_id = selected_library_id
         .as_deref()
         .context("library operation has no registered queue store for its root")?
@@ -1004,9 +1012,9 @@ where
     {
         bail!("library root identity changed; refresh settings and retry");
     }
-    let default_library_id = settings.default_library_id;
     let io_lease = match admission {
-        CloudLibraryAdmission::TryManagement => {
+        CloudLibraryAdmission::TryManagement
+        | CloudLibraryAdmission::TryManagementAndLibraryOperation => {
             library_migration_bot::try_acquire_library_io(
                 runtime,
                 std::slice::from_ref(&selected_queue_library_id),
@@ -1021,16 +1029,33 @@ where
             .await?
         }
     };
-    let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
-        .lock_owned()
-        .await;
+    let operation_gate = {
+        let mut gates = runtime.library_snapshot_operation_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(selected_queue_library_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    };
+    let operation_guard = match admission {
+        CloudLibraryAdmission::TryManagementAndLibraryOperation => {
+            operation_gate.try_lock_owned().map_err(|_| {
+                anyhow::anyhow!(
+                    "another operation is active for this library; automatic scan deferred"
+                )
+            })?
+        }
+        CloudLibraryAdmission::TryManagement | CloudLibraryAdmission::WaitManagement => {
+            operation_gate.lock_owned().await
+        }
+    };
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
     let context = runtime.bot.clone();
     let inbox = Arc::clone(&runtime.inbox);
     let queue = Arc::clone(&runtime.bot.queue);
-    let selected_library_id_for_worker = selected_queue_library_id;
+    let selected_library_id_for_worker = selected_queue_library_id.clone();
     let blocking_io_lease = Arc::clone(&io_lease);
     let worker = tokio::task::spawn_blocking(move || {
         let _io_lease = blocking_io_lease;
@@ -1046,26 +1071,55 @@ where
             };
             operation(context, inbox, verified_root)
         })();
-        (result, publication_guard)
+        (result, operation_guard)
     })
     .await;
-    let (worker, _publication_guard) = match worker {
-        Ok((result, publication_guard)) => (Ok(result), Some(publication_guard)),
-        Err(error) => (Err(error).with_context(|| failure_context), None),
+    let (worker, operation_guard) = match worker {
+        Ok((result, operation_guard)) => (result, Some(operation_guard)),
+        Err(error) => (Err(error.into()), None),
     };
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
-    match worker {
-        Ok(Ok((value, snapshot_update))) => {
+    let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+        .lock_owned()
+        .await;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
+    let queue = Arc::clone(&runtime.bot.queue);
+    let committed_settings = tokio::task::spawn_blocking(move || queue.registry_snapshot())
+        .await
+        .context("media-library settings worker failed before snapshot publication")??;
+    // A removal may finish while this scan is running. Its commit shares the gate, so verify
+    // the registration incarnation here before making the scanned snapshot visible.
+    let selected_library_is_current = committed_settings.libraries.iter().any(|library| {
+        library.id == selected_queue_library_id
+            && selected_library_root_binding
+                .as_ref()
+                .is_none_or(|expected_binding| {
+                    library.root_binding_token().as_ref() == Some(expected_binding)
+                })
+    });
+    if !selected_library_is_current {
+        bail!("media library registration changed before its snapshot could be published");
+    }
+    let default_library_id = committed_settings.default_library_id;
+    let mut reconcile_migration_history_metadata = false;
+    let result = match worker {
+        Ok((value, snapshot_update)) => {
             match snapshot_update {
                 CloudLibrarySnapshotUpdate::Publish(snapshot) => {
                     if let Some(library_id) = selected_library_id.as_ref() {
-                        runtime
+                        let generation = (snapshot.revision.clone(), snapshot.scanned_at);
+                        let previous_generation = runtime
                             .library_snapshots
                             .lock()
                             .await
-                            .insert(library_id.clone(), snapshot.clone());
+                            .insert(library_id.clone(), snapshot.clone())
+                            .map(|previous| (previous.revision, previous.scanned_at));
+                        reconcile_migration_history_metadata =
+                            previous_generation.as_ref() != Some(&generation);
                         runtime.library_unavailable.lock().await.remove(library_id);
                         if library_id == &default_library_id {
                             *runtime.library_snapshot.lock().await = Some(snapshot);
@@ -1078,6 +1132,15 @@ where
                             *runtime.library_scan_warning.lock().await = warning;
                         }
                     } else {
+                        let generation = (snapshot.revision.clone(), snapshot.scanned_at);
+                        reconcile_migration_history_metadata = runtime
+                            .library_snapshot
+                            .lock()
+                            .await
+                            .as_ref()
+                            .is_none_or(|previous| {
+                                (previous.revision.clone(), previous.scanned_at) != generation
+                            });
                         *runtime.library_snapshot.lock().await = Some(snapshot);
                         *runtime.library_scan_warning.lock().await = None;
                     }
@@ -1097,28 +1160,10 @@ where
                         *runtime.library_scan_warning.lock().await = Some(warning);
                     }
                 }
+                CloudLibrarySnapshotUpdate::Keep => {}
             }
             runtime.state_notify.notify_one();
             Ok(value)
-        }
-        Ok(Err(error)) => {
-            if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
-                let warning = bounded_cloud_library_warning(&format!("{error:#}"));
-                if let Some(library_id) = selected_library_id.as_ref() {
-                    runtime
-                        .library_unavailable
-                        .lock()
-                        .await
-                        .insert(library_id.clone(), warning.clone());
-                    if library_id == &default_library_id {
-                        *runtime.library_scan_warning.lock().await = Some(warning);
-                    }
-                } else {
-                    *runtime.library_scan_warning.lock().await = Some(warning);
-                }
-            }
-            runtime.state_notify.notify_one();
-            Err(error).with_context(|| failure_context)
         }
         Err(error) => {
             if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
@@ -1137,9 +1182,16 @@ where
                 }
             }
             runtime.state_notify.notify_one();
-            Err(error)
+            Err(error).with_context(|| failure_context)
         }
+    };
+    drop(publication_guard);
+    drop(operation_guard);
+    drop(io_lease);
+    if reconcile_migration_history_metadata && !runtime.epoch_fatal.is_signaled() {
+        media_library_bot::request_migration_history_metadata_reconciliation(runtime).await;
     }
+    result
 }
 
 fn bounded_cloud_library_warning(warning: &str) -> String {
@@ -1374,6 +1426,50 @@ impl CloudStateSnapshot {
             "settings": {"download_dir": self.download_dir, "applied": self.settings_applied},
         }))
         .context("failed to fingerprint local cloud state")
+    }
+
+    fn background_fingerprint(&self) -> Result<String> {
+        let mut library = self.library.clone();
+        if let Some(fields) = library.as_object_mut() {
+            fields.remove("scanned_at");
+        }
+        if let Some(libraries) = library
+            .get_mut("libraries")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for view in libraries {
+                if let Some(fields) = view.as_object_mut() {
+                    fields.remove("scanned_at");
+                    fields.remove("free_bytes");
+                }
+                if let Some(fields) = view
+                    .get_mut("snapshot")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    fields.remove("scanned_at");
+                }
+            }
+        }
+        let mut operations = self.operations.clone();
+        for operation in &mut operations {
+            if operation.get("kind").and_then(serde_json::Value::as_str) == Some("library_scan")
+                && let Some(fields) = operation
+                    .get_mut("result")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                fields.remove("scanned_at");
+            }
+        }
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "revision": self.revision,
+            "library": library,
+            "previews": self.previews,
+            "operations": operations,
+            "tasks": self.tasks,
+            "settings": {"download_dir": self.download_dir, "applied": self.settings_applied},
+        }))
+        .context("failed to fingerprint semantic local cloud state")?;
+        Ok(format!("{:x}", Sha256::digest(payload)))
     }
 
     fn watch_fingerprint(&self) -> Result<String> {
@@ -2033,6 +2129,7 @@ fn set_migration_compaction_warning(
 struct PendingCloudState {
     snapshot: CloudStateSnapshot,
     fingerprint: Vec<u8>,
+    background_fingerprint: String,
     state_version: u64,
     rejected_fingerprint: Option<Vec<u8>>,
     watch_fingerprint: String,
@@ -2043,7 +2140,13 @@ struct PendingCloudState {
 #[derive(Clone, Default)]
 struct CloudPublicationTrigger {
     bootstrap: bool,
-    idle_expiry: bool,
+    hourly_check: bool,
+    full_library_scan_due: bool,
+    background_recheck: bool,
+    // Re-evaluate semantic changes without forcing a state already acknowledged by Cloud.
+    retry_after_rejection: bool,
+    // Preserve the bounded retry probe for irreducible 413 responses.
+    retry_after_payload_too_large: bool,
     refreshes: Vec<SnapshotRefreshRequest>,
     watched_operation: bool,
     settings_auth_changed: bool,
@@ -2052,13 +2155,18 @@ struct CloudPublicationTrigger {
 impl CloudPublicationTrigger {
     fn is_forced(&self) -> bool {
         self.bootstrap
-            || self.idle_expiry
+            || self.retry_after_payload_too_large
             || !self.refreshes.is_empty()
             || self.settings_auth_changed
     }
 
     fn is_admitted(&self) -> bool {
-        self.is_forced() || self.watched_operation
+        self.is_forced()
+            || self.hourly_check
+            || self.full_library_scan_due
+            || self.background_recheck
+            || self.retry_after_rejection
+            || self.watched_operation
     }
 }
 
@@ -2129,8 +2237,10 @@ async fn run_cloud_bot(
         migration_discovery_warnings: Arc::new(Mutex::new(
             library_migration::MigrationDiscoveryWarnings::default(),
         )),
+        migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        library_snapshot_operation_gates: Arc::new(Mutex::new(BTreeMap::new())),
         #[cfg(test)]
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         #[cfg(test)]
@@ -2162,7 +2272,7 @@ async fn run_cloud_bot(
     info!(
         configured_fallback_poll_seconds = cloud_config.fallback_poll_seconds,
         effective_max_idle_reconciliation_seconds = CLOUD_IDLE_RECONCILIATION_INTERVAL.as_secs(),
-        idle_snapshot_expiry_seconds = CLOUD_IDLE_PUBLICATION_EXPIRY.as_secs(),
+        hourly_background_check_interval_seconds = CLOUD_BACKGROUND_CHECK_INTERVAL.as_secs(),
         "telegram local cloud ingress started"
     );
     tokio::spawn(cloud_initial_library_scan(runtime.clone()));
@@ -2259,14 +2369,215 @@ async fn cloud_queue_state_watcher_with_debounce(runtime: CloudBotRuntime, debou
     }
 }
 
-async fn cloud_state_reporter(runtime: CloudBotRuntime) {
-    cloud_state_reporter_with_heartbeat(runtime, CLOUD_IDLE_PUBLICATION_EXPIRY).await;
+fn cloud_library_full_scan_due(
+    last_successful_scan_at: Option<u64>,
+    now: u64,
+    cached_snapshot_present: bool,
+    available: bool,
+) -> bool {
+    available
+        && (!cached_snapshot_present
+            || last_successful_scan_at.is_none_or(|last| {
+                now.saturating_sub(last) >= CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs()
+            }))
 }
 
-async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, expiry: Duration) {
+async fn next_cloud_library_full_scan_deadline(
+    runtime: &CloudBotRuntime,
+    library_scan_retry_not_before: &HashMap<String, Instant>,
+    scan_pass_retry_not_before: Option<Instant>,
+) -> Result<Instant> {
+    let queue = Arc::clone(&runtime.bot.queue);
+    let libraries = tokio::task::spawn_blocking(move || queue.registry_snapshot())
+        .await
+        .context("media-library settings worker failed while scheduling full scans")??
+        .libraries;
+    let last_successful_scans = last_successful_cloud_library_scans(runtime).await?;
+    let cached_ids = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let now = now_seconds();
+    let interval = CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs();
+    let now_instant = Instant::now();
+    let next_library_deadline = libraries
+        .iter()
+        .map(|library| {
+            let due_at = if !cached_ids.contains(&library.id) {
+                now
+            } else {
+                last_successful_scans
+                    .get(&library.id)
+                    .map(|last| last.saturating_add(interval))
+                    .unwrap_or(now)
+            };
+            let deadline = now_instant + Duration::from_secs(due_at.saturating_sub(now));
+            library_scan_retry_not_before
+                .get(&library.id)
+                .copied()
+                .map_or(deadline, |retry| deadline.max(retry))
+        })
+        .min()
+        .unwrap_or_else(|| now_instant + Duration::from_secs(interval));
+    Ok(
+        scan_pass_retry_not_before.map_or(next_library_deadline, |retry| {
+            next_library_deadline.max(retry)
+        }),
+    )
+}
+
+async fn has_pending_snapshot_refreshes(runtime: &CloudBotRuntime) -> bool {
+    let now = now_millis();
+    let mut queue = runtime.snapshot_refreshes.lock().await;
+    queue.pending.retain(|request| request.expires_at > now);
+    !queue.pending.is_empty()
+}
+
+#[cfg(test)]
+async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
+    let mut library_scan_retry_not_before = HashMap::new();
+    scan_due_cloud_libraries_with_retries(
+        runtime,
+        &mut library_scan_retry_not_before,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn scan_due_cloud_libraries_with_retries(
+    runtime: &CloudBotRuntime,
+    library_scan_retry_not_before: &mut HashMap<String, Instant>,
+    retry_interval: Duration,
+) -> Result<()> {
+    let queue = Arc::clone(&runtime.bot.queue);
+    let (settings, availability) = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>((queue.registry_snapshot()?, queue.video_library_statuses()?))
+    })
+    .await
+    .context("media-library availability worker failed before due full scans")??;
+    let mut last_successful_scans = last_successful_cloud_library_scans(runtime).await?;
+    let now = now_seconds();
+    let retry_delay = retry_interval.max(Duration::from_millis(1));
+
+    for library in settings.libraries {
+        if has_pending_snapshot_refreshes(runtime).await {
+            break;
+        }
+        let available = availability
+            .get(&library.id)
+            .is_some_and(|status| status.available);
+        let cached_snapshot_present = runtime
+            .library_snapshots
+            .lock()
+            .await
+            .contains_key(&library.id);
+        if !cloud_library_full_scan_due(
+            last_successful_scans.get(&library.id).copied(),
+            now,
+            cached_snapshot_present,
+            true,
+        ) {
+            library_scan_retry_not_before.remove(&library.id);
+            continue;
+        }
+        if library_scan_retry_not_before
+            .get(&library.id)
+            .is_some_and(|retry| Instant::now() < *retry)
+        {
+            continue;
+        }
+        library_scan_retry_not_before.remove(&library.id);
+        if !available {
+            library_scan_retry_not_before.insert(library.id, Instant::now() + retry_delay);
+            continue;
+        }
+        let (scoped_runtime, _) = match media_library_bot::scoped_runtime(
+            runtime,
+            Some(&library.id),
+        ) {
+            Ok(scoped_runtime) => scoped_runtime,
+            Err(error) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
+                debug!(
+                    library_id = %library.id,
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "automatic media-library scan could not prepare this library; its complete-scan time remains due"
+                );
+                continue;
+            }
+        };
+        #[cfg(test)]
+        let test_refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
+        let result = run_cloud_library_operation_with_snapshot_update_and_policy(
+            &scoped_runtime,
+            "automatic media-library scan worker failed",
+            CloudLibraryFailurePolicy::PreserveAvailability,
+            CloudLibraryAdmission::TryManagementAndLibraryOperation,
+            None,
+            move |context, inbox, _root| {
+                #[cfg(test)]
+                if let Some(message) = test_refresh_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    bail!("{message}");
+                }
+                let Some(scan) =
+                    try_scan_cloud_library_with_completeness(&context, Arc::clone(&inbox))?
+                else {
+                    return Ok((false, CloudLibrarySnapshotUpdate::Keep));
+                };
+                if !scan.complete {
+                    return Ok((false, CloudLibrarySnapshotUpdate::Keep));
+                }
+                record_successful_cloud_library_scan(&context, &inbox, scan.snapshot.scanned_at)?;
+                Ok((true, CloudLibrarySnapshotUpdate::Publish(scan.snapshot)))
+            },
+        )
+        .await;
+        match result {
+            Ok(true) => {
+                last_successful_scans.insert(library.id.clone(), now_seconds());
+                library_scan_retry_not_before.remove(&library.id);
+            }
+            Ok(false) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
+                debug!(
+                    library_id = %library.id,
+                    "automatic media-library scan was busy or incomplete; its complete-scan time remains due"
+                );
+            }
+            Err(error) => {
+                library_scan_retry_not_before
+                    .insert(library.id.clone(), Instant::now() + retry_delay);
+                debug!(
+                    library_id = %library.id,
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "automatic media-library scan failed or was deferred; its complete-scan time remains due"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cloud_state_reporter(runtime: CloudBotRuntime) {
+    cloud_state_reporter_with_heartbeat(runtime, CLOUD_BACKGROUND_CHECK_INTERVAL).await;
+}
+
+async fn cloud_state_reporter_with_heartbeat(
+    runtime: CloudBotRuntime,
+    background_check_interval: Duration,
+) {
     cloud_state_reporter_with_retry_policy(
         runtime,
-        expiry,
+        background_check_interval,
         Duration::from_secs(5),
         Duration::from_secs(60),
     )
@@ -2275,7 +2586,7 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, expiry: D
 
 async fn cloud_state_reporter_with_retry_policy(
     runtime: CloudBotRuntime,
-    expiry: Duration,
+    background_check_interval: Duration,
     retry_backoff_base: Duration,
     version_exhausted_backoff: Duration,
 ) {
@@ -2283,16 +2594,17 @@ async fn cloud_state_reporter_with_retry_policy(
     let last_successful_publication = match last_successful_cloud_publication_at(&runtime).await {
         Ok(last_successful_publication) => last_successful_publication,
         Err(error) => {
-            warn!(error = %format!("{error:#}"), "could not read persisted cloud publication expiry; scheduling a bootstrap snapshot");
+            warn!(error = %format!("{error:#}"), "could not read persisted cloud publication time; scheduling a bootstrap snapshot");
             None
         }
     };
     let mut bootstrap_due = last_successful_publication.is_none();
-    let expiry_millis = u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX);
-    let mut idle_deadline =
+    let check_interval_millis =
+        u64::try_from(background_check_interval.as_millis()).unwrap_or(u64::MAX);
+    let mut maintenance_deadline =
         last_successful_publication.map_or_else(Instant::now, |last_successful_publication| {
             let elapsed = now_millis().saturating_sub(last_successful_publication);
-            let remaining = expiry_millis.saturating_sub(elapsed);
+            let remaining = check_interval_millis.saturating_sub(elapsed);
             Instant::now() + Duration::from_millis(remaining)
         });
     let mut published_watch_fingerprint = match last_successful_cloud_watch_fingerprint(&runtime)
@@ -2304,10 +2616,26 @@ async fn cloud_state_reporter_with_retry_policy(
             None
         }
     };
+    let mut published_background_fingerprint = match last_successful_cloud_background_fingerprint(
+        &runtime,
+    )
+    .await
+    {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "could not read persisted background snapshot fingerprint; allowing one baseline publication");
+            None
+        }
+    };
     let mut permanently_rejected_fingerprint: Option<Vec<u8>> = None;
+    let mut permanently_rejected_background_fingerprint: Option<String> = None;
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
     let mut failure_retry_not_before: Option<Instant> = None;
+    let mut failure_retry_is_payload_too_large = false;
+    let mut library_scan_retry_not_before: HashMap<String, Instant> = HashMap::new();
+    let mut scan_pass_retry_not_before: Option<Instant> = None;
     let mut pending: Option<PendingCloudState> = None;
+    let mut background_recheck_after_pending_success = false;
     let mut retry_backoff =
         CloudStateRetryBackoff::new(retry_backoff_base, CLOUD_STATE_RETRY_BACKOFF_MAX);
 
@@ -2315,26 +2643,120 @@ async fn cloud_state_reporter_with_retry_policy(
         if runtime.epoch_fatal.is_signaled() {
             return;
         }
+        if pending.is_some() {
+            // Keep a pending snapshot immutable for same-version retries, but do not let
+            // upload backoff suspend local availability checks or due full scans.
+            let scan_deadline = match next_cloud_library_full_scan_deadline(
+                &runtime,
+                &library_scan_retry_not_before,
+                scan_pass_retry_not_before,
+            )
+            .await
+            {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "could not schedule daily media-library scans while a cloud snapshot is pending");
+                    maintenance_deadline
+                }
+            };
+            let hourly_check = Instant::now() >= maintenance_deadline;
+            let full_library_scan_due = !hourly_check && Instant::now() >= scan_deadline;
+            if hourly_check || full_library_scan_due {
+                if hourly_check && let Err(error) = sync_cloud_backlog_if_idle_due(&runtime).await {
+                    warn!(error = %format!("{error:#}"), "cloud inbox reconciliation failed while a snapshot upload was pending");
+                }
+                if let Err(error) = media_library_bot::refresh_library_bindings(&runtime).await {
+                    warn!(error = %format!("{error:#}"), "media-library availability refresh failed while a snapshot upload was pending");
+                }
+                if !has_pending_snapshot_refreshes(&runtime).await
+                    && scan_pass_retry_not_before.is_none_or(|retry| Instant::now() >= retry)
+                {
+                    match scan_due_cloud_libraries_with_retries(
+                        &runtime,
+                        &mut library_scan_retry_not_before,
+                        background_check_interval,
+                    )
+                    .await
+                    {
+                        Ok(()) => scan_pass_retry_not_before = None,
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "daily media-library scan pass failed while a snapshot upload was pending");
+                            scan_pass_retry_not_before =
+                                Some(Instant::now() + background_check_interval);
+                        }
+                    }
+                }
+                if hourly_check {
+                    maintenance_deadline = Instant::now() + background_check_interval;
+                }
+                background_recheck_after_pending_success = true;
+            }
+        }
         if pending.is_none() {
             let mut trigger = if bootstrap_due {
                 CloudPublicationTrigger {
                     bootstrap: true,
                     ..CloudPublicationTrigger::default()
                 }
+            } else if background_recheck_after_pending_success {
+                background_recheck_after_pending_success = false;
+                CloudPublicationTrigger {
+                    background_recheck: true,
+                    ..CloudPublicationTrigger::default()
+                }
             } else {
-                let publication_deadline = failure_retry_not_before
-                    .map_or(idle_deadline, |retry| idle_deadline.max(retry));
-                tokio::select! {
-                    _ = runtime.epoch_fatal.notified() => return,
-                    _ = runtime.state_notify.notified() => CloudPublicationTrigger::default(),
-                    _ = bilibili_auth_status_notify().notified() => CloudPublicationTrigger {
-                        settings_auth_changed: true,
+                let scan_deadline = match next_cloud_library_full_scan_deadline(
+                    &runtime,
+                    &library_scan_retry_not_before,
+                    scan_pass_retry_not_before,
+                )
+                .await
+                {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "could not schedule daily media-library scans; retrying at the next hourly check");
+                        maintenance_deadline
+                    }
+                };
+                if Instant::now() >= maintenance_deadline {
+                    CloudPublicationTrigger {
+                        hourly_check: true,
                         ..CloudPublicationTrigger::default()
-                    },
-                    _ = tokio::time::sleep_until(publication_deadline) => CloudPublicationTrigger {
-                        idle_expiry: true,
+                    }
+                } else if Instant::now() >= scan_deadline {
+                    CloudPublicationTrigger {
+                        full_library_scan_due: true,
                         ..CloudPublicationTrigger::default()
-                    },
+                    }
+                } else {
+                    let retry_deadline = failure_retry_not_before;
+                    tokio::select! {
+                        _ = runtime.epoch_fatal.notified() => return,
+                        _ = runtime.state_notify.notified() => CloudPublicationTrigger::default(),
+                        _ = bilibili_auth_status_notify().notified() => CloudPublicationTrigger {
+                            settings_auth_changed: true,
+                            ..CloudPublicationTrigger::default()
+                        },
+                        _ = tokio::time::sleep_until(maintenance_deadline) => CloudPublicationTrigger {
+                            hourly_check: true,
+                            ..CloudPublicationTrigger::default()
+                        },
+                        _ = tokio::time::sleep_until(scan_deadline) => CloudPublicationTrigger {
+                            full_library_scan_due: true,
+                            ..CloudPublicationTrigger::default()
+                        },
+                        _ = async {
+                            if let Some(deadline) = retry_deadline {
+                                tokio::time::sleep_until(deadline).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => CloudPublicationTrigger {
+                            retry_after_rejection: !failure_retry_is_payload_too_large,
+                            retry_after_payload_too_large: failure_retry_is_payload_too_large,
+                            ..CloudPublicationTrigger::default()
+                        },
+                    }
                 }
             };
             if !trigger.bootstrap {
@@ -2349,23 +2771,62 @@ async fn cloud_state_reporter_with_retry_policy(
                 trigger.refreshes = take_live_snapshot_refreshes(&runtime).await;
                 trigger.watched_operation = active_cloud_operation_watch(&runtime).await;
             }
+            if trigger.retry_after_rejection || trigger.retry_after_payload_too_large {
+                failure_retry_not_before = None;
+                failure_retry_is_payload_too_large = false;
+                permanently_rejected_background_fingerprint = None;
+            }
 
             let bootstrap_attempt = trigger.bootstrap;
             let mut failed_refreshes = HashSet::new();
-            if (trigger.idle_expiry || !trigger.refreshes.is_empty())
+            if (trigger.hourly_check || !trigger.refreshes.is_empty())
                 && let Err(error) = sync_cloud_backlog_if_idle_due(&runtime).await
             {
                 warn!(error = %format!("{error:#}"), "cloud inbox reconciliation failed before snapshot publication");
             }
             if !trigger.refreshes.is_empty() {
                 failed_refreshes = refresh_snapshot_references(&runtime, &trigger.refreshes).await;
-            } else if trigger.idle_expiry {
-                // The cached local index is the source of truth for idle snapshots. Reconcile
-                // only current root availability here; full scans and metadata backfills remain
-                // attached to explicit library actions and the existing operation watchers.
-                if let Err(error) = media_library_bot::refresh_library_bindings(&runtime).await {
-                    warn!(error = %format!("{error:#}"), "hourly media-library availability refresh failed before snapshot expiry publication");
+            }
+            if (trigger.hourly_check || trigger.full_library_scan_due)
+                && let Err(error) = media_library_bot::refresh_library_bindings(&runtime).await
+            {
+                warn!(error = %format!("{error:#}"), "media-library availability refresh failed before background snapshot evaluation");
+            }
+            if (trigger.hourly_check || trigger.full_library_scan_due)
+                && trigger.refreshes.is_empty()
+            {
+                let arrived_refreshes = take_live_snapshot_refreshes(&runtime).await;
+                if arrived_refreshes.is_empty() {
+                    if scan_pass_retry_not_before.is_none_or(|retry| Instant::now() >= retry) {
+                        match scan_due_cloud_libraries_with_retries(
+                            &runtime,
+                            &mut library_scan_retry_not_before,
+                            background_check_interval,
+                        )
+                        .await
+                        {
+                            Ok(()) => scan_pass_retry_not_before = None,
+                            Err(error) => {
+                                warn!(error = %format!("{error:#}"), "daily media-library scan pass failed");
+                                scan_pass_retry_not_before =
+                                    Some(Instant::now() + background_check_interval);
+                            }
+                        }
+                    }
+                } else {
+                    failed_refreshes
+                        .extend(refresh_snapshot_references(&runtime, &arrived_refreshes).await);
+                    trigger.refreshes.extend(arrived_refreshes);
                 }
+                let arrived_after_scan = take_live_snapshot_refreshes(&runtime).await;
+                if !arrived_after_scan.is_empty() {
+                    failed_refreshes
+                        .extend(refresh_snapshot_references(&runtime, &arrived_after_scan).await);
+                    trigger.refreshes.extend(arrived_after_scan);
+                }
+            }
+            if trigger.hourly_check {
+                maintenance_deadline = Instant::now() + background_check_interval;
             }
             prune_publication_trigger(&runtime, &mut trigger, &failed_refreshes).await;
             if !trigger.is_admitted() {
@@ -2390,10 +2851,23 @@ async fn cloud_state_reporter_with_retry_policy(
                             continue;
                         }
                     };
+                    let background_fingerprint = match snapshot.background_fingerprint() {
+                        Ok(fingerprint) => fingerprint,
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "failed to fingerprint semantic local cloud state");
+                            continue;
+                        }
+                    };
                     let watched_change = trigger.watched_operation
                         && published_watch_fingerprint.as_ref() != Some(&watch_fingerprint);
+                    let background_change = (trigger.hourly_check
+                        || trigger.full_library_scan_due
+                        || trigger.background_recheck
+                        || trigger.retry_after_rejection)
+                        && published_background_fingerprint.as_ref()
+                            != Some(&background_fingerprint);
                     let forced = trigger.is_forced();
-                    if !forced && !watched_change {
+                    if !forced && !watched_change && !background_change {
                         continue;
                     }
                     if published_oversized_source_fingerprint.as_ref() == Some(&fingerprint) {
@@ -2402,7 +2876,12 @@ async fn cloud_state_reporter_with_retry_policy(
                         }
                         published_oversized_source_fingerprint = None;
                     }
-                    if !forced && permanently_rejected_fingerprint.as_ref() == Some(&fingerprint) {
+                    if !forced
+                        && !trigger.retry_after_rejection
+                        && (permanently_rejected_fingerprint.as_ref() == Some(&fingerprint)
+                            || permanently_rejected_background_fingerprint.as_ref()
+                                == Some(&background_fingerprint))
+                    {
                         continue;
                     }
                     let state_version = match next_cloud_state_version(&runtime).await {
@@ -2440,11 +2919,12 @@ async fn cloud_state_reporter_with_retry_policy(
                         // succeed. A later permanent/irreducible post failure uses its own
                         // retry cooldown without claiming a successful publication.
                         bootstrap_due = false;
-                        idle_deadline = Instant::now() + expiry;
+                        maintenance_deadline = Instant::now() + background_check_interval;
                     }
                     pending = Some(PendingCloudState {
                         snapshot,
                         fingerprint,
+                        background_fingerprint,
                         state_version,
                         rejected_fingerprint: None,
                         watch_fingerprint,
@@ -2483,7 +2963,6 @@ async fn cloud_state_reporter_with_retry_policy(
         let state = pending
             .as_ref()
             .expect("pending cloud state remains present");
-        let failed_fingerprint = state.fingerprint.clone();
         let failed_version = state.state_version;
         let state_version = state.state_version;
         let notify_viewers = !state.trigger.refreshes.is_empty()
@@ -2500,26 +2979,30 @@ async fn cloud_state_reporter_with_retry_policy(
                 );
                 let state_version = published_state.state_version;
                 let watch_fingerprint = published_state.watch_fingerprint.clone();
+                let background_fingerprint = published_state.background_fingerprint.clone();
                 let trigger = published_state.trigger.clone();
                 let failed_refreshes = published_state.failed_refreshes.clone();
                 let rejected_fingerprint = published_state.rejected_fingerprint.clone();
                 published_watch_fingerprint = Some(watch_fingerprint.clone());
+                published_background_fingerprint = Some(background_fingerprint.clone());
                 permanently_rejected_fingerprint = rejected_fingerprint.clone();
+                permanently_rejected_background_fingerprint = None;
                 published_oversized_source_fingerprint = rejected_fingerprint.clone();
                 bootstrap_due = false;
                 failure_retry_not_before = None;
-                idle_deadline = Instant::now() + expiry;
+                failure_retry_is_payload_too_large = false;
                 if let Err(error) = record_successful_cloud_publication_at(
                     &runtime,
                     reported_at,
                     &watch_fingerprint,
+                    &background_fingerprint,
                 )
                 .await
                 {
                     warn!(
                         reported_at,
                         error = %format!("{error:#}"),
-                        "snapshot was acknowledged by Cloudflare but its local expiry timestamp could not be persisted"
+                        "snapshot was acknowledged by Cloudflare but its local publication fingerprints could not be persisted"
                     );
                 }
                 let mut trigger = trigger;
@@ -2536,6 +3019,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 retry_backoff.reset();
             }
             Err(error) if error.is_payload_too_large() => {
+                permanently_rejected_background_fingerprint = None;
                 let Some(rejected) = pending.take() else {
                     continue;
                 };
@@ -2597,6 +3081,7 @@ async fn cloud_state_reporter_with_retry_policy(
                                 // The admission baseline is the semantic source state, not the
                                 // compacted wire representation accepted after a 413 retry.
                                 watch_fingerprint: rejected.watch_fingerprint.clone(),
+                                background_fingerprint: rejected.background_fingerprint.clone(),
                                 snapshot: trimmed,
                                 fingerprint,
                                 state_version: next_version,
@@ -2615,7 +3100,9 @@ async fn cloud_state_reporter_with_retry_policy(
                             // A permanent 413 is retried only at the next bounded admission
                             // window (or by an explicit request). Keep this separate from the
                             // successful-publication expiry, which must advance only on ACK.
-                            failure_retry_not_before = Some(Instant::now() + expiry);
+                            failure_retry_not_before =
+                                Some(Instant::now() + background_check_interval);
+                            failure_retry_is_payload_too_large = true;
                             fail_pending_snapshot_refreshes(
                                 &runtime,
                                 &rejected,
@@ -2630,7 +3117,9 @@ async fn cloud_state_reporter_with_retry_policy(
                             );
                             permanently_rejected_fingerprint = Some(rejected_fingerprint);
                             published_oversized_source_fingerprint = None;
-                            failure_retry_not_before = Some(Instant::now() + expiry);
+                            failure_retry_not_before =
+                                Some(Instant::now() + background_check_interval);
+                            failure_retry_is_payload_too_large = true;
                             fail_pending_snapshot_refreshes(
                                 &runtime,
                                 &rejected,
@@ -2646,7 +3135,8 @@ async fn cloud_state_reporter_with_retry_policy(
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
-                        failure_retry_not_before = Some(Instant::now() + expiry);
+                        failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                        failure_retry_is_payload_too_large = true;
                         fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
                             .await;
                     }
@@ -2657,7 +3147,8 @@ async fn cloud_state_reporter_with_retry_policy(
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
                         published_oversized_source_fingerprint = None;
-                        failure_retry_not_before = Some(Instant::now() + expiry);
+                        failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                        failure_retry_is_payload_too_large = true;
                         fail_pending_snapshot_refreshes(&runtime, &rejected, "payload_too_large")
                             .await;
                     }
@@ -2739,18 +3230,16 @@ async fn cloud_state_reporter_with_retry_policy(
                 warn!(
                     state_version = failed_version,
                     error = %error,
-                    "permanent local cloud state rejection; waiting for a changed snapshot"
+                    "permanent local cloud state rejection; deferring an unchanged retry"
                 );
-                permanently_rejected_fingerprint = Some(
-                    state
-                        .rejected_fingerprint
-                        .clone()
-                        .unwrap_or(failed_fingerprint),
-                );
+                permanently_rejected_fingerprint = None;
+                permanently_rejected_background_fingerprint =
+                    Some(state.background_fingerprint.clone());
                 published_oversized_source_fingerprint = None;
                 // Permanent server rejection is an admission cooldown, not a successful
                 // snapshot refresh. Explicit user refreshes still wake the reporter directly.
-                failure_retry_not_before = Some(Instant::now() + expiry);
+                failure_retry_not_before = Some(Instant::now() + background_check_interval);
+                failure_retry_is_payload_too_large = false;
                 pending = None;
                 fail_snapshot_refresh_requests(&runtime, &failed_trigger, "publish_rejected").await;
             }
@@ -2801,15 +3290,39 @@ async fn last_successful_cloud_watch_fingerprint(
         .context("cloud watch-fingerprint read worker failed")?
 }
 
+async fn last_successful_cloud_background_fingerprint(
+    runtime: &CloudBotRuntime,
+) -> Result<Option<String>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.last_successful_background_fingerprint())
+        .await
+        .context("cloud background-fingerprint read worker failed")?
+}
+
+async fn last_successful_cloud_library_scans(
+    runtime: &CloudBotRuntime,
+) -> Result<BTreeMap<String, u64>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.last_successful_library_scans())
+        .await
+        .context("cloud library-scan-time read worker failed")?
+}
+
 async fn record_successful_cloud_publication_at(
     runtime: &CloudBotRuntime,
     published_at: u64,
     watch_fingerprint: &str,
+    background_fingerprint: &str,
 ) -> Result<()> {
     let inbox = Arc::clone(&runtime.inbox);
     let watch_fingerprint = watch_fingerprint.to_string();
+    let background_fingerprint = background_fingerprint.to_string();
     tokio::task::spawn_blocking(move || {
-        inbox.record_successful_publication_at(published_at, &watch_fingerprint)
+        inbox.record_successful_publication_at_with_background(
+            published_at,
+            &watch_fingerprint,
+            Some(&background_fingerprint),
+        )
     })
     .await
     .context("cloud publication-time persistence worker failed")?
@@ -7084,6 +7597,7 @@ fn execute_cloud_file_preview_with_provider(
     (crate::library::BatchMoveResult, Option<String>),
     CloudLibrarySnapshotUpdate,
 )> {
+    let scan_inbox = Arc::clone(&inbox);
     let manager = open_cloud_library_manager_with_bound_root(root, inbox, file_provider)?;
     let preview_key = (preview_id.to_string(), revision.to_string());
     if manager
@@ -7106,16 +7620,24 @@ fn execute_cloud_file_preview_with_provider(
     let refreshed = injected_refresh_error.map_or_else(
         || {
             queue_source_hints(bot)
-                .and_then(|hints| manager.scan(&hints))
+                .and_then(|hints| manager.scan_with_completeness(&hints))
                 .map_err(|error| error.context("local library refresh failed after confirmation"))
         },
         Err,
     );
     match refreshed {
-        Ok(snapshot) => Ok((
-            (result, None),
-            CloudLibrarySnapshotUpdate::Publish(snapshot),
-        )),
+        Ok(scan) => {
+            if scan.complete
+                && let Err(error) =
+                    record_successful_cloud_library_scan(bot, &scan_inbox, scan.snapshot.scanned_at)
+            {
+                warn!(error = %format!("{error:#}"), "complete media-library scan after file confirmation succeeded but its refresh time could not be persisted");
+            }
+            Ok((
+                (result, None),
+                CloudLibrarySnapshotUpdate::Publish(scan.snapshot),
+            ))
+        }
         Err(error) => {
             let warning = truncate_cloud_warning(
                 &redact_sensitive_text(&format!(
@@ -7137,16 +7659,60 @@ fn import_cloud_legacy_metadata(
     inbox: Arc<CloudInbox>,
     root: crate::safe_fs::RootedFs,
 ) -> Result<(crate::library::LegacyImportReport, LibrarySnapshot)> {
-    let manager = open_cloud_library_manager_with_bound_root(root, inbox, None)?;
+    let manager = open_cloud_library_manager_with_bound_root(root, Arc::clone(&inbox), None)?;
     let hints = queue_source_hints(bot)?;
     let report = manager.import_legacy_with_hints(text, &hints)?;
-    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
-    Ok((report, snapshot))
+    let scan = manager.scan_with_completeness(&queue_source_hints(bot)?)?;
+    if scan.complete
+        && let Err(error) =
+            record_successful_cloud_library_scan(bot, &inbox, scan.snapshot.scanned_at)
+    {
+        warn!(error = %format!("{error:#}"), "complete media-library scan after legacy import succeeded but its refresh time could not be persisted");
+    }
+    Ok((report, scan.snapshot))
 }
 
 fn scan_cloud_library(bot: &BotContext, inbox: Arc<CloudInbox>) -> Result<LibrarySnapshot> {
+    let result = scan_cloud_library_with_completeness(bot, Arc::clone(&inbox))?;
+    if result.complete
+        && let Err(error) =
+            record_successful_cloud_library_scan(bot, &inbox, result.snapshot.scanned_at)
+    {
+        warn!(error = %format!("{error:#}"), "complete media-library scan succeeded but its refresh time could not be persisted");
+    }
+    Ok(result.snapshot)
+}
+
+fn scan_cloud_library_with_completeness(
+    bot: &BotContext,
+    inbox: Arc<CloudInbox>,
+) -> Result<MigrationScanResult> {
     let manager = open_cloud_library_manager(bot, inbox, None)?;
-    manager.scan(&queue_source_hints(bot)?)
+    manager.scan_with_completeness(&queue_source_hints(bot)?)
+}
+
+fn try_scan_cloud_library_with_completeness(
+    bot: &BotContext,
+    inbox: Arc<CloudInbox>,
+) -> Result<Option<MigrationScanResult>> {
+    let manager = open_cloud_library_manager(bot, inbox, None)?;
+    manager.try_scan_with_completeness(&queue_source_hints(bot)?)
+}
+
+fn record_successful_cloud_library_scan(
+    bot: &BotContext,
+    inbox: &CloudInbox,
+    scanned_at: u64,
+) -> Result<()> {
+    let library_id = media_library_bot::original_library_id_from_bot(bot)?;
+    let active_library_ids = bot
+        .queue
+        .registry_snapshot()?
+        .libraries
+        .into_iter()
+        .map(|library| library.id)
+        .collect::<Vec<_>>();
+    inbox.record_successful_library_scan_at(&library_id, scanned_at, &active_library_ids)
 }
 
 fn open_cloud_library_manager(
@@ -17557,6 +18123,117 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    #[test]
+    fn background_fingerprint_ignores_scan_time_and_free_space_only() {
+        let mut snapshot = CloudStateSnapshot {
+            revision: "revision-a".to_string(),
+            library: serde_json::json!({
+                "revision": "revision-a",
+                "scanned_at": 100,
+                "items": [{"id":"item-a", "title":"Clip"}],
+                "libraries": [{
+                    "id":"primary",
+                    "availability":"available",
+                    "scanned_at": 100,
+                    "free_bytes": 10,
+                    "snapshot": {"revision":"revision-a", "scanned_at":100}
+                }]
+            }),
+            previews: Vec::new(),
+            operations: vec![serde_json::json!({
+                "seq": 1,
+                "kind": "library_scan",
+                "status": "completed",
+                "result": {"revision":"revision-a", "scanned_at":100}
+            })],
+            tasks: Vec::new(),
+            download_dir: "/tmp/videos".to_string(),
+            settings_applied: serde_json::json!({"default_category":""}),
+        };
+        let first = snapshot
+            .background_fingerprint()
+            .expect("background fingerprint should build");
+
+        snapshot.library["scanned_at"] = serde_json::json!(200);
+        snapshot.library["libraries"][0]["scanned_at"] = serde_json::json!(200);
+        snapshot.library["libraries"][0]["free_bytes"] = serde_json::json!(20);
+        snapshot.library["libraries"][0]["snapshot"]["scanned_at"] = serde_json::json!(200);
+        snapshot.operations[0]["result"]["scanned_at"] = serde_json::json!(200);
+        assert_eq!(
+            snapshot.background_fingerprint().unwrap(),
+            first,
+            "scan timestamps and incidental free-space counters are not background changes"
+        );
+
+        let stable = snapshot.background_fingerprint().unwrap();
+        snapshot.operations[0]["status"] = serde_json::json!("failed");
+        assert_ne!(
+            snapshot.background_fingerprint().unwrap(),
+            stable,
+            "action status remains semantically significant"
+        );
+        snapshot.operations[0]["status"] = serde_json::json!("completed");
+        snapshot
+            .tasks
+            .push(serde_json::json!({"id":"task-a", "status":"running"}));
+        assert_ne!(
+            snapshot.background_fingerprint().unwrap(),
+            stable,
+            "task changes remain semantically significant"
+        );
+        snapshot.tasks.clear();
+        snapshot.library["libraries"][0]["availability"] = serde_json::json!("unavailable");
+        assert_ne!(
+            snapshot.background_fingerprint().unwrap(),
+            stable,
+            "library availability remains semantically significant"
+        );
+        snapshot.library["libraries"][0]["availability"] = serde_json::json!("available");
+
+        snapshot.library["items"][0]["title"] = serde_json::json!("Renamed clip");
+        assert_ne!(
+            snapshot.background_fingerprint().unwrap(),
+            first,
+            "actual library content remains part of the background fingerprint"
+        );
+    }
+
+    #[test]
+    fn library_full_scan_due_is_bounded_by_availability_and_exact_age() {
+        let last_scan = 1_800_000_000;
+        assert!(!cloud_library_full_scan_due(
+            Some(last_scan),
+            last_scan + CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs() - 1,
+            true,
+            true,
+        ));
+        assert!(cloud_library_full_scan_due(
+            Some(last_scan),
+            last_scan + CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs(),
+            true,
+            true,
+        ));
+        assert!(!cloud_library_full_scan_due(
+            Some(last_scan),
+            last_scan + CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs() * 2,
+            true,
+            false,
+        ));
+        assert!(
+            cloud_library_full_scan_due(
+                Some(last_scan),
+                last_scan + CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs() * 2,
+                true,
+                true,
+            ),
+            "a failed or skipped scan leaves the previous success time due for retry"
+        );
+        assert!(
+            cloud_library_full_scan_due(Some(last_scan), last_scan, false, true,),
+            "a newly registered root without a cached snapshot needs a full scan despite a reused ID"
+        );
+    }
 
     #[test]
     fn youtube_queue_source_hint_keeps_its_platform_prefix() {

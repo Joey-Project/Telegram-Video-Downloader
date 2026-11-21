@@ -1,6 +1,7 @@
 //! Cloud commands and background scheduling for durable media-library migrations.
 
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::*;
@@ -1126,7 +1127,9 @@ async fn run_terminal_finalizer(
     _io_lease: LibraryIoLease,
 ) {
     let result = async {
-        let mut status = finish_task_transfers(&runtime, &engine, &initial, None).await?;
+        let terminal_status =
+            finalize_terminal_copy_record_transfers(&runtime, &engine, &initial, None).await?;
+        let mut status = finish_task_transfers(&runtime, &engine, &terminal_status, None).await?;
         if status.status == MigrationRunStatus::Completed {
             apply_success_default(&runtime, &engine, &status).await?;
         }
@@ -1178,6 +1181,50 @@ async fn run_terminal_finalizer(
     }
 
     runtime.migration_runners.lock().await.remove(&migration_id);
+}
+
+async fn finalize_terminal_copy_record_transfers(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    initial: &MigrationStatus,
+    existing_output_lease: Option<Arc<StdMutex<crate::downloader::VideoMigrationGuard>>>,
+) -> Result<MigrationStatus> {
+    let worker = engine.clone();
+    let migration_id = initial.id.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        worker.terminal_copy_record_finalization_pending(&migration_id)
+    })
+    .await??;
+    if !pending {
+        return Ok(initial.clone());
+    }
+
+    let output_lease = match existing_output_lease {
+        Some(lease) => lease,
+        None => acquire_task_cleanup_lease(runtime, initial).await?,
+    };
+    let mut status = initial.clone();
+    loop {
+        if runtime.epoch_fatal.is_signaled() {
+            bail!("database epoch changed before terminal migration identity recovery");
+        }
+        let worker = engine.clone();
+        let migration_id = status.id.clone();
+        let output_lease = Arc::clone(&output_lease);
+        let finalized = tokio::task::spawn_blocking(move || {
+            let lease = output_lease
+                .lock()
+                .map_err(|_| anyhow::anyhow!("terminal migration output lease is poisoned"))?;
+            worker
+                .finalize_one_terminal_copy_record_transfer_with_output_lease(&migration_id, &lease)
+        })
+        .await??;
+        status = finalized.status;
+        if !finalized.copy_record_pending {
+            break;
+        }
+    }
+    Ok(status)
 }
 
 async fn ensure_message_context(
@@ -1252,7 +1299,15 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
         };
         #[cfg(test)]
         runtime.test_migration_runner_gate_acquired.notify_one();
-        if let Err(error) = run(&runtime, status, Arc::clone(&io_lease)).await {
+        let history_metadata_reconciliation_requested = Arc::new(AtomicBool::new(false));
+        if let Err(error) = run(
+            &runtime,
+            status,
+            Arc::clone(&io_lease),
+            Arc::clone(&history_metadata_reconciliation_requested),
+        )
+        .await
+        {
             warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"media-library migration paused for recovery");
             if let Some(kind) =
                 crate::library_migration::migration_record_warning_kind(&format!("{error:#}"))
@@ -1296,8 +1351,14 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
             }
             runtime.state_notify.notify_one();
         }
-        runtime.migration_runners.lock().await.remove(&id);
         drop(io_lease);
+        if history_metadata_reconciliation_requested.load(Ordering::Acquire) {
+            // A delayed target snapshot can complete legacy receipt proof after startup refresh.
+            // Request the shared background reconciler only after this runner releases its IO lease.
+            crate::media_library_bot::request_migration_history_metadata_reconciliation(&runtime)
+                .await;
+        }
+        runtime.migration_runners.lock().await.remove(&id);
     });
 }
 
@@ -1384,10 +1445,44 @@ async fn discover(runtime: &CloudBotRuntime) -> Result<()> {
     };
     *runtime.migration_discovery_warnings.lock().await = discovered.1;
     for status in discovered.0 {
+        let receipt_changed = {
+            let migrations = runtime.migrations.lock().await;
+            migration_history_receipt_changed(migrations.get(&status.id), &status)
+        };
         publish_status(runtime, status.clone()).await;
+        if receipt_changed {
+            // Discovery runs without migration output or library IO leases. This catches
+            // complete receipts that were already on disk before their snapshots arrived.
+            crate::media_library_bot::request_migration_history_metadata_reconciliation(runtime)
+                .await;
+        }
         start(runtime.clone(), status).await;
     }
     Ok(())
+}
+
+fn migration_history_receipt_changed(
+    previous: Option<&MigrationStatus>,
+    current: &MigrationStatus,
+) -> bool {
+    let has_completed_targets = !matches!(
+        current.status,
+        MigrationRunStatus::Queued | MigrationRunStatus::Running
+    ) && current.items.iter().any(|item| {
+        item.status == MigrationItemPhase::Complete
+            && item
+                .target_item_id
+                .as_deref()
+                .is_some_and(|target_item_id| !target_item_id.is_empty())
+    });
+    has_completed_targets
+        && previous.is_none_or(|previous| {
+            previous.status != current.status
+                || previous.created_at != current.created_at
+                || previous.source_library_id != current.source_library_id
+                || previous.target_library_id != current.target_library_id
+                || previous.items != current.items
+        })
 }
 
 async fn edit_status(
@@ -1404,6 +1499,41 @@ async fn edit_status(
     Ok(())
 }
 
+fn migration_status_message_text(status: &MigrationStatus) -> String {
+    let mut text = format!(
+        "Library migration {}: {:?}\n{} completed, {} skipped, {} failed; {} / {} copied.\nSee /file for actual locations and recovery controls.",
+        status.id,
+        status.status,
+        status.success_count,
+        status.skipped_count,
+        status.failed_count,
+        human_bytes(status.copied_bytes),
+        human_bytes(status.total_bytes)
+    );
+    if let Some(warning) = status
+        .warnings
+        .iter()
+        .rev()
+        .find(|warning| warning.starts_with("Migration needs attention:"))
+    {
+        text.push_str(&format!("\n{}", truncate(warning)));
+    }
+    truncate(&text)
+}
+
+async fn edit_status_if_message_changed(
+    runtime: &CloudBotRuntime,
+    context: Option<&MigrationRuntimeContext>,
+    previous: &MigrationStatus,
+    current: &MigrationStatus,
+) {
+    if migration_status_message_text(previous) != migration_status_message_text(current)
+        && let Some(context) = context
+    {
+        edit_status_with_context(runtime, context, current).await;
+    }
+}
+
 async fn edit_status_with_context(
     runtime: &CloudBotRuntime,
     context: &MigrationRuntimeContext,
@@ -1413,28 +1543,11 @@ async fn edit_status_with_context(
         && context.chat_id == configured_cloud_management_chat_id(&runtime.bot.config)
         && let (Some(chat), Some(message)) = (context.chat_id, context.message_id)
     {
-        let mut text = format!(
-            "Library migration {}: {:?}\n{} completed, {} skipped, {} failed; {} / {} copied.\nSee /file for actual locations and recovery controls.",
-            status.id,
-            status.status,
-            status.success_count,
-            status.skipped_count,
-            status.failed_count,
-            human_bytes(status.copied_bytes),
-            human_bytes(status.total_bytes)
-        );
-        if let Some(warning) = status
-            .warnings
-            .iter()
-            .rev()
-            .find(|warning| warning.starts_with("Migration needs attention:"))
-        {
-            text.push_str(&format!("\n{}", truncate(warning)));
-        }
+        let text = migration_status_message_text(status);
         if let Err(error) = runtime
             .bot
             .telegram
-            .edit_message_text(chat, message, truncate(&text))
+            .edit_message_text(chat, message, text)
             .await
         {
             warn!(error=%error,"could not update library migration Telegram status");
@@ -1446,6 +1559,7 @@ async fn run(
     runtime: &CloudBotRuntime,
     initial: MigrationStatus,
     io_lease: LibraryIoLease,
+    history_metadata_reconciliation_requested: Arc<AtomicBool>,
 ) -> Result<()> {
     let worker = runtime.clone();
     let source_id = initial.source_library_id.clone();
@@ -1469,21 +1583,33 @@ async fn run(
         return Ok(());
     }
     if initial.status == MigrationRunStatus::Stopped {
-        let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
-        let status =
+        let terminal_status =
+            finalize_terminal_copy_record_transfers(runtime, &engine, &initial, None).await?;
+        let status = finish_task_transfers(runtime, &engine, &terminal_status, None).await?;
+        let (status, reconcile_history_metadata) =
             upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                 .await;
+        if reconcile_history_metadata {
+            history_metadata_reconciliation_requested.store(true, Ordering::Release);
+        }
+        edit_status_if_message_changed(runtime, context.as_ref(), &initial, &status).await;
         publish_status(runtime, status).await;
         return Ok(());
     }
     if initial.status == MigrationRunStatus::Completed {
-        let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
-        let status =
+        let terminal_status =
+            finalize_terminal_copy_record_transfers(runtime, &engine, &initial, None).await?;
+        let status = finish_task_transfers(runtime, &engine, &terminal_status, None).await?;
+        let (status, reconcile_history_metadata) =
             upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                 .await;
+        if reconcile_history_metadata {
+            history_metadata_reconciliation_requested.store(true, Ordering::Release);
+        }
         if status.status == MigrationRunStatus::Completed {
             apply_success_default(runtime, &engine, &status).await?;
         }
+        edit_status_if_message_changed(runtime, context.as_ref(), &initial, &status).await;
         publish_status(runtime, status).await;
         return Ok(());
     }
@@ -1546,11 +1672,13 @@ async fn run(
             status.status,
             MigrationRunStatus::Queued | MigrationRunStatus::Running
         );
-        runtime
-            .migrations
-            .lock()
-            .await
-            .insert(status.id.clone(), status.clone());
+        {
+            let mut migrations = runtime.migrations.lock().await;
+            if terminal && migration_history_receipt_changed(migrations.get(&status.id), &status) {
+                history_metadata_reconciliation_requested.store(true, Ordering::Release);
+            }
+            migrations.insert(status.id.clone(), status.clone());
+        }
         // Copy checkpoints may complete faster than a cloud round trip. Keep local progress
         // current, but coalesce snapshot uploads and Telegram edits to a bounded cadence.
         if terminal || last_edit.elapsed() >= Duration::from_secs(5) {
@@ -1559,14 +1687,32 @@ async fn run(
             last_edit = Instant::now();
         }
         if terminal {
+            let message_status_before_finalization = status.clone();
+            let status = finalize_terminal_copy_record_transfers(
+                runtime,
+                &engine,
+                &status,
+                Some(Arc::clone(&guards)),
+            )
+            .await?;
             let status =
                 finish_task_transfers(runtime, &engine, &status, Some(Arc::clone(&guards))).await?;
-            let status =
+            let (status, reconcile_history_metadata) =
                 upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                     .await;
+            if reconcile_history_metadata {
+                history_metadata_reconciliation_requested.store(true, Ordering::Release);
+            }
             if status.status == MigrationRunStatus::Completed {
                 apply_success_default(runtime, &engine, &status).await?;
             }
+            edit_status_if_message_changed(
+                runtime,
+                context.as_ref(),
+                &message_status_before_finalization,
+                &status,
+            )
+            .await;
             publish_status(runtime, status).await;
             drop(guards);
             runtime.bot.queue.publication_notify().notify_one();
@@ -1581,16 +1727,16 @@ async fn upgrade_legacy_target_birth_once(
     engine: &MigrationEngine,
     status: &MigrationStatus,
     io_lease: LibraryIoLease,
-) -> MigrationStatus {
+) -> (MigrationStatus, bool) {
     if !matches!(
         status.status,
         MigrationRunStatus::Completed | MigrationRunStatus::Stopped
     ) {
-        return status.clone();
+        return (status.clone(), false);
     }
     let unavailable = runtime.library_unavailable.lock().await;
     if unavailable.contains_key(&status.target_library_id) {
-        return status.clone();
+        return (status.clone(), false);
     }
     drop(unavailable);
     let target_snapshot = runtime
@@ -1600,7 +1746,7 @@ async fn upgrade_legacy_target_birth_once(
         .get(&status.target_library_id)
         .cloned();
     let Some(target_snapshot) = target_snapshot else {
-        return status.clone();
+        return (status.clone(), false);
     };
 
     let worker = engine.clone();
@@ -1630,18 +1776,19 @@ async fn upgrade_legacy_target_birth_once(
             if upgrade.attempted {
                 runtime.state_notify.notify_one();
             }
-            upgrade.status
+            let reconcile_history_metadata = upgrade.attempted && !upgrade.remaining;
+            (upgrade.status, reconcile_history_metadata)
         }
-        Ok(Ok(None)) => status.clone(),
+        Ok(Ok(None)) => (status.clone(), false),
         Ok(Err(error)) => {
             // A failed read, unavailable provider, or CAS race leaves the job status intact.
             // Another discovery pass can retry once the target scan is usable.
             warn!(migration_id=%status.id,error=%redact_sensitive_text(&format!("{error:#}")),"legacy migration target proof upgrade did not complete");
-            status.clone()
+            (status.clone(), false)
         }
         Err(error) => {
             warn!(migration_id=%status.id,error=%error,"legacy migration target proof worker failed");
-            status.clone()
+            (status.clone(), false)
         }
     }
 }

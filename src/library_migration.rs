@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -431,6 +431,12 @@ pub(crate) struct MigrationStatus {
     pub(crate) warnings: Vec<String>,
     pub(crate) items: Vec<MigrationStatusItem>,
     pub(crate) task_transfers: Vec<MigrationTaskTransferStatus>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalCopyRecordFinalization {
+    pub(crate) status: MigrationStatus,
+    pub(crate) copy_record_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1559,6 +1565,7 @@ impl MigrationEngine {
             let result = self.step_group(
                 &mut job.groups[index],
                 !job.request.include_incomplete_tasks,
+                output_lease,
             );
             if let Err(error) = result {
                 let group = &mut job.groups[index];
@@ -1680,7 +1687,7 @@ impl MigrationEngine {
                 .groups
                 .iter()
                 .position(|group| group.status == MigrationItemPhase::CleaningSource)
-            && let Err(error) = self.step_group(&mut job.groups[index], true)
+            && let Err(error) = self.step_group(&mut job.groups[index], true, output_lease)
         {
             let group = &mut job.groups[index];
             group.status = MigrationItemPhase::Failed;
@@ -1701,7 +1708,9 @@ impl MigrationEngine {
                     MigrationItemPhase::Complete | MigrationItemPhase::Skipped
                 )
             });
-            job.status = if failed && any_complete {
+            job.status = if job.stop_remaining_latched {
+                MigrationRunStatus::Stopped
+            } else if failed && any_complete {
                 MigrationRunStatus::Partial
             } else if failed {
                 MigrationRunStatus::Failed
@@ -2840,6 +2849,109 @@ impl MigrationEngine {
         Ok(Some(status_from_job(&job)))
     }
 
+    /// Reconciles one pending copy-record transfer for a stopped or completed job. A saved
+    /// primary cleanup intent is not sufficient to remove media here: if the exact source
+    /// object is still present, the intent is cleared and both independently identified copies
+    /// are retained. If the source is absent, a complete scan must prove its physical identity
+    /// is gone before the verified target adopts the stable source ID.
+    pub(crate) fn finalize_one_terminal_copy_record_transfer_with_output_lease(
+        &self,
+        migration_id: &str,
+        lease: &crate::downloader::VideoMigrationGuard,
+    ) -> Result<TerminalCopyRecordFinalization> {
+        self.source.migration_validate_output_lease(lease)?;
+        self.target.migration_validate_output_lease(lease)?;
+
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            bail!("copy-record terminal recovery requires a completed or stopped migration");
+        }
+
+        let Some(group_index) = job.groups.iter().position(terminal_copy_record_pending) else {
+            return Ok(TerminalCopyRecordFinalization {
+                status: status_from_job(&job),
+                copy_record_pending: false,
+            });
+        };
+        let group = job
+            .groups
+            .get_mut(group_index)
+            .ok_or_else(|| anyhow!("pending terminal migration group disappeared"))?;
+        let primary_index = group
+            .files
+            .iter()
+            .position(|file| {
+                file.plan.source_path == group.plan.source_path
+                    && file.plan.target_path == group.plan.target_path
+            })
+            .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
+        let primary = group.files[primary_index].clone();
+        let expected_source_identity = primary.plan.proof.entry_identity();
+        match self
+            .source
+            .migration_path_identity(&primary.plan.source_path)?
+        {
+            Some(identity) if identity == expected_source_identity => {
+                ensure!(
+                    !primary.source_removed,
+                    "migration primary is present despite its durable source_removed checkpoint"
+                );
+                ensure!(
+                    self.source.migration_file_identity_matches(
+                        &primary.plan.source_path,
+                        &primary.plan.proof,
+                    )?,
+                    "migration primary no longer matches its durable cleanup proof"
+                );
+                if primary.source_cleanup_intent {
+                    group.files[primary_index].source_cleanup_intent = false;
+                    self.save_job(&job)?;
+                }
+            }
+            Some(_) => {
+                bail!("migration primary source path was replaced during terminal recovery")
+            }
+            None => {
+                ensure!(
+                    primary.source_cleanup_intent || primary.source_removed,
+                    "missing migration primary has no durable cleanup proof"
+                );
+                self.verify_primary_source_absent_after_cleanup_intent(&primary, Some(lease))?;
+                group.files[primary_index].source_removed = true;
+                group.files[primary_index].source_cleanup_intent = false;
+                self.commit_copy_record_transfer_after_primary_unlink(group)?;
+                if group.files.iter().all(|file| file.source_removed) {
+                    group.status = MigrationItemPhase::Complete;
+                    group.error = None;
+                    group.failure_kind = None;
+                }
+                self.save_job(&job)?;
+            }
+        }
+        Ok(TerminalCopyRecordFinalization {
+            status: status_from_job(&job),
+            copy_record_pending: job.groups.iter().any(terminal_copy_record_pending),
+        })
+    }
+
+    pub(crate) fn terminal_copy_record_finalization_pending(
+        &self,
+        migration_id: &str,
+    ) -> Result<bool> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        Ok(matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) && job.groups.iter().any(terminal_copy_record_pending))
+    }
+
     pub(crate) fn record_finalization_warning(
         &self,
         migration_id: &str,
@@ -2978,7 +3090,12 @@ impl MigrationEngine {
         )))
     }
 
-    fn step_group(&self, group: &mut GroupCheckpoint, allow_cleanup: bool) -> Result<()> {
+    fn step_group(
+        &self,
+        group: &mut GroupCheckpoint,
+        allow_cleanup: bool,
+        output_lease: Option<&crate::downloader::VideoMigrationGuard>,
+    ) -> Result<()> {
         if group.status == MigrationItemPhase::Copying
             || group.status == MigrationItemPhase::Verifying
             || group.status == MigrationItemPhase::Publishing
@@ -3159,57 +3276,280 @@ impl MigrationEngine {
             if !allow_cleanup {
                 return Ok(());
             }
+            if let Some(mut transfer) = group.plan.record_transfer.clone() {
+                let primary = group
+                    .files
+                    .iter()
+                    .find(|file| {
+                        file.plan.source_path == group.plan.source_path
+                            && file.plan.target_path == group.plan.target_path
+                    })
+                    .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
+                if !primary.published {
+                    bail!("migration primary target is not published before identity preflight");
+                }
+
+                if !group.plan.record_transfer_prepared {
+                    if primary.source_removed {
+                        bail!("migration primary was removed before its identity preflight");
+                    }
+                    let target_identity = primary
+                        .target_identity
+                        .ok_or_else(|| anyhow!("migration primary target identity is missing"))?
+                        .to_entry_identity();
+                    let target_access = primary
+                        .target_access_policy
+                        .ok_or_else(|| anyhow!("migration primary access-policy proof is missing"))?
+                        .to_bound_file_access_policy();
+                    if !self.target.migration_target_matches_exact(
+                        &primary.plan.target_path,
+                        target_identity,
+                        primary.plan.proof.size,
+                        target_access,
+                        &primary.plan.proof.sha256,
+                    )? {
+                        bail!("verified primary target changed before identity preflight");
+                    }
+                    if !self.source.migration_file_identity_matches(
+                        &primary.plan.source_path,
+                        &primary.plan.proof,
+                    )? {
+                        bail!("migration primary source changed before identity preflight");
+                    }
+                    let target_physical_identity = self
+                        .target
+                        .migration_physical_identity(
+                            &primary.plan.target_path,
+                            target_identity.device(),
+                            target_identity.inode(),
+                        )?
+                        .ok_or_else(|| anyhow!("verified migration target disappeared"))?;
+                    anyhow::ensure!(
+                        target_physical_identity.birth_seconds == primary.target_birth_seconds
+                            && target_physical_identity.birth_nanoseconds
+                                == primary.target_birth_nanoseconds,
+                        "migration target creation identity changed before identity preflight"
+                    );
+                    let file_moves = group
+                        .files
+                        .iter()
+                        .map(|file| (file.plan.source_path.clone(), file.plan.target_path.clone()))
+                        .collect::<Vec<_>>();
+                    let current_queue_metadata = self.source.migration_bind_copy_lineage(
+                        &group.plan.item_id,
+                        &group.plan.source_path,
+                        &primary.plan.proof,
+                        &transfer.copy_lineage,
+                    )?;
+                    transfer.replace_queue_metadata(current_queue_metadata);
+                    group.plan.record_transfer = Some(transfer.clone());
+                    let reserved_target_item_id =
+                        self.target.migration_preflight_copy_record_transfer(
+                            &transfer,
+                            &primary.plan.target_path,
+                            target_physical_identity,
+                            target_access,
+                            primary.plan.proof.size,
+                            &file_moves,
+                        )?;
+                    transfer.reserved_target_item_id = Some(reserved_target_item_id);
+                    group.plan.record_transfer = Some(transfer);
+                    group.plan.record_transfer_prepared = true;
+                    group.plan.record_transfer_committed = false;
+                    return Ok(());
+                }
+
+                if primary.source_removed && !group.plan.record_transfer_committed {
+                    self.commit_copy_record_transfer_after_primary_unlink(group)?;
+                    return Ok(());
+                }
+            }
             // The primary file is the first member in a plan and is deliberately cleaned last.
-            for file in group.files.iter_mut().rev() {
-                if file.source_removed {
+            for file_index in (0..group.files.len()).rev() {
+                if group.files[file_index].source_removed {
                     continue;
                 }
-                let target_identity = file
+                let file_plan = group.files[file_index].plan.clone();
+                let target_identity = group.files[file_index]
                     .target_identity
                     .ok_or_else(|| {
                         anyhow!("published migration file is missing its target identity")
                     })?
                     .to_entry_identity();
-                let target_access = file
+                let target_access = group.files[file_index]
                     .target_access_policy
                     .ok_or_else(|| {
                         anyhow!("published migration file is missing its access-policy proof")
                     })?
                     .to_bound_file_access_policy();
                 if !self.target.migration_target_matches_exact(
-                    &file.plan.target_path,
+                    &file_plan.target_path,
                     target_identity,
-                    file.plan.proof.size,
+                    file_plan.proof.size,
                     target_access,
-                    &file.plan.proof.sha256,
+                    &file_plan.proof.sha256,
                 )? {
                     bail!("verified target changed before source cleanup");
                 }
                 let source_identity = self
                     .source
-                    .migration_path_identity(&file.plan.source_path)?;
+                    .migration_path_identity(&file_plan.source_path)?;
+                let primary_removed = file_plan.source_path == group.plan.source_path
+                    && file_plan.target_path == group.plan.target_path;
                 if source_identity.is_none() {
-                    if file.source_cleanup_intent {
-                        // Reconcile a crash after exact-source removal but before its journal save.
-                        file.source_removed = true;
+                    if group.files[file_index].source_cleanup_intent {
+                        if primary_removed {
+                            self.verify_primary_source_absent_after_cleanup_intent(
+                                &group.files[file_index],
+                                output_lease,
+                            )?;
+                        }
+                        group.files[file_index].source_removed = true;
+                        if primary_removed && group.plan.record_transfer.is_some() {
+                            self.commit_copy_record_transfer_after_primary_unlink(group)?;
+                        }
                         return Ok(());
                     }
                     bail!("migration source disappeared before its cleanup checkpoint");
                 }
-                if source_identity != Some(file.plan.proof.entry_identity()) {
+                if source_identity != Some(file_plan.proof.entry_identity()) {
                     bail!("migration source was replaced before cleanup");
                 }
-                if !file.source_cleanup_intent {
-                    file.source_cleanup_intent = true;
+                if !group.files[file_index].source_cleanup_intent {
+                    group.files[file_index].source_cleanup_intent = true;
                     return Ok(());
                 }
                 self.source
-                    .migration_remove_source(&file.plan.source_path, &file.plan.proof)?;
-                file.source_removed = true;
+                    .migration_remove_source(&file_plan.source_path, &file_plan.proof)?;
+                group.files[file_index].source_removed = true;
+                if primary_removed && group.plan.record_transfer.is_some() {
+                    self.commit_copy_record_transfer_after_primary_unlink(group)?;
+                }
                 return Ok(());
             }
             group.status = MigrationItemPhase::Complete;
         }
+        Ok(())
+    }
+
+    fn verify_primary_source_absent_after_cleanup_intent(
+        &self,
+        primary: &FileCheckpoint,
+        output_lease: Option<&crate::downloader::VideoMigrationGuard>,
+    ) -> Result<()> {
+        let scan = if let Some(lease) = output_lease {
+            self.source
+                .migration_scan_with_output_lease_and_completeness(lease)?
+        } else {
+            self.source.migration_scan_with_completeness()?
+        };
+        ensure!(
+            scan.complete,
+            "source library scan was incomplete while reconciling a missing primary after cleanup intent"
+        );
+        let expected_identity = crate::library::PhysicalItemIdentity::from_parts(
+            primary.plan.proof.device,
+            primary.plan.proof.inode,
+            primary.plan.proof.birth_seconds,
+            primary.plan.proof.birth_nanoseconds,
+        );
+        ensure!(
+            !scan.snapshot.items.iter().any(|item| {
+                item.presence != crate::library::Presence::Missing
+                    && item.physical_identity == Some(expected_identity)
+            }),
+            "migration primary remains present in the source library after its cleanup intent"
+        );
+        let physical_identity_present = if let Some(lease) = output_lease {
+            self.source
+                .migration_physical_identity_present_with_output_lease(lease, expected_identity)?
+        } else {
+            self.source
+                .migration_physical_identity_present(expected_identity)?
+        };
+        ensure!(
+            !physical_identity_present,
+            "migration primary remains present under another filename in the source library"
+        );
+        Ok(())
+    }
+
+    fn commit_copy_record_transfer_after_primary_unlink(
+        &self,
+        group: &mut GroupCheckpoint,
+    ) -> Result<()> {
+        if group.plan.record_transfer_committed {
+            return Ok(());
+        }
+        let Some(transfer) = group.plan.record_transfer.clone() else {
+            return Ok(());
+        };
+        ensure!(
+            group.plan.record_transfer_prepared,
+            "copy-record transfer was not preflighted before source cleanup"
+        );
+        let primary = group
+            .files
+            .iter()
+            .find(|file| {
+                file.plan.source_path == group.plan.source_path
+                    && file.plan.target_path == group.plan.target_path
+            })
+            .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
+        ensure!(
+            primary.source_removed,
+            "stable copy ID cannot be adopted before durable primary source removal"
+        );
+        ensure!(
+            self.source
+                .migration_path_identity(&primary.plan.source_path)?
+                .is_none(),
+            "migration primary source path is occupied after source cleanup"
+        );
+        let target_identity = primary
+            .target_identity
+            .ok_or_else(|| anyhow!("migration primary target identity is missing"))?
+            .to_entry_identity();
+        let target_access = primary
+            .target_access_policy
+            .ok_or_else(|| anyhow!("migration primary access-policy proof is missing"))?
+            .to_bound_file_access_policy();
+        if !self.target.migration_target_matches_exact(
+            &primary.plan.target_path,
+            target_identity,
+            primary.plan.proof.size,
+            target_access,
+            &primary.plan.proof.sha256,
+        )? {
+            bail!("verified primary target changed before final copy-ID adoption");
+        }
+        let target_physical_identity = self
+            .target
+            .migration_physical_identity(
+                &primary.plan.target_path,
+                target_identity.device(),
+                target_identity.inode(),
+            )?
+            .ok_or_else(|| anyhow!("verified migration target disappeared"))?;
+        ensure!(
+            target_physical_identity.birth_seconds == primary.target_birth_seconds
+                && target_physical_identity.birth_nanoseconds == primary.target_birth_nanoseconds,
+            "migration target creation identity changed before final copy-ID adoption"
+        );
+        let file_moves = group
+            .files
+            .iter()
+            .map(|file| (file.plan.source_path.clone(), file.plan.target_path.clone()))
+            .collect::<Vec<_>>();
+        self.target.migration_adopt_verified_copy_record(
+            &transfer,
+            &primary.plan.target_path,
+            target_physical_identity,
+            target_access,
+            primary.plan.proof.size,
+            &file_moves,
+        )?;
+        group.plan.record_transfer_committed = true;
         Ok(())
     }
 
@@ -4291,9 +4631,17 @@ fn apply_control_to_job(job: &mut JobDocument, control: MigrationControl) -> Res
                 for group in &mut job.groups {
                     if !is_group_terminal(group) {
                         if group.files.iter().all(|file| file.source_removed) {
-                            group.status = MigrationItemPhase::Complete;
-                            group.error = None;
-                            group.failure_kind = None;
+                            if group.plan.record_transfer.is_some()
+                                && !group.plan.record_transfer_committed
+                            {
+                                group.status = MigrationItemPhase::Failed;
+                                group.failure_kind = Some(MigrationFailureKind::CleanupFailed);
+                                group.error = Some("source media was removed but destination identity finalization remains pending".to_string());
+                            } else {
+                                group.status = MigrationItemPhase::Complete;
+                                group.error = None;
+                                group.failure_kind = None;
+                            }
                         } else if group.files.iter().any(|file| file.source_removed) {
                             group.status = MigrationItemPhase::Failed;
                             group.failure_kind = Some(MigrationFailureKind::CleanupFailed);
@@ -4313,10 +4661,25 @@ fn apply_control_to_job(job: &mut JobDocument, control: MigrationControl) -> Res
                 MigrationRunStatus::Partial | MigrationRunStatus::Failed
             ) {
                 if job.stop_remaining_latched {
-                    // A retry after StopRemaining may reconcile only durable task handoffs.
-                    // Keep every media checkpoint in its stopped state so retry cannot copy
-                    // or remove files the user chose to leave at the source.
-                    if job.groups.iter().all(is_group_terminal) {
+                    // A stopped retry may only finish identity bookkeeping for media whose
+                    // source files were already durably removed. It never resumes source cleanup.
+                    let mut identity_finalization_pending = false;
+                    for group in &mut job.groups {
+                        if group.status == MigrationItemPhase::Failed
+                            && group.plan.record_transfer.is_some()
+                            && group.plan.record_transfer_prepared
+                            && !group.plan.record_transfer_committed
+                            && group.files.iter().all(|file| file.source_removed)
+                        {
+                            group.status = MigrationItemPhase::CleaningSource;
+                            group.error = None;
+                            group.failure_kind = None;
+                            identity_finalization_pending = true;
+                        }
+                    }
+                    if identity_finalization_pending {
+                        job.status = MigrationRunStatus::Queued;
+                    } else if job.groups.iter().all(is_group_terminal) {
                         job.status = MigrationRunStatus::Stopped;
                     }
                 } else {
@@ -4372,11 +4735,29 @@ fn terminal_finalization_pending(job: &JobDocument) -> bool {
         && job.preview.set_target_default_on_success
         && !job.default_update_resolved
         && !job.default_update_applied;
-    handoff_cleanup_pending || default_update_pending
+    let copy_record_pending = job.groups.iter().any(terminal_copy_record_pending);
+    handoff_cleanup_pending || default_update_pending || copy_record_pending
+}
+
+fn terminal_copy_record_pending(group: &GroupCheckpoint) -> bool {
+    if group.plan.record_transfer.is_none()
+        || !group.plan.record_transfer_prepared
+        || group.plan.record_transfer_committed
+    {
+        return false;
+    }
+    group.files.iter().any(|file| {
+        file.plan.source_path == group.plan.source_path
+            && file.plan.target_path == group.plan.target_path
+            && (file.source_cleanup_intent || file.source_removed)
+    })
 }
 
 fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {
     let primary = completed_primary_file(group)?;
+    if group.plan.record_transfer_committed {
+        return Some(group.plan.item_id.clone());
+    }
     let identity = primary.target_identity?;
     Some(
         crate::file_manager::physical_item_id_from_migration_checkpoint(

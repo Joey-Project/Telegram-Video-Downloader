@@ -9,6 +9,13 @@ use super::*;
 
 const CLOUD_MIGRATION_HISTORY_LIMIT: usize = 32;
 const MAX_MIGRATION_PROVENANCE_CHAIN_HOPS: usize = 64;
+const MAX_MIGRATION_HISTORY_METADATA_CANDIDATES: usize = 5_000;
+
+#[derive(Default)]
+pub(super) struct MigrationHistoryReconciliationState {
+    running: bool,
+    pending: bool,
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LibraryItemLocation {
@@ -30,6 +37,19 @@ struct MovedToProjection {
     library_name: String,
     item_id: String,
     relative_path: String,
+    physical_identity: crate::library::PhysicalItemIdentity,
+}
+
+#[derive(Clone)]
+struct MigrationHistoryMetadataCandidate {
+    source_library_id: String,
+    source_item_id: String,
+    source_relative_path: String,
+    source_physical_identity: crate::library::PhysicalItemIdentity,
+    target_library_id: String,
+    target_item_id: String,
+    target_relative_path: String,
+    target_physical_identity: crate::library::PhysicalItemIdentity,
 }
 
 fn migration_moved_to_projections(
@@ -166,6 +186,7 @@ fn migration_moved_to_projections(
                 library_name: library_name.clone(),
                 item_id: destination.item_id,
                 relative_path: relative_path.clone(),
+                physical_identity: destination.physical_identity,
             },
         );
     }
@@ -434,6 +455,78 @@ pub(super) async fn refresh_library(
     refresh_libraries_selected(runtime, Some(vec![selected_id])).await
 }
 
+fn has_reconcilable_migration_history(
+    migrations: &BTreeMap<String, crate::library_migration::MigrationStatus>,
+) -> bool {
+    migrations.values().any(|status| {
+        status.items.iter().any(|item| {
+            item.status == crate::library_migration::MigrationItemPhase::Complete
+                && item
+                    .target_item_id
+                    .as_deref()
+                    .is_some_and(|target_item_id| !target_item_id.is_empty())
+        })
+    })
+}
+
+/// Schedule bounded history cleanup after a receipt or a scanned snapshot changes.
+/// Requests arriving during a run collapse into one follow-up pass, while the actual
+/// reconciler retains its exact identity, generation, and publication-gate checks.
+pub(super) async fn request_migration_history_metadata_reconciliation(runtime: &CloudBotRuntime) {
+    if runtime.epoch_fatal.is_signaled() {
+        return;
+    }
+    let migrations = runtime.migrations.lock().await;
+    let has_receipts = has_reconcilable_migration_history(&migrations);
+    drop(migrations);
+    if !has_receipts {
+        return;
+    }
+
+    {
+        let mut state = runtime.migration_history_reconciliation.lock().await;
+        if state.running {
+            state.pending = true;
+            return;
+        }
+        state.running = true;
+    }
+
+    let worker = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            if !worker.epoch_fatal.is_signaled() {
+                match reconcile_migration_history_metadata(&worker).await {
+                    Ok(()) => worker.state_notify.notify_one(),
+                    Err(error) => warn!(
+                        error = %redact_sensitive_text(&format!("{error:#}")),
+                        "verified migration history metadata reconciliation failed"
+                    ),
+                }
+            }
+
+            let mut state = worker.migration_history_reconciliation.lock().await;
+            if state.pending && !worker.epoch_fatal.is_signaled() {
+                state.pending = false;
+                drop(state);
+                continue;
+            }
+            state.pending = false;
+            state.running = false;
+            break;
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) async fn migration_history_reconciliation_running(runtime: &CloudBotRuntime) -> bool {
+    runtime
+        .migration_history_reconciliation
+        .lock()
+        .await
+        .running
+}
+
 async fn refresh_libraries_selected(
     runtime: &CloudBotRuntime,
     selected_library_ids: Option<Vec<String>>,
@@ -526,6 +619,281 @@ async fn refresh_libraries_selected(
         .get(&default_id)
         .cloned();
     runtime.state_notify.notify_one();
+    Ok(())
+}
+
+pub(super) async fn reconcile_migration_history_metadata(runtime: &CloudBotRuntime) -> Result<()> {
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let default_library_id = settings.default_library_id.clone();
+    let unavailable = runtime.library_unavailable.lock().await.clone();
+    let availability = runtime.bot.queue.video_library_statuses()?;
+    let snapshots = runtime.library_snapshots.lock().await.clone();
+    let snapshot_generations = snapshots
+        .iter()
+        .map(|(library_id, snapshot)| {
+            (
+                library_id.clone(),
+                (snapshot.revision.clone(), snapshot.scanned_at),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let migrations = runtime.migrations.lock().await.clone();
+    let descriptors = settings
+        .libraries
+        .iter()
+        .map(|library| json!({"id": library.id, "name": library.name}))
+        .collect::<Vec<_>>();
+    let projections = migration_moved_to_projections(
+        &migrations,
+        &descriptors,
+        &snapshots,
+        &unavailable,
+        &availability,
+    );
+    if projections.len() > MAX_MIGRATION_HISTORY_METADATA_CANDIDATES {
+        warn!(
+            candidate_count = projections.len(),
+            candidate_limit = MAX_MIGRATION_HISTORY_METADATA_CANDIDATES,
+            "migration history metadata reconciliation exceeded its bounded candidate limit"
+        );
+        return Ok(());
+    }
+
+    let mut missing_source_rows = HashMap::<LibraryItemLocation, Option<String>>::new();
+    let mut present_target_rows = HashMap::<LibraryItemLocation, Option<String>>::new();
+    for (library_id, snapshot) in &snapshots {
+        for item in &snapshot.items {
+            let Some(physical_identity) = item
+                .physical_identity
+                .filter(crate::library::PhysicalItemIdentity::has_complete_birth)
+            else {
+                continue;
+            };
+            let key = LibraryItemLocation {
+                library_id: library_id.clone(),
+                item_id: item.id.clone(),
+                physical_identity,
+            };
+            let rows = match item.presence {
+                crate::library::Presence::Missing => &mut missing_source_rows,
+                crate::library::Presence::Present => &mut present_target_rows,
+                crate::library::Presence::Unavailable => continue,
+            };
+            match rows.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(item.relative_path.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (source, destination) in projections {
+        if unavailable.contains_key(&source.library_id)
+            || unavailable.contains_key(&destination.library_id)
+            || !availability
+                .get(&source.library_id)
+                .is_some_and(|status| status.available)
+            || !availability
+                .get(&destination.library_id)
+                .is_some_and(|status| status.available)
+        {
+            continue;
+        }
+        let Some(Some(source_relative_path)) = missing_source_rows.get(&source) else {
+            continue;
+        };
+        let target = LibraryItemLocation {
+            library_id: destination.library_id.clone(),
+            item_id: destination.item_id.clone(),
+            physical_identity: destination.physical_identity,
+        };
+        if present_target_rows.get(&target).and_then(Option::as_deref)
+            != Some(destination.relative_path.as_str())
+        {
+            continue;
+        }
+        candidates.push(MigrationHistoryMetadataCandidate {
+            source_library_id: source.library_id,
+            source_item_id: source.item_id,
+            source_relative_path: source_relative_path.clone(),
+            source_physical_identity: source.physical_identity,
+            target_library_id: destination.library_id,
+            target_item_id: destination.item_id,
+            target_relative_path: destination.relative_path,
+            target_physical_identity: destination.physical_identity,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let mut target_source_counts = HashMap::new();
+    for candidate in &candidates {
+        *target_source_counts
+            .entry((
+                candidate.target_library_id.clone(),
+                candidate.target_item_id.clone(),
+                candidate.target_physical_identity,
+            ))
+            .or_insert(0_usize) += 1;
+    }
+    candidates.retain(|candidate| {
+        target_source_counts.get(&(
+            candidate.target_library_id.clone(),
+            candidate.target_item_id.clone(),
+            candidate.target_physical_identity,
+        )) == Some(&1)
+    });
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let libraries = settings
+        .libraries
+        .into_iter()
+        .map(|library| (library.id.clone(), library))
+        .collect::<HashMap<_, _>>();
+    let queue = Arc::clone(&runtime.bot.queue);
+    let inbox = Arc::clone(&runtime.inbox);
+    #[cfg(test)]
+    let file_provider = runtime.test_file_provider.clone();
+    #[cfg(not(test))]
+    let file_provider = None;
+    let mut cached_target_snapshots = snapshots;
+    let replacements = tokio::task::spawn_blocking(
+        move || -> Result<Vec<(String, crate::library::LibrarySnapshot)>> {
+            let mut source_groups =
+                HashMap::<String, Vec<MigrationHistoryMetadataCandidate>>::new();
+            for candidate in candidates {
+                source_groups
+                    .entry(candidate.source_library_id.clone())
+                    .or_default()
+                    .push(candidate);
+            }
+            let mut updates_by_target = HashMap::<
+                String,
+                Vec<(
+                    String,
+                    String,
+                    crate::library::PhysicalItemIdentity,
+                    crate::file_manager::MigrationQueueMetadata,
+                )>,
+            >::new();
+            for (source_library_id, source_candidates) in source_groups {
+                let source_library = libraries
+                    .get(&source_library_id)
+                    .context("migration source library is no longer registered")?;
+                let source_binding = source_library
+                    .root_binding_token()
+                    .context("migration source library has no root binding")?;
+                let source_root = queue.verified_video_library_root_with_binding(
+                    &source_library_id,
+                    &source_binding,
+                )?;
+                let source_manager = super::open_cloud_library_manager_with_bound_root(
+                    source_root,
+                    Arc::clone(&inbox),
+                    file_provider.clone(),
+                )?;
+                let source_records = source_candidates
+                    .iter()
+                    .map(|candidate| {
+                        (
+                            candidate.source_item_id.clone(),
+                            candidate.source_relative_path.clone(),
+                            candidate.source_physical_identity,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let source_metadata =
+                    source_manager.migration_historical_queue_metadata(&source_records)?;
+                for (candidate, metadata) in source_candidates.into_iter().zip(source_metadata) {
+                    let Some(metadata) = metadata else {
+                        continue;
+                    };
+                    if metadata.title.as_deref().is_none_or(str::is_empty)
+                        && metadata.source_ids.is_empty()
+                        && metadata.collection.is_none()
+                        && !metadata.requires_confirmation
+                    {
+                        continue;
+                    }
+                    updates_by_target
+                        .entry(candidate.target_library_id)
+                        .or_default()
+                        .push((
+                            candidate.target_item_id,
+                            candidate.target_relative_path,
+                            candidate.target_physical_identity,
+                            metadata,
+                        ));
+                }
+            }
+
+            let mut replaced = Vec::new();
+            for (target_library_id, updates) in updates_by_target {
+                let Some(mut snapshot) = cached_target_snapshots.remove(&target_library_id) else {
+                    continue;
+                };
+                let target_library = libraries
+                    .get(&target_library_id)
+                    .context("migration destination library is no longer registered")?;
+                let target_binding = target_library
+                    .root_binding_token()
+                    .context("migration destination library has no root binding")?;
+                let target_root = queue.verified_video_library_root_with_binding(
+                    &target_library_id,
+                    &target_binding,
+                )?;
+                let target_manager = super::open_cloud_library_manager_with_bound_root(
+                    target_root,
+                    Arc::clone(&inbox),
+                    file_provider.clone(),
+                )?;
+                let matched = target_manager
+                    .migration_merge_verified_history_queue_metadata(&mut snapshot, &updates)?;
+                if matched.iter().any(|matched| *matched) {
+                    replaced.push((target_library_id, snapshot));
+                }
+            }
+            Ok(replaced)
+        },
+    )
+    .await
+    .context("migration history metadata worker failed")??;
+
+    if !replacements.is_empty() {
+        let _publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+            .lock_owned()
+            .await;
+        let mut current = runtime.library_snapshots.lock().await;
+        let mut default_replacement = None;
+        for (library_id, snapshot) in replacements {
+            let Some(expected_generation) = snapshot_generations.get(&library_id) else {
+                continue;
+            };
+            let Some(current_snapshot) = current.get(&library_id) else {
+                continue;
+            };
+            if (&current_snapshot.revision, current_snapshot.scanned_at)
+                != (&expected_generation.0, expected_generation.1)
+            {
+                continue;
+            }
+            current.insert(library_id.clone(), snapshot.clone());
+            if library_id == default_library_id {
+                default_replacement = Some(snapshot);
+            }
+        }
+        drop(current);
+        if let Some(snapshot) = default_replacement {
+            *runtime.library_snapshot.lock().await = Some(snapshot);
+        }
+    }
     Ok(())
 }
 
@@ -984,9 +1352,8 @@ pub(super) async fn dispatch(
     } else {
         None
     };
-    // Serialize removal against every scan from manager open through cache publication. The
-    // per-library admission lease also excludes migration discovery and runners. The
-    // management-dispatch semaphore does not cover startup and publication-watcher scans.
+    // Serialize removal with cache commits. A scan already underway revalidates the
+    // registration before publishing. Per-library admission also excludes migration runners.
     let publication_guard = if kind == "library_remove" {
         Some(
             Arc::clone(&runtime.library_scan_publication_gate)
