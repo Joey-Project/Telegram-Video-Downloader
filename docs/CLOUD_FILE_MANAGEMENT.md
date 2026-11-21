@@ -273,10 +273,11 @@ Task status and progress use a separate local notification. Relevant changes can
 - Bilibili tasks can publish verified episodes before the whole task completes. Their source hints use only each verified entry's own stable ID and durable output paths/hashes, retaining its original episode index. Failed or pending entries are not advertised as published. Legacy completed tasks without per-entry attempt records retain the original whole-task hint path. A receipt is a source hint, not proof that the file's current content is intact.
 - A newly persisted verified episode receipt notifies the debounced library scanner; ordinary progress updates do not. A partial task keeps its existing retry/history semantics, independently of whether its published episodes appear in the library.
 - Queue-derived titles, source IDs, and collection metadata survive identity-preserving moves and index reloads. A different file at the old path does not inherit that identity. YouTube source IDs use `youtube:<video-id>`; NFO collection IDs and kinds survive metadata updates. Fully populated recognized NFO metadata is marked complete.
-- A managed cross-library move binds the verified destination to the original
-  item ID before removing source files. The durable move can resume the index
-  update after interruption. The original library retains a history row whose
-  destination is projected from the verified move receipt.
+- A managed cross-library move verifies the destination and reserves the
+  original item ID before source cleanup. The destination adopts that ID
+  after the primary source file is removed. A stopped move that preserves both
+  physical copies leaves each with its own ID. The original library retains a
+  history row whose destination is projected from the verified move receipt.
 - For older managed moves with an exact receipt, a complete library refresh can
   fill gaps in the destination's queue metadata while retaining its existing
   ID. NFO fields remain authoritative on scan. Source IDs and byte sizes are

@@ -25,8 +25,10 @@ superseded_by: ""
   scan time from publication time.
 - Verified managed moves carry the existing item identity into the destination,
   including metadata provenance. A retained history entry can show the previous
-  library and path. An unattended scan can reconcile a historical row when
-  it proves a unique move. Source IDs and size identify possible matches.
+  library and path. When a move stops with both primary files present, each
+  file has its own identity. Historical reconciliation uses completed move
+  receipts and verified source and destination identities. Source IDs and
+  size identify possible matches.
 - Library and Needs organizing show available media by default. Missing,
   Unavailable and Moved history remain explicit status filters.
 
@@ -43,8 +45,8 @@ superseded_by: ""
 
 - The 24-hour mock transport exercise makes one startup and 24 hourly inbox
   reads, with zero periodic snapshot manifests or chunk uploads.
-- Sixteen focused Rust tests cover scan timing and recovery, explicit refresh,
-  notification delivery, migration replay and round trips, and verified
-  historical metadata repair in temporary libraries.
+- Nineteen focused Rust tests cover scan timing and upload recovery,
+  migration stops, replay and round trips, and verified historical metadata
+  repair in temporary libraries.
 - Worker type checking, 457 Worker integration tests, 128 Mini App UI tests,
   four torrent widget tests, and dry-run packaging pass.

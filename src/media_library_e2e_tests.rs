@@ -2216,6 +2216,18 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         source_after_cleanup.warnings
     );
 
+    let finished_admission = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::library_migration_bot::acquire_library_io(
+            &reopened_runtime,
+            std::slice::from_ref(&fixture.source_library_id),
+        ),
+    )
+    .await
+    .expect("the completed runner should release library admission")
+    .expect("the registered source should remain available");
+    drop(finished_admission);
+
     let recovered_removal = run_library_management_test_request(
         &reopened_runtime,
         2_805,

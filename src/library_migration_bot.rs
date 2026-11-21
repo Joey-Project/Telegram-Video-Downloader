@@ -1,6 +1,7 @@
 //! Cloud commands and background scheduling for durable media-library migrations.
 
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::*;
@@ -1252,7 +1253,15 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
         };
         #[cfg(test)]
         runtime.test_migration_runner_gate_acquired.notify_one();
-        if let Err(error) = run(&runtime, status, Arc::clone(&io_lease)).await {
+        let history_metadata_reconciliation_requested = Arc::new(AtomicBool::new(false));
+        if let Err(error) = run(
+            &runtime,
+            status,
+            Arc::clone(&io_lease),
+            Arc::clone(&history_metadata_reconciliation_requested),
+        )
+        .await
+        {
             warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"media-library migration paused for recovery");
             if let Some(kind) =
                 crate::library_migration::migration_record_warning_kind(&format!("{error:#}"))
@@ -1296,8 +1305,19 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
             }
             runtime.state_notify.notify_one();
         }
-        runtime.migration_runners.lock().await.remove(&id);
         drop(io_lease);
+        if history_metadata_reconciliation_requested.load(Ordering::Acquire) {
+            // A delayed target snapshot can complete legacy receipt proof after startup refresh.
+            // Reconcile only after this runner has released its output and library IO leases.
+            if let Err(error) =
+                crate::media_library_bot::reconcile_migration_history_metadata(&runtime).await
+            {
+                warn!(error=%redact_sensitive_text(&format!("{error:#}")),"verified migration history metadata reconciliation after legacy receipt upgrade failed");
+            } else {
+                runtime.state_notify.notify_one();
+            }
+        }
+        runtime.migration_runners.lock().await.remove(&id);
     });
 }
 
@@ -1446,6 +1466,7 @@ async fn run(
     runtime: &CloudBotRuntime,
     initial: MigrationStatus,
     io_lease: LibraryIoLease,
+    history_metadata_reconciliation_requested: Arc<AtomicBool>,
 ) -> Result<()> {
     let worker = runtime.clone();
     let source_id = initial.source_library_id.clone();
@@ -1470,17 +1491,23 @@ async fn run(
     }
     if initial.status == MigrationRunStatus::Stopped {
         let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
-        let status =
+        let (status, reconcile_history_metadata) =
             upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                 .await;
+        if reconcile_history_metadata {
+            history_metadata_reconciliation_requested.store(true, Ordering::Release);
+        }
         publish_status(runtime, status).await;
         return Ok(());
     }
     if initial.status == MigrationRunStatus::Completed {
         let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
-        let status =
+        let (status, reconcile_history_metadata) =
             upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                 .await;
+        if reconcile_history_metadata {
+            history_metadata_reconciliation_requested.store(true, Ordering::Release);
+        }
         if status.status == MigrationRunStatus::Completed {
             apply_success_default(runtime, &engine, &status).await?;
         }
@@ -1561,9 +1588,12 @@ async fn run(
         if terminal {
             let status =
                 finish_task_transfers(runtime, &engine, &status, Some(Arc::clone(&guards))).await?;
-            let status =
+            let (status, reconcile_history_metadata) =
                 upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
                     .await;
+            if reconcile_history_metadata {
+                history_metadata_reconciliation_requested.store(true, Ordering::Release);
+            }
             if status.status == MigrationRunStatus::Completed {
                 apply_success_default(runtime, &engine, &status).await?;
             }
@@ -1581,16 +1611,16 @@ async fn upgrade_legacy_target_birth_once(
     engine: &MigrationEngine,
     status: &MigrationStatus,
     io_lease: LibraryIoLease,
-) -> MigrationStatus {
+) -> (MigrationStatus, bool) {
     if !matches!(
         status.status,
         MigrationRunStatus::Completed | MigrationRunStatus::Stopped
     ) {
-        return status.clone();
+        return (status.clone(), false);
     }
     let unavailable = runtime.library_unavailable.lock().await;
     if unavailable.contains_key(&status.target_library_id) {
-        return status.clone();
+        return (status.clone(), false);
     }
     drop(unavailable);
     let target_snapshot = runtime
@@ -1600,7 +1630,7 @@ async fn upgrade_legacy_target_birth_once(
         .get(&status.target_library_id)
         .cloned();
     let Some(target_snapshot) = target_snapshot else {
-        return status.clone();
+        return (status.clone(), false);
     };
 
     let worker = engine.clone();
@@ -1630,18 +1660,19 @@ async fn upgrade_legacy_target_birth_once(
             if upgrade.attempted {
                 runtime.state_notify.notify_one();
             }
-            upgrade.status
+            let reconcile_history_metadata = upgrade.attempted && !upgrade.remaining;
+            (upgrade.status, reconcile_history_metadata)
         }
-        Ok(Ok(None)) => status.clone(),
+        Ok(Ok(None)) => (status.clone(), false),
         Ok(Err(error)) => {
             // A failed read, unavailable provider, or CAS race leaves the job status intact.
             // Another discovery pass can retry once the target scan is usable.
             warn!(migration_id=%status.id,error=%redact_sensitive_text(&format!("{error:#}")),"legacy migration target proof upgrade did not complete");
-            status.clone()
+            (status.clone(), false)
         }
         Err(error) => {
             warn!(migration_id=%status.id,error=%error,"legacy migration target proof worker failed");
-            status.clone()
+            (status.clone(), false)
         }
     }
 }

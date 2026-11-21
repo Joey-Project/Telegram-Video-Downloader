@@ -410,6 +410,129 @@ async fn cloud_state_retry_backoff_grows_resets_and_ignores_notifications_while_
 }
 
 #[tokio::test]
+async fn pending_cloud_upload_runs_due_scan_then_rechecks_latest_state_after_ack() {
+    let _auth_generation_guard = TEST_AUTH_GENERATION_LOCK.lock().await;
+    let root = temp_cloud_bot_dir("pending-upload-background-scan");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    std::fs::write(
+        config.downloads.video_dir.join("arrived-during-retry.mp4"),
+        b"media",
+    )
+    .expect("the scan fixture should be written before the due scan");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([503, 200, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("before-pending-scan"));
+
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    ));
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(posts[0]["status"], 503);
+
+    let (observed_tx, observed_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    *cloud_state
+        .state_post_pause
+        .lock()
+        .expect("fake state pause lock should not poison") = Some((observed_tx, resume_rx));
+    let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx).await;
+    if observed.is_err() {
+        let _ = resume_tx.send(());
+        panic!("the pending snapshot retry should reach the paused second post");
+    }
+    observed
+        .expect("second post should arrive before the bounded timeout")
+        .expect("fake state server should signal the paused post");
+
+    let retry_posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake state post lock should not poison")
+        .clone();
+    let scan_times = inbox.last_successful_library_scans();
+    let (library_id, _) = cloud_test_default_library_binding(&queue);
+    let scanned_snapshot = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&library_id)
+        .cloned();
+    let _ = resume_tx.send(());
+
+    assert_eq!(retry_posts.len(), 2);
+    assert_eq!(retry_posts[1]["status"], 200);
+    assert_eq!(
+        retry_posts[1]["state_version"],
+        retry_posts[0]["state_version"]
+    );
+    assert_eq!(
+        retry_posts[1]["content_hash"], retry_posts[0]["content_hash"],
+        "a local scan must not mutate the pending same-version retry payload"
+    );
+    assert!(
+        scan_times
+            .expect("the successful local scan receipt should be readable")
+            .contains_key(&library_id),
+        "the local complete scan should finish before the pending retry is acknowledged"
+    );
+    assert!(scanned_snapshot.is_some_and(|snapshot| {
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.relative_path == "arrived-during-retry.mp4")
+    }));
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("the latest local snapshot should publish after the pending retry succeeds");
+    assert_eq!(posts[2]["status"], 200);
+    assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
+    assert_ne!(posts[2]["content_hash"], posts[1]["content_hash"]);
+    assert_eq!(posts[2]["library_item_count"], 1);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cloud_state_reporter_retries_bad_request_with_fresh_timestamp_and_backoff() {
     let root = temp_cloud_bot_dir("state-reporter-clock-skew");
     let mut config = AppConfig::for_test();

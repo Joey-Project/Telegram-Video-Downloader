@@ -663,6 +663,67 @@ async fn cloud_snapshot_compacts_large_migration_task_details_with_stable_aggreg
 }
 
 #[tokio::test]
+async fn due_scan_defers_while_a_video_output_lease_is_held() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) =
+        create_migration_fixture("due-scan-busy-output", crate::cloud::TEST_DATABASE_EPOCH);
+    queue
+        .refresh_video_libraries()
+        .expect("fixture library bindings should refresh");
+    fs::write(fixture.video_root.join("new.mp4"), b"new media").unwrap();
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    let output_lease =
+        downloader::hold_video_outputs_for_migration(std::slice::from_ref(&fixture.video_root))
+            .await
+            .expect("fixture should hold the actual video output lease");
+    let deferred =
+        tokio::time::timeout(Duration::from_secs(5), scan_due_cloud_libraries(&runtime)).await;
+    drop(output_lease);
+    deferred
+        .expect("automatic scan should defer rather than wait for a busy output lease")
+        .expect("the maintenance pass should otherwise succeed");
+    assert!(
+        !inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .contains_key(&fixture.source_library_id),
+        "a deferred scan must leave the busy library due"
+    );
+
+    scan_due_cloud_libraries(&runtime).await.unwrap();
+    let refreshed = runtime.library_snapshots.lock().await;
+    let snapshot = refreshed
+        .get(&fixture.source_library_id)
+        .expect("released library should scan");
+    assert!(
+        snapshot
+            .items
+            .iter()
+            .any(|item| item.relative_path == "new.mp4" && item.presence == Presence::Present)
+    );
+    drop(refreshed);
+    assert!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .contains_key(&fixture.source_library_id)
+    );
+
+    let _ = shutdown.send(());
+    let _ = server.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
 async fn round_trip_migration_reuses_the_original_record() {
     let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) =

@@ -551,7 +551,7 @@ async fn refresh_libraries_selected(
     Ok(())
 }
 
-async fn reconcile_migration_history_metadata(runtime: &CloudBotRuntime) -> Result<()> {
+pub(super) async fn reconcile_migration_history_metadata(runtime: &CloudBotRuntime) -> Result<()> {
     let settings = runtime.bot.queue.registry_snapshot()?;
     let default_library_id = settings.default_library_id.clone();
     let unavailable = runtime.library_unavailable.lock().await.clone();

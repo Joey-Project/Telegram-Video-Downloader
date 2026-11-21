@@ -1448,6 +1448,8 @@ pub(crate) struct MigrationPlannedGroup {
     #[serde(default)]
     pub(crate) record_transfer: Option<MigrationRecordTransfer>,
     #[serde(default)]
+    pub(crate) record_transfer_prepared: bool,
+    #[serde(default)]
     pub(crate) record_transfer_committed: bool,
 }
 
@@ -1457,7 +1459,20 @@ pub(crate) struct MigrationPlannedGroup {
 pub(crate) struct MigrationRecordTransfer {
     pub(crate) item: LibraryItem,
     pub(crate) copy_lineage: String,
+    #[serde(default)]
+    pub(crate) reserved_target_item_id: Option<String>,
     queue_metadata: QueueMetadataProvenance,
+}
+
+impl MigrationRecordTransfer {
+    pub(crate) fn replace_queue_metadata(&mut self, metadata: MigrationQueueMetadata) {
+        self.queue_metadata = QueueMetadataProvenance {
+            title: metadata.title,
+            source_ids: metadata.source_ids,
+            collection: metadata.collection,
+            requires_confirmation: metadata.requires_confirmation,
+        };
+    }
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -1625,6 +1640,26 @@ impl LibraryManager {
         self.scan_locked_with_completeness(hints)
     }
 
+    pub(crate) fn try_scan_with_completeness(
+        &self,
+        hints: &[SourceHint],
+    ) -> Result<Option<MigrationScanResult>> {
+        let _process_guard = match self.in_process_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                bail!("media-library lock is poisoned")
+            }
+        };
+        let Some(_output_guard) = self.try_lock_output()? else {
+            return Ok(None);
+        };
+        let Some(_library_guard) = self.try_lock_library()? else {
+            return Ok(None);
+        };
+        self.scan_locked_with_completeness(hints).map(Some)
+    }
+
     pub(crate) fn migration_root_path(&self) -> &Path {
         self.root.root_path()
     }
@@ -1743,7 +1778,7 @@ impl LibraryManager {
         source_path: &str,
         source_proof: &MigrationFileProof,
         copy_lineage: &str,
-    ) -> Result<()> {
+    ) -> Result<MigrationQueueMetadata> {
         ensure!(!copy_lineage.trim().is_empty(), "copy lineage is empty");
         let _process_guard = self
             .in_process_lock
@@ -1758,6 +1793,7 @@ impl LibraryManager {
         ensure!(
             record.item.id == item_id
                 && record.item.relative_path == source_path
+                && record.item.presence == Presence::Present
                 && record.file_type == "regular_file"
                 && record.device == source_proof.device
                 && record.inode == source_proof.inode
@@ -1765,19 +1801,199 @@ impl LibraryManager {
                 && record.birth_nanoseconds == source_proof.birth_nanoseconds,
             "migration source record no longer matches its planned physical identity"
         );
+        let mut changed = false;
         match record.copy_lineage.as_deref() {
             Some(existing) if existing != copy_lineage => {
                 bail!("migration source item is already bound to another copy lineage");
             }
-            Some(_) => return Ok(()),
-            None => record.copy_lineage = Some(copy_lineage.to_string()),
+            Some(_) => {}
+            None => {
+                record.copy_lineage = Some(copy_lineage.to_string());
+                changed = true;
+            }
         }
+        let metadata = MigrationQueueMetadata {
+            title: record.queue_metadata.title.clone(),
+            source_ids: record.queue_metadata.source_ids.clone(),
+            collection: record.queue_metadata.collection.clone(),
+            requires_confirmation: record.queue_metadata.requires_confirmation,
+        };
+        if changed {
+            index.version = INDEX_VERSION;
+            ensure!(
+                self.write_index(&index, INDEX_LIMIT)?,
+                "media-library index exceeded its configured size limit while saving migration lineage"
+            );
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) fn migration_preflight_copy_record_transfer(
+        &self,
+        transfer: &MigrationRecordTransfer,
+        target_path: &str,
+        target_identity: PhysicalItemIdentity,
+        target_access: BoundFileAccessPolicy,
+        expected_size: u64,
+        file_moves: &[(String, String)],
+    ) -> Result<String> {
+        ensure!(
+            !transfer.copy_lineage.trim().is_empty(),
+            "copy lineage is empty"
+        );
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _library_guard = self.lock_library()?;
+        let target_absolute = self.absolute_path(target_path)?;
+        self.coordinate_read(&target_absolute, |coordinated| {
+            if coordinated != target_absolute {
+                bail!("coordinated migration target path changed before record preflight");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let file = self.root.open_bound_file_if_identity(
+                &entry,
+                EntryIdentity::regular_file(target_identity.device, target_identity.inode),
+            )?;
+            let actual = fingerprint(&file)?;
+            if actual.size != expected_size
+                || physical_item_identity(&actual) != target_identity
+                || file.access_policy()? != target_access
+            {
+                bail!("verified migration target changed before record preflight");
+            }
+            Ok(())
+        })?;
+
+        let item_id = transfer.item.id.as_str();
+        let (mut index, _) = self.read_index_with_recovery()?;
+        let matching_lineage_stale_present = index.records.get(item_id).is_some_and(|record| {
+            record.item.presence == Presence::Present
+                && record.copy_lineage.as_deref() == Some(transfer.copy_lineage.as_str())
+                && !index_record_matches_physical_identity(record, target_path, target_identity)
+        });
+        if matching_lineage_stale_present {
+            // A previous completed move may have left a stale Present row. Reconcile it before
+            // allowing cleanup, so a same-lineage object moved elsewhere is never overwritten.
+            let scan = self.scan_locked_with_completeness(&[])?;
+            ensure!(
+                scan.complete,
+                "migration target library scan was incomplete during record preflight"
+            );
+            (index, _) = self.read_index_with_recovery()?;
+        }
+
+        let existing_identity_record = index.records.get(item_id).cloned();
+        let identity_record_is_target = existing_identity_record.as_ref().is_some_and(|record| {
+            index_record_matches_physical_identity(record, target_path, target_identity)
+        });
+        if let Some(existing) = existing_identity_record.as_ref()
+            && !identity_record_is_target
+            && !(existing.item.presence == Presence::Missing
+                && existing.copy_lineage.as_deref() == Some(transfer.copy_lineage.as_str()))
+        {
+            bail!("migration target already contains a different record with the source item ID");
+        }
+
+        let target_record_id = find_migration_target_record(&index, target_path, target_identity)?;
+        let current_target_record = target_record_id
+            .as_ref()
+            .and_then(|id| index.records.get(id))
+            .cloned();
+        if let Some(current) = current_target_record.as_ref()
+            && current
+                .copy_lineage
+                .as_deref()
+                .is_some_and(|lineage| lineage != transfer.copy_lineage)
+        {
+            bail!("migration target object is already bound to another copy lineage");
+        }
+
+        let mut reserved_target_item_id = transfer
+            .reserved_target_item_id
+            .clone()
+            .or_else(|| {
+                target_record_id
+                    .as_ref()
+                    .filter(|id| id.as_str() != item_id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| {
+                physical_item_id_from_migration_checkpoint(
+                    target_identity.device,
+                    target_identity.inode,
+                    target_path,
+                )
+            });
+        if reserved_target_item_id == item_id {
+            if transfer.reserved_target_item_id.is_some() {
+                bail!("reserved target identity collides with the source copy ID");
+            }
+            reserved_target_item_id = new_operation_id("copy-reserved");
+        }
+        if let Some(existing) = index.records.get(&reserved_target_item_id)
+            && !index_record_matches_physical_identity(existing, target_path, target_identity)
+        {
+            if transfer.reserved_target_item_id.is_some() {
+                bail!("reserved migration target ID now belongs to another record");
+            }
+            reserved_target_item_id = new_operation_id("copy-reserved");
+        }
+
+        let mut target_item = current_target_record
+            .as_ref()
+            .map(|record| record.item.clone())
+            .unwrap_or_else(|| transfer.item.clone());
+        target_item.id = reserved_target_item_id.clone();
+        target_item.relative_path = target_path.to_string();
+        target_item.presence = Presence::Present;
+        target_item.physical_identity = Some(target_identity);
+        target_item.authoritative_nfo_path = None;
+        if target_item.organization_status.is_none() {
+            target_item.organization_status = transfer.item.organization_status;
+        }
+        if current_target_record.is_none() {
+            target_item.attachments = remap_migration_attachments(&transfer.item, file_moves)?;
+        }
+
+        let mut queue_metadata = current_target_record
+            .as_ref()
+            .map(|record| record.queue_metadata.clone())
+            .unwrap_or_default();
+        merge_queue_metadata(&mut queue_metadata, &transfer.queue_metadata);
+        let sidecar_title_present = transfer.item.authoritative_nfo_path.is_some()
+            || target_item
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == "nfo");
+        preserve_queue_metadata(&mut target_item, &queue_metadata, sidecar_title_present);
+
+        if let Some(target_record_id) = target_record_id.as_deref()
+            && target_record_id != reserved_target_item_id
+        {
+            index.records.remove(target_record_id);
+        }
+        index.records.insert(
+            reserved_target_item_id.clone(),
+            IndexRecord {
+                item: target_item,
+                device: target_identity.device,
+                inode: target_identity.inode,
+                file_type: "regular_file".to_string(),
+                birth_seconds: target_identity.birth_seconds,
+                birth_nanoseconds: target_identity.birth_nanoseconds,
+                missing_since: None,
+                queue_metadata,
+                copy_lineage: Some(transfer.copy_lineage.clone()),
+            },
+        );
         index.version = INDEX_VERSION;
         ensure!(
             self.write_index(&index, INDEX_LIMIT)?,
-            "media-library index exceeded its configured size limit while saving migration lineage"
+            "media-library index exceeded its configured size limit while preparing the migrated record"
         );
-        Ok(())
+        Ok(reserved_target_item_id)
     }
 
     pub(crate) fn migration_adopt_verified_copy_record(
@@ -1836,6 +2052,19 @@ impl LibraryManager {
             (index, _) = self.read_index_with_recovery()?;
         }
         let target_record_id = find_migration_target_record(&index, target_path, target_identity)?;
+        if let Some(reserved_target_item_id) = transfer.reserved_target_item_id.as_deref()
+            && let Some(target_record_id) = target_record_id.as_deref()
+        {
+            let already_adopted = target_record_id == item_id
+                && index.records.get(item_id).is_some_and(|record| {
+                    index_record_matches_physical_identity(record, target_path, target_identity)
+                        && record.copy_lineage.as_deref() == Some(transfer.copy_lineage.as_str())
+                });
+            ensure!(
+                target_record_id == reserved_target_item_id || already_adopted,
+                "migration target object no longer matches its reserved physical ID"
+            );
+        }
         let existing_identity_record = index.records.get(item_id).cloned();
         let identity_record_is_target = existing_identity_record.as_ref().is_some_and(|record| {
             index_record_matches_physical_identity(record, target_path, target_identity)
@@ -1882,6 +2111,12 @@ impl LibraryManager {
             .map(|record| record.queue_metadata.clone())
             .unwrap_or_default();
         merge_queue_metadata(&mut queue_metadata, &transfer.queue_metadata);
+        let sidecar_title_present = transfer.item.authoritative_nfo_path.is_some()
+            || target_item
+                .attachments
+                .iter()
+                .any(|attachment| attachment.kind == "nfo");
+        preserve_queue_metadata(&mut target_item, &queue_metadata, sidecar_title_present);
 
         if let Some(target_record_id) = target_record_id.as_deref()
             && target_record_id != item_id
@@ -2020,12 +2255,22 @@ impl LibraryManager {
                 continue;
             }
             let before = record.queue_metadata.clone();
+            let observed_collection = snapshot.items[snapshot_index].collection.as_ref();
+            let historical_collection = queue_metadata.collection.as_ref().filter(|incoming| {
+                [
+                    record.queue_metadata.collection.as_ref(),
+                    observed_collection,
+                ]
+                .into_iter()
+                .flatten()
+                .all(|current| same_historical_collection(current, incoming))
+            });
             merge_queue_metadata(
                 &mut record.queue_metadata,
                 &QueueMetadataProvenance {
                     title: queue_metadata.title.clone(),
                     source_ids: queue_metadata.source_ids.clone(),
-                    collection: queue_metadata.collection.clone(),
+                    collection: historical_collection.cloned(),
                     requires_confirmation: queue_metadata.requires_confirmation,
                 },
             );
@@ -2593,6 +2838,7 @@ impl LibraryManager {
                         .copy_lineage
                         .clone()
                         .unwrap_or_else(|| new_operation_id("copy-lineage")),
+                    reserved_target_item_id: None,
                     queue_metadata: record.queue_metadata.clone(),
                 })
             };
@@ -2608,6 +2854,7 @@ impl LibraryManager {
                 conflict: has_conflict,
                 files,
                 record_transfer,
+                record_transfer_prepared: false,
                 record_transfer_committed: false,
             });
         }
@@ -8122,6 +8369,39 @@ impl LibraryManager {
         Ok(file)
     }
 
+    fn try_lock_library(&self) -> Result<Option<BoundFile>> {
+        let path = self.library_dir.join(LIBRARY_LOCK);
+        let file = self.coordinate_read(&path, |coordinated| {
+            self.validate_library_directory()?;
+            let file = self
+                .root
+                .open_bound_file(coordinated)?
+                .ok_or_else(|| anyhow!("media-library lock file disappeared"))?;
+            file.validate_private_single_link(0o600)?;
+            Ok(file)
+        })?;
+        if file.try_lock_exclusive()? {
+            Ok(Some(file))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn try_lock_output(&self) -> Result<Option<BoundFile>> {
+        let path = self.root.logical_root_path().to_path_buf();
+        let file = self.coordinate_write(&path, |coordinated| {
+            if coordinated != path {
+                bail!("coordinated download root changed while acquiring its output lock");
+            }
+            video_output_lock_file(&self.root)
+        })?;
+        if file.try_lock_exclusive()? {
+            Ok(Some(file))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn lock_output(&self) -> Result<BoundFile> {
         let path = self.root.logical_root_path().to_path_buf();
         let file = self.coordinate_write(&path, |coordinated| {
@@ -9417,6 +9697,11 @@ fn merge_collection_metadata(
     let Some(current) = current else {
         return;
     };
+    if let (Some(current_id), Some(previous_id)) = (&current.id, &previous.id)
+        && current_id != previous_id
+    {
+        return;
+    }
     if current.id.is_none() {
         current.id = previous.id.clone();
     }
@@ -9431,6 +9716,18 @@ fn merge_collection_metadata(
     }
     if current.part_id.is_none() {
         current.part_id = previous.part_id.clone();
+    }
+}
+
+fn same_historical_collection(current: &CollectionMetadata, incoming: &CollectionMetadata) -> bool {
+    match (&current.id, &incoming.id) {
+        (Some(current_id), Some(incoming_id)) => current_id == incoming_id,
+        (None, None) => {
+            !current.title.trim().is_empty()
+                && current.title.trim() == incoming.title.trim()
+                && current.kind == incoming.kind
+        }
+        _ => false,
     }
 }
 
@@ -17833,6 +18130,69 @@ mod tests {
                 .and_then(|collection| collection.id.as_deref()),
             Some("playlist-9")
         );
+    }
+
+    #[test]
+    fn historical_queue_metadata_only_fills_fields_for_the_same_collection() {
+        let root = TemporaryRoot::new("migration-history-collection-identity");
+        fs::write(root.path().join("clip.mp4"), b"target media").unwrap();
+        let target = manager(&root);
+        let current_collection = CollectionMetadata {
+            id: Some("playlist-current".to_string()),
+            title: "Current playlist".to_string(),
+            kind: "youtube_playlist".to_string(),
+            order: None,
+            part_id: None,
+        };
+        let target_hint = SourceHint {
+            source_ids: Vec::new(),
+            title: None,
+            relative_path: Some("clip.mp4".to_string()),
+            collection: Some(current_collection.clone()),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let mut snapshot = target.scan(&[target_hint]).unwrap();
+        let item = item_at(&snapshot, "clip.mp4").clone();
+        let identity = item.physical_identity.expect("verified target identity");
+
+        for incoming_id in ["playlist-other", "playlist-current"] {
+            let incoming = MigrationQueueMetadata {
+                title: None,
+                source_ids: Vec::new(),
+                collection: Some(CollectionMetadata {
+                    id: Some(incoming_id.to_string()),
+                    title: "Historical playlist title".to_string(),
+                    kind: "youtube_playlist".to_string(),
+                    order: Some(10),
+                    part_id: Some("track-10".to_string()),
+                }),
+                requires_confirmation: false,
+            };
+            let update = (
+                item.id.clone(),
+                item.relative_path.clone(),
+                identity,
+                incoming,
+            );
+            assert_eq!(
+                target
+                    .migration_merge_verified_history_queue_metadata(&mut snapshot, &[update])
+                    .unwrap(),
+                vec![true]
+            );
+            let collection = item_at(&snapshot, "clip.mp4").collection.clone().unwrap();
+            assert_eq!(collection.id, current_collection.id);
+            assert_eq!(collection.title, current_collection.title);
+            let agrees = incoming_id == "playlist-current";
+            assert_eq!(collection.order, agrees.then_some(10));
+            assert_eq!(collection.part_id.as_deref(), agrees.then_some("track-10"));
+            let rescanned = target.scan(&[]).unwrap();
+            assert_eq!(
+                item_at(&rescanned, "clip.mp4").collection.as_ref(),
+                Some(&collection)
+            );
+        }
     }
 
     #[test]
