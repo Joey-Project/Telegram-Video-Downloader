@@ -12,6 +12,9 @@ pub enum JobRequest {
     Youtube {
         url: String,
     },
+    Social {
+        url: String,
+    },
     Pdf {
         url: String,
     },
@@ -58,6 +61,7 @@ impl JobRequest {
         match self {
             Self::Bilibili { .. } => "Bilibili download",
             Self::Youtube { .. } => "YouTube download",
+            Self::Social { .. } => "Social media download",
             Self::Pdf { .. } => "PDF capture",
         }
     }
@@ -67,7 +71,7 @@ impl JobRequest {
             Self::Bilibili { url, selection } => {
                 selection.is_none() && bilibili_url_requires_selection(url)
             }
-            Self::Youtube { .. } | Self::Pdf { .. } => false,
+            Self::Youtube { .. } | Self::Social { .. } | Self::Pdf { .. } => false,
         }
     }
 }
@@ -148,6 +152,9 @@ pub fn extract_http_urls(text: &str) -> Vec<String> {
 fn classify_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<JobRequest> {
     classify_bilibili_opus_url(raw_url)
         .or_else(|| classify_video_url(raw_url))
+        .or_else(|| {
+            crate::social_media::canonicalize_url(raw_url).map(|url| JobRequest::Social { url })
+        })
         .or_else(|| classify_auto_pdf_url(raw_url, auto_pdf_domains))
 }
 
@@ -512,6 +519,20 @@ mod tests {
 
     fn auto_pdf_domains() -> Vec<String> {
         vec!["mp.weixin.qq.com".to_string()]
+    }
+
+    #[test]
+    fn routes_canonical_social_urls_before_auto_pdf() {
+        let input = "https://x.com/testcreator/status/12345?utm_source=tracking";
+        let mut auto_pdf = auto_pdf_domains();
+        auto_pdf.push("x.com".to_string());
+        let canonical = crate::social_media::canonicalize_url(input)
+            .expect("synthetic X status URL should be supported");
+
+        assert_eq!(
+            route_message(input, &auto_pdf),
+            RouteResult::Jobs(vec![JobRequest::Social { url: canonical }])
+        );
     }
 
     #[test]

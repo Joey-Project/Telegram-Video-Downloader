@@ -442,7 +442,7 @@ fn expected_profile_root() -> Result<PathBuf> {
     Ok(home.join(".local/lib").join(profile))
 }
 
-fn expected_python_path() -> Result<PathBuf> {
+pub(crate) fn expected_python_path() -> Result<PathBuf> {
     Ok(expected_profile_root()?.join("music-runtime/bin/python3"))
 }
 
@@ -450,7 +450,7 @@ fn expected_helper_path() -> Result<PathBuf> {
     Ok(expected_profile_root()?.join("libexec/music_transfer.py"))
 }
 
-fn expected_credentials_path() -> Result<PathBuf> {
+pub(crate) fn expected_credentials_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())

@@ -74,6 +74,7 @@ jobs:
           python3 scripts/test_macos_service.py
           python3 scripts/test_music_test_runtime.py
           python3 scripts/test_music_transfer.py
+          python3 scripts/test_social_media_reply.py
           python3 scripts/test_music_runtime_installer.py
           python3 scripts/test_install_flac_converter.py
           bash scripts/test_launch_agent.sh

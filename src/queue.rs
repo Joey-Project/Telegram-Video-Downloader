@@ -367,6 +367,9 @@ pub struct TaskRecord {
     pub status_message_id: Option<i64>,
     pub chat_id: i64,
     pub submitter_user_id: Option<i64>,
+    /// Telegram Bot ID that admitted a Social task, used to bind replies across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) social_bot_id: Option<i64>,
     pub ordinal: usize,
     pub original_url: String,
     pub url_was_sanitized: bool,
@@ -526,6 +529,7 @@ impl TaskRecord {
         let original_url = match &job {
             JobRequest::Bilibili { url, .. }
             | JobRequest::Youtube { url }
+            | JobRequest::Social { url }
             | JobRequest::Pdf { url } => url.clone(),
         };
         let now = unix_time();
@@ -537,6 +541,7 @@ impl TaskRecord {
             status_message_id: None,
             chat_id,
             submitter_user_id,
+            social_bot_id: None,
             ordinal,
             original_url,
             url_was_sanitized: false,
@@ -2167,6 +2172,9 @@ impl QueueManager {
         Ok(snapshot)
     }
 
+    /// List unfinished tasks whose durable state is safe to transfer with the video staging and
+    /// published-media proofs below. Social archives and delivery receipts remain source-bound
+    /// in private downloader directories, so Social tasks are deliberately not migration inputs.
     pub fn list_incomplete_task_transfer_snapshots(
         &self,
         source_library_id: &str,
@@ -2188,6 +2196,8 @@ impl QueueManager {
         let mut snapshots = Vec::new();
         for record in records.into_iter().filter(|record| {
             !matches!(record.status, TaskStatus::Completed | TaskStatus::Cancelled)
+                // Social originals and receipts stay in the source library's reserved directory.
+                && !matches!(&record.job, JobRequest::Social { .. })
                 && if let Some(destination) = &record.destination {
                     destination.library_id == source_library_id
                 } else {
@@ -2218,7 +2228,8 @@ impl QueueManager {
         Ok(snapshots)
     }
 
-    /// Return the bounded, authorized summary used by cloud settings projections. The task set
+    /// Return the bounded, authorized summary of transferable video tasks used by cloud settings
+    /// projections. Social archives and receipts remain bound to their source library. The task set
     /// is counted from active queue-index entries only; history sidecars are intentionally out of
     /// scope. A per-task staging estimate failure keeps the task count but makes the aggregate
     /// byte estimate unknown.
@@ -2268,7 +2279,12 @@ impl QueueManager {
         let mut task_count = 0_usize;
         let mut staging_bytes = Some(0_u64);
         for record in records {
-            if record.status.is_history() || matches!(&record.job, JobRequest::Pdf { .. }) {
+            if record.status.is_history()
+                || matches!(
+                    &record.job,
+                    JobRequest::Pdf { .. } | JobRequest::Social { .. }
+                )
+            {
                 continue;
             }
             match record.destination.as_ref() {
@@ -2462,6 +2478,9 @@ impl QueueManager {
             bail!("task {task_id} was not found");
         };
         validate_task_transfer_migration_id(migration_id)?;
+        if matches!(&record.job, JobRequest::Social { .. }) {
+            bail!("unfinished social media tasks must remain in their original library");
+        }
         if record.destination_transfer_ack.is_some() {
             bail!("task {task_id} is awaiting durable media migration handoff finalization");
         }
@@ -8216,11 +8235,49 @@ pub fn sanitize_job_for_storage(job: JobRequest) -> (JobRequest, bool) {
             let (url, changed) = sanitize_url(&url);
             (JobRequest::Youtube { url }, changed)
         }
+        JobRequest::Social { url } => {
+            let (url, changed) = sanitize_social_url(&url);
+            (JobRequest::Social { url }, changed)
+        }
         JobRequest::Pdf { url } => {
             let (url, changed) = sanitize_url(&url);
             (JobRequest::Pdf { url }, changed)
         }
     }
+}
+
+fn sanitize_social_url(raw: &str) -> (String, bool) {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return (raw.to_string(), false);
+    };
+    let mut changed = false;
+    if !url.username().is_empty() {
+        let _ = url.set_username("");
+        changed = true;
+    }
+    if url.password().is_some() {
+        let _ = url.set_password(None);
+        changed = true;
+    }
+
+    let mut story_media_id = None;
+    for (key, value) in url.query_pairs() {
+        if key == "story_media_id" && story_media_id.is_none() {
+            story_media_id = Some((key.into_owned(), value.into_owned()));
+        }
+    }
+
+    let mut sanitized = url.clone();
+    sanitized.set_query(None);
+    if let Some((key, value)) = story_media_id {
+        sanitized.query_pairs_mut().append_pair(&key, &value);
+    }
+    let sanitized_query = sanitized.query().map(str::to_owned);
+    if url.query() != sanitized_query.as_deref() {
+        url.set_query(sanitized_query.as_deref());
+        changed = true;
+    }
+    (url.to_string(), changed)
 }
 
 fn sanitize_url(raw: &str) -> (String, bool) {
@@ -8274,6 +8331,7 @@ fn job_url(job: &JobRequest) -> &str {
     match job {
         JobRequest::Bilibili { url, .. }
         | JobRequest::Youtube { url }
+        | JobRequest::Social { url }
         | JobRequest::Pdf { url } => url,
     }
 }
@@ -8310,6 +8368,27 @@ mod tests {
 
     fn test_task(id: &str, job: JobRequest) -> TaskRecord {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn social_task_storage_keeps_only_the_exact_story_media_id_query() {
+        let (job, changed) = sanitize_job_for_storage(JobRequest::Social {
+            url: "https://user:password@example.com/stories/1?story_media_id=keep&tracking=drop&story_media_id=duplicate&Story_media_id=case-sensitive".to_string(),
+        });
+
+        assert!(changed);
+        let expected_url = "https://example.com/stories/1?story_media_id=keep";
+        let expected = JobRequest::Social {
+            url: expected_url.to_string(),
+        };
+        assert_eq!(job, expected);
+
+        let record = test_task("social-task", job);
+        let serialized = serde_json::to_value(&record).expect("social task should serialize");
+        let restored: TaskRecord =
+            serde_json::from_value(serialized).expect("social task should deserialize");
+        assert_eq!(restored.job, expected);
+        assert_eq!(restored.original_url, expected_url);
     }
 
     fn grouped_attempt() -> BilibiliAttemptSnapshot {
@@ -9254,6 +9333,90 @@ mod tests {
                 target.clone(),
             )
             .expect("transfer should begin")
+    }
+
+    #[test]
+    fn social_tasks_stay_out_of_library_transfer_candidates_and_summary() {
+        let (directory, _config, queue, _) = task_transfer_fixture("social-transfer-candidates");
+        let source = queue
+            .default_video_destination()
+            .expect("source library destination should resolve");
+        assert!(
+            queue
+                .create(test_task(
+                    "social-transfer-candidate",
+                    JobRequest::Social {
+                        url: "https://x.com/example/status/12345".to_string(),
+                    },
+                ))
+                .expect("Social task should persist")
+        );
+        assert!(
+            queue
+                .create(test_task(
+                    "video-transfer-candidate",
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=transfer-candidate".to_string(),
+                    },
+                ))
+                .expect("video task should persist")
+        );
+
+        let snapshots = queue
+            .list_incomplete_task_transfer_snapshots(&source.library_id, 10)
+            .expect("transfer preview should enumerate eligible tasks");
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(
+            &snapshots[0].record.job,
+            JobRequest::Youtube { .. }
+        ));
+
+        let summary = queue
+            .incomplete_task_transfer_summary(&source.library_id, &[123_456_789])
+            .expect("transfer summary should load");
+        assert_eq!(summary.task_count, 1);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn social_tasks_cannot_begin_destination_transfers() {
+        let (directory, _config, queue, target) = task_transfer_fixture("social-transfer-guard");
+        let id = "social-task-transfer-guard";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Social {
+                        url: "https://x.com/example/status/12345".to_string(),
+                    },
+                ))
+                .expect("Social task should persist")
+        );
+        let record = queue
+            .get(id)
+            .expect("Social task should be readable")
+            .expect("Social task should exist");
+
+        let error = queue
+            .begin_task_destination_transfer(
+                id,
+                "social-transfer-guard",
+                record.generation,
+                record.revision,
+                target,
+            )
+            .expect_err("Social tasks must remain in their source library");
+        assert!(error.to_string().contains("original library"));
+        let unchanged = queue
+            .get(id)
+            .expect("Social task should remain readable")
+            .expect("Social task should remain present");
+        assert!(unchanged.destination_transfer.is_none());
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -13330,6 +13493,23 @@ mod tests {
         let task: TaskRecord = serde_json::from_value(json)
             .expect("legacy task record without generation should deserialize");
         assert_eq!(task.generation, 0);
+        assert_eq!(task.social_bot_id, None);
+    }
+
+    #[test]
+    fn task_records_preserve_social_admission_bot_id() {
+        let mut task = test_task(
+            "task-social-bot-id",
+            JobRequest::Social {
+                url: "https://x.com/example/status/12345".to_string(),
+            },
+        );
+        task.social_bot_id = Some(123_456);
+
+        let json = serde_json::to_value(&task).expect("task should serialize");
+        assert_eq!(json["social_bot_id"], 123_456);
+        let restored: TaskRecord = serde_json::from_value(json).expect("task should deserialize");
+        assert_eq!(restored.social_bot_id, Some(123_456));
     }
 
     #[test]

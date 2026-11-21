@@ -1526,6 +1526,11 @@ async fn submit_download(
             "enter a supported video or collection link",
         ));
     };
+    if jobs.len() == 1 && matches!(jobs[0], JobRequest::Social { .. }) {
+        return Ok(cloud_dispatch_failure(
+            "send Instagram or X links directly in your private Telegram chat to receive the original files",
+        ));
+    }
     if jobs.len() != 1 || matches!(jobs[0], JobRequest::Pdf { .. }) {
         return Ok(cloud_dispatch_failure("enter one video or collection link"));
     }

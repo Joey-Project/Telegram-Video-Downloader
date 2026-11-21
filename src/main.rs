@@ -52,6 +52,8 @@ mod safe_fs;
 mod settings_auth;
 #[cfg(test)]
 mod settings_auth_e2e_tests;
+mod social_media;
+mod social_media_job;
 mod staging_cleanup;
 mod staging_cleanup_bot;
 #[cfg(test)]
@@ -8057,7 +8059,7 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                     });
                 }
             }
-            JobRequest::Pdf { .. } => continue,
+            JobRequest::Pdf { .. } | JobRequest::Social { .. } => continue,
         }
     }
     Ok(hints)
@@ -8652,7 +8654,9 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                     JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => {
                         run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
                     }
-                    JobRequest::Pdf { .. } => run_job(&config, &job, Some(progress_tx)).await,
+                    JobRequest::Pdf { .. } | JobRequest::Social { .. } => {
+                        run_job(&config, &job, Some(progress_tx)).await
+                    }
                 };
                 let _ = progress_handle.await;
                 match result {
@@ -8997,7 +9001,25 @@ async fn handle_message(
 
     match route_message(text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
+            let mut declined_social = false;
             for (ordinal, job) in jobs.into_iter().enumerate() {
+                let social_bot_id = if matches!(job, JobRequest::Social { .. }) {
+                    let Some(bot_id) = social_media_job::bot_id(&config).filter(|_| {
+                        is_private_chat
+                            && social_media_job::owner_matches(
+                                &config,
+                                chat_id,
+                                submitter_user_id,
+                                message_id,
+                            )
+                    }) else {
+                        declined_social = true;
+                        continue;
+                    };
+                    Some(bot_id)
+                } else {
+                    None
+                };
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
                 let task_id = task_id_for_update(update_id, ordinal);
                 let (stored_job, sanitized) = sanitize_job_for_storage(job.clone());
@@ -9011,11 +9033,19 @@ async fn handle_message(
                     stored_job,
                 );
                 task.url_was_sanitized = sanitized;
+                task.social_bot_id = social_bot_id;
                 let generation = task.generation;
                 if !queue.create(task)? {
                     continue;
                 }
                 queue_or_prompt_job(context.clone(), chat_id, job_id, task_id, generation, job);
+            }
+            if declined_social {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    "Send Instagram or X links from the configured owner's private chat with this bot.".into(),
+                ).await;
             }
         }
         RouteResult::BilibiliAuth(command) => {
@@ -9044,7 +9074,7 @@ async fn handle_message(
             send_or_log(
                 &telegram,
                 chat_id,
-                "No supported links found. Send Bilibili/YouTube links directly, use /pdf URL, or configure a PDF auto-domain."
+                "No supported links found. Send a Bilibili, YouTube, Instagram or X link, use /pdf URL, or configure a PDF auto-domain."
                     .to_string(),
             )
             .await;
@@ -9216,6 +9246,7 @@ fn help_message() -> String {
         "Telegram Local Downloader Bot",
         "",
         "Send Bilibili or YouTube links directly to download videos.",
+        "Send an Instagram or X link in the configured owner's private chat to download and reply with the originals.",
         "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
         "Send .m4a, .mp3, .aac, .flac or .wav files in the allowed private chat to import music automatically.",
         "Send .torrent files to download all contents in local qBittorrent, then choose music to import in the task card.",
@@ -12703,7 +12734,7 @@ async fn process_job_after_duplicate_check(
     let telegram = context.telegram.clone();
     let config = Arc::clone(&context.config);
     let queue = Arc::clone(&context.queue);
-    if matches!(job, JobRequest::Pdf { .. }) {
+    if matches!(job, JobRequest::Pdf { .. } | JobRequest::Social { .. }) {
         queue_job(
             context,
             chat_id,
@@ -13926,7 +13957,7 @@ async fn handle_bilibili_selection_callback(
 fn default_run_mode(job: &JobRequest) -> JobRunMode {
     match job {
         JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => JobRunMode::StagedKeepBoth,
-        JobRequest::Pdf { .. } => JobRunMode::Direct,
+        JobRequest::Pdf { .. } | JobRequest::Social { .. } => JobRunMode::Direct,
     }
 }
 
@@ -15198,7 +15229,12 @@ async fn run_queued_job(
                     )
                     .await
                 }
-                JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+                JobRunMode::Direct => match &job {
+                    JobRequest::Social { url } => {
+                        social_media_job::run(&config, &updated_task, url, Some(&progress_tx)).await
+                    }
+                    _ => run_job(&config, &job, Some(progress_tx)).await,
+                },
             }
         }),
     )
@@ -15289,6 +15325,14 @@ async fn run_queued_job(
                 };
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 let hashes = hash_and_validate_published_media(&media_root, &report).await?;
+                if let JobRequest::Social { url } = &job {
+                    social_media_job::verify_completed_hashes(
+                        &config,
+                        &updated_task,
+                        url,
+                        &hashes,
+                    )?;
+                }
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 complete_published_task_with_retry(
                     &telegram,
@@ -19339,6 +19383,202 @@ mod tests {
             .expect("fake Telegram API should stop within timeout")
             .expect("fake Telegram API task should not panic")
             .expect("fake Telegram API should not fail");
+    }
+
+    #[tokio::test]
+    async fn social_media_original_reply_partial_send_and_queue_retry_e2e() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let root = temp.path();
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("video");
+        config.downloads.pdf_dir = root.join("pdf");
+        let chat_id = 123_456_789;
+        let bot_id = 987_654;
+        config.telegram.token = format!("{bot_id}:{}", config.telegram.token);
+        config.telegram.allowed_chat_ids = vec![chat_id];
+        config.telegram.allow_all_chats = false;
+        fs::create_dir(&config.downloads.video_dir).unwrap();
+        fs::create_dir(&config.downloads.pdf_dir).unwrap();
+
+        let downloader = root.join("fake-yt-dlp");
+        fs::write(
+            &downloader,
+            "#!/bin/sh\nprintf 'first original' >001.mp4\nprintf 'second original' >002.mp4\nprintf 'large original' >003.mp4\nprintf 'fourth original' >004.mp4\n",
+        )
+        .unwrap();
+        fs::set_permissions(&downloader, fs::Permissions::from_mode(0o700)).unwrap();
+        config.tools.yt_dlp = downloader.clone();
+        let sender = root.join("fake-mtproto-python");
+        fs::write(
+            &sender,
+            r#"#!/usr/bin/env python3
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+request = json.load(sys.stdin)
+file = Path(request["file_path"])
+assert request.pop("bot_token").split(":") == ["987654", "test-token"]
+assert hashlib.sha256(file.read_bytes()).hexdigest() == request["expected_sha256"]
+assert file.name == request["file_name"]
+log = Path(__file__).with_name("replies.jsonl")
+with log.open("a") as stream:
+    stream.write(json.dumps(request) + "\n")
+if file.name == "002.mp4":
+    first_failure = log.with_name("first-failure")
+    if not first_failure.exists():
+        first_failure.touch()
+        print(json.dumps({"ok": False, "error": "delivery_unknown"}))
+        sys.exit(1)
+if file.name == "003.mp4":
+    print(json.dumps({"ok": False, "error": "file_too_large"}))
+    sys.exit(1)
+print(json.dumps({"ok": True}))
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&sender, fs::Permissions::from_mode(0o700)).unwrap();
+        config.music.helper_python = sender;
+        let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+        let (telegram, mut requests, updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+            music: None,
+            torrent: None,
+        };
+        updates
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 2_001,
+                    "message": {
+                        "message_id": 33,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": chat_id + 1},
+                        "text": "https://x.com/creator/status/12345"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 2_002,
+                    "message": {
+                        "message_id": 34,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": chat_id},
+                        "text": "https://x.com/creator/status/12345"
+                    }
+                }),
+            ])
+            .unwrap();
+        let updates = telegram.get_updates(None, 0).await.unwrap();
+        let mut offset = None;
+        process_telegram_updates_with_context(&context, updates, &mut offset)
+            .await
+            .unwrap();
+        assert_eq!(offset, Some(2_003));
+        assert!(queue.get("u2001-0").unwrap().is_none());
+
+        tokio_timeout(Duration::from_secs(30), async {
+            loop {
+                let request = requests.recv().await.expect("fake Telegram API ended");
+                if request.body["text"].as_str().is_some_and(|text| {
+                    text.contains("Telegram did not confirm delivery of 1 file")
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("failed attachment should produce a retryable queue error");
+
+        let id = "u2002-0";
+        let failed = queue.get(id).unwrap().unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.message_id, 34);
+        assert_eq!(failed.social_bot_id, Some(bot_id));
+        let mut other_bot = context.config.as_ref().clone();
+        other_bot.telegram.token = format!("{}:{}", bot_id + 1, "test-token");
+        let wrong_bot_error =
+            social_media_job::run(&other_bot, &failed, &failed.original_url, None)
+                .await
+                .unwrap_err();
+        assert!(wrong_bot_error.to_string().contains("Bot that received"));
+        let archive = root
+            .join("video")
+            .join(".telegram-video-downloader-social")
+            .join(id);
+        assert_eq!(
+            fs::read(archive.join("001.mp4")).unwrap(),
+            b"first original"
+        );
+        assert_eq!(
+            fs::read(archive.join("002.mp4")).unwrap(),
+            b"second original"
+        );
+        assert_eq!(
+            fs::read(archive.join("003.mp4")).unwrap(),
+            b"large original"
+        );
+        assert_eq!(
+            fs::read(archive.join("004.mp4")).unwrap(),
+            b"fourth original"
+        );
+        // Removing the mock worker proves retry uses the already archived originals.
+        fs::remove_file(downloader).unwrap();
+        let callback = serde_json::from_value(serde_json::json!({
+            "id": "social-queue-retry",
+            "from": {"id": chat_id},
+            "data": queue_callback_data("retry", id, failed.generation),
+            "message": {
+                "message_id": 999,
+                "chat": {"id": chat_id, "type": "private"}
+            }
+        }))
+        .unwrap();
+        handle_callback_query(context, callback).await;
+        tokio_timeout(Duration::from_secs(30), async {
+            loop {
+                let request = requests.recv().await.expect("fake Telegram API ended");
+                if request.body["text"].as_str().is_some_and(|text| {
+                    text.contains(
+                        "3 uploaded to Telegram. 1 over the upload limit and saved locally.",
+                    )
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("retry should finish sending the second attachment");
+
+        let complete = queue.get(id).unwrap().unwrap();
+        assert_eq!(complete.status, TaskStatus::Completed);
+        assert_eq!(complete.primary_media_hashes.len(), 4);
+        let calls = fs::read_to_string(root.join("replies.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0]["file_name"], "001.mp4");
+        assert_eq!(calls[1]["file_name"], "002.mp4");
+        assert_eq!(calls[2]["file_name"], "003.mp4");
+        assert_eq!(calls[3]["file_name"], "004.mp4");
+        assert_eq!(calls[1], calls[4]);
+        assert_ne!(calls[0]["random_id"], calls[1]["random_id"]);
+        assert!(
+            calls
+                .iter()
+                .all(|call| { call["chat_id"] == chat_id && call["reply_to_message_id"] == 34 })
+        );
+        stop_fake_telegram_api(shutdown, server).await;
     }
 
     fn test_auth_epoch(value: u64) -> bilibili_auth::AuthEpoch {
