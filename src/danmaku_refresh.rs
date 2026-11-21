@@ -2510,7 +2510,7 @@ mod tests {
         for altered in [
             ass.replace("(2)", "(3)"),
             ass.replace("source_comments=2", "source_comments=99"),
-            ass.replace("Danmaku XML v3:", "Danmaku XML v4:"),
+            ass.replace("Danmaku XML v4:", "Danmaku XML v99:"),
             format!("{ass}; user metadata\n"),
         ] {
             assert_ne!(altered, ass);
