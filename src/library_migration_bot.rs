@@ -1499,6 +1499,41 @@ async fn edit_status(
     Ok(())
 }
 
+fn migration_status_message_text(status: &MigrationStatus) -> String {
+    let mut text = format!(
+        "Library migration {}: {:?}\n{} completed, {} skipped, {} failed; {} / {} copied.\nSee /file for actual locations and recovery controls.",
+        status.id,
+        status.status,
+        status.success_count,
+        status.skipped_count,
+        status.failed_count,
+        human_bytes(status.copied_bytes),
+        human_bytes(status.total_bytes)
+    );
+    if let Some(warning) = status
+        .warnings
+        .iter()
+        .rev()
+        .find(|warning| warning.starts_with("Migration needs attention:"))
+    {
+        text.push_str(&format!("\n{}", truncate(warning)));
+    }
+    truncate(&text)
+}
+
+async fn edit_status_if_message_changed(
+    runtime: &CloudBotRuntime,
+    context: Option<&MigrationRuntimeContext>,
+    previous: &MigrationStatus,
+    current: &MigrationStatus,
+) {
+    if migration_status_message_text(previous) != migration_status_message_text(current)
+        && let Some(context) = context
+    {
+        edit_status_with_context(runtime, context, current).await;
+    }
+}
+
 async fn edit_status_with_context(
     runtime: &CloudBotRuntime,
     context: &MigrationRuntimeContext,
@@ -1508,28 +1543,11 @@ async fn edit_status_with_context(
         && context.chat_id == configured_cloud_management_chat_id(&runtime.bot.config)
         && let (Some(chat), Some(message)) = (context.chat_id, context.message_id)
     {
-        let mut text = format!(
-            "Library migration {}: {:?}\n{} completed, {} skipped, {} failed; {} / {} copied.\nSee /file for actual locations and recovery controls.",
-            status.id,
-            status.status,
-            status.success_count,
-            status.skipped_count,
-            status.failed_count,
-            human_bytes(status.copied_bytes),
-            human_bytes(status.total_bytes)
-        );
-        if let Some(warning) = status
-            .warnings
-            .iter()
-            .rev()
-            .find(|warning| warning.starts_with("Migration needs attention:"))
-        {
-            text.push_str(&format!("\n{}", truncate(warning)));
-        }
+        let text = migration_status_message_text(status);
         if let Err(error) = runtime
             .bot
             .telegram
-            .edit_message_text(chat, message, truncate(&text))
+            .edit_message_text(chat, message, text)
             .await
         {
             warn!(error=%error,"could not update library migration Telegram status");
@@ -1574,6 +1592,7 @@ async fn run(
         if reconcile_history_metadata {
             history_metadata_reconciliation_requested.store(true, Ordering::Release);
         }
+        edit_status_if_message_changed(runtime, context.as_ref(), &initial, &status).await;
         publish_status(runtime, status).await;
         return Ok(());
     }
@@ -1590,6 +1609,7 @@ async fn run(
         if status.status == MigrationRunStatus::Completed {
             apply_success_default(runtime, &engine, &status).await?;
         }
+        edit_status_if_message_changed(runtime, context.as_ref(), &initial, &status).await;
         publish_status(runtime, status).await;
         return Ok(());
     }
@@ -1667,6 +1687,7 @@ async fn run(
             last_edit = Instant::now();
         }
         if terminal {
+            let message_status_before_finalization = status.clone();
             let status = finalize_terminal_copy_record_transfers(
                 runtime,
                 &engine,
@@ -1685,6 +1706,13 @@ async fn run(
             if status.status == MigrationRunStatus::Completed {
                 apply_success_default(runtime, &engine, &status).await?;
             }
+            edit_status_if_message_changed(
+                runtime,
+                context.as_ref(),
+                &message_status_before_finalization,
+                &status,
+            )
+            .await;
             publish_status(runtime, status).await;
             drop(guards);
             runtime.bot.queue.publication_notify().notify_one();

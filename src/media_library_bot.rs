@@ -477,7 +477,7 @@ pub(super) async fn request_migration_history_metadata_reconciliation(runtime: &
         return;
     }
     let migrations = runtime.migrations.lock().await;
-    let has_receipts = has_reconcilable_migration_history(&*migrations);
+    let has_receipts = has_reconcilable_migration_history(&migrations);
     drop(migrations);
     if !has_receipts {
         return;
@@ -1352,9 +1352,8 @@ pub(super) async fn dispatch(
     } else {
         None
     };
-    // Serialize removal against every scan from manager open through cache publication. The
-    // per-library admission lease also excludes migration discovery and runners. The
-    // management-dispatch semaphore does not cover startup and publication-watcher scans.
+    // Serialize removal with cache commits. A scan already underway revalidates the
+    // registration before publishing. Per-library admission also excludes migration runners.
     let publication_guard = if kind == "library_remove" {
         Some(
             Arc::clone(&runtime.library_scan_publication_gate)

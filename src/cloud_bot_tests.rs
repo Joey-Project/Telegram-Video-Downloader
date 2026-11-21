@@ -1926,6 +1926,7 @@ pub(super) fn make_runtime(
         migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        library_snapshot_operation_gates: Arc::new(Mutex::new(BTreeMap::new())),
         test_management_admission_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_acquired: Arc::new(Notify::new()),
@@ -9191,7 +9192,7 @@ fn scan_order_test_snapshot(revision: &str) -> LibrarySnapshot {
 }
 
 #[tokio::test]
-async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
+async fn per_library_operations_keep_snapshot_and_warning_ordered() {
     let root = temp_cloud_bot_dir("library-publication-order");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -9200,6 +9201,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, _) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -9233,7 +9235,14 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     .await
     .expect("older scan start barrier should complete");
 
-    let older_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let older_holds_library_operation_gate = runtime
+        .library_snapshot_operation_gates
+        .lock()
+        .await
+        .get(&library_id)
+        .is_some_and(|gate| gate.try_lock().is_err());
+    let publication_gate_stays_available_during_scan =
+        runtime.library_scan_publication_gate.try_lock().is_ok();
     let newer_runtime = runtime.clone();
     let mut newer_future = Box::pin(async move {
         run_cloud_library_operation(&newer_runtime, "newer fixture scan failed", move |_, _| {
@@ -9241,7 +9250,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         })
         .await
     });
-    let newer_waits_on_gate = std::future::poll_fn(|context| {
+    let newer_waits_on_library_operation_gate = std::future::poll_fn(|context| {
         Poll::Ready(Future::poll(newer_future.as_mut(), context).is_pending())
     })
     .await;
@@ -9261,8 +9270,10 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .expect("newer scan task should join")
         .expect("newer scan should publish");
     assert!(
-        older_holds_publication_gate && newer_waits_on_gate,
-        "the older scan should hold the gate and a newer operation should poll to Pending"
+        older_holds_library_operation_gate
+            && publication_gate_stays_available_during_scan
+            && newer_waits_on_library_operation_gate,
+        "same-library operations should serialize per library without holding the global commit gate during scanning"
     );
     assert_eq!(
         runtime
@@ -9295,7 +9306,14 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     .await
     .expect("failing scan start barrier should complete");
 
-    let failing_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let failing_holds_library_operation_gate = runtime
+        .library_snapshot_operation_gates
+        .lock()
+        .await
+        .get(&library_id)
+        .is_some_and(|gate| gate.try_lock().is_err());
+    let publication_gate_stays_available_during_failure =
+        runtime.library_scan_publication_gate.try_lock().is_ok();
     let recovery_runtime = runtime.clone();
     let mut recovery_future = Box::pin(async move {
         run_cloud_library_operation(
@@ -9305,7 +9323,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         )
         .await
     });
-    let recovery_waits_on_gate = std::future::poll_fn(|context| {
+    let recovery_waits_on_library_operation_gate = std::future::poll_fn(|context| {
         Poll::Ready(Future::poll(recovery_future.as_mut(), context).is_pending())
     })
     .await;
@@ -9328,8 +9346,10 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .expect("recovery task should join")
         .expect("recovery scan should publish");
     assert!(
-        failing_holds_publication_gate && recovery_waits_on_gate,
-        "the failing scan should hold the gate and recovery should poll to Pending"
+        failing_holds_library_operation_gate
+            && publication_gate_stays_available_during_failure
+            && recovery_waits_on_library_operation_gate,
+        "same-library recovery should wait per library while a failed scan leaves the global commit gate free"
     );
     assert_eq!(
         runtime
@@ -10930,6 +10950,32 @@ async fn busy_library_retry_does_not_delay_another_library_full_scan_deadline() 
         downloader::hold_video_outputs_for_migration(std::slice::from_ref(&video_root))
             .await
             .expect("default library output should be held busy");
+    let (manual_runtime, _) = media_library_bot::scoped_runtime(&runtime, Some(&busy_library_id))
+        .expect("default library scan runtime should be scoped");
+    let manual_library_id = busy_library_id.clone();
+    let manual_scan = tokio::spawn(async move {
+        media_library_bot::refresh_library(&manual_runtime, Some(&manual_library_id)).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation_gate = runtime
+                .library_snapshot_operation_gates
+                .lock()
+                .await
+                .get(&busy_library_id)
+                .cloned();
+            if operation_gate.is_some_and(|gate| gate.try_lock().is_err()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("manual scan should reach the busy library's output lock");
+    assert!(
+        runtime.library_scan_publication_gate.try_lock().is_ok(),
+        "a manual scan waiting for one root must not hold the global snapshot commit gate"
+    );
     let mut library_scan_retry_not_before = HashMap::new();
     super::scan_due_cloud_libraries_with_retries(
         &runtime,
@@ -10968,6 +11014,18 @@ async fn busy_library_retry_does_not_delay_another_library_full_scan_deadline() 
     );
 
     drop(output_lease);
+    manual_scan
+        .await
+        .expect("manual scan task should join")
+        .expect("manual scan should finish after the output lease is released");
+    assert!(
+        inbox
+            .last_successful_library_scans()
+            .expect("scan receipts should remain readable after the manual scan")
+            .get(&busy_library_id)
+            .is_some_and(|scanned_at| *scanned_at > due_scan_at),
+        "the same-library manual scan should publish after the output lease is released"
+    );
     drop(runtime);
     drop(inbox);
     drop(queue);

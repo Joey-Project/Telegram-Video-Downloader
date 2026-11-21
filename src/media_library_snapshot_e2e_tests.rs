@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -2556,9 +2555,8 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     .await;
     assert_eq!(restore_source_default.status, InboxStatus::Completed);
 
-    // Hold a real scan after it has opened and read the old root but before it publishes its
-    // snapshot. The remove dispatch is polled until it blocks on the same gate, so this ordering
-    // remains deterministic under a slow CI worker.
+    // Hold a real scan after it has read the old root but before it publishes its snapshot.
+    // Removing the registration must invalidate this in-flight scan's cache publication.
     let (scan_read_tx, scan_read_rx) = oneshot::channel();
     let (release_scan_tx, release_scan_rx) = std::sync::mpsc::channel();
     let scan_runtime = archive_runtime.clone();
@@ -2584,7 +2582,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     scan_read_rx
         .await
         .expect("scan should reach the pre-publication checkpoint");
-    assert!(runtime.library_scan_publication_gate.try_lock().is_err());
+    assert!(runtime.library_scan_publication_gate.try_lock().is_ok());
 
     let request = CloudRequest {
         seq: 8_106,
@@ -2593,48 +2591,26 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         created_at: now_millis(),
         extra: serde_json::Map::new(),
     };
-    let remove_runtime = runtime.clone();
-    let (remove_pending_tx, remove_pending_rx) = oneshot::channel();
-    let remove_task = tokio::spawn(async move {
-        let mut dispatch_future = Box::pin(media_library_bot::dispatch(&remove_runtime, &request));
-        let mut pending_sender = Some(remove_pending_tx);
-        futures_util::future::poll_fn(move |context| {
-            let polled = dispatch_future.as_mut().poll(context);
-            if let Some(sender) = pending_sender.take() {
-                let _ = sender.send(polled.is_pending());
-            }
-            polled
-        })
-        .await
-    });
-    assert!(
-        remove_pending_rx
-            .await
-            .expect("remove should report its first poll state"),
-        "removal must wait behind the scan publication gate"
-    );
-    assert!(
-        queue
-            .registry_snapshot()
-            .expect("registry should remain readable while removal waits")
-            .libraries
-            .iter()
-            .any(|library| library.id == archive.id),
-        "the scan must retain the old registration until its snapshot is published"
-    );
+    let remove_outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        media_library_bot::dispatch(&runtime, &request),
+    )
+    .await
+    .expect("removal should not wait for the held scan")
+    .expect("remove request should be handled")
+    .expect("remove should complete while the scan is waiting to publish");
+    assert_eq!(remove_outcome.status, InboxStatus::Completed);
     release_scan_tx
         .send(())
         .expect("scan should be released for publication");
-    scan_task
+    let scan_error = scan_task
         .await
         .expect("scan worker should join")
-        .expect("scan should publish successfully");
-    let remove_outcome = remove_task
-        .await
-        .expect("remove dispatch should join")
-        .expect("remove request should be handled")
-        .expect("remove should complete after the scan releases the gate");
-    assert_eq!(remove_outcome.status, InboxStatus::Completed);
+        .expect_err("a scan of a removed registration must not publish");
+    assert!(
+        scan_error.to_string().contains("registration changed"),
+        "{scan_error:#}"
+    );
     assert!(
         !runtime
             .library_snapshots

@@ -3460,6 +3460,17 @@ impl MigrationEngine {
             }),
             "migration primary remains present in the source library after its cleanup intent"
         );
+        let physical_identity_present = if let Some(lease) = output_lease {
+            self.source
+                .migration_physical_identity_present_with_output_lease(lease, expected_identity)?
+        } else {
+            self.source
+                .migration_physical_identity_present(expected_identity)?
+        };
+        ensure!(
+            !physical_identity_present,
+            "migration primary remains present under another filename in the source library"
+        );
         Ok(())
     }
 

@@ -1026,7 +1026,10 @@ async fn irreducible_413_is_paced_but_explicit_refresh_bypasses_failure_cooldown
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("irreducible"));
+    let irreducible = empty_cloud_test_library_snapshot("irreducible");
+    seed_mocked_cloud_library_snapshot(&runtime, &irreducible)
+        .await
+        .expect("the irreducible fixture should have a recent complete-scan receipt");
     let (writer, mut results) = mpsc::channel(4);
     *runtime.websocket_writer.lock().await = Some(writer);
     let viewer_id = "22222222-2222-4222-8222-222222222222".to_string();
@@ -1052,6 +1055,7 @@ async fn irreducible_413_is_paced_but_explicit_refresh_bypasses_failure_cooldown
     ));
     let posts = wait_for_state_posts(&cloud_state, 1).await;
     assert_eq!(posts[0]["status"], 413);
+    assert_eq!(posts[0]["revision"], "irreducible");
     assert_eq!(
         inbox.last_successful_publication_at().unwrap(),
         None,
@@ -1090,6 +1094,7 @@ async fn irreducible_413_is_paced_but_explicit_refresh_bypasses_failure_cooldown
     .await
     .expect("explicit refresh should bypass the admission cooldown");
     assert_eq!(posts[1]["status"], 413);
+    assert_eq!(posts[1]["revision"], "irreducible");
     assert_eq!(posts[1]["snapshot_notify_viewers"], "1");
     let result = tokio::time::timeout(Duration::from_secs(1), results.recv())
         .await
@@ -1117,6 +1122,7 @@ async fn irreducible_413_is_paced_but_explicit_refresh_bypasses_failure_cooldown
     .await
     .expect("the failed admission should retry once at the expiry deadline");
     assert_eq!(posts[2]["status"], 413);
+    assert_eq!(posts[2]["revision"], "irreducible");
     assert!(
         posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64(),
         "the bounded expiry attempt should allocate a fresh version"
@@ -1243,6 +1249,117 @@ async fn permanent_rejection_retry_skips_last_ack_but_explicit_refresh_still_pub
     assert_eq!(posts[1]["status"], 200);
     assert_eq!(posts[1]["revision"], "last-ack");
     assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn permanent_rejection_retries_unacknowledged_state_after_cooldown() {
+    let root = temp_cloud_bot_dir("state-reporter-rejection-retry-current-state");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([422, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let acknowledged = empty_cloud_test_library_snapshot("last-ack");
+    seed_mocked_cloud_library_snapshot(&runtime, &acknowledged)
+        .await
+        .expect("the acknowledged fixture should have a recent complete-scan receipt");
+    let baseline = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("baseline state should build")
+        .expect("local baseline should exist");
+    let watch_fingerprint = baseline
+        .watch_fingerprint()
+        .expect("baseline watch fingerprint should build");
+    let background_fingerprint = baseline
+        .background_fingerprint()
+        .expect("baseline semantic fingerprint should build");
+    inbox
+        .record_successful_publication_at_with_background(
+            now_millis(),
+            &watch_fingerprint,
+            Some(&background_fingerprint),
+        )
+        .expect("last acknowledged state should persist");
+
+    let retry_interval = Duration::from_millis(500);
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        retry_interval,
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+    ));
+    let unacknowledged = empty_cloud_test_library_snapshot("unacknowledged");
+    replace_mocked_cloud_library_snapshot(&runtime, &unacknowledged)
+        .await
+        .expect("the unacknowledged fixture should remain registered");
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000003803")
+        .await
+        .expect("explicit refresh should submit the changed state");
+
+    let first = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(first[0]["status"], 422);
+    assert_eq!(first[0]["revision"], "unacknowledged");
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 2),
+    )
+    .await
+    .expect("a stable changed state should retry once after its rejection cooldown");
+    assert_eq!(second[1]["status"], 200);
+    assert_eq!(second[1]["revision"], "unacknowledged");
+    assert!(second[1]["state_version"].as_u64() > second[0]["state_version"].as_u64());
+    assert_eq!(
+        second[1]["content_hash"], second[0]["content_hash"],
+        "the cooldown retry should preserve the same unacknowledged semantic content"
+    );
+    assert!(
+        second[1]["reported_at"].as_u64().unwrap_or_default()
+            >= second[0]["reported_at"].as_u64().unwrap_or_default()
+                + (retry_interval / 2).as_millis() as u64,
+        "the retry should honor the permanent-rejection cooldown"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        2,
+        "a successful cooldown retry should clear the rejection and avoid duplicate writes"
+    );
 
     reporter.abort();
     let _ = reporter.await;

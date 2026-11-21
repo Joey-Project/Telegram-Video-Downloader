@@ -643,6 +643,7 @@ struct CloudBotRuntime {
         Arc<Mutex<media_library_bot::MigrationHistoryReconciliationState>>,
     migration_runners: Arc<Mutex<HashSet<String>>>,
     library_io_gates: library_migration_bot::LibraryIoGateRegistry,
+    library_snapshot_operation_gates: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     #[cfg(test)]
     test_migration_runner_gate_waiting: Arc<Notify>,
     #[cfg(test)]
@@ -890,13 +891,13 @@ enum CloudLibraryFailurePolicy {
 #[derive(Clone, Copy)]
 enum CloudLibraryAdmission {
     TryManagement,
-    TryManagementAndPublication,
+    TryManagementAndLibraryOperation,
     WaitManagement,
 }
 
-/// Serializes each library scan through publishing its snapshot or failure warning.
-/// The scan itself runs on a blocking thread, but the async guard stays held until the
-/// result is visible to the cloud state reporter.
+/// Serializes one library's work through its cache commit without blocking other roots.
+/// The per-library guard stays with the blocking worker if its async caller is cancelled;
+/// the global publication gate is held only while the completed result is committed.
 async fn run_cloud_library_operation<T>(
     runtime: &CloudBotRuntime,
     failure_context: &'static str,
@@ -999,6 +1000,8 @@ where
         media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
     });
     let selected_library_id = selected_library.map(|library| library.id.clone());
+    let selected_library_root_binding =
+        selected_library.and_then(crate::media_libraries::MediaLibrary::root_binding_token);
     let selected_queue_library_id = selected_library_id
         .as_deref()
         .context("library operation has no registered queue store for its root")?
@@ -1009,10 +1012,9 @@ where
     {
         bail!("library root identity changed; refresh settings and retry");
     }
-    let default_library_id = settings.default_library_id;
     let io_lease = match admission {
         CloudLibraryAdmission::TryManagement
-        | CloudLibraryAdmission::TryManagementAndPublication => {
+        | CloudLibraryAdmission::TryManagementAndLibraryOperation => {
             library_migration_bot::try_acquire_library_io(
                 runtime,
                 std::slice::from_ref(&selected_queue_library_id),
@@ -1027,15 +1029,24 @@ where
             .await?
         }
     };
-    let publication_gate = Arc::clone(&runtime.library_scan_publication_gate);
-    let publication_guard = match admission {
-        CloudLibraryAdmission::TryManagementAndPublication => {
-            publication_gate.try_lock_owned().map_err(|_| {
-                anyhow::anyhow!("another media-library scan is active; automatic scan deferred")
+    let operation_gate = {
+        let mut gates = runtime.library_snapshot_operation_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(selected_queue_library_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    };
+    let operation_guard = match admission {
+        CloudLibraryAdmission::TryManagementAndLibraryOperation => {
+            operation_gate.try_lock_owned().map_err(|_| {
+                anyhow::anyhow!(
+                    "another operation is active for this library; automatic scan deferred"
+                )
             })?
         }
         CloudLibraryAdmission::TryManagement | CloudLibraryAdmission::WaitManagement => {
-            publication_gate.lock_owned().await
+            operation_gate.lock_owned().await
         }
     };
     if runtime.epoch_fatal.is_signaled() {
@@ -1044,7 +1055,7 @@ where
     let context = runtime.bot.clone();
     let inbox = Arc::clone(&runtime.inbox);
     let queue = Arc::clone(&runtime.bot.queue);
-    let selected_library_id_for_worker = selected_queue_library_id;
+    let selected_library_id_for_worker = selected_queue_library_id.clone();
     let blocking_io_lease = Arc::clone(&io_lease);
     let worker = tokio::task::spawn_blocking(move || {
         let _io_lease = blocking_io_lease;
@@ -1060,19 +1071,43 @@ where
             };
             operation(context, inbox, verified_root)
         })();
-        (result, publication_guard)
+        (result, operation_guard)
     })
     .await;
-    let (worker, publication_guard) = match worker {
-        Ok((result, publication_guard)) => (Ok(result), Some(publication_guard)),
-        Err(error) => (Err(error).with_context(|| failure_context), None),
+    let (worker, operation_guard) = match worker {
+        Ok((result, operation_guard)) => (result, Some(operation_guard)),
+        Err(error) => (Err(error.into()), None),
     };
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
+    let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+        .lock_owned()
+        .await;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
+    let queue = Arc::clone(&runtime.bot.queue);
+    let committed_settings = tokio::task::spawn_blocking(move || queue.registry_snapshot())
+        .await
+        .context("media-library settings worker failed before snapshot publication")??;
+    // A removal may finish while this scan is running. Its commit shares the gate, so verify
+    // the registration incarnation here before making the scanned snapshot visible.
+    let selected_library_is_current = committed_settings.libraries.iter().any(|library| {
+        library.id == selected_queue_library_id
+            && selected_library_root_binding
+                .as_ref()
+                .is_none_or(|expected_binding| {
+                    library.root_binding_token().as_ref() == Some(expected_binding)
+                })
+    });
+    if !selected_library_is_current {
+        bail!("media library registration changed before its snapshot could be published");
+    }
+    let default_library_id = committed_settings.default_library_id;
     let mut reconcile_migration_history_metadata = false;
     let result = match worker {
-        Ok(Ok((value, snapshot_update))) => {
+        Ok((value, snapshot_update)) => {
             match snapshot_update {
                 CloudLibrarySnapshotUpdate::Publish(snapshot) => {
                     if let Some(library_id) = selected_library_id.as_ref() {
@@ -1130,7 +1165,7 @@ where
             runtime.state_notify.notify_one();
             Ok(value)
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
                 let warning = bounded_cloud_library_warning(&format!("{error:#}"));
                 if let Some(library_id) = selected_library_id.as_ref() {
@@ -1149,27 +1184,9 @@ where
             runtime.state_notify.notify_one();
             Err(error).with_context(|| failure_context)
         }
-        Err(error) => {
-            if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
-                let warning = bounded_cloud_library_warning(&format!("{error:#}"));
-                if let Some(library_id) = selected_library_id.as_ref() {
-                    runtime
-                        .library_unavailable
-                        .lock()
-                        .await
-                        .insert(library_id.clone(), warning.clone());
-                    if library_id == &default_library_id {
-                        *runtime.library_scan_warning.lock().await = Some(warning);
-                    }
-                } else {
-                    *runtime.library_scan_warning.lock().await = Some(warning);
-                }
-            }
-            runtime.state_notify.notify_one();
-            Err(error)
-        }
     };
     drop(publication_guard);
+    drop(operation_guard);
     drop(io_lease);
     if reconcile_migration_history_metadata && !runtime.epoch_fatal.is_signaled() {
         media_library_bot::request_migration_history_metadata_reconciliation(runtime).await;
@@ -2223,6 +2240,7 @@ async fn run_cloud_bot(
         migration_history_reconciliation: Arc::new(Mutex::new(Default::default())),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        library_snapshot_operation_gates: Arc::new(Mutex::new(BTreeMap::new())),
         #[cfg(test)]
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         #[cfg(test)]
@@ -2418,6 +2436,7 @@ async fn has_pending_snapshot_refreshes(runtime: &CloudBotRuntime) -> bool {
     !queue.pending.is_empty()
 }
 
+#[cfg(test)]
 async fn scan_due_cloud_libraries(runtime: &CloudBotRuntime) -> Result<()> {
     let mut library_scan_retry_not_before = HashMap::new();
     scan_due_cloud_libraries_with_retries(
@@ -2497,7 +2516,7 @@ async fn scan_due_cloud_libraries_with_retries(
             &scoped_runtime,
             "automatic media-library scan worker failed",
             CloudLibraryFailurePolicy::PreserveAvailability,
-            CloudLibraryAdmission::TryManagementAndPublication,
+            CloudLibraryAdmission::TryManagementAndLibraryOperation,
             None,
             move |context, inbox, _root| {
                 #[cfg(test)]
@@ -2855,7 +2874,10 @@ async fn cloud_state_reporter_with_retry_policy(
                         }
                         published_oversized_source_fingerprint = None;
                     }
-                    if !forced && permanently_rejected_fingerprint.as_ref() == Some(&fingerprint) {
+                    if !forced
+                        && !trigger.retry_after_rejection
+                        && permanently_rejected_fingerprint.as_ref() == Some(&fingerprint)
+                    {
                         continue;
                     }
                     let state_version = match next_cloud_state_version(&runtime).await {

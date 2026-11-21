@@ -1356,6 +1356,7 @@ struct ScanWalk {
     started_at: Instant,
     timed_out: bool,
     incomplete_scan: bool,
+    unaddressable_entries: bool,
     migration_incomplete_paths: BTreeSet<String>,
     scope_unknown: bool,
     max_entries: usize,
@@ -1375,6 +1376,7 @@ impl Default for ScanWalk {
             started_at: Instant::now(),
             timed_out: false,
             incomplete_scan: false,
+            unaddressable_entries: false,
             migration_incomplete_paths: BTreeSet::new(),
             scope_unknown: false,
             max_entries: MAX_ENTRIES,
@@ -1693,6 +1695,87 @@ impl LibraryManager {
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _library_guard = self.lock_library()?;
         self.scan_locked_with_completeness(&[])
+    }
+
+    /// Searches the same bounded, rooted, user-visible library tree as the scanner, including
+    /// regular files whose extensions are not recognized as media. A negative result is returned
+    /// only after every allowed directory was enumerated; inaccessible, over-limit, or
+    /// non-UTF-8 entries make absence unprovable.
+    pub(crate) fn migration_physical_identity_present_with_output_lease(
+        &self,
+        lease: &crate::downloader::VideoMigrationGuard,
+        expected: PhysicalItemIdentity,
+    ) -> Result<bool> {
+        lease.validate_for_root(&self.root)?;
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _library_guard = self.lock_library()?;
+        self.migration_physical_identity_present_locked(expected)
+    }
+
+    pub(crate) fn migration_physical_identity_present(
+        &self,
+        expected: PhysicalItemIdentity,
+    ) -> Result<bool> {
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _output_guard = self.lock_output()?;
+        let _library_guard = self.lock_library()?;
+        self.migration_physical_identity_present_locked(expected)
+    }
+
+    fn migration_physical_identity_present_locked(
+        &self,
+        expected: PhysicalItemIdentity,
+    ) -> Result<bool> {
+        let mut walk = ScanWalk::default();
+        self.walk_directory(Path::new(""), 0, &mut walk)?;
+        for scanned in &walk.files {
+            if walk.started_at.elapsed() >= SCAN_TIMEOUT {
+                bail!("source identity search exceeded its scan time limit");
+            }
+            if scanned.identity.device() != expected.device
+                || scanned.identity.inode() != expected.inode
+            {
+                continue;
+            }
+            if !expected.has_complete_birth() {
+                return Ok(true);
+            }
+            let absolute = self.absolute_path(&scanned.relative_path)?;
+            let actual = self.coordinate_read(&absolute, |coordinated| {
+                if coordinated != absolute {
+                    bail!("coordinated source identity path changed during proof");
+                }
+                let Some(file) = self.root.open_bound_file(coordinated)? else {
+                    bail!("source entry disappeared during physical identity proof");
+                };
+                if file.identity() != scanned.identity {
+                    bail!("source entry identity changed during physical identity proof");
+                }
+                file.physical_identity()
+            })?;
+            if !actual.has_complete_birth() {
+                return Ok(true);
+            }
+            if actual == expected {
+                return Ok(true);
+            }
+        }
+        if walk.started_at.elapsed() >= SCAN_TIMEOUT
+            || walk.timed_out
+            || walk.incomplete_scan
+            || !walk.incomplete_directories.is_empty()
+            || walk.scope_unknown
+            || walk.unaddressable_entries
+        {
+            bail!("source identity search could not prove a complete library walk");
+        }
+        Ok(false)
     }
 
     pub(crate) fn migration_validate_output_lease(
@@ -2263,7 +2346,7 @@ impl LibraryManager {
                 ]
                 .into_iter()
                 .flatten()
-                .all(|current| same_historical_collection(current, incoming))
+                .all(|current| collection_accepts_prior_metadata(current, incoming))
             });
             merge_queue_metadata(
                 &mut record.queue_metadata,
@@ -7562,15 +7645,14 @@ impl LibraryManager {
                 }
                 return Ok(());
             }
+            if name.to_str().is_none() {
+                walk.unaddressable_entries = true;
+                continue;
+            }
             if excluded_entry(&name, identity, semantics, self.library_dir_identity)? {
                 continue;
             }
-            let Some(name_text) = name.to_str() else {
-                walk.warnings.push(format!(
-                    "ignored a non-UTF-8 media path under {relative_string}"
-                ));
-                continue;
-            };
+            let name_text = name.to_str().expect("entry name was checked as UTF-8");
             let child_relative = relative.join(name_text);
             if identity.is_dir() {
                 if relative.as_os_str().is_empty() {
@@ -9697,17 +9779,7 @@ fn merge_collection_metadata(
     let Some(current) = current else {
         return;
     };
-    let same_collection = match (&current.id, &previous.id) {
-        (Some(current_id), Some(previous_id)) => current_id == previous_id,
-        _ => {
-            !current.title.trim().is_empty()
-                && current.title.trim() == previous.title.trim()
-                && (current.kind == previous.kind
-                    || current.kind.trim().is_empty()
-                    || current.kind == "nfo_set")
-        }
-    };
-    if !same_collection {
+    if !collection_accepts_prior_metadata(current, previous) {
         return;
     }
     if current.id.is_none() {
@@ -9727,15 +9799,19 @@ fn merge_collection_metadata(
     }
 }
 
-fn same_historical_collection(current: &CollectionMetadata, incoming: &CollectionMetadata) -> bool {
+fn collection_accepts_prior_metadata(
+    current: &CollectionMetadata,
+    incoming: &CollectionMetadata,
+) -> bool {
     match (&current.id, &incoming.id) {
         (Some(current_id), Some(incoming_id)) => current_id == incoming_id,
-        (None, None) => {
+        _ => {
             !current.title.trim().is_empty()
                 && current.title.trim() == incoming.title.trim()
-                && current.kind == incoming.kind
+                && (current.kind == incoming.kind
+                    || current.kind.trim().is_empty()
+                    || current.kind == "nfo_set")
         }
-        _ => false,
     }
 }
 
@@ -18004,7 +18080,7 @@ mod tests {
             .expect("target media should write");
         fs::write(
             target_root.path().join("clip.nfo"),
-            b"<movie><title>Current target NFO</title><uniqueid type=\"bilibili\">BV1target</uniqueid></movie>",
+            b"<movie><title>Current target NFO</title><uniqueid type=\"bilibili\">BV1target</uniqueid><set><name>Historical playlist</name></set></movie>",
         )
         .expect("target NFO should write");
         let source = manager(&source_root);
@@ -18073,6 +18149,10 @@ mod tests {
         let mut target_snapshot = target.scan(&[]).expect("target should scan");
         let target_item = item_at(&target_snapshot, "clip.mp4").clone();
         assert_eq!(target_item.title, "Current target NFO");
+        let target_collection = target_item.collection.as_ref().unwrap();
+        assert_eq!(target_collection.title, "Historical playlist");
+        assert!(target_collection.id.is_none());
+        assert!(target_collection.order.is_none());
         let target_nfo_source_ids = target_item.source_ids.clone();
         assert!(!target_nfo_source_ids.is_empty());
         let target_identity = target_item
@@ -18113,13 +18193,9 @@ mod tests {
                 .source_ids
                 .contains(&"youtube:abcdefghijk".to_string())
         );
-        assert_eq!(
-            merged
-                .collection
-                .as_ref()
-                .and_then(|collection| collection.id.as_deref()),
-            Some("playlist-9")
-        );
+        let merged_collection = merged.collection.as_ref().unwrap();
+        assert_eq!(merged_collection.id.as_deref(), Some("playlist-9"));
+        assert_eq!(merged_collection.order, Some(9));
 
         let rescanned = target
             .scan(&[])
