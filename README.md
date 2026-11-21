@@ -135,14 +135,15 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 
 When `bilibili.danmaku.enabled = true`, the bot asks `bbdown-core` to write the configured formats, which default to XML and ASS. With both sidecars available, it renders ASS from the reported XML. Identical scrolling comments in the same direction are grouped within `merge_window_ms` of the first comment (default 1500, range 0–10000). A group starts at its first timestamp and displays the total in a small suffix such as `(10)`. Large groups gradually grow up to 1.3× the normal font size. Fixed comments remain individual.
 
-The renderer places each comment using its own height and the estimated positions of other comments while they are visible. After an initial placement, it can reposition comments based on both earlier and later events. Collision scores use the time each pair actually spends overlapping on screen, including the different display durations of scrolling and fixed comments. Very crowded paths retain their initial placements. Multiline comments occupy extra vertical space for their own duration. Every rendered event keeps its start time and duration.
+The renderer places each comment using its own height and the estimated positions of other comments while they are visible. After an initial placement, it can reposition comments based on both earlier and later events. Collision scores use the time each pair spends overlapping on screen, including the different display durations of scrolling and fixed comments. Multiline comments occupy extra vertical space for their own duration. When the renderer cannot find a non-overlapping placement, it skips the event. Every rendered event keeps its start time and duration.
 
 The existing `font_scale`, `opacity`, and `display_area` defaults are 3×, 70%, and the top half of the screen. Their valid ranges are `0 < font_scale <= 10`, `0 <= opacity <= 1`, and `0 < display_area <= 1`. Set `merge_window_ms = 0` for legacy bot rendering. ASS-only downloads use legacy styling because the paired XML is unavailable. For saved media, **Refresh danmaku** appends new comments to the original XML and rebuilds recognized generated ASS after confirmation. It checks grouped ASS against its XML source and recorded renderer version, including after a refresh interrupted between the two writes. Custom ASS, ordinary subtitles, and video files are preserved.
 
-The standalone Rust crate accepts XML and render options and returns ASS. The CLI writes ASS to stdout and accepts a file or `-` for stdin.
+The bot uses [danmaku-renderer](https://crates.io/crates/danmaku-renderer) from crates.io. It writes the v4 layout marker for new grouped ASS and can verify v1–v3 sidecars from their XML before replacing them. The same crate's CLI writes ASS to stdout and accepts a file or `-` for stdin.
 
 ```sh
-cargo run -p danmaku-renderer -- --font-scale 3 --opacity 0.7 --display-area 0.5 episode.xml > episode.preview.ass
+cargo install danmaku-renderer --version 0.1.0 --locked --features cli
+danmaku-renderer --font-scale 3 --opacity 0.7 --display-area 0.5 episode.xml > episode.preview.ass
 ```
 
 The pinned SDK decodes plain, raw DEFLATE, zlib, and gzip danmaku payloads

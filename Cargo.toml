@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/danmaku-renderer", "crates/flac-alac-converter"]
+members = ["crates/flac-alac-converter"]
 resolver = "3"
 
 [features]
@@ -13,7 +13,7 @@ test-runtime = []
 [dependencies]
 anyhow = "1"
 bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "f0cb37ce9821f28a7fb8fb2a238553ed9c0265cf", package = "bbdown-core" }
-danmaku-renderer = { path = "crates/danmaku-renderer" }
+danmaku-renderer = "0.1.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2"
 qrcode = "0.14.1"
