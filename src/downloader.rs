@@ -1857,6 +1857,9 @@ pub async fn run_job(
             run_video_job_staged_keep_both(config, job, progress).await
         }
         JobRequest::Pdf { .. } => run_simple_job(config, job, progress).await,
+        JobRequest::Social { .. } => {
+            bail!("Social media downloads require a saved Telegram reply target")
+        }
     }
 }
 
@@ -5841,6 +5844,10 @@ async fn inspect_job_plan_inner(
     planning_context: Option<BilibiliPlanningContext>,
 ) -> Result<PlanValidationSnapshot> {
     match job {
+        JobRequest::Social { url } => Ok(PlanValidationSnapshot {
+            stable_media_ids: vec![format!("social:{url}")],
+            ..PlanValidationSnapshot::default()
+        }),
         JobRequest::Pdf { url } => {
             let (safe_job, _) = sanitize_job_for_storage(job.clone());
             let JobRequest::Pdf { url: safe_url } = safe_job else {
@@ -15099,6 +15106,9 @@ async fn run_staged_video_job(
             }
         }
         JobRequest::Pdf { .. } => run_simple_job(config, job, progress.clone()).await,
+        JobRequest::Social { .. } => {
+            bail!("Social media downloads require a saved Telegram reply target")
+        }
     };
 
     let mut report = match result {
@@ -15891,6 +15901,9 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec>
             &SubtitlePlan::none(),
         )),
         JobRequest::Pdf { url } => Ok(pdf_command_spec(config, url)),
+        JobRequest::Social { .. } => {
+            bail!("Social media downloads use a provider-specific original-media worker")
+        }
     }
 }
 
@@ -15904,7 +15917,7 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
             provider: VideoProvider::Youtube,
             id: "unknown".to_string(),
         }),
-        JobRequest::Pdf { .. } => None,
+        JobRequest::Pdf { .. } | JobRequest::Social { .. } => None,
     })
 }
 
@@ -18830,7 +18843,7 @@ fn send_bilibili_attempt(progress: Option<&JobProgressSender>, snapshot: Bilibil
     }
 }
 
-fn send_progress(progress: Option<&JobProgressSender>, message: String) {
+pub(crate) fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
         let message = redact_sensitive_text(&message);
         if let Some(path) = message.strip_prefix("staging: downloading into ") {
@@ -21090,7 +21103,7 @@ fn video_identity(job: &JobRequest) -> Option<VideoIdentity> {
             provider: VideoProvider::Youtube,
             id,
         }),
-        JobRequest::Pdf { .. } => None,
+        JobRequest::Pdf { .. } | JobRequest::Social { .. } => None,
     }
 }
 

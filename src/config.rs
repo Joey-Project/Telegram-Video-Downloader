@@ -115,6 +115,8 @@ pub struct ToolsConfig {
     pub chrome: PathBuf,
     #[serde(default = "default_ffmpeg")]
     pub ffmpeg: PathBuf,
+    #[serde(default = "default_gallery_dl")]
+    pub gallery_dl: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -321,6 +323,7 @@ impl AppConfig {
         self.tools.pdf_helper = expand_home_path(&self.tools.pdf_helper);
         self.tools.chrome = expand_home_path(&self.tools.chrome);
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
+        self.tools.gallery_dl = expand_home_path(&self.tools.gallery_dl);
         let state_path = expand_home_path(&self.bilibili.auth.state_path);
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
         let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
@@ -797,6 +800,7 @@ impl Default for ToolsConfig {
             pdf_helper: default_pdf_helper(),
             chrome: default_chrome(),
             ffmpeg: default_ffmpeg(),
+            gallery_dl: default_gallery_dl(),
         }
     }
 }
@@ -921,6 +925,10 @@ fn default_chrome() -> PathBuf {
 
 fn default_ffmpeg() -> PathBuf {
     PathBuf::from("ffmpeg")
+}
+
+fn default_gallery_dl() -> PathBuf {
+    PathBuf::from("gallery-dl")
 }
 
 fn home_path(parts: &[&str], fallback: &str) -> PathBuf {
@@ -1220,6 +1228,7 @@ mod tests {
             PathBuf::from("scripts/pdf_helper.py")
         );
         assert_eq!(config.tools.ffmpeg, PathBuf::from("ffmpeg"));
+        assert_eq!(config.tools.gallery_dl, PathBuf::from("gallery-dl"));
         assert!(config.music.ffmpeg.is_absolute());
         assert!(config.music.ffprobe.is_absolute());
         assert_eq!(config.bot.concurrency, 2);

@@ -11,6 +11,7 @@ pdf_dir = "~/Documents/Downloads"
 # Bilibili downloads/auth use the embedded bbdown-core crate; bbdown is kept for legacy helpers only.
 bbdown = "bbdown"
 yt_dlp = "yt-dlp"
+gallery_dl = "gallery-dl" # Used for Instagram posts, stories and profile photos.
 uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
 chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
