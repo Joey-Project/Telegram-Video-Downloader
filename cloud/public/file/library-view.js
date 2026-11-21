@@ -378,7 +378,7 @@ export function filterLibraryItems(items, { query = "", category = "", status = 
     const moved = movedToTarget(item) !== null;
     const matchesStatus = status === "moved"
       ? moved
-      : !moved && (!status || statusOf(item) === status);
+      : !moved && statusOf(item) === (status || "present");
     return (!normalizedQuery || text.includes(normalizedQuery))
       && (!category || itemFolder(item) === category)
       && matchesStatus;

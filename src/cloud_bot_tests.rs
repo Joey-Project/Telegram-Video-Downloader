@@ -8354,8 +8354,10 @@ async fn coalesced_queue_progress_publishes_final_state_without_library_rescan()
         .expect("progress task should persist");
     let queue_changes = queue.state_change_notify();
     queue_changes.notified().await;
-    *runtime.library_snapshot.lock().await =
-        Some(empty_cloud_test_library_snapshot("stable-library-revision"));
+    let stable_library = empty_cloud_test_library_snapshot("stable-library-revision");
+    seed_mocked_cloud_library_snapshot(&runtime, &stable_library)
+        .await
+        .expect("the mocked fixture should have a recent complete-scan receipt");
 
     let publication_watcher = tokio::spawn(cloud_library_publication_watcher(runtime.clone()));
     let queue_state_watcher = tokio::spawn(cloud_queue_state_watcher_with_debounce(
@@ -10573,6 +10575,276 @@ async fn preview_cancel_rejects_completed_confirmation_after_history_eviction_an
     drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
+async fn cloud_hourly_maintenance_skips_unchanged_state_and_publishes_changed_content() {
+    let root = temp_cloud_bot_dir("hourly-semantic-snapshot");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (default_library_id, _) = cloud_test_default_library_binding(&queue);
+    inbox
+        .record_successful_library_scan_at(
+            &default_library_id,
+            now_seconds(),
+            std::slice::from_ref(&default_library_id),
+        )
+        .expect("recent full scan time should prevent a daily scan during this test");
+
+    let snapshot = empty_cloud_test_library_snapshot("hourly-baseline");
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(default_library_id.clone(), snapshot.clone());
+
+    let expiry = Duration::from_millis(300);
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        expiry,
+        Duration::from_millis(5),
+        Duration::from_millis(100),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !cloud_state
+                .state_posts
+                .lock()
+                .expect("fake state-post lock should not poison")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bootstrap snapshot should publish");
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        1,
+        "an hourly availability check with unchanged semantic state must not write Cloud state"
+    );
+
+    let mut changed = snapshot;
+    changed.revision = "hourly-content-changed".to_string();
+    changed.scanned_at = now_seconds();
+    changed.items.push(LibraryItem {
+        id: "new-item".to_string(),
+        title: "New clip".to_string(),
+        relative_path: "New clip.mp4".to_string(),
+        bytes: 42,
+        width: None,
+        height: None,
+        codec: None,
+        source_ids: Vec::new(),
+        collection: None,
+        organization_status: None,
+        attachments: Vec::new(),
+        authoritative_nfo_path: None,
+        confidence: Confidence::High,
+        metadata_status: MetadataStatus::Complete,
+        integrity_status: IntegrityStatus::Unverified,
+        physical_identity: None,
+        presence: Presence::Present,
+    });
+    *runtime.library_snapshot.lock().await = Some(changed.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(default_library_id, changed);
+    runtime.state_notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        1,
+        "ordinary queue notifications do not turn idle background changes into unrequested writes"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if cloud_state
+                .state_posts
+                .lock()
+                .expect("fake state-post lock should not poison")
+                .len()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the next hourly check should publish changed media content");
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .len(),
+        2,
+        "one changed background snapshot should produce one Cloud write"
+    );
+
+    reporter.abort();
+    let _ = reporter.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn due_full_scan_preserves_previous_state_on_failure_and_advances_after_success() {
+    let root = temp_cloud_bot_dir("failed-due-full-scan");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    queue
+        .refresh_video_libraries()
+        .expect("registered test library should be available");
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (library_id, _) = cloud_test_default_library_binding(&queue);
+    let last_successful_scan =
+        now_seconds().saturating_sub(super::CLOUD_LIBRARY_FULL_SCAN_INTERVAL.as_secs());
+    inbox
+        .record_successful_library_scan_at(
+            &library_id,
+            last_successful_scan,
+            std::slice::from_ref(&library_id),
+        )
+        .expect("old complete scan time should persist");
+
+    let previous = empty_cloud_test_library_snapshot("last-complete-snapshot");
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    *runtime.library_snapshot.lock().await = Some(previous.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(library_id.clone(), previous.clone());
+    *runtime
+        .test_library_refresh_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some("injected incomplete scan".to_string());
+
+    super::scan_due_cloud_libraries(&runtime)
+        .await
+        .expect("a failed library scan should defer and allow the hourly pass to continue");
+    assert!(
+        runtime
+            .test_library_refresh_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the due scan should have attempted the available library"
+    );
+    assert_eq!(
+        runtime
+            .library_snapshots
+            .lock()
+            .await
+            .get(&library_id)
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("last-complete-snapshot")
+    );
+    assert_eq!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .get(&library_id)
+            .copied(),
+        Some(last_successful_scan)
+    );
+    assert!(super::cloud_library_full_scan_due(
+        Some(last_successful_scan),
+        now_seconds(),
+        true,
+        true,
+    ));
+
+    fs::write(
+        runtime.bot.config.downloads.video_dir.join("new-clip.mp4"),
+        b"new local fixture media",
+    )
+    .expect("new media should write");
+    super::scan_due_cloud_libraries(&runtime)
+        .await
+        .expect("the still-due library should successfully scan on the next pass");
+    let completed = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&library_id)
+        .cloned()
+        .expect("a successful complete scan should publish its local snapshot");
+    assert!(completed.scanned_at > last_successful_scan);
+    assert!(completed.items.iter().any(|item| {
+        item.relative_path == "new-clip.mp4" && item.presence == Presence::Present
+    }));
+    assert_eq!(
+        inbox
+            .last_successful_library_scans()
+            .unwrap()
+            .get(&library_id)
+            .copied(),
+        Some(completed.scanned_at)
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[path = "cloud_liveness_tests.rs"]

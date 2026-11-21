@@ -15,7 +15,7 @@ The local service initiates every cloud connection and sends Telegram replies di
 3. Rust obtains the authenticated database epoch before opening its local inbox, validates the envelope and JavaScript-safe sequence number, and durably writes the full request under that epoch. It sends `POST /api/local/ack` only after that write succeeds. WebSocket delivery uses this same HTTPS receipt; the WebSocket itself has no ACK frame.
 4. Within one epoch, the inbox deduplicates by exact sequence and envelope, not by a maximum-sequence watermark. An unseen lower sequence is accepted. Re-delivery of an identical sequence wakes recovery without creating another local record.
 5. Local receipt and operation completion are separate. Pending management work survives restart; a confirmed file batch uses its persisted preview and move journal to resume unfinished steps. An interrupted Telegram update whose external side effect is uncertain is surfaced as uncertain rather than blindly replayed.
-6. Rust publishes time snapshots through HTTPS on an explicit Mini App refresh, a relevant change while a foreground user awaits operation results, or hourly expiry. Ordinary local state changes remain local. Successful snapshot publication moves the snapshot deadline forward. Authoritative inbox reconciliation retains its own maximum one-hour gap and is coalesced with refresh work where possible; publishing progress cannot indefinitely defer a missing-command check. Startup and reconnect still fetch the oldest pending batch immediately. WebSocket reconnect uses bounded backoff.
+6. Rust publishes time snapshots through HTTPS on an explicit Mini App refresh, a relevant change while a foreground user awaits operation results, or a scheduled check that finds changed state. Local progress is coalesced. The hourly check refreshes local library availability and compares the resulting view to the last acknowledged snapshot. A change to scan timestamps or routine free-space readings alone does not require a publication. Authoritative inbox reconciliation retains its own maximum one-hour gap and is coalesced with refresh work where possible; publishing progress cannot indefinitely defer a missing-command check. Startup and reconnect still fetch the oldest pending batch immediately. WebSocket reconnect uses bounded backoff.
 
 Failed background inbox reads use exponential retry backoff, capped at one hour,
 without advancing the last successful-read deadline. New command hints and
@@ -232,11 +232,15 @@ Authenticated, validated snapshot canonicalization permits up to 1,000,000 nodes
 
 The Mini App exposes private library data only after the current Telegram identity passes the Worker owner check. An authorization failure hides private content and stops action dispatch until authentication succeeds again. Network errors, rate limits, and server failures retain queued action IDs for retry; permanently rejected actions are surfaced and removed so later valid requests can proceed. Failed previews remain visible in operation history, and missing or unavailable media cannot be selected for a move.
 
+Library and Needs organizing start with available media. The Missing and
+Unavailable filters reveal retained rows of those statuses. Moved history
+shows verified destinations for completed cross-library moves.
+
 Every successful online state refresh can resume saved actions after owner verification recovers. Background refreshes suppress transient notices while retaining the same delivery and request-ID deduplication behavior. Explicit refreshes show failures to the user.
 
 Selection controls and preview submission share the 100-item request limit. Bulk selection preserves existing selections, adds only the available capacity, and reports when another batch is needed.
 
-Snapshot commits notify interested Mini App viewers after the durable D1 write; an unobserved hourly publication skips that notification. Inbox changes retain durable-command notifications. A scan runs at startup, on an explicit library refresh or scan request, after a newly published download completes, or after a local management operation changes the library. Scan failures preserve the prior snapshot and record a sanitized warning. The UI shows report and scan times separately; absence of the first scan means waiting for synchronization, not an empty library. Saved snapshots become outdated after one hour; their timestamps are not proof that the Mac is currently online.
+Snapshot commits notify interested Mini App viewers after the durable D1 write; an unobserved background publication skips that notification. Inbox changes retain durable-command notifications. A scan runs at startup, on an explicit library refresh or scan request, after a newly published download completes, or after a local management operation changes the library. During hourly maintenance, each available library is due for a bounded media scan 24 hours after its last successful complete scan. A failed or incomplete maintenance scan retains the last good view and remains due for a later check. The UI shows report and scan times separately; a saved snapshot may remain unchanged across multiple checks even while the Mac is connected.
 
 A requested refresh can publish its warning with the preserved library. Its item list, revision, and original scan time remain intact. A subsequent successful scan clears the local warning; the recovered state is included in the next admitted publication.
 
@@ -269,6 +273,14 @@ Task status and progress use a separate local notification. Relevant changes can
 - Bilibili tasks can publish verified episodes before the whole task completes. Their source hints use only each verified entry's own stable ID and durable output paths/hashes, retaining its original episode index. Failed or pending entries are not advertised as published. Legacy completed tasks without per-entry attempt records retain the original whole-task hint path. A receipt is a source hint, not proof that the file's current content is intact.
 - A newly persisted verified episode receipt notifies the debounced library scanner; ordinary progress updates do not. A partial task keeps its existing retry/history semantics, independently of whether its published episodes appear in the library.
 - Queue-derived titles, source IDs, and collection metadata survive identity-preserving moves and index reloads. A different file at the old path does not inherit that identity. YouTube source IDs use `youtube:<video-id>`; NFO collection IDs and kinds survive metadata updates. Fully populated recognized NFO metadata is marked complete.
+- A managed cross-library move binds the verified destination to the original
+  item ID before removing source files. The durable move can resume the index
+  update after interruption. The original library retains a history row whose
+  destination is projected from the verified move receipt.
+- For older managed moves with an exact receipt, a complete library refresh can
+  fill gaps in the destination's queue metadata while retaining its existing
+  ID. NFO fields remain authoritative on scan. Source IDs and byte sizes are
+  useful for finding possible historical matches that still need proof.
 - Structured Kodi collection metadata keeps its `<set>` container, attributes, and unknown children when changing its nested `<name>`. Ambiguous or unsupported structures fail before a metadata write; a subsequent scan reads the collection name without folding unrelated child text into the title.
 - Hint-path aliases use each component's parent-directory naming policy, including case, Unicode normalization, and HFS-ignorable characters when supported by that filesystem. Physical identity checks remain required; sensitive volumes do not gain blanket case or normalization equivalence.
 - Confirmed missing history is capped at 1,024 records and pruned further when necessary to fit the 16 MiB index budget. Present or unavailable records are not discarded to make room for missing history. The index remains rebuildable.

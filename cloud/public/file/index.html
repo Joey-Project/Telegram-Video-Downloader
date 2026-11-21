@@ -64,7 +64,7 @@
               <label class="select-label">Media library <select id="library-select" class="select-control" aria-label="Choose media library"></select></label>
               <input id="category-filter" class="select-control" type="search" list="category-folders" placeholder="All folders" autocomplete="off" aria-label="Filter by folder">
               <datalist id="category-folders"></datalist>
-              <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">Current items</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option><option value="moved">Moved history</option></select>
+              <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option><option value="moved">Moved history</option></select>
               <button id="download-here" class="secondary-button" type="button">Download here</button>
               <button id="select-visible" class="quiet-button" type="button">Select this page</button>
               <button id="refresh-library-danmaku" class="quiet-button" type="button">Refresh all library danmaku</button>
@@ -98,7 +98,7 @@
           </section>
 
           <section id="view-needs" class="view-panel hidden">
-            <div class="panel-heading"><div><p class="eyebrow">NEEDS A LOOK</p><h2>Needs organizing</h2><p>Items with incomplete details, uncertain matches, or no collection.</p></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">NEEDS A LOOK</p><h2>Needs organizing</h2><p>Available items with incomplete details, uncertain matches, or no collection. Choose a File status in Library to include missing or unavailable items.</p></div></div>
             <div id="needs-summary" class="section-summary"></div>
             <section class="recovery-card" aria-labelledby="recovery-title">
               <div class="recovery-card-heading"><div><p class="eyebrow">METADATA RECOVERY</p><h3 id="recovery-title">Review suggested metadata</h3><p>Analyze selected items or review the next bounded batch from this library. Suggestions never change a file until you preview and confirm them.</p></div><button id="recover-library" class="secondary-button" type="button">Analyze current library</button></div>
@@ -106,7 +106,7 @@
               <div id="metadata-recovery-results" class="recovery-results"></div>
             </section>
             <div id="needs-list" class="library-list" aria-live="polite"></div>
-            <div id="needs-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">✓</div><h2>Everything looks organized</h2><p>Items needing metadata review or a collection will appear here.</p></div>
+            <div id="needs-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">✓</div><h2>No matching items need organizing</h2><p>Available items needing metadata review or a collection appear here. Choose a File status in Library to include missing, unavailable, or unknown items.</p></div>
           </section>
 
           <section id="view-waiting" class="view-panel hidden">

@@ -486,10 +486,10 @@ describe("bounded library views", () => {
 
   it("honors numeric episode order inside stable collection blocks", () => {
     const items = [
-      { id: "episode-10", title: "Episode 1", collection: { id: "series-a", title: "Series A", kind: "series", order: 10 } },
-      { id: "episode-2", title: "Episode 2", collection: { id: "series-a", title: "Series A", kind: "series", order: 2 } },
-      { id: "episode-1", title: "Episode 10", collection: { id: "series-a", title: "Series A", kind: "series", order: 1 } },
-      { id: "other-series-1", title: "Episode 0", collection: { id: "series-b", title: "Series B", kind: "series", order: 1 } },
+      { id: "episode-10", title: "Episode 1", presence: "present", collection: { id: "series-a", title: "Series A", kind: "series", order: 10 } },
+      { id: "episode-2", title: "Episode 2", presence: "present", collection: { id: "series-a", title: "Series A", kind: "series", order: 2 } },
+      { id: "episode-1", title: "Episode 10", presence: "present", collection: { id: "series-a", title: "Series A", kind: "series", order: 1 } },
+      { id: "other-series-1", title: "Episode 0", presence: "present", collection: { id: "series-b", title: "Series B", kind: "series", order: 1 } },
     ];
     const filtered = filterLibraryItems(items);
     const groups = groupLibraryItems(filtered);
@@ -540,7 +540,8 @@ describe("bounded library views", () => {
     const incompleteMove = { id: "incomplete-move", presence: "missing", moved_to: { ...moved.moved_to, item_id: " " } };
 
     expect(movedToTarget(moved)).toEqual(moved.moved_to);
-    expect(filterLibraryItems([moved, ordinaryMissing]).map((item) => item.id)).toEqual(["ordinary-missing"]);
+    const available = { id: "available-item", presence: "present" };
+    expect(filterLibraryItems([moved, ordinaryMissing, available]).map((item) => item.id)).toEqual(["available-item"]);
     expect(filterLibraryItems([moved, ordinaryMissing], { status: "missing" }).map((item) => item.id)).toEqual(["ordinary-missing"]);
     expect(filterLibraryItems([moved, ordinaryMissing], { status: "moved" }).map((item) => item.id)).toEqual(["source-item"]);
     expect(needsOrganizing(moved)).toBe(false);
@@ -549,10 +550,8 @@ describe("bounded library views", () => {
     expect(needsOrganizing(presentWithStaleMove)).toBe(true);
     expect(movedToTarget(incompleteMove)).toBeNull();
     expect(needsOrganizing(incompleteMove)).toBe(true);
-    expect(filterLibraryItems([presentWithStaleMove, incompleteMove]).map((item) => item.id)).toEqual([
-      "present-source",
-      "incomplete-move",
-    ]);
+    expect(filterLibraryItems([presentWithStaleMove, incompleteMove]).map((item) => item.id)).toEqual(["present-source"]);
+    expect(filterLibraryItems([presentWithStaleMove, incompleteMove], { status: "missing" }).map((item) => item.id)).toEqual(["incomplete-move"]);
     expect(filterLibraryItems([presentWithStaleMove, incompleteMove], { status: "moved" })).toEqual([]);
   });
 
@@ -614,11 +613,11 @@ describe("bounded library views", () => {
 
   it("sorts known episode orders before missing orders with title fallback", () => {
     const items = [
-      { id: "missing-2", title: "Episode 2", collection: { id: "series", title: "Series", kind: "series", order: null } },
-      { id: "order-10", title: "Episode 1", collection: { id: "series", title: "Series", kind: "series", order: 10 } },
-      { id: "invalid-order", title: "Episode 11", collection: { id: "series", title: "Series", kind: "series", order: -1 } },
-      { id: "order-1", title: "Episode 10", collection: { id: "series", title: "Series", kind: "series", order: 1 } },
-      { id: "missing-1", title: "Episode 3", collection: { id: "series", title: "Series", kind: "series" } },
+      { id: "missing-2", title: "Episode 2", presence: "present", collection: { id: "series", title: "Series", kind: "series", order: null } },
+      { id: "order-10", title: "Episode 1", presence: "present", collection: { id: "series", title: "Series", kind: "series", order: 10 } },
+      { id: "invalid-order", title: "Episode 11", presence: "present", collection: { id: "series", title: "Series", kind: "series", order: -1 } },
+      { id: "order-1", title: "Episode 10", presence: "present", collection: { id: "series", title: "Series", kind: "series", order: 1 } },
+      { id: "missing-1", title: "Episode 3", presence: "present", collection: { id: "series", title: "Series", kind: "series" } },
     ];
 
     expect(filterLibraryItems(items).map((item) => item.id)).toEqual([
@@ -632,6 +631,7 @@ describe("bounded library views", () => {
       return {
         id: `episode-${order}`,
         title: `Episode ${String(52 - order).padStart(2, "0")}`,
+        presence: "present",
         collection: { id: "series", title: "Series", kind: "series", order },
       };
     });

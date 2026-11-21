@@ -3159,6 +3159,81 @@ impl MigrationEngine {
             if !allow_cleanup {
                 return Ok(());
             }
+            if !group.plan.record_transfer_committed
+                && let Some(transfer) = group.plan.record_transfer.as_ref()
+            {
+                let primary = group
+                    .files
+                    .iter()
+                    .find(|file| {
+                        file.plan.source_path == group.plan.source_path
+                            && file.plan.target_path == group.plan.target_path
+                    })
+                    .ok_or_else(|| anyhow!("migration primary file checkpoint is missing"))?;
+                if !primary.published || primary.source_removed {
+                    bail!("migration primary is not ready for record adoption");
+                }
+                let target_identity = primary
+                    .target_identity
+                    .ok_or_else(|| anyhow!("migration primary target identity is missing"))?
+                    .to_entry_identity();
+                let target_access = primary
+                    .target_access_policy
+                    .ok_or_else(|| anyhow!("migration primary access-policy proof is missing"))?
+                    .to_bound_file_access_policy();
+                if !self.target.migration_target_matches_exact(
+                    &primary.plan.target_path,
+                    target_identity,
+                    primary.plan.proof.size,
+                    target_access,
+                    &primary.plan.proof.sha256,
+                )? {
+                    bail!("verified primary target changed before record adoption");
+                }
+                if !self.source.migration_file_identity_matches(
+                    &primary.plan.source_path,
+                    &primary.plan.proof,
+                )? {
+                    bail!("migration primary source changed before record adoption");
+                }
+                let target_physical_identity = self
+                    .target
+                    .migration_physical_identity(
+                        &primary.plan.target_path,
+                        target_identity.device(),
+                        target_identity.inode(),
+                    )?
+                    .ok_or_else(|| anyhow!("verified migration target disappeared"))?;
+                anyhow::ensure!(
+                    target_physical_identity.birth_seconds == primary.target_birth_seconds
+                        && target_physical_identity.birth_nanoseconds
+                            == primary.target_birth_nanoseconds,
+                    "migration target creation identity changed before record adoption"
+                );
+                let file_moves = group
+                    .files
+                    .iter()
+                    .map(|file| (file.plan.source_path.clone(), file.plan.target_path.clone()))
+                    .collect::<Vec<_>>();
+                self.source.migration_bind_copy_lineage(
+                    &group.plan.item_id,
+                    &group.plan.source_path,
+                    &primary.plan.proof,
+                    &transfer.copy_lineage,
+                )?;
+                self.target.migration_adopt_verified_copy_record(
+                    transfer,
+                    &primary.plan.target_path,
+                    target_physical_identity,
+                    target_access,
+                    primary.plan.proof.size,
+                    &file_moves,
+                )?;
+                // If the process stops before this checkpoint is saved, both index writes are
+                // safe to replay because they are bound to the same lineage and object.
+                group.plan.record_transfer_committed = true;
+                return Ok(());
+            }
             // The primary file is the first member in a plan and is deliberately cleaned last.
             for file in group.files.iter_mut().rev() {
                 if file.source_removed {
@@ -4377,6 +4452,9 @@ fn terminal_finalization_pending(job: &JobDocument) -> bool {
 
 fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {
     let primary = completed_primary_file(group)?;
+    if group.plan.record_transfer_committed {
+        return Some(group.plan.item_id.clone());
+    }
     let identity = primary.target_identity?;
     Some(
         crate::file_manager::physical_item_id_from_migration_checkpoint(

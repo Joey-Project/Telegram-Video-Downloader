@@ -566,7 +566,9 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
             .expect("unavailable projected items should serialize"),
         )
     );
-    *runtime.library_snapshot.lock().await = Some(cached_snapshot.clone());
+    seed_mocked_cloud_library_snapshot(&runtime, &cached_snapshot)
+        .await
+        .expect("the cached fixture should have a recent complete-scan receipt");
 
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
         runtime.clone(),
@@ -779,7 +781,9 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
             physical_identity: None,
         })
         .collect();
-    *runtime.library_snapshot.lock().await = Some(library);
+    seed_mocked_cloud_library_snapshot(&runtime, &library)
+        .await
+        .expect("the oversized fixture should have a recent complete-scan receipt");
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
         runtime.clone(),
         Duration::from_millis(500),
@@ -820,22 +824,23 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
             .is_some_and(|warnings| !warnings.is_empty())
     );
 
-    let posts = tokio::time::timeout(
-        Duration::from_secs(5),
-        wait_for_state_posts(&cloud_state, 4),
-    )
-    .await
-    .expect("accepted reduced snapshots should remain healthy on heartbeat");
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000414")
+        .await
+        .expect("explicit refresh should rebuild the retained full local source");
+    let posts = wait_for_state_posts(&cloud_state, 4).await;
     assert_eq!(posts[3]["status"], 200);
     assert!(posts[3]["state_version"].as_u64() > posts[2]["state_version"].as_u64());
     assert_eq!(
         posts[3]["library_item_count"], 8,
-        "the expiry attempt rebuilds from the retained full local source"
+        "an explicit refresh rebuilds from the retained full local source"
     );
     assert_ne!(posts[3]["content_hash"], posts[2]["content_hash"]);
     assert_ne!(posts[3]["reported_at"], posts[2]["reported_at"]);
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("after-413"));
+    let after_413 = empty_cloud_test_library_snapshot("after-413");
+    replace_mocked_cloud_library_snapshot(&runtime, &after_413)
+        .await
+        .expect("the changed fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000413")
         .await
         .expect("explicit refresh should publish the changed source after 413 recovery");
@@ -1245,7 +1250,10 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("same"));
+    let source_library = empty_cloud_test_library_snapshot("same");
+    seed_mocked_cloud_library_snapshot(&runtime, &source_library)
+        .await
+        .expect("the mocked fixture should have a recent complete-scan receipt");
 
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
         runtime.clone(),
@@ -1255,10 +1263,10 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
 
     let posts = tokio::time::timeout(
         Duration::from_secs(8),
-        wait_for_state_posts(&cloud_state, 3),
+        wait_for_state_posts(&cloud_state, 2),
     )
     .await
-    .expect("operation compaction should recover and heartbeat without another 413");
+    .expect("operation compaction should recover without another 413");
     assert_eq!(posts[0]["status"], 413);
     assert_eq!(posts[1]["status"], 200);
     assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
@@ -1272,6 +1280,10 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
     assert_ne!(posts[0]["operation_hash"], posts[1]["operation_hash"]);
     assert_eq!(posts[1]["library_hash"], posts[0]["library_hash"]);
 
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000001414")
+        .await
+        .expect("explicit refresh should rebuild the complete local operation receipts");
+    let posts = wait_for_state_posts(&cloud_state, 3).await;
     assert_eq!(posts[2]["status"], 200);
     assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
     assert_ne!(posts[2]["content_hash"], posts[1]["content_hash"]);
@@ -1279,13 +1291,14 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
     assert!(
         posts[2]["operation_bytes"].as_u64().unwrap_or_default()
             >= posts[0]["operation_bytes"].as_u64().unwrap_or_default(),
-        "the hourly expiry rebuild should start from the unmodified local receipts"
+        "the explicit rebuild should start from the unmodified local receipts"
     );
     assert_ne!(posts[2]["reported_at"], posts[1]["reported_at"]);
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot(
-        "updated-after-compaction",
-    ));
+    let updated_library = empty_cloud_test_library_snapshot("updated-after-compaction");
+    replace_mocked_cloud_library_snapshot(&runtime, &updated_library)
+        .await
+        .expect("the updated fixture should remain registered");
     enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000001413")
         .await
         .expect("explicit refresh should publish the changed cached library revision");
@@ -1460,7 +1473,8 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
 }
 
 #[tokio::test]
-async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_accepted_content() {
+async fn cloud_state_reporter_advances_same_version_conflict_and_explicitly_republishes_accepted_content()
+ {
     let root = temp_cloud_bot_dir("state-reporter-version-conflict-same-version");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -1489,8 +1503,10 @@ async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await =
-        Some(empty_cloud_test_library_snapshot("same-version-conflict"));
+    let conflict_library = empty_cloud_test_library_snapshot("same-version-conflict");
+    seed_mocked_cloud_library_snapshot(&runtime, &conflict_library)
+        .await
+        .expect("the cached fixture should have a recent complete-scan receipt");
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
         Duration::from_millis(250),
@@ -1531,16 +1547,14 @@ async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_
         "version rebases must reuse durable content-addressed chunks"
     );
 
-    let posts = tokio::time::timeout(
-        Duration::from_secs(3),
-        wait_for_state_posts(&cloud_state, 3),
-    )
-    .await
-    .expect("the accepted state should continue heartbeating");
+    enqueue_test_operations_refresh(&runtime, "33333333-3333-4333-8333-000000000015")
+        .await
+        .expect("an explicit refresh should republish accepted content");
+    let posts = wait_for_state_posts(&cloud_state, 3).await;
     assert_eq!(posts[2]["status"], 200);
     assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
     assert_eq!(posts[2]["revision"], posts[1]["revision"]);
-    assert!(posts[2]["content_hash"].as_str().is_some());
+    assert_eq!(posts[2]["content_hash"], posts[1]["content_hash"]);
     assert_ne!(posts[2]["reported_at"], posts[1]["reported_at"]);
 
     reporter.abort();
@@ -2159,6 +2173,49 @@ async fn enqueue_test_operations_refresh(
     Ok(())
 }
 
+async fn seed_mocked_cloud_library_snapshot(
+    runtime: &CloudBotRuntime,
+    snapshot: &LibrarySnapshot,
+) -> Result<String> {
+    runtime.bot.queue.refresh_video_libraries()?;
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let library_id = settings.default_library_id;
+    let active_library_ids = settings
+        .libraries
+        .iter()
+        .map(|library| library.id.clone())
+        .collect::<Vec<_>>();
+
+    *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(library_id.clone(), snapshot.clone());
+    runtime.library_unavailable.lock().await.remove(&library_id);
+    runtime.inbox.record_successful_library_scan_at(
+        &library_id,
+        now_seconds(),
+        &active_library_ids,
+    )?;
+
+    Ok(library_id)
+}
+
+async fn replace_mocked_cloud_library_snapshot(
+    runtime: &CloudBotRuntime,
+    snapshot: &LibrarySnapshot,
+) -> Result<()> {
+    *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(settings.default_library_id, snapshot.clone());
+    Ok(())
+}
+
 fn metadata_budget_library_snapshot(item_count: usize) -> LibrarySnapshot {
     let mut snapshot =
         empty_cloud_test_library_snapshot(&format!("metadata-budget-items-{item_count}"));
@@ -2318,16 +2375,26 @@ async fn restart_watch_and_disconnect_gate_semantic_snapshot_publication() {
         Arc::clone(&queue),
         Arc::clone(&initial_inbox),
     );
-    *initial_runtime.library_snapshot.lock().await =
-        Some(empty_cloud_test_library_snapshot("cached"));
-    let baseline = build_cloud_state_snapshot(&initial_runtime)
+    let cached_library = empty_cloud_test_library_snapshot("cached");
+    seed_mocked_cloud_library_snapshot(&initial_runtime, &cached_library)
+        .await
+        .expect("the cached fixture should have a recent complete-scan receipt");
+    let baseline_snapshot = build_cloud_state_snapshot(&initial_runtime)
         .await
         .expect("baseline state should build")
-        .expect("local state should exist")
+        .expect("local state should exist");
+    let baseline = baseline_snapshot
         .watch_fingerprint()
         .expect("baseline operations should fingerprint");
+    let baseline_background = baseline_snapshot
+        .background_fingerprint()
+        .expect("baseline semantic state should fingerprint");
     initial_inbox
-        .record_successful_publication_at(now_millis(), &baseline)
+        .record_successful_publication_at_with_background(
+            now_millis(),
+            &baseline,
+            Some(&baseline_background),
+        )
         .expect("previous publication baseline should persist");
     drop(initial_runtime);
     drop(initial_inbox);
@@ -2347,7 +2414,9 @@ async fn restart_watch_and_disconnect_gate_semantic_snapshot_publication() {
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("cached"));
+    seed_mocked_cloud_library_snapshot(&runtime, &cached_library)
+        .await
+        .expect("the restarted cache should retain its complete-scan receipt");
 
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
@@ -2355,9 +2424,10 @@ async fn restart_watch_and_disconnect_gate_semantic_snapshot_publication() {
         Duration::from_millis(20),
         Duration::from_millis(100),
     ));
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot(
-        "capacity-noise-without-viewer",
-    ));
+    let capacity_noise = empty_cloud_test_library_snapshot("capacity-noise-without-viewer");
+    replace_mocked_cloud_library_snapshot(&runtime, &capacity_noise)
+        .await
+        .expect("the capacity fixture should remain registered");
     runtime.state_notify.notify_one();
     persist_test_operation_result(&inbox, 710, "completed while no viewer watched");
     runtime.state_notify.notify_one();
@@ -2390,9 +2460,10 @@ async fn restart_watch_and_disconnect_gate_semantic_snapshot_publication() {
     assert_eq!(posts[0]["snapshot_notify_viewers"], "1");
     assert_eq!(posts[0]["operation_count"], 1);
 
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot(
-        "capacity-noise-while-watched",
-    ));
+    let watched_capacity_noise = empty_cloud_test_library_snapshot("capacity-noise-while-watched");
+    replace_mocked_cloud_library_snapshot(&runtime, &watched_capacity_noise)
+        .await
+        .expect("the watched capacity fixture should remain registered");
     runtime.state_notify.notify_one();
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
@@ -2547,6 +2618,7 @@ async fn explicit_selected_library_scan_failure_returns_failed_result_and_keeps_
 
 #[tokio::test]
 async fn idle_snapshot_and_inbox_http_counts_stay_hourly_for_24_hours() {
+    let _auth_generation_guard = TEST_AUTH_GENERATION_LOCK.lock().await;
     let root = temp_cloud_bot_dir("snapshot-hourly-http-counts-24h");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -2571,15 +2643,27 @@ async fn idle_snapshot_and_inbox_http_counts_stay_hourly_for_24_hours() {
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("idle"));
-    let source_fingerprint = build_cloud_state_snapshot(&runtime)
+    let idle_library = empty_cloud_test_library_snapshot("idle");
+    seed_mocked_cloud_library_snapshot(&runtime, &idle_library)
+        .await
+        .expect("the idle fixture should have a recent complete-scan receipt");
+    let baseline_snapshot = build_cloud_state_snapshot(&runtime)
         .await
         .expect("baseline state should build")
-        .expect("baseline local state should exist")
+        .expect("baseline local state should exist");
+    let source_fingerprint = baseline_snapshot
         .watch_fingerprint()
         .expect("baseline operation fingerprint should build");
+    let background_fingerprint = baseline_snapshot
+        .background_fingerprint()
+        .expect("baseline semantic fingerprint should build");
+    let baseline_published_at = now_millis();
     inbox
-        .record_successful_publication_at(now_millis(), &source_fingerprint)
+        .record_successful_publication_at_with_background(
+            baseline_published_at,
+            &source_fingerprint,
+            Some(&background_fingerprint),
+        )
         .expect("recent prior publication should persist");
     sync_cloud_backlog(&runtime)
         .await
@@ -2595,7 +2679,7 @@ async fn idle_snapshot_and_inbox_http_counts_stay_hourly_for_24_hours() {
         tokio::time::advance(Duration::from_secs(60 * 60)).await;
         tokio::time::resume();
         wait_for_idle_backlog_reconciliation(&runtime, &cloud_state, hour + 1, previous_get).await;
-        wait_for_reported_publication(&runtime, &cloud_state, hour - 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let posts = cloud_state
             .state_posts
             .lock()
@@ -2603,11 +2687,17 @@ async fn idle_snapshot_and_inbox_http_counts_stay_hourly_for_24_hours() {
             .clone();
         assert_eq!(
             posts.len(),
-            hour,
-            "exactly one manifest post per idle expiry"
+            0,
+            "unchanged hourly maintenance should not write Cloud state at simulated hour {hour}"
         );
         assert!(posts.iter().all(|post| post["status"] == 200));
-        assert_eq!(posts[hour - 1]["snapshot_notify_viewers"], "0");
+        assert_eq!(
+            last_successful_cloud_publication_at(&runtime)
+                .await
+                .expect("publication receipt should remain readable"),
+            Some(baseline_published_at),
+            "a skipped hourly check must not advance the last cloud publication time"
+        );
         tokio::time::pause();
     }
     let chunk_posts = cloud_state.state_chunk_posts.load(AtomicOrdering::SeqCst);
@@ -2618,11 +2708,11 @@ async fn idle_snapshot_and_inbox_http_counts_stay_hourly_for_24_hours() {
             .lock()
             .expect("fake state post lock should not poison")
             .len(),
-        24,
-        "a 24-hour idle window should make24 periodic manifests"
+        0,
+        "a 24-hour idle window with unchanged state should make no periodic manifests"
     );
     println!(
-        "24h idle HTTP metrics: authoritative GETs=25 (one startup plus24 hourly), manifest POSTs=24, chunk PUTs={chunk_posts}"
+        "24h idle HTTP metrics: authoritative GETs=25 (one startup plus24 hourly), manifest POSTs=0, chunk PUTs={chunk_posts}"
     );
 
     reporter.abort();

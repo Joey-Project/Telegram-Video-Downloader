@@ -37,6 +37,7 @@ const CLOUD_REQUEST_PREFIX: &str = "request-";
 const CLOUD_REQUEST_SUFFIX: &str = ".json";
 const INBOX_RECORD_VERSION: u32 = 1;
 const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_SUCCESSFUL_LIBRARY_ID_BYTES: usize = 128;
 const MAX_PREVIEW_CANCEL_ID_BYTES: usize = 128;
 const MAX_PREVIEW_CANCEL_REVISION_BYTES: usize = 256;
 const PREVIEW_CANCELLED_RESULT_MARKER: &str = "_tvd_preview_cancelled_v1";
@@ -436,6 +437,12 @@ fn is_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_valid_persisted_library_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SUCCESSFUL_LIBRARY_ID_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 pub fn decode_cloud_websocket_json(bytes: &[u8]) -> Result<CloudWebSocketMessage> {
@@ -2220,6 +2227,23 @@ struct PersistedStateVersion {
     last_successful_publication_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_successful_watch_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    last_successful_library_scans: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_successful_background_fingerprint: Option<String>,
+}
+
+impl PersistedStateVersion {
+    fn empty(state_version: u64) -> Self {
+        Self {
+            schema_version: INBOX_RECORD_VERSION,
+            state_version,
+            last_successful_publication_at: None,
+            last_successful_watch_fingerprint: None,
+            last_successful_library_scans: BTreeMap::new(),
+            last_successful_background_fingerprint: None,
+        }
+    }
 }
 
 struct InboxRecoveryScan {
@@ -2924,18 +2948,9 @@ impl CloudInbox {
         if next > MAX_CLOUD_STATE_VERSION {
             return Err(CloudStateVersionExhausted.into());
         }
-        self.write_state_version_metadata(
-            &path,
-            PersistedStateVersion {
-                schema_version: INBOX_RECORD_VERSION,
-                state_version: next,
-                last_successful_publication_at: metadata
-                    .as_ref()
-                    .and_then(|state| state.last_successful_publication_at),
-                last_successful_watch_fingerprint: metadata
-                    .and_then(|state| state.last_successful_watch_fingerprint.clone()),
-            },
-        )?;
+        let mut metadata = metadata.unwrap_or_else(|| PersistedStateVersion::empty(0));
+        metadata.state_version = next;
+        self.write_state_version_metadata(&path, metadata)?;
         Ok(next)
     }
 
@@ -2970,13 +2985,51 @@ impl CloudInbox {
         Ok(Some(fingerprint))
     }
 
-    pub fn record_successful_publication_at(
+    pub fn last_successful_background_fingerprint(&self) -> Result<Option<String>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        let Some(fingerprint) = self
+            .read_state_version_metadata(&path)?
+            .and_then(|state| state.last_successful_background_fingerprint)
+        else {
+            return Ok(None);
+        };
+        if !is_sha256_hex(&fingerprint) {
+            bail!("persisted cloud background fingerprint is not a SHA-256 digest");
+        }
+        Ok(Some(fingerprint))
+    }
+
+    pub fn last_successful_library_scans(&self) -> Result<BTreeMap<String, u64>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        Ok(self
+            .read_state_version_metadata(&path)?
+            .map_or_else(BTreeMap::new, |state| state.last_successful_library_scans))
+    }
+
+    pub fn record_successful_library_scan_at(
         &self,
-        published_at: u64,
-        watch_fingerprint: &str,
+        library_id: &str,
+        scanned_at: u64,
+        active_library_ids: &[String],
     ) -> Result<()> {
-        if !is_sha256_hex(watch_fingerprint) {
-            bail!("cloud watch fingerprint must be a lowercase SHA-256 digest");
+        if !is_valid_persisted_library_id(library_id)
+            || active_library_ids.len() > crate::media_libraries::MAX_MEDIA_LIBRARIES
+            || active_library_ids
+                .iter()
+                .any(|id| !is_valid_persisted_library_id(id))
+            || !active_library_ids.iter().any(|id| id == library_id)
+        {
+            bail!("successful library scan metadata has an invalid active library set");
         }
         let _guard = self
             .operation_lock
@@ -2984,16 +3037,58 @@ impl CloudInbox {
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
         self.require_initial_recovery_complete_before_write()?;
         let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
-        let metadata = self.read_state_version_metadata(&path)?;
-        self.write_state_version_metadata(
-            &path,
-            PersistedStateVersion {
-                schema_version: INBOX_RECORD_VERSION,
-                state_version: metadata.as_ref().map_or(0, |state| state.state_version),
-                last_successful_publication_at: Some(published_at),
-                last_successful_watch_fingerprint: Some(watch_fingerprint.to_string()),
-            },
-        )
+        let mut metadata = self
+            .read_state_version_metadata(&path)?
+            .unwrap_or_else(|| PersistedStateVersion::empty(0));
+        let active = active_library_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        metadata
+            .last_successful_library_scans
+            .retain(|id, _| active.contains(id.as_str()));
+        metadata
+            .last_successful_library_scans
+            .insert(library_id.to_string(), scanned_at);
+        self.write_state_version_metadata(&path, metadata)
+    }
+
+    #[cfg(test)]
+    pub fn record_successful_publication_at(
+        &self,
+        published_at: u64,
+        watch_fingerprint: &str,
+    ) -> Result<()> {
+        self.record_successful_publication_at_with_background(published_at, watch_fingerprint, None)
+    }
+
+    pub fn record_successful_publication_at_with_background(
+        &self,
+        published_at: u64,
+        watch_fingerprint: &str,
+        background_fingerprint: Option<&str>,
+    ) -> Result<()> {
+        if !is_sha256_hex(watch_fingerprint) {
+            bail!("cloud watch fingerprint must be a lowercase SHA-256 digest");
+        }
+        if background_fingerprint.is_some_and(|fingerprint| !is_sha256_hex(fingerprint)) {
+            bail!("cloud background fingerprint must be a lowercase SHA-256 digest");
+        }
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        let mut metadata = self
+            .read_state_version_metadata(&path)?
+            .unwrap_or_else(|| PersistedStateVersion::empty(0));
+        metadata.last_successful_publication_at = Some(published_at);
+        metadata.last_successful_watch_fingerprint = Some(watch_fingerprint.to_string());
+        if let Some(fingerprint) = background_fingerprint {
+            metadata.last_successful_background_fingerprint = Some(fingerprint.to_string());
+        }
+        self.write_state_version_metadata(&path, metadata)
     }
 
     fn record_path(&self, seq: u64) -> PathBuf {
@@ -3185,6 +3280,22 @@ impl CloudInbox {
             if state.schema_version != INBOX_RECORD_VERSION {
                 bail!("unsupported cloud state-version file version");
             }
+            if state
+                .last_successful_background_fingerprint
+                .as_deref()
+                .is_some_and(|value| !is_sha256_hex(value))
+            {
+                bail!("persisted cloud background fingerprint is not a SHA-256 digest");
+            }
+            if state.last_successful_library_scans.len()
+                > crate::media_libraries::MAX_MEDIA_LIBRARIES
+                || state
+                    .last_successful_library_scans
+                    .keys()
+                    .any(|id| !is_valid_persisted_library_id(id))
+            {
+                bail!("cloud state-version file has invalid library scan metadata");
+            }
             metadata = Some(state);
             Ok(())
         };
@@ -3196,19 +3307,11 @@ impl CloudInbox {
 
     #[cfg(test)]
     fn write_state_version(&self, path: &Path, state_version: u64) -> Result<()> {
-        let metadata = self.read_state_version_metadata(path)?;
-        self.write_state_version_metadata(
-            path,
-            PersistedStateVersion {
-                schema_version: INBOX_RECORD_VERSION,
-                state_version,
-                last_successful_publication_at: metadata
-                    .as_ref()
-                    .and_then(|state| state.last_successful_publication_at),
-                last_successful_watch_fingerprint: metadata
-                    .and_then(|state| state.last_successful_watch_fingerprint),
-            },
-        )
+        let mut metadata = self
+            .read_state_version_metadata(path)?
+            .unwrap_or_else(|| PersistedStateVersion::empty(0));
+        metadata.state_version = state_version;
+        self.write_state_version_metadata(path, metadata)
     }
 
     fn write_state_version_metadata(
@@ -3217,6 +3320,9 @@ impl CloudInbox {
         metadata: PersistedStateVersion,
     ) -> Result<()> {
         let bytes = serde_json::to_vec(&metadata)?;
+        if bytes.len() > 4096 {
+            bail!("cloud state-version file exceeds its limit");
+        }
         let mut write = |coordinated_path: &Path| -> Result<()> {
             let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
             if coordinated != path {
@@ -4610,8 +4716,18 @@ mod tests {
         assert_eq!(inbox.last_successful_publication_at().unwrap(), None);
         assert_eq!(inbox.next_state_version().unwrap(), 1);
         let watch_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let background_fingerprint =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let active_libraries = vec!["primary".to_string(), "archive".to_string()];
         inbox
-            .record_successful_publication_at(1_800_000_000_123, watch_fingerprint)
+            .record_successful_library_scan_at("primary", 1_800_000_000, &active_libraries)
+            .expect("complete primary scan time should persist");
+        inbox
+            .record_successful_publication_at_with_background(
+                1_800_000_000_123,
+                watch_fingerprint,
+                Some(background_fingerprint),
+            )
             .expect("successful post time should persist");
         assert_eq!(
             inbox.last_successful_publication_at().unwrap(),
@@ -4624,6 +4740,21 @@ mod tests {
                 .as_deref(),
             Some(watch_fingerprint)
         );
+        assert_eq!(
+            inbox
+                .last_successful_background_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(background_fingerprint)
+        );
+        assert_eq!(
+            inbox
+                .last_successful_library_scans()
+                .unwrap()
+                .get("primary")
+                .copied(),
+            Some(1_800_000_000)
+        );
         assert_eq!(inbox.next_state_version().unwrap(), 2);
         assert_eq!(
             inbox.last_successful_publication_at().unwrap(),
@@ -4635,6 +4766,21 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(watch_fingerprint)
+        );
+        assert_eq!(
+            inbox
+                .last_successful_background_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(background_fingerprint)
+        );
+        assert_eq!(
+            inbox
+                .last_successful_library_scans()
+                .unwrap()
+                .get("primary")
+                .copied(),
+            Some(1_800_000_000)
         );
         drop(inbox);
 
@@ -4650,6 +4796,21 @@ mod tests {
                 .as_deref(),
             Some(watch_fingerprint)
         );
+        assert_eq!(
+            reopened
+                .last_successful_background_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(background_fingerprint)
+        );
+        assert_eq!(
+            reopened
+                .last_successful_library_scans()
+                .unwrap()
+                .get("primary")
+                .copied(),
+            Some(1_800_000_000)
+        );
         assert_eq!(reopened.next_state_version().unwrap(), 3);
         assert_eq!(
             reopened.last_successful_publication_at().unwrap(),
@@ -4662,7 +4823,97 @@ mod tests {
                 .as_deref(),
             Some(watch_fingerprint)
         );
+        assert_eq!(
+            reopened
+                .last_successful_background_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(background_fingerprint)
+        );
+        assert_eq!(
+            reopened
+                .last_successful_library_scans()
+                .unwrap()
+                .get("primary")
+                .copied(),
+            Some(1_800_000_000)
+        );
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn old_state_version_metadata_migrates_and_keeps_existing_watch_fingerprint() {
+        let root = temp_root("state-version-background-migration");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let path = inbox.directory.join(CLOUD_STATE_VERSION_FILE);
+        inbox
+            .next_state_version()
+            .expect("state-version file should be created with private permissions");
+        fs::write(
+            &path,
+            br#"{"schema_version":1,"state_version":7,"last_successful_publication_at":1800000000123,"last_successful_watch_fingerprint":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        )
+        .expect("legacy metadata should be written");
+        assert_eq!(
+            inbox.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        assert_eq!(
+            inbox.last_successful_background_fingerprint().unwrap(),
+            None,
+            "legacy state has no content fingerprint, so it needs one baseline publication"
+        );
+        assert!(inbox.last_successful_library_scans().unwrap().is_empty());
+        assert_eq!(inbox.next_state_version().unwrap(), 8);
+        assert_eq!(
+            inbox
+                .last_successful_watch_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            inbox.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_library_scan_metadata_prunes_removed_libraries_only_on_success() {
+        let root = temp_root("successful-library-scan-metadata");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let both = vec!["primary".to_string(), "archive".to_string()];
+        inbox
+            .record_successful_library_scan_at("primary", 100, &both)
+            .expect("primary scan should persist");
+        inbox
+            .record_successful_library_scan_at("archive", 200, &both)
+            .expect("archive scan should persist");
+
+        let primary_only = vec!["primary".to_string()];
+        inbox
+            .record_successful_library_scan_at("primary", 300, &primary_only)
+            .expect("later complete primary scan should persist");
+        assert_eq!(
+            inbox.last_successful_library_scans().unwrap(),
+            BTreeMap::from([("primary".to_string(), 300)])
+        );
+        assert!(
+            inbox
+                .record_successful_library_scan_at("archive", 400, &primary_only)
+                .is_err(),
+            "a removed library cannot advance its persisted refresh time"
+        );
+        assert_eq!(
+            inbox.last_successful_library_scans().unwrap(),
+            BTreeMap::from([("primary".to_string(), 300)])
+        );
+        drop(inbox);
         let _ = fs::remove_dir_all(root);
     }
 

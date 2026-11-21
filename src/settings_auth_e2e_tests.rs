@@ -898,6 +898,7 @@ async fn durable_settings_auth_dispatcher_covers_qr_lifecycle_privacy_and_snapsh
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("snapshot client should use only the loopback fake cloud API");
 
+    cloud_initial_library_scan(runtime.clone()).await;
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
         Duration::from_secs(3_600),

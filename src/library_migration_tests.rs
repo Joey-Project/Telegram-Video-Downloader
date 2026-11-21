@@ -151,10 +151,16 @@ impl Fixture {
             if status.status == MigrationRunStatus::Completed {
                 return status;
             }
-            assert!(!matches!(
+            assert!(
+                !matches!(
+                    status.status,
+                    MigrationRunStatus::Partial | MigrationRunStatus::Failed
+                ),
+                "migration reached terminal state {:?}; items={:#?}; warnings={:#?}",
                 status.status,
-                MigrationRunStatus::Partial | MigrationRunStatus::Failed
-            ));
+                status.items,
+                status.warnings
+            );
             self.engine
                 .step(&self.migration_id)
                 .expect("migration step should complete");
@@ -198,6 +204,96 @@ impl Fixture {
     }
 }
 
+fn fixture_with_seeded_target_id_collision(
+    label: &str,
+    target_present: bool,
+    foreign_lineage: Option<&str>,
+) -> Fixture {
+    let source_root = TestRoot::new(&format!("{label}-source"));
+    let target_root = TestRoot::new(&format!("{label}-target"));
+    let source_path = source_root.path().join("clip.mp4");
+    let source_nfo = source_root.path().join("clip.nfo");
+    fs::write(&source_path, MEDIA_BYTES).expect("synthetic media should write");
+    fs::write(
+        &source_nfo,
+        b"<movie><title>Source metadata</title><uniqueid type=\"bilibili\">BV1abcdefgh</uniqueid></movie>",
+    )
+    .expect("synthetic source NFO should write");
+    let target_seed = target_root.path().join("clip.mp4");
+    fs::write(&target_seed, b"unrelated target bytes").expect("target seed should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let source_snapshot = source.migration_scan().expect("source library should scan");
+    let item_id = source_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("synthetic source media should be indexed")
+        .id
+        .clone();
+    let target_snapshot = target
+        .migration_scan()
+        .expect("target seed should be indexed");
+    let target_seed_id = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("target seed should have an index ID")
+        .id
+        .clone();
+    if !target_present {
+        fs::remove_file(&target_seed).expect("target seed should be removed");
+        target
+            .migration_scan()
+            .expect("removed target seed should become history");
+    }
+    target
+        .migration_rekey_record_for_test(&target_seed_id, &item_id, foreign_lineage)
+        .expect("target record should be rebound to the selected collision ID");
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: if target_present {
+                ConflictPolicy::KeepBoth
+            } else {
+                ConflictPolicy::Skip
+            },
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("collision preview should be created");
+    let migration_id = preview.id.clone();
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("collision preview should confirm");
+    Fixture {
+        _source_root: source_root,
+        _target_root: target_root,
+        source_path,
+        target_root_path: engine.target.migration_root_path().to_path_buf(),
+        engine,
+        migration_id,
+    }
+}
+
 fn reopen_fixture_engine(fixture: &Fixture) -> MigrationEngine {
     let source = Arc::new(
         LibraryManager::open_with_provider(
@@ -215,6 +311,190 @@ fn reopen_fixture_engine(fixture: &Fixture) -> MigrationEngine {
     );
     MigrationEngine::new("source-library", source, "target-library", target)
         .expect("migration engine should reopen after simulated restart")
+}
+
+#[test]
+fn completed_cross_library_move_preserves_the_source_item_id() {
+    let fixture = Fixture::new("copy-record-id");
+    let source_item_id = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load")
+        .groups[0]
+        .plan
+        .item_id
+        .clone();
+
+    let status = fixture.drive_to_completion();
+    assert_eq!(
+        status.items[0].target_item_id.as_deref(),
+        Some(source_item_id.as_str())
+    );
+    let target = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("target should scan after a completed move");
+    let target_item = target
+        .items
+        .iter()
+        .find(|item| item.presence == Presence::Present)
+        .expect("target copy should remain present");
+    assert_eq!(target_item.id, source_item_id);
+
+    let source = fixture
+        .engine
+        .source
+        .migration_scan()
+        .expect("source should scan after cleanup");
+    let source_history = source
+        .items
+        .iter()
+        .find(|item| item.id == source_item_id)
+        .expect("source record should remain as migration history");
+    assert_eq!(source_history.presence, Presence::Missing);
+}
+
+#[tokio::test]
+async fn copy_record_transfer_replays_after_interruption_before_job_checkpoint() {
+    let fixture = Fixture::new("copy-record-transfer-interruption");
+    fixture.drive_to_source_cleanup();
+    let mut unsaved = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load");
+    let source_item_id = unsaved.groups[0].plan.item_id.clone();
+    assert_eq!(unsaved.groups[0].status, MigrationItemPhase::CleaningSource);
+    assert!(!unsaved.groups[0].plan.record_transfer_committed);
+
+    let output_lease = crate::downloader::hold_video_outputs_for_migration(&[
+        fixture.engine.source.migration_root_path().to_path_buf(),
+        fixture.engine.target.migration_root_path().to_path_buf(),
+    ])
+    .await
+    .expect("both migration roots should acquire output leases");
+    fixture
+        .engine
+        .source
+        .migration_validate_output_lease(&output_lease)
+        .expect("source output lease should be valid");
+    fixture
+        .engine
+        .target
+        .migration_validate_output_lease(&output_lease)
+        .expect("target output lease should be valid");
+    fixture
+        .engine
+        .step_group(&mut unsaved.groups[0], true)
+        .expect("record adoption should complete before the simulated process loss");
+    assert!(unsaved.groups[0].plan.record_transfer_committed);
+    assert!(
+        fixture.source_path.exists(),
+        "source must remain before the durable job checkpoint"
+    );
+    drop(unsaved); // Simulate process loss after durable index writes but before the job save.
+
+    let persisted_before_replay = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("last durable migration checkpoint should load");
+    assert_eq!(
+        persisted_before_replay.groups[0].status,
+        MigrationItemPhase::CleaningSource
+    );
+    assert!(
+        !persisted_before_replay.groups[0]
+            .plan
+            .record_transfer_committed
+    );
+
+    let replayed = fixture
+        .engine
+        .step_with_output_lease(&fixture.migration_id, &output_lease)
+        .expect("restart should replay the durable index adoption safely");
+    assert!(!matches!(
+        replayed.status,
+        MigrationRunStatus::Partial | MigrationRunStatus::Failed
+    ));
+    assert!(replayed.items[0].error.is_none());
+    drop(output_lease);
+
+    let replayed_checkpoint = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("replayed migration checkpoint should load");
+    assert!(replayed_checkpoint.groups[0].plan.record_transfer_committed);
+    let target_after_replay = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("adopted target index should survive replay");
+    assert_eq!(
+        target_after_replay
+            .items
+            .iter()
+            .find(|item| item.presence == Presence::Present)
+            .expect("adopted target should be present")
+            .id,
+        source_item_id
+    );
+
+    let completed = fixture.drive_to_completion();
+    assert_eq!(
+        completed.items[0].target_item_id.as_deref(),
+        Some(source_item_id.as_str())
+    );
+    assert!(
+        !fixture.source_path.exists(),
+        "successful retry should clean source"
+    );
+}
+
+fn assert_copy_record_collision_keeps_source(fixture: &Fixture, target_seed_bytes: &[u8]) {
+    let mut latest = None;
+    for _ in 0..64 {
+        let status = fixture
+            .engine
+            .step(&fixture.migration_id)
+            .expect("migration step should persist collision status");
+        if status.items[0].status == MigrationItemPhase::Failed {
+            latest = Some(status);
+            break;
+        }
+    }
+    let status = latest.expect("copy-record collision should stop before source cleanup");
+    assert_eq!(status.items[0].status, MigrationItemPhase::Failed);
+    assert!(
+        fixture.source_path.exists(),
+        "source media must remain recoverable"
+    );
+    assert!(
+        fixture._source_root.path().join("clip.nfo").exists(),
+        "source attachment must remain when record adoption is rejected"
+    );
+    assert_eq!(
+        fs::read(fixture._target_root.path().join("clip.mp4"))
+            .expect("the existing target record should remain readable"),
+        target_seed_bytes,
+        "the existing target record must not be overwritten"
+    );
+}
+
+#[test]
+fn copy_record_transfer_rejects_a_present_target_id_impostor_before_cleanup() {
+    let fixture =
+        fixture_with_seeded_target_id_collision("copy-record-present-impostor", true, None);
+    assert_copy_record_collision_keeps_source(&fixture, b"unrelated target bytes");
+}
+
+#[test]
+fn copy_record_transfer_rejects_a_missing_target_id_with_foreign_lineage() {
+    let fixture = fixture_with_seeded_target_id_collision(
+        "copy-record-missing-impostor",
+        false,
+        Some("foreign-copy-lineage"),
+    );
+    assert_copy_record_collision_keeps_source(&fixture, MEDIA_BYTES);
 }
 
 #[test]
@@ -1674,14 +1954,22 @@ fn publication_rename_before_checkpoint_recovers_only_the_captured_inode() {
 fn source_unlink_after_durable_intent_reconciles_after_restart() {
     let fixture = Fixture::new("unlink-before-save");
     fixture.drive_to_source_cleanup();
-    fixture
-        .engine
-        .step(&fixture.migration_id)
-        .expect("cleanup intent should persist");
-    let unsaved = fixture
-        .engine
-        .load_job(&fixture.migration_id)
-        .expect("cleanup intent checkpoint should load");
+    let unsaved = (0..8)
+        .find_map(|_| {
+            let job = fixture
+                .engine
+                .load_job(&fixture.migration_id)
+                .expect("cleanup checkpoint should load");
+            if job.groups[0].files[0].source_cleanup_intent {
+                return Some(job);
+            }
+            fixture
+                .engine
+                .step(&fixture.migration_id)
+                .expect("cleanup should advance through record-transfer checkpoints");
+            None
+        })
+        .expect("migration should persist a source-unlink intent");
     let file = &unsaved.groups[0].files[0];
     assert!(file.source_cleanup_intent);
     fixture

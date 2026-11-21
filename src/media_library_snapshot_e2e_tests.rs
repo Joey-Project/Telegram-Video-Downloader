@@ -16,13 +16,18 @@ async fn wait_for_snapshot_migration_completion(
     runtime: &CloudBotRuntime,
     migration_id: &str,
 ) -> crate::library_migration::MigrationStatus {
+    use crate::library_migration::MigrationRunStatus;
+
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let status = runtime.migrations.lock().await.get(migration_id).cloned();
-            if let Some(status) = status
-                && status.status == crate::library_migration::MigrationRunStatus::Completed
-            {
-                return status;
+            if let Some(status) = runtime.migrations.lock().await.get(migration_id).cloned() {
+                match status.status {
+                    MigrationRunStatus::Completed => return status,
+                    MigrationRunStatus::Failed
+                    | MigrationRunStatus::Partial
+                    | MigrationRunStatus::Stopped => panic!("mock migration failed: {status:?}"),
+                    _ => {}
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -658,6 +663,97 @@ async fn cloud_snapshot_compacts_large_migration_task_details_with_stable_aggreg
 }
 
 #[tokio::test]
+async fn round_trip_migration_reuses_the_original_record() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) =
+        create_migration_fixture("round-trip-record", crate::cloud::TEST_DATABASE_EPOCH);
+    let media = b"synthetic round-trip video bytes";
+    let sidecar = b"<movie><title>Round trip</title></movie>";
+    fs::write(fixture.video_root.join("clip.mp4"), media).unwrap();
+    fs::write(fixture.video_root.join("clip.nfo"), sidecar).unwrap();
+
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let original_id =
+        scan_file_item_id(&runtime, 9_001, &fixture.source_library_id, "clip.mp4").await;
+
+    for (sequence, source, target) in [
+        (
+            9_002,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+        ),
+        (
+            9_005,
+            &fixture.target_library_id,
+            &fixture.source_library_id,
+        ),
+    ] {
+        let migration =
+            start_selected_snapshot_migration(&runtime, sequence, source, target, &original_id)
+                .await;
+        let status = wait_for_snapshot_migration_completion(&runtime, &migration).await;
+        assert_eq!(status.success_count, 1);
+        wait_for_snapshot_migration_runner_idle(&runtime, &migration).await;
+        assert_eq!(
+            scan_file_item_id(&runtime, sequence + 2, target, "clip.mp4").await,
+            original_id
+        );
+    }
+
+    rescan_snapshot_library(&runtime, 9_008, &fixture.target_library_id).await;
+    let snapshot = build_cloud_state_snapshot(&runtime).await.unwrap().unwrap();
+    let source = snapshot_library_items(&snapshot.library, &fixture.source_library_id);
+    let archive = snapshot_library_items(&snapshot.library, &fixture.target_library_id);
+    assert_eq!(
+        source.len(),
+        1,
+        "returning the tracked copy should reuse its old row"
+    );
+    let restored = snapshot_item(&source, &original_id);
+    assert_eq!(restored["presence"], "present");
+    assert_eq!(restored["title"], "Round trip");
+    assert!(restored.get("moved_to").is_none());
+    assert_eq!(
+        snapshot_item(&archive, &original_id)["moved_to"]["library_id"],
+        fixture.source_library_id
+    );
+    assert_eq!(
+        fs::read(fixture.video_root.join("clip.mp4")).unwrap(),
+        media
+    );
+    assert_eq!(
+        fs::read(fixture.video_root.join("clip.nfo")).unwrap(),
+        sidecar
+    );
+    assert!(!fixture.archive_root.join("clip.mp4").exists());
+    assert!(!fixture.archive_root.join("clip.nfo").exists());
+
+    fs::remove_file(fixture.video_root.join("clip.nfo")).unwrap();
+    let refreshed = rescan_snapshot_library(&runtime, 9_009, &fixture.source_library_id).await;
+    let refreshed = snapshot_item(refreshed["items"].as_array().unwrap(), &original_id);
+    assert_ne!(
+        refreshed["title"], "Round trip",
+        "copying a sidecar title must not promote it into persistent queue metadata"
+    );
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    let _ = shutdown.send(());
+    let _ = server.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
 async fn moved_history_follows_verified_migration_targets_after_restart_and_degrades_safely() {
     let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) = create_migration_fixture(
@@ -701,6 +797,11 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     .await;
     let first_status = wait_for_snapshot_migration_completion(&runtime, &first_migration_id).await;
     assert_eq!(first_status.success_count, 1);
+    assert_eq!(
+        first_status.items[0].target_item_id.as_deref(),
+        Some(original_source_id.as_str()),
+        "the completed job must durably record the preserved item identity"
+    );
     wait_for_snapshot_migration_runner_idle(&runtime, &first_migration_id).await;
     assert!(!fixture.video_root.join("clip.mp4").exists());
     assert!(!fixture.video_root.join("clip.nfo").exists());
@@ -845,7 +946,19 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .as_str()
         .expect("migrated target should have a stable item identity")
         .to_string();
-    assert_ne!(first_target_id, original_source_id);
+    assert_eq!(
+        first_target_id, original_source_id,
+        "a verified cross-library move should retain the original item ID across restart"
+    );
+    assert_eq!(first_target_item["title"], "Moved history fixture");
+    assert!(
+        first_target_item["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attachment| attachment["relative_path"] == "clip.nfo"),
+        "the migrated record should still expose its moved NFO"
+    );
     let first_target_identity_before_rename = cached_item_physical_identity(
         &reopened_runtime,
         &fixture.target_library_id,
@@ -1138,11 +1251,11 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         })
         .expect("final target scan should identify the current migrated media")["id"]
         .as_str()
-        .expect("final target should have its own item identity")
+        .expect("final target should expose the original item identity")
         .to_string();
     let final_target_identity =
         cached_item_physical_identity(&final_runtime, &final_library.id, &final_target_id).await;
-    assert_ne!(final_target_id, first_target_id);
+    assert_eq!(final_target_id, original_source_id);
     assert_eq!(
         second_status.items[0].target_physical_identity,
         Some(final_target_identity),
