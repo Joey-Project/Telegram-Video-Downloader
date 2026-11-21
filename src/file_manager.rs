@@ -9805,7 +9805,8 @@ fn collection_accepts_prior_metadata(
 ) -> bool {
     match (&current.id, &incoming.id) {
         (Some(current_id), Some(incoming_id)) => current_id == incoming_id,
-        _ => {
+        (Some(_), None) => false,
+        (None, _) => {
             !current.title.trim().is_empty()
                 && current.title.trim() == incoming.title.trim()
                 && (current.kind == incoming.kind
@@ -18265,13 +18266,13 @@ mod tests {
         let item = item_at(&snapshot, "clip.mp4").clone();
         let identity = item.physical_identity.expect("verified target identity");
 
-        for incoming_id in ["playlist-other", "playlist-current"] {
+        for incoming_id in [None, Some("playlist-other"), Some("playlist-current")] {
             let incoming = MigrationQueueMetadata {
                 title: None,
                 source_ids: Vec::new(),
                 collection: Some(CollectionMetadata {
-                    id: Some(incoming_id.to_string()),
-                    title: "Historical playlist title".to_string(),
+                    id: incoming_id.map(str::to_owned),
+                    title: "Current playlist".to_string(),
                     kind: "youtube_playlist".to_string(),
                     order: Some(10),
                     part_id: Some("track-10".to_string()),
@@ -18293,7 +18294,7 @@ mod tests {
             let collection = item_at(&snapshot, "clip.mp4").collection.clone().unwrap();
             assert_eq!(collection.id, current_collection.id);
             assert_eq!(collection.title, current_collection.title);
-            let agrees = incoming_id == "playlist-current";
+            let agrees = incoming_id == Some("playlist-current");
             assert_eq!(collection.order, agrees.then_some(10));
             assert_eq!(collection.part_id.as_deref(), agrees.then_some("track-10"));
             let rescanned = target.scan(&[]).unwrap();

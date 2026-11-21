@@ -1341,7 +1341,7 @@ async fn permanent_rejection_retries_unacknowledged_state_after_cooldown() {
     assert_eq!(second[1]["revision"], "unacknowledged");
     assert!(second[1]["state_version"].as_u64() > second[0]["state_version"].as_u64());
     assert_eq!(
-        second[1]["content_hash"], second[0]["content_hash"],
+        second[1]["stable_content_hash"], second[0]["stable_content_hash"],
         "the cooldown retry should preserve the same unacknowledged semantic content"
     );
     assert!(

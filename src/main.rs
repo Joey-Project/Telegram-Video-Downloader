@@ -2628,6 +2628,7 @@ async fn cloud_state_reporter_with_retry_policy(
         }
     };
     let mut permanently_rejected_fingerprint: Option<Vec<u8>> = None;
+    let mut permanently_rejected_background_fingerprint: Option<String> = None;
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
     let mut failure_retry_not_before: Option<Instant> = None;
     let mut failure_retry_is_payload_too_large = false;
@@ -2876,7 +2877,9 @@ async fn cloud_state_reporter_with_retry_policy(
                     }
                     if !forced
                         && !trigger.retry_after_rejection
-                        && permanently_rejected_fingerprint.as_ref() == Some(&fingerprint)
+                        && (permanently_rejected_fingerprint.as_ref() == Some(&fingerprint)
+                            || permanently_rejected_background_fingerprint.as_ref()
+                                == Some(&background_fingerprint))
                     {
                         continue;
                     }
@@ -2959,7 +2962,6 @@ async fn cloud_state_reporter_with_retry_policy(
         let state = pending
             .as_ref()
             .expect("pending cloud state remains present");
-        let failed_fingerprint = state.fingerprint.clone();
         let failed_version = state.state_version;
         let state_version = state.state_version;
         let notify_viewers = !state.trigger.refreshes.is_empty()
@@ -2983,6 +2985,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 published_watch_fingerprint = Some(watch_fingerprint.clone());
                 published_background_fingerprint = Some(background_fingerprint.clone());
                 permanently_rejected_fingerprint = rejected_fingerprint.clone();
+                permanently_rejected_background_fingerprint = None;
                 published_oversized_source_fingerprint = rejected_fingerprint.clone();
                 bootstrap_due = false;
                 failure_retry_not_before = None;
@@ -3015,6 +3018,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 retry_backoff.reset();
             }
             Err(error) if error.is_payload_too_large() => {
+                permanently_rejected_background_fingerprint = None;
                 let Some(rejected) = pending.take() else {
                     continue;
                 };
@@ -3225,14 +3229,11 @@ async fn cloud_state_reporter_with_retry_policy(
                 warn!(
                     state_version = failed_version,
                     error = %error,
-                    "permanent local cloud state rejection; waiting for a changed snapshot"
+                    "permanent local cloud state rejection; deferring an unchanged retry"
                 );
-                permanently_rejected_fingerprint = Some(
-                    state
-                        .rejected_fingerprint
-                        .clone()
-                        .unwrap_or(failed_fingerprint),
-                );
+                permanently_rejected_fingerprint = None;
+                permanently_rejected_background_fingerprint =
+                    Some(state.background_fingerprint.clone());
                 published_oversized_source_fingerprint = None;
                 // Permanent server rejection is an admission cooldown, not a successful
                 // snapshot refresh. Explicit user refreshes still wake the reporter directly.

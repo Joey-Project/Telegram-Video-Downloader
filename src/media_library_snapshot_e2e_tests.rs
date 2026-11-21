@@ -2600,17 +2600,6 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     .expect("remove request should be handled")
     .expect("remove should complete while the scan is waiting to publish");
     assert_eq!(remove_outcome.status, InboxStatus::Completed);
-    release_scan_tx
-        .send(())
-        .expect("scan should be released for publication");
-    let scan_error = scan_task
-        .await
-        .expect("scan worker should join")
-        .expect_err("a scan of a removed registration must not publish");
-    assert!(
-        scan_error.to_string().contains("registration changed"),
-        "{scan_error:#}"
-    );
     assert!(
         !runtime
             .library_snapshots
@@ -2672,6 +2661,17 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         .and_then(|view| view["root_binding"].as_str())
         .expect("replacement root should have a binding token");
     assert_ne!(new_binding, old_binding);
+    release_scan_tx
+        .send(())
+        .expect("scan should be released after the library ID is reused");
+    let scan_error = scan_task
+        .await
+        .expect("scan worker should join")
+        .expect_err("the prior registration's scan must not publish under the reused ID");
+    assert!(
+        scan_error.to_string().contains("registration changed"),
+        "{scan_error:#}"
+    );
     assert!(
         !runtime
             .library_snapshots
