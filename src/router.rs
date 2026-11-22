@@ -36,6 +36,7 @@ pub enum RouteResult {
     Jobs(Vec<JobRequest>),
     Help,
     PdfUsage,
+    StoryUsage,
     BilibiliAuth(BilibiliAuthCommand),
     BilibiliAuthUsage,
     UnsupportedLinks,
@@ -98,6 +99,16 @@ pub fn route_message(text: &str, auto_pdf_domains: &[String]) -> RouteResult {
             (Some("status"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Status),
             (Some("logout"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Logout),
             _ => RouteResult::BilibiliAuthUsage,
+        };
+    }
+
+    if let Some(args) = story_command_args(trimmed) {
+        let mut parts = args.split_whitespace();
+        return match (parts.next(), parts.next()) {
+            (Some(profile), None) => crate::social_media::canonicalize_story_homepage(profile)
+                .map(|url| RouteResult::Jobs(vec![JobRequest::Social { url }]))
+                .unwrap_or(RouteResult::StoryUsage),
+            _ => RouteResult::StoryUsage,
         };
     }
 
@@ -380,6 +391,15 @@ fn is_help_command(text: &str) -> bool {
 fn pdf_command_args(text: &str) -> Option<&str> {
     let first = text.split_whitespace().next()?;
     if first == "/pdf" || first.starts_with("/pdf@") {
+        Some(text[first.len()..].trim())
+    } else {
+        None
+    }
+}
+
+fn story_command_args(text: &str) -> Option<&str> {
+    let first = text.split_whitespace().next()?;
+    if first == "/story" || first.starts_with("/story@") {
         Some(text[first.len()..].trim())
     } else {
         None
@@ -839,6 +859,51 @@ mod tests {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M&t=47s".to_string()
             }])
         );
+    }
+
+    #[test]
+    fn story_command_routes_the_account_story_list_without_changing_avatar_links() {
+        let profile = "https://www.instagram.com/creator.example/?igsh=tracking";
+        let stories = "https://www.instagram.com/stories/creator.example/";
+        for command in ["/story", "/story@DownloaderBot"] {
+            assert_eq!(
+                route_message(&format!("{command} {profile}"), &auto_pdf_domains()),
+                RouteResult::Jobs(vec![JobRequest::Social {
+                    url: stories.into()
+                }])
+            );
+        }
+        assert_eq!(
+            route_message(profile, &auto_pdf_domains()),
+            RouteResult::Jobs(vec![JobRequest::Social {
+                url: "https://www.instagram.com/creator.example/avatar/".into(),
+            }])
+        );
+        assert_eq!(
+            route_message(stories, &auto_pdf_domains()),
+            RouteResult::UnsupportedLinks
+        );
+    }
+
+    #[test]
+    fn story_command_requires_one_instagram_homepage() {
+        for input in [
+            "/story",
+            "/story @creator",
+            "/story https://instagram.com/creator/ https://instagram.com/other/",
+            "/story https://notinstagram.com/creator/",
+            "/story https://instagram.com/accounts/",
+            "/story https://instagram.com/p/ABC/",
+            "/story https://instagram.com/creator/avatar/",
+            "/story https://instagram.com/stories/creator/123/",
+            "/story https://example.com/creator",
+        ] {
+            assert_eq!(
+                route_message(input, &["example.com".into()]),
+                RouteResult::StoryUsage,
+                "{input}"
+            );
+        }
     }
 
     #[test]

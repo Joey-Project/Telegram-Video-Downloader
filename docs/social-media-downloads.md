@@ -2,6 +2,8 @@
 
 在 Bot 的所有者私聊中直接发送链接。Instagram 支持帖子和轮播、Reel、单条 Story、指向单条媒体的 Highlight 分享链接，以及用 https://www.instagram.com/USERNAME/ 取得头像。X 支持包含视频的 x.com 和 twitter.com 帖子。Bot 将下载到的文件以 Telegram 文档回复原消息。图片不做 Telegram 照片压缩。X 的视频和音频在需要时使用 FFmpeg 封装到同一个文件。
 
+发送 `/story https://www.instagram.com/USERNAME/` 可下载该账号当前可见的所有活跃 Story，适合没有单条分享链接的情况。Bot 会用 Mac 上配置的 Instagram 会话读取该账号的 Story，并将图片和视频作为原文件回复这条指令。每次最多处理 100 条，超限会报错。直接发送主页链接仍会下载头像。
+
 ## Mac 配置
 
 - 将 Telegram 的 allowed_chat_ids 配置为一个私聊用户 ID，allow_all_chats 设为 false。
