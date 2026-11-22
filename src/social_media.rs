@@ -12,8 +12,53 @@ use tokio::io::AsyncReadExt;
 use url::Url;
 
 pub(crate) const MAX_FILES: usize = 64;
+pub(crate) const MAX_STORY_FILES: usize = 100;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DIAGNOSTIC_LIMIT: u64 = 128 * 1024;
+
+pub(crate) fn canonicalize_story_homepage(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || !matches!(
+            url.host_str()?,
+            "instagram.com" | "www.instagram.com" | "m.instagram.com"
+        )
+    {
+        return None;
+    }
+    let path = url.path().strip_prefix('/')?;
+    let owner = path.strip_suffix('/').unwrap_or(path);
+    if !valid_instagram_homepage_owner(owner) {
+        return None;
+    }
+    Some(format!("https://www.instagram.com/stories/{owner}/"))
+}
+
+fn canonical_story_collection_url(raw: &str) -> Option<&str> {
+    let owner = raw
+        .strip_prefix("https://www.instagram.com/stories/")?
+        .strip_suffix('/')?;
+    valid_instagram_homepage_owner(owner).then_some(raw)
+}
+
+fn valid_instagram_homepage_owner(owner: &str) -> bool {
+    valid_user(owner)
+        && ![
+            "about", "accounts", "api", "direct", "explore", "p", "reel", "s", "stories", "tv",
+        ]
+        .contains(&owner)
+}
+
+pub(crate) fn max_files_for_url(url: &str) -> usize {
+    if canonical_story_collection_url(url).is_some() {
+        MAX_STORY_FILES
+    } else {
+        MAX_FILES
+    }
+}
 
 pub(crate) fn canonicalize_url(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
@@ -53,14 +98,7 @@ pub(crate) fn canonicalize_url(raw: &str) -> Option<String> {
                     (numeric_id(&id) && ids.next().is_none())
                         .then(|| format!("{base}/s/{link}?story_media_id={id}"))
                 }
-                [owner] | [owner, "avatar"]
-                    if valid_user(owner)
-                        && ![
-                            "about", "accounts", "api", "direct", "explore", "p", "reel", "s",
-                            "stories", "tv",
-                        ]
-                        .contains(owner) =>
-                {
+                [owner] | [owner, "avatar"] if valid_instagram_homepage_owner(owner) => {
                     Some(format!("{base}/{owner}/avatar/"))
                 }
                 _ => None,
@@ -162,7 +200,14 @@ pub(crate) async fn download(
     raw: &str,
     staging: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let url = canonicalize_url(raw).context("Unsupported Instagram or X link")?;
+    let (url, story_collection) = if let Some(story_url) = canonical_story_collection_url(raw) {
+        (story_url.to_owned(), true)
+    } else {
+        (
+            canonicalize_url(raw).context("Unsupported Instagram or X link")?,
+            false,
+        )
+    };
     ensure!(
         std::fs::read_dir(staging)?.next().is_none(),
         "Original media download needs empty staging"
@@ -194,11 +239,11 @@ pub(crate) async fn download(
         command.arg("--").arg(&url);
         let (status, _) = run_worker(command, staging).await?;
         ensure!(status.success(), "Could not download this X video");
-        return media_files(staging);
+        return media_files(staging, false);
     }
 
     let profiles = tokio::task::spawn_blocking(instagram_profiles).await??;
-    download_instagram(config, &url, staging, &profiles).await
+    download_instagram(config, &url, staging, &profiles, story_collection).await
 }
 
 async fn download_instagram(
@@ -206,29 +251,44 @@ async fn download_instagram(
     url: &str,
     staging: &Path,
     profiles: &InstagramProfiles,
+    story_collection: bool,
 ) -> Result<Vec<PathBuf>> {
-    let (status, stderr) = run_instagram(config, url, staging, &profiles.primary).await?;
-    if status.success()
-        && !stderr.contains("[error]")
-        && std::fs::read_dir(staging)?.next().is_some()
-    {
-        return media_files(staging);
+    let (status, stderr) =
+        run_instagram(config, url, staging, &profiles.primary, story_collection).await?;
+    let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
+    if status.success() && !staging_is_empty {
+        return media_files(staging, story_collection);
     }
     let failure = instagram_failure(&stderr);
     if failure == InstagramFailure::Account
         && let Some(fallback) = &profiles.fallback
-        && std::fs::read_dir(staging)?.next().is_none()
+        && staging_is_empty
     {
-        let (status, stderr) = run_instagram(config, url, staging, fallback).await?;
-        if status.success()
-            && !stderr.contains("[error]")
-            && std::fs::read_dir(staging)?.next().is_some()
-        {
-            return media_files(staging);
+        let (status, stderr) =
+            run_instagram(config, url, staging, fallback, story_collection).await?;
+        let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
+        if status.success() && !staging_is_empty {
+            return media_files(staging, story_collection);
         }
-        bail!("{}", instagram_failure(&stderr).message());
+        bail!(
+            "{}",
+            instagram_failure_message(
+                instagram_failure(&stderr),
+                story_collection,
+                status.success(),
+                staging_is_empty,
+            )
+        );
     }
-    bail!("{}", failure.message());
+    bail!(
+        "{}",
+        instagram_failure_message(
+            failure,
+            story_collection,
+            status.success(),
+            staging_is_empty
+        )
+    );
 }
 
 async fn run_instagram(
@@ -236,22 +296,29 @@ async fn run_instagram(
     url: &str,
     staging: &Path,
     profile: &BrowserProfile,
+    story_collection: bool,
 ) -> Result<(ExitStatus, String)> {
     let mut command = tokio::process::Command::new(&config.tools.gallery_dl);
+    let range = if story_collection {
+        format!("1-{}", MAX_STORY_FILES + 1)
+    } else {
+        format!("1-{}", MAX_FILES + 1)
+    };
+    let filename = if story_collection {
+        "{num:0>3}-{media_id}.{extension}"
+    } else {
+        "{num:0>3}.{extension}"
+    };
     command.args([
         "--config-ignore",
         "--no-input",
         "--retries",
         "0",
         "--range",
-        "1-65",
+        &range,
     ]);
     command.arg("--directory").arg(staging);
-    command.args([
-        "--filename",
-        "{num:0>3}.{extension}",
-        "--cookies-from-browser",
-    ]);
+    command.args(["--filename", filename, "--cookies-from-browser"]);
     command.arg(profile.cookie_scope()?);
     command.arg("--").arg(url);
     run_worker(command, staging).await
@@ -318,6 +385,19 @@ fn instagram_failure(stderr: &str) -> InstagramFailure {
     InstagramFailure::Download
 }
 
+fn instagram_failure_message(
+    failure: InstagramFailure,
+    story_collection: bool,
+    status_success: bool,
+    staging_is_empty: bool,
+) -> &'static str {
+    if story_collection && status_success && staging_is_empty {
+        "No active Instagram Stories were found for this account"
+    } else {
+        failure.message()
+    }
+}
+
 struct ProcessGroup(Option<i32>);
 
 impl Drop for ProcessGroup {
@@ -366,7 +446,12 @@ async fn run_worker(
     Ok((status, String::from_utf8_lossy(&diagnostic).into_owned()))
 }
 
-fn media_files(directory: &Path) -> Result<Vec<PathBuf>> {
+fn media_files(directory: &Path, story_collection: bool) -> Result<Vec<PathBuf>> {
+    let maximum = if story_collection {
+        MAX_STORY_FILES
+    } else {
+        MAX_FILES
+    };
     let mut files = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
@@ -393,13 +478,26 @@ fn media_files(directory: &Path) -> Result<Vec<PathBuf>> {
                 ),
             "A social media download left an unsupported or incomplete file"
         );
+        if files.len() == maximum {
+            bail!(
+                "{}",
+                if story_collection {
+                    "Instagram Story collection exceeds the 100-item limit"
+                } else {
+                    "Social media download exceeds the attachment count limit"
+                }
+            );
+        }
         files.push(path);
-        ensure!(
-            files.len() <= MAX_FILES,
-            "Social media download exceeds the attachment count limit"
-        );
     }
-    ensure!(!files.is_empty(), "No original media files were downloaded");
+    ensure!(
+        !files.is_empty(),
+        if story_collection {
+            "No active Instagram Stories were found for this account"
+        } else {
+            "No original media files were downloaded"
+        }
+    );
     files.sort();
     Ok(files)
 }
@@ -435,6 +533,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn story_command_canonicalizes_only_instagram_homepages() {
+        let canonical = "https://www.instagram.com/stories/creator/";
+        assert_eq!(
+            canonicalize_story_homepage("https://instagram.com/creator/?igsh=tracking"),
+            Some(canonical.into())
+        );
+        assert_eq!(
+            canonicalize_story_homepage("http://m.instagram.com/creator"),
+            Some(canonical.into())
+        );
+        assert_eq!(canonical_story_collection_url(canonical), Some(canonical));
+        assert_eq!(max_files_for_url(canonical), MAX_STORY_FILES);
+        assert_eq!(
+            max_files_for_url("https://www.instagram.com/p/Example/"),
+            MAX_FILES
+        );
+        assert_eq!(
+            canonicalize_url("https://instagram.com/creator/"),
+            Some("https://www.instagram.com/creator/avatar/".into()),
+            "generic homepage routing must still request the avatar"
+        );
+        assert_eq!(
+            canonicalize_url(canonical),
+            None,
+            "generic URL routing must continue rejecting a Story collection"
+        );
+
+        for unsupported in [
+            "https://www.instagram.com/stories/creator/",
+            "https://www.instagram.com/creator/reels/",
+            "https://www.instagram.com/explore/",
+            "https://www.instagram.com.evil.example/creator/",
+            "https://user@www.instagram.com/creator/",
+            "https://www.instagram.com:8443/creator/",
+        ] {
+            assert_eq!(
+                canonicalize_story_homepage(unsupported),
+                None,
+                "{unsupported}"
+            );
+        }
+        for unsupported_internal in [
+            "http://www.instagram.com/stories/creator/",
+            "https://instagram.com/stories/creator/",
+            "https://www.instagram.com/stories/creator/?tracking=1",
+            "https://www.instagram.com/stories/creator/1/",
+            "https://www.instagram.com/stories/explore/",
+        ] {
+            assert_eq!(
+                canonical_story_collection_url(unsupported_internal),
+                None,
+                "{unsupported_internal}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_file_order_uses_story_ordinal_and_story_limit_is_one_hundred() {
+        let fixture = tempfile::tempdir().unwrap();
+        for name in ["002-story-c.mp4", "001-story-b.mp4", "001-story-a.jpg"] {
+            std::fs::write(fixture.path().join(name), b"story").unwrap();
+        }
+        let files = media_files(fixture.path(), true).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|path| path.file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["001-story-a.jpg", "001-story-b.mp4", "002-story-c.mp4"]
+        );
+
+        let over_limit = tempfile::tempdir().unwrap();
+        for index in 1..=MAX_STORY_FILES + 1 {
+            std::fs::write(
+                over_limit
+                    .path()
+                    .join(format!("{index:03}-story-{index:03}.jpg")),
+                b"story",
+            )
+            .unwrap();
+        }
+        let error = media_files(over_limit.path(), true).unwrap_err();
+        assert!(error.to_string().contains("100-item limit"));
+
+        let generic_over_limit = tempfile::tempdir().unwrap();
+        for index in 1..=MAX_FILES + 1 {
+            std::fs::write(
+                generic_over_limit.path().join(format!("{index:03}.jpg")),
+                b"media",
+            )
+            .unwrap();
+        }
+        assert!(
+            media_files(generic_over_limit.path(), false)
+                .unwrap_err()
+                .to_string()
+                .contains("attachment count limit")
+        );
+    }
+
     #[tokio::test]
     async fn instagram_uses_fallback_only_for_account_access_with_empty_staging() {
         use std::os::unix::fs::PermissionsExt;
@@ -450,6 +649,23 @@ for arg do
         'chrome/instagram.com:/test/primary-access') echo '[instagram][error] Login required' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-empty') echo '[instagram][info] No results for this exact link' >&2; exit 0 ;;
         'chrome/instagram.com:/test/primary-rate') echo '[instagram][error] HTTP 429: Too Many Requests' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/primary-recovered')
+            printf 'complete' >003.mp4; echo '[ytdl][error] Cannot import yt-dlp or youtube-dl' >&2; echo '[download][info] Trying fallback URL #1' >&2; exit 0 ;;
+        'chrome/instagram.com:/test/primary-story')
+            range_ok=0; filename_ok=0; url_ok=0
+            for arg do
+                case "$arg" in
+                    '1-101') range_ok=1 ;;
+                    '{num:0>3}-{media_id}.{extension}') filename_ok=1 ;;
+                    'https://www.instagram.com/stories/creator/') url_ok=1 ;;
+                esac
+            done
+            if [ "$range_ok" = 1 ] && [ "$filename_ok" = 1 ] && [ "$url_ok" = 1 ]; then
+                printf 'third' >002-story-c.mp4; printf 'second' >001-story-b.mp4; printf 'first' >001-story-a.jpg; exit 0
+            fi
+            exit 3 ;;
+        'chrome/instagram.com:/test/primary-no-active')
+            echo '[instagram][info] No results for this exact link' >&2; exit 0 ;;
         'chrome/instagram.com:/test/primary-partial')
             printf 'partial' >002.mp4.part; echo '[instagram][error] Login required' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-generic')
@@ -466,7 +682,7 @@ exit 2
         let mut config = AppConfig::for_test();
         config.tools.gallery_dl = worker;
         let url = "https://www.instagram.com/p/Example/";
-        for case in ["access", "empty", "rate", "partial", "generic"] {
+        for case in ["access", "empty", "recovered", "rate", "partial", "generic"] {
             let staging = temp.join(case);
             std::fs::create_dir(&staging).unwrap();
             let profiles = InstagramProfiles {
@@ -477,12 +693,14 @@ exit 2
                     cookies_from_browser: "chrome:/test/fallback".into(),
                 }),
             };
-            let result = download_instagram(&config, url, &staging, &profiles).await;
+            let result = download_instagram(&config, url, &staging, &profiles, false).await;
             if matches!(case, "access" | "empty") {
                 assert_eq!(
                     result.unwrap(),
                     [staging.join("001.jpg"), staging.join("002.mp4")]
                 );
+            } else if case == "recovered" {
+                assert_eq!(result.unwrap(), [staging.join("003.mp4")]);
             } else {
                 assert!(result.is_err(), "{case}");
                 assert!(
@@ -495,5 +713,44 @@ exit 2
             std::fs::read(temp.join("partial/002.mp4.part")).unwrap(),
             b"partial"
         );
+
+        let story_url = "https://www.instagram.com/stories/creator/";
+        let story_staging = temp.join("story");
+        std::fs::create_dir(&story_staging).unwrap();
+        let story_profile = InstagramProfiles {
+            primary: BrowserProfile {
+                cookies_from_browser: "chrome:/test/primary-story".into(),
+            },
+            fallback: None,
+        };
+        assert_eq!(
+            download_instagram(&config, story_url, &story_staging, &story_profile, true)
+                .await
+                .unwrap(),
+            vec![
+                story_staging.join("001-story-a.jpg"),
+                story_staging.join("001-story-b.mp4"),
+                story_staging.join("002-story-c.mp4")
+            ]
+        );
+
+        let no_active_staging = temp.join("no-active-story");
+        std::fs::create_dir(&no_active_staging).unwrap();
+        let no_active_profile = InstagramProfiles {
+            primary: BrowserProfile {
+                cookies_from_browser: "chrome:/test/primary-no-active".into(),
+            },
+            fallback: None,
+        };
+        let error = download_instagram(
+            &config,
+            story_url,
+            &no_active_staging,
+            &no_active_profile,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("No active Instagram Stories"));
     }
 }

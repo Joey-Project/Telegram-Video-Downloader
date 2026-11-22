@@ -8691,6 +8691,7 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             }
         }
         RouteResult::PdfUsage => bail!("usage: /pdf https://example.com"),
+        RouteResult::StoryUsage => bail!("usage: /story https://www.instagram.com/USERNAME/"),
         RouteResult::Help => {
             println!("{}", help_message());
             Ok(())
@@ -9070,6 +9071,14 @@ async fn handle_message(
             )
             .await;
         }
+        RouteResult::StoryUsage => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                "Usage: /story https://www.instagram.com/USERNAME/".to_string(),
+            )
+            .await;
+        }
         RouteResult::UnsupportedLinks => {
             send_or_log(
                 &telegram,
@@ -9093,6 +9102,11 @@ fn default_bot_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "pdf".to_string(),
             description: "Save a webpage as PDF.".to_string(),
+        },
+        BotCommand {
+            command: "story".to_string(),
+            description: "Download all currently visible Instagram Stories from a profile."
+                .to_string(),
         },
         BotCommand {
             command: "queue".to_string(),
@@ -9255,6 +9269,7 @@ fn help_message() -> String {
         "Commands:",
         "/help - Show this help.",
         "/pdf URL - Save a webpage as PDF.",
+        "/story INSTAGRAM_PROFILE_URL - Download all currently visible Stories from an Instagram profile.",
         "/file - Open the private file manager in a private chat.",
         "/settings - Manage media libraries and download defaults in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
@@ -19386,6 +19401,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn story_command_preserves_the_original_reply_target_e2e() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = temp.path().join("video");
+        config.downloads.pdf_dir = temp.path().join("pdf");
+        fs::create_dir(&config.downloads.video_dir).unwrap();
+        fs::create_dir(&config.downloads.pdf_dir).unwrap();
+        let chat_id = 123_456_789;
+        let bot_id = 987_654;
+        config.telegram.token = format!("{bot_id}:{}", config.telegram.token);
+        config.telegram.allowed_chat_ids = vec![chat_id];
+        config.telegram.allow_all_chats = false;
+        let queue = Arc::new(QueueManager::open(&config).unwrap());
+        let (telegram, mut requests, updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(0)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+            music: None,
+            torrent: None,
+        };
+        let update = |update_id, message_id, sender_id| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": sender_id},
+                    "text": "/story https://www.instagram.com/creator.example/?igsh=tracking"
+                }
+            })
+        };
+        updates
+            .send(vec![
+                update(2001, 33, chat_id + 1),
+                update(2002, 34, chat_id),
+            ])
+            .unwrap();
+        let mut offset = None;
+        process_telegram_updates_with_context(
+            &context,
+            telegram.get_updates(None, 0).await.unwrap(),
+            &mut offset,
+        )
+        .await
+        .unwrap();
+
+        tokio_timeout(Duration::from_secs(5), async {
+            loop {
+                let request = requests.recv().await.expect("fake Telegram API ended");
+                if request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Queued job #1:"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the story command should acknowledge the queued job");
+        assert_eq!(offset, Some(2003));
+        assert!(queue.get("u2001-0").unwrap().is_none());
+        let task = queue.get("u2002-0").unwrap().unwrap();
+        let url = "https://www.instagram.com/stories/creator.example/";
+        assert_eq!(task.original_url, url);
+        assert_eq!(task.job, JobRequest::Social { url: url.into() });
+        assert_eq!(task.message_id, 34);
+        assert_eq!(task.social_bot_id, Some(bot_id));
+        assert_eq!(task.status, TaskStatus::Queued);
+        queue.cancel(&task.id, chat_id).unwrap().unwrap();
+        stop_fake_telegram_api(shutdown, server).await;
+    }
+
+    #[tokio::test]
     async fn social_media_original_reply_partial_send_and_queue_retry_e2e() {
         let temp = tempfile::tempdir().expect("test directory");
         let root = temp.path();
@@ -19628,6 +19723,7 @@ print(json.dumps({"ok": True}))
         for expected in [
             "/help",
             "/pdf URL",
+            "/story INSTAGRAM_PROFILE_URL",
             "/bbdown login [web|tv|access-key]",
             "/bbdown status",
         ] {
@@ -20066,7 +20162,8 @@ print(json.dumps({"ok": True}))
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "help", "pdf", "queue", "file", "settings", "music", "torrents", "magnet", "bbdown"
+                "help", "pdf", "story", "queue", "file", "settings", "music", "torrents", "magnet",
+                "bbdown"
             ]
         );
         assert_eq!(

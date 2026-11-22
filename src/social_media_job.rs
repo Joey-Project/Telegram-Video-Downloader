@@ -4,7 +4,7 @@ use crate::config::AppConfig;
 use crate::downloader::{JobProgressSender, JobReport, send_progress};
 use crate::queue::TaskRecord;
 use crate::safe_fs::{EntryIdentity, RootedFs};
-use crate::social_media::MAX_FILES;
+use crate::social_media::max_files_for_url;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -252,6 +252,7 @@ async fn download_and_publish(
     ensure!(private_directory_identity(root, &staging)? == staging_identity);
     let worker_root = root.clone();
     let worker_staging = staging.clone();
+    let maximum_files = max_files_for_url(url);
     let mut originals = Originals {
         version: 1,
         chat_id: task.chat_id,
@@ -262,7 +263,7 @@ async fn download_and_publish(
     // Hashes bind the file bytes to the retry and to the subsequent MTProto upload.
     let originals = tokio::task::spawn_blocking(move || {
         ensure!(
-            (1..=MAX_FILES).contains(&files.len()),
+            (1..=maximum_files).contains(&files.len()),
             "Invalid number of social media files"
         );
         let root = &worker_root;
@@ -350,7 +351,7 @@ fn load_originals(
             && originals.chat_id == task.chat_id
             && originals.message_id == task.message_id
             && originals.url == url
-            && (1..=MAX_FILES).contains(&originals.files.len()),
+            && (1..=max_files_for_url(url)).contains(&originals.files.len()),
         "Saved original-media manifest belongs to another request"
     );
     let mut names = BTreeSet::new();
@@ -527,4 +528,59 @@ fn reply_error(category: Option<&str>) -> ReplyRejection {
         _ => "Telegram did not verify delivery of the original file",
     };
     ReplyRejection::Other(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::JobRequest;
+    use crate::social_media::MAX_FILES;
+
+    #[test]
+    fn story_archive_recovers_more_files_than_an_ordinary_social_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = RootedFs::new(directory.path()).unwrap();
+        let count = MAX_FILES + 1;
+        for (name, url, expected) in [
+            (
+                "stories",
+                "https://www.instagram.com/stories/example/",
+                true,
+            ),
+            ("post", "https://www.instagram.com/p/example/", false),
+        ] {
+            let archive = root.logical_root_path().join(name);
+            root.create_dir(&archive, 0o700).unwrap();
+            let task = TaskRecord::new(
+                name.into(),
+                100,
+                23,
+                123,
+                Some(123),
+                0,
+                JobRequest::Social { url: url.into() },
+            );
+            let originals = Originals {
+                version: 1,
+                chat_id: task.chat_id,
+                message_id: task.message_id,
+                url: url.into(),
+                files: (1..=count)
+                    .map(|index| Original {
+                        name: format!("{index:03}.jpg"),
+                        sha256: "a".repeat(64),
+                    })
+                    .collect(),
+            };
+            let body = serde_json::to_vec(&originals).unwrap();
+            root.create_new_bound_file(&archive.join(MANIFEST), &body, 0o600)
+                .unwrap();
+            let result = load_originals(&root, &archive, &task, url);
+            if expected {
+                assert_eq!(result.unwrap().files.len(), count);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
 }
