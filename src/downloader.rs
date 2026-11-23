@@ -15936,6 +15936,16 @@ pub(crate) async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result
     Ok(())
 }
 
+pub(crate) async fn load_bilibili_client_for_metadata(
+    config: &AppConfig,
+) -> Result<bbdown_core::BiliClient> {
+    let config = config.clone();
+    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), move || {
+        bilibili_core::client(&config)
+    })
+    .await?
+}
+
 fn bilibili_credential_sync_semaphore() -> Arc<Semaphore> {
     Arc::clone(BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
 }

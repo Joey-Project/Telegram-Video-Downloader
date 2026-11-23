@@ -7,15 +7,13 @@ use bbdown_core::{
     AccessKeyLoginConfig, AccessKeyLoginCredentials, AccessKeyLoginTicket, BiliClient,
     ClientConfig, CredentialHealthReport, CredentialProfileSelection, CredentialSource,
     CredentialStore, Credentials, DanmakuFormat, DownloadMode, DownloadOptions, EndpointConfig,
-    MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
+    Input, MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
     RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection, StreamSelection,
     UgcCollectionKind, UgcCollectionReference,
 };
 
 use crate::config::AppConfig;
 use crate::router::{BilibiliSelection, bilibili_bvid_from_url};
-#[cfg(test)]
-use bbdown_core::Input;
 use reqwest::redirect::Policy;
 use url::Url;
 
@@ -200,10 +198,17 @@ pub(crate) fn ugc_metadata_resolve_options() -> bbdown_core::UgcCollectionResolv
     }
 }
 
-pub async fn resolve_video_page_info(
+pub(crate) struct VideoPageInfo {
+    pub(crate) page_count: usize,
+    pub(crate) page_title: Option<String>,
+    pub(crate) collection: Option<UgcCollectionReference>,
+}
+
+pub(crate) async fn resolve_video_page_info(
     config: &AppConfig,
     raw_url: &str,
-) -> Result<(usize, Option<UgcCollectionReference>)> {
+    page: Option<u32>,
+) -> Result<VideoPageInfo> {
     let client = client(config)?;
     let resolved = client
         .resolve_input(raw_url, Some(Selection::All))
@@ -213,6 +218,13 @@ pub async fn resolve_video_page_info(
         bail!("Bilibili URL did not resolve to a normal video")
     };
     let page_count = video.pages.len().max(1);
+    let page_title = video
+        .pages
+        .iter()
+        .find(|metadata| metadata.index == page.unwrap_or(1))
+        .map(|metadata| metadata.title.trim())
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned);
     let parsed_bvid = bilibili_bvid_from_url(raw_url);
     let bvid = video
         .bvid
@@ -223,7 +235,64 @@ pub async fn resolve_video_page_info(
         .resolve_video_collection_membership(bvid)
         .await
         .context("failed to resolve Bilibili UGC collection membership")?;
-    Ok((page_count, collection))
+    Ok(VideoPageInfo {
+        page_count,
+        page_title,
+        collection,
+    })
+}
+
+pub(crate) async fn resolve_ugc_collection_page_count(
+    config: &AppConfig,
+    raw_url: &str,
+    expected_items: Option<usize>,
+) -> Result<usize> {
+    let (list_id, owner_mid, kind) =
+        match Input::parse(raw_url).context("failed to parse Bilibili UGC collection URL")? {
+            Input::SpaceCollectionList { list_id, owner_mid } => {
+                (list_id, owner_mid, UgcCollectionKind::Collection)
+            }
+            Input::SpaceSeriesList { list_id, owner_mid } => {
+                (list_id, owner_mid, UgcCollectionKind::Series)
+            }
+            _ => bail!("Bilibili URL did not resolve to a space collection or series"),
+        };
+    let reference = UgcCollectionReference {
+        id: list_id,
+        kind,
+        owner_mid,
+        title: String::new(),
+        description: String::new(),
+        cover_url: None,
+        item_count: 0,
+    };
+    let client = crate::downloader::load_bilibili_client_for_metadata(config).await?;
+    let resolution = client
+        .resolve_video_collection_with_options(
+            &reference,
+            Some(Selection::All),
+            &ugc_metadata_resolve_options(),
+        )
+        .await
+        .context("failed to resolve Bilibili UGC collection pages")?;
+    let page_count = resolution.selected_items.len();
+    ensure!(
+        page_count > 0,
+        "Bilibili UGC collection resolved no video pages"
+    );
+    if let Some(expected) = expected_items.filter(|count| *count > 0) {
+        let resolved_videos = resolution
+            .selected_items
+            .iter()
+            .map(|item| item.aid)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        ensure!(
+            resolved_videos == expected,
+            "Bilibili UGC collection did not match its reported item count"
+        );
+    }
+    Ok(page_count)
 }
 
 pub fn ugc_collection_url(reference: &UgcCollectionReference) -> String {
@@ -1205,16 +1274,23 @@ mod tests {
         config.bilibili.auth.state_path = directory.path().join("legacy-auth.json");
         config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
 
-        let (page_count, collection) = tokio::time::timeout(
+        let page_info = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            resolve_video_page_info(&config, "https://www.bilibili.com/video/BV17x411w7KC"),
+            resolve_video_page_info(
+                &config,
+                "https://www.bilibili.com/video/BV17x411w7KC?p=2",
+                Some(2),
+            ),
         )
         .await??;
         let (request_lines, view_responses) =
             tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
 
-        assert_eq!(page_count, 3);
-        let collection = collection.expect("oversized valid membership should be preserved");
+        assert_eq!(page_info.page_count, 3);
+        assert_eq!(page_info.page_title.as_deref(), Some("Page 2"));
+        let collection = page_info
+            .collection
+            .expect("oversized valid membership should be preserved");
         assert_eq!(collection.kind, UgcCollectionKind::Collection);
         assert_eq!(collection.id, 167_822);
         assert_eq!(collection.owner_mid, 210_798);
