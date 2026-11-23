@@ -19273,6 +19273,8 @@ mod tests {
         body: serde_json::Value,
     }
 
+    const FIRST_FAKE_TELEGRAM_MESSAGE_ID: i64 = 1_000;
+
     async fn spawn_fake_telegram_api() -> (
         TelegramClient,
         mpsc::UnboundedReceiver<FakeTelegramRequest>,
@@ -19290,7 +19292,7 @@ mod tests {
         let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut next_message_id = 1_000_i64;
+            let mut next_message_id = FIRST_FAKE_TELEGRAM_MESSAGE_ID;
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => return Ok(()),
@@ -20874,18 +20876,23 @@ print(json.dumps({"ok": True}))
                 .starts_with("Cancel · #1 ·")
         );
 
-        update_sender.send(vec![
-            serde_json::json!({
-                "update_id": 802,
-                "callback_query": {
-                    "id": "cancel-failed-task",
-                    "data": buttons[1]["callback_data"],
-                    "message": { "message_id": 1001, "chat": { "id": chat_id, "type": "private" } }
-                }
-            }),
-            queue_command(803, "/queue"),
-            queue_command(804, "/queue history"),
-        ]).unwrap();
+        update_sender
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 802,
+                    "callback_query": {
+                        "id": "cancel-failed-task",
+                        "data": buttons[1]["callback_data"],
+                        "message": {
+                            "message_id": FIRST_FAKE_TELEGRAM_MESSAGE_ID,
+                            "chat": { "id": chat_id, "type": "private" }
+                        }
+                    }
+                }),
+                queue_command(803, "/queue"),
+                queue_command(804, "/queue history"),
+            ])
+            .unwrap();
         let updates = telegram.get_updates(offset, 0).await.unwrap();
         process_telegram_updates(
             &telegram,
@@ -20906,6 +20913,12 @@ print(json.dumps({"ok": True}))
                 .any(|request| request.method == "answerCallbackQuery"
                     && request.body["text"] == "Task canceled.")
         );
+        let edit = recorded
+            .iter()
+            .find(|request| request.method == "editMessageText")
+            .expect("cancellation should edit the queue message");
+        assert_eq!(edit.body["chat_id"], chat_id);
+        assert_eq!(edit.body["message_id"], FIRST_FAKE_TELEGRAM_MESSAGE_ID);
         let pages = recorded
             .iter()
             .filter(|request| request.method == "sendMessage")
