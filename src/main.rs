@@ -212,6 +212,7 @@ const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_DUPLICATE_JOBS: usize = 64;
 const PENDING_DUPLICATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BILIBILI_SELECTION_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
+const BILIBILI_COLLECTION_PROMPT_COUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_BILIBILI_SELECTION_JOBS: usize = 256;
 const COLLECTION_DETAILS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PENDING_COLLECTION_DETAILS: usize = 128;
@@ -264,9 +265,13 @@ enum BilibiliSelectionPrompt {
     VideoPages {
         page: Option<u32>,
         page_count: usize,
+        page_title: Option<String>,
         collection: Option<UgcCollectionReference>,
+        collection_page_count: Option<usize>,
     },
-    UgcCollection,
+    UgcCollection {
+        page_count: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -12447,7 +12452,13 @@ async fn queue_or_prompt_normalized_job(
         return;
     }
 
-    match bilibili_ugc_selection_prompt(context.config.as_ref(), &job).await {
+    match bilibili_ugc_selection_prompt(
+        context.config.as_ref(),
+        &job,
+        &context.job_dispatch.duplicate_scan_semaphore,
+    )
+    .await
+    {
         Ok(Some(prompt)) => {
             prompt_bilibili_selection(&context, chat_id, job_id, task_id, generation, job, prompt)
                 .await;
@@ -12481,13 +12492,26 @@ async fn queue_or_prompt_normalized_job(
 async fn bilibili_ugc_selection_prompt(
     config: &AppConfig,
     job: &JobRequest,
+    metadata_semaphore: &Semaphore,
 ) -> Result<Option<BilibiliSelectionPrompt>> {
     let JobRequest::Bilibili { url, selection } = job else {
         return Ok(None);
     };
 
     if selection.is_none() && is_bilibili_ugc_collection_url(url) {
-        return Ok(Some(BilibiliSelectionPrompt::UgcCollection));
+        let page_count = if matches!(
+            Input::parse(url),
+            Ok(Input::SpaceCollectionList { .. } | Input::SpaceSeriesList { .. })
+        ) {
+            optional_bilibili_collection_page_count(metadata_semaphore, async {
+                sync_bilibili_rust_credentials(config).await?;
+                bilibili_core::resolve_ugc_collection_page_count(config, url, None).await
+            })
+            .await
+        } else {
+            None
+        };
+        return Ok(Some(BilibiliSelectionPrompt::UgcCollection { page_count }));
     }
     if !matches!(selection, None | Some(BilibiliSelection::Page(_))) {
         return Ok(None);
@@ -12502,23 +12526,54 @@ async fn bilibili_ugc_selection_prompt(
         BilibiliSelection::Page(page) => Some(page),
         _ => None,
     });
-    let (page_count, collection) = bilibili_core::resolve_video_page_info(config, url).await?;
-    bilibili_video_pages_prompt(page, page_count, Ok(collection))
+    let info = bilibili_core::resolve_video_page_info(config, url, page).await;
+    let collection_page_count = if let Ok(info) = &info
+        && let Some(reference) = info.collection.as_ref()
+    {
+        let collection_url = bilibili_core::ugc_collection_url(reference);
+        optional_bilibili_collection_page_count(
+            metadata_semaphore,
+            bilibili_core::resolve_ugc_collection_page_count(
+                config,
+                &collection_url,
+                Some(reference.item_count),
+            ),
+        )
+        .await
+    } else {
+        None
+    };
+    bilibili_video_pages_prompt(page, info, collection_page_count)
+}
+
+async fn optional_bilibili_collection_page_count(
+    metadata_semaphore: &Semaphore,
+    resolve_count: impl Future<Output = Result<usize>>,
+) -> Option<usize> {
+    tokio::time::timeout(BILIBILI_COLLECTION_PROMPT_COUNT_TIMEOUT, async {
+        let _permit = metadata_semaphore.acquire().await?;
+        resolve_count.await
+    })
+    .await
+    .ok()?
+    .ok()
 }
 
 fn bilibili_video_pages_prompt(
     page: Option<u32>,
-    page_count: usize,
-    membership: Result<Option<UgcCollectionReference>>,
+    info: Result<bilibili_core::VideoPageInfo>,
+    collection_page_count: Option<usize>,
 ) -> Result<Option<BilibiliSelectionPrompt>> {
-    membership.map(|collection| {
-        if page_count <= 1 && collection.is_none() {
+    info.map(|info| {
+        if info.page_count <= 1 && info.collection.is_none() {
             None
         } else {
             Some(BilibiliSelectionPrompt::VideoPages {
                 page,
-                page_count,
-                collection,
+                page_count: info.page_count,
+                page_title: info.page_title,
+                collection: info.collection,
+                collection_page_count,
             })
         }
     })
@@ -12537,7 +12592,7 @@ fn bilibili_membership_probe_failure_message() -> &'static str {
 }
 
 fn should_suppress_selection_file_provider_notice(prompt: &BilibiliSelectionPrompt) -> bool {
-    matches!(prompt, BilibiliSelectionPrompt::UgcCollection)
+    matches!(prompt, BilibiliSelectionPrompt::UgcCollection { .. })
 }
 
 async fn normalize_bilibili_short_link_job(
@@ -14364,6 +14419,8 @@ fn bilibili_selection_keyboard(
             page,
             page_count,
             collection,
+            collection_page_count,
+            ..
         } => {
             let single_page_label = format!("P{} only", page.unwrap_or(1));
             let mut rows = vec![vec![InlineKeyboardButton {
@@ -14380,15 +14437,15 @@ fn bilibili_selection_keyboard(
             }
             if collection.is_some() {
                 rows.push(vec![InlineKeyboardButton {
-                    text: "Entire collection".to_string(),
+                    text: entire_bilibili_collection_label(*collection_page_count),
                     callback_data: bilibili_selection_callback_data(token, "collection"),
                     web_app: None,
                 }]);
             }
             rows
         }
-        BilibiliSelectionPrompt::UgcCollection => vec![vec![InlineKeyboardButton {
-            text: "Entire collection".to_string(),
+        BilibiliSelectionPrompt::UgcCollection { page_count } => vec![vec![InlineKeyboardButton {
+            text: entire_bilibili_collection_label(*page_count),
             callback_data: bilibili_selection_callback_data(token, "all"),
             web_app: None,
         }]],
@@ -14401,6 +14458,13 @@ fn bilibili_selection_keyboard(
     InlineKeyboardMarkup { inline_keyboard }
 }
 
+fn entire_bilibili_collection_label(page_count: Option<usize>) -> String {
+    page_count.map_or_else(
+        || "Entire collection".to_string(),
+        |count| format!("Entire collection ({count} P found)"),
+    )
+}
+
 fn bilibili_selection_message(job_id: u64, prompt: &BilibiliSelectionPrompt) -> String {
     match prompt {
         BilibiliSelectionPrompt::SeasonMedia => {
@@ -14409,27 +14473,37 @@ fn bilibili_selection_message(job_id: u64, prompt: &BilibiliSelectionPrompt) -> 
         BilibiliSelectionPrompt::VideoPages {
             page,
             page_count,
+            page_title,
             collection,
+            ..
         } => {
             let page_label = format!("P{}", page.unwrap_or(1));
-            match collection {
+            let message = match collection {
                 Some(reference) if *page_count > 1 => format!(
                     "Bilibili video belongs to collection {} ({} items). Choose {page_label}, all P, or the entire collection for job #{job_id}:",
-                    truncate(&reference.title),
+                    truncate_utf16_units(&reference.title, 512),
                     reference.item_count
                 ),
                 Some(reference) => format!(
                     "This one-page Bilibili video belongs to collection {} ({} items). Choose P1 only or the entire collection for job #{job_id}:",
-                    truncate(&reference.title),
+                    truncate_utf16_units(&reference.title, 512),
                     reference.item_count
                 ),
                 None if *page_count > 1 => format!(
                     "Bilibili video queued as job #{job_id}. Choose {page_label} only or all P:"
                 ),
                 None => format!("Bilibili video queued as job #{job_id}."),
+            };
+            if let Some(title) = page_title {
+                format!(
+                    "{message}\n{page_label} · {}",
+                    truncate_utf16_units(title, 512)
+                )
+            } else {
+                message
             }
         }
-        BilibiliSelectionPrompt::UgcCollection => {
+        BilibiliSelectionPrompt::UgcCollection { .. } => {
             format!(
                 "Bilibili collection link queued as job #{job_id}. Download the entire collection?"
             )
@@ -14473,10 +14547,12 @@ fn apply_bilibili_selection(
             },
             "entire collection",
         )),
-        (BilibiliSelectionPrompt::UgcCollection, BilibiliSelectionCallbackAction::All) => Some((
-            set_bilibili_selection(job, BilibiliSelection::All),
-            "entire collection",
-        )),
+        (BilibiliSelectionPrompt::UgcCollection { .. }, BilibiliSelectionCallbackAction::All) => {
+            Some((
+                set_bilibili_selection(job, BilibiliSelection::All),
+                "entire collection",
+            ))
+        }
         (_, BilibiliSelectionCallbackAction::Cancel) => None,
         _ => None,
     }
@@ -25544,7 +25620,9 @@ print(json.dumps({"ok": True}))
         let membership_prompt = BilibiliSelectionPrompt::VideoPages {
             page: Some(2),
             page_count: 4,
+            page_title: Some("Second part".into()),
             collection: Some(reference.clone()),
+            collection_page_count: Some(41),
         };
         let membership_keyboard = bilibili_selection_keyboard(42, &membership_prompt);
         let membership_data = membership_keyboard
@@ -25564,6 +25642,11 @@ print(json.dumps({"ok": True}))
         );
         assert_eq!(membership_keyboard.inline_keyboard[0][0].text, "P2 only");
         assert_eq!(membership_keyboard.inline_keyboard[0][1].text, "All P");
+        assert_eq!(
+            membership_keyboard.inline_keyboard[1][0].text,
+            "Entire collection (41 P found)"
+        );
+        assert!(bilibili_selection_message(42, &membership_prompt).ends_with("P2 · Second part"));
         assert_eq!(
             apply_bilibili_selection(
                 JobRequest::Bilibili {
@@ -25624,36 +25707,75 @@ print(json.dumps({"ok": True}))
         let standalone_prompt = BilibiliSelectionPrompt::VideoPages {
             page: None,
             page_count: 2,
+            page_title: None,
             collection: None,
+            collection_page_count: None,
         };
         let standalone_keyboard = bilibili_selection_keyboard(42, &standalone_prompt);
         assert_eq!(standalone_keyboard.inline_keyboard[0][0].text, "P1 only");
         assert_eq!(standalone_keyboard.inline_keyboard[0][1].text, "All P");
         assert!(matches!(
-            bilibili_video_pages_prompt(None, 2, Ok(None))
-                .expect("a multi-page non-collection video should show the page choice"),
+            bilibili_video_pages_prompt(
+                None,
+                Ok(bilibili_core::VideoPageInfo {
+                    page_count: 2,
+                    page_title: None,
+                    collection: None,
+                }),
+                None,
+            )
+            .expect("a multi-page non-collection video should show the page choice"),
             Some(BilibiliSelectionPrompt::VideoPages {
                 page: None,
                 page_count: 2,
                 collection: None,
+                ..
             })
         ));
         assert!(
-            bilibili_video_pages_prompt(None, 1, Ok(None))
-                .expect("a single-page video should not need a prompt")
-                .is_none()
+            bilibili_video_pages_prompt(
+                None,
+                Ok(bilibili_core::VideoPageInfo {
+                    page_count: 1,
+                    page_title: Some("Single-part title".into()),
+                    collection: None,
+                }),
+                None,
+            )
+            .expect("a single-page video should not need a prompt")
+            .is_none()
         );
-        let single_page_collection =
-            bilibili_video_pages_prompt(None, 1, Ok(Some(reference.clone())))
-                .expect("collection membership should remain selectable");
-        let single_page_keyboard = bilibili_selection_keyboard(
-            42,
-            single_page_collection.as_ref().expect("collection prompt"),
-        );
+        let single_page_collection = bilibili_video_pages_prompt(
+            None,
+            Ok(bilibili_core::VideoPageInfo {
+                page_count: 1,
+                page_title: Some("没有题目 237 复制_720p_2".into()),
+                collection: Some(reference),
+            }),
+            None,
+        )
+        .expect("collection membership should remain selectable")
+        .expect("collection prompt");
+        let single_page_keyboard = bilibili_selection_keyboard(42, &single_page_collection);
         assert_eq!(single_page_keyboard.inline_keyboard[0].len(), 1);
+        assert_eq!(single_page_keyboard.inline_keyboard[0][0].text, "P1 only");
+        assert_eq!(
+            single_page_keyboard.inline_keyboard[1][0].text,
+            "Entire collection"
+        );
+        assert!(
+            bilibili_selection_message(42, &single_page_collection)
+                .ends_with("P1 · 没有题目 237 复制_720p_2")
+        );
 
-        let direct_prompt = BilibiliSelectionPrompt::UgcCollection;
+        let direct_prompt = BilibiliSelectionPrompt::UgcCollection {
+            page_count: Some(41),
+        };
         let direct_keyboard = bilibili_selection_keyboard(42, &direct_prompt);
+        assert_eq!(
+            direct_keyboard.inline_keyboard[0][0].text,
+            "Entire collection (41 P found)"
+        );
         let direct_data = direct_keyboard
             .inline_keyboard
             .iter()
@@ -25736,7 +25858,9 @@ print(json.dumps({"ok": True}))
                 &BilibiliSelectionPrompt::VideoPages {
                     page: Some(2),
                     page_count: 2,
+                    page_title: None,
                     collection: None,
+                    collection_page_count: None,
                 },
                 BilibiliSelectionCallbackAction::Current,
             )
@@ -25833,14 +25957,16 @@ print(json.dumps({"ok": True}))
             &BilibiliSelectionPrompt::VideoPages {
                 page: Some(2),
                 page_count: 2,
+                page_title: None,
                 collection: None,
+                collection_page_count: None,
             }
         ));
         assert!(!should_suppress_selection_file_provider_notice(
             &BilibiliSelectionPrompt::SeasonMedia
         ));
         assert!(should_suppress_selection_file_provider_notice(
-            &BilibiliSelectionPrompt::UgcCollection
+            &BilibiliSelectionPrompt::UgcCollection { page_count: None }
         ));
     }
 
@@ -25848,10 +25974,10 @@ print(json.dumps({"ok": True}))
     fn membership_probe_error_does_not_fall_back_to_a_single_video() {
         let error = bilibili_video_pages_prompt(
             None,
-            0,
             Err(anyhow!(
                 "HTTP status client error (412 Precondition Failed)"
             )),
+            None,
         )
         .expect_err("a failed membership probe must block automatic download");
 
@@ -25864,16 +25990,52 @@ print(json.dumps({"ok": True}))
 
     #[tokio::test]
     async fn membership_probe_migrates_legacy_cookie_before_request() -> anyhow::Result<()> {
+        check_collection_prompt_legacy_cookie(false, 2, "Entire collection (3 P found)").await
+    }
+
+    #[tokio::test]
+    async fn direct_collection_count_migrates_legacy_cookie_before_request() -> anyhow::Result<()> {
+        check_collection_prompt_legacy_cookie(true, 2, "Entire collection (3 P found)").await
+    }
+
+    #[tokio::test]
+    async fn legacy_collection_link_does_not_wait_for_count_capacity() -> anyhow::Result<()> {
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/medialist/play?business=space_collection&business_id=167822"
+                .into(),
+            selection: None,
+        };
+        let config = AppConfig::for_test();
+        let semaphore = Semaphore::new(0);
+        let prompt = tokio::time::timeout(
+            Duration::ZERO,
+            bilibili_ugc_selection_prompt(&config, &job, &semaphore),
+        )
+        .await??;
+        assert!(matches!(
+            prompt,
+            Some(BilibiliSelectionPrompt::UgcCollection { page_count: None })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_count_omits_number_when_expected_videos_are_missing() -> anyhow::Result<()>
+    {
+        check_collection_prompt_legacy_cookie(false, 3, "Entire collection").await
+    }
+
+    async fn check_collection_prompt_legacy_cookie(
+        direct_collection: bool,
+        expected_items: usize,
+        expected_label: &str,
+    ) -> anyhow::Result<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::TcpListener;
 
-        let directory = std::env::temp_dir().join(format!(
-            "telegram-video-downloader-membership-legacy-cookie-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        ));
-        let state_path = directory.join("legacy-state.json");
-        let credential_file = directory.join("credentials.json");
+        let directory = tempfile::tempdir()?;
+        let state_path = directory.path().join("legacy-state.json");
+        let credential_file = directory.path().join("credentials.json");
         bilibili_auth::save_auth_state(
             &state_path,
             &bilibili_auth::AuthState {
@@ -25886,9 +26048,10 @@ print(json.dumps({"ok": True}))
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        let expected_requests = if direct_collection { 3 } else { 6 };
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..expected_requests {
                 let (mut stream, _) = listener.accept().await.expect("test client should connect");
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -25908,9 +26071,17 @@ print(json.dumps({"ok": True}))
                     String::from_utf8(request).expect("test request should be UTF-8");
                 let body = if request_text.starts_with("GET /x/tag/archive/tags") {
                     r#"{"code":0,"data":[]}"#
+                } else if request_text
+                    .starts_with("GET /x/polymer/web-space/seasons_archives_list?")
+                {
+                    r#"{"code":0,"data":{"page":{"total":2},"archives":[{"aid":170001},{"aid":170002}]}}"#
+                } else if request_text.starts_with("GET /x/web-interface/view?aid=170002 ") {
+                    r#"{"code":0,"data":{"aid":170002,"bvid":"BV1multipart","title":"Multi-part video","pages":[{"page":1,"cid":9989,"part":"First half"},{"page":2,"cid":9990,"part":"Second half"}]}}"#
                 } else {
-                    r#"{"code":0,"data":{"aid":170001,"bvid":"BV1cookie","title":"Cookie test","owner":{"mid":210798,"name":"Satori"},"pages":[{"page":1,"cid":9988,"part":"P1"}],"ugc_season":{"id":167822,"title":"Piano collection","cover":"https://example.invalid/season.jpg","mid":210798,"intro":"Test collection","ep_count":37,"season_type":1}}}"#
+                    r#"{"code":0,"data":{"aid":170001,"bvid":"BV1cookie","title":"Cookie test","owner":{"mid":210798,"name":"Satori"},"pages":[{"page":1,"cid":9988,"part":"Single-part title"}],"ugc_season":{"id":167822,"title":"Piano collection","cover":"https://example.invalid/season.jpg","mid":210798,"intro":"Test collection","ep_count":2,"season_type":1}}}"#
                 };
+                let body =
+                    body.replace("\"ep_count\":2", &format!("\"ep_count\":{expected_items}"));
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -25921,40 +26092,58 @@ print(json.dumps({"ok": True}))
                     .expect("test response should be writable");
                 requests.push(request_text);
             }
-            requests.join("\n")
+            requests
         });
 
         let mut config = AppConfig::for_test();
         config.bilibili.auth.state_path = state_path;
         config.bilibili.auth.credential_file = credential_file.clone();
         config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+        let url = if direct_collection {
+            "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+        } else {
+            "https://www.bilibili.com/video/BV1cookie"
+        };
         let job = JobRequest::Bilibili {
-            url: "https://www.bilibili.com/video/BV1cookie".to_string(),
+            url: url.to_string(),
             selection: None,
         };
 
-        let prompt = bilibili_ugc_selection_prompt(&config, &job)
+        let prompt = bilibili_ugc_selection_prompt(&config, &job, &Semaphore::new(1))
             .await?
-            .expect("legacy cookie should resolve collection membership");
-        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .expect("legacy cookie should resolve the collection prompt");
+        let requests = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("test client should finish")
             .expect("test server should not panic");
 
-        assert!(matches!(
-            prompt,
-            BilibiliSelectionPrompt::VideoPages {
-                collection: Some(reference),
-                ..
-            } if reference.id == 167_822
-        ));
+        let collection_row = if direct_collection {
+            assert!(matches!(
+                &prompt,
+                BilibiliSelectionPrompt::UgcCollection { .. }
+            ));
+            0
+        } else {
+            assert!(matches!(
+                &prompt,
+                BilibiliSelectionPrompt::VideoPages {
+                    collection: Some(reference),
+                    ..
+                } if reference.id == 167_822
+            ));
+            assert!(bilibili_selection_message(42, &prompt).ends_with("P1 · Single-part title"));
+            1
+        };
+        assert_eq!(
+            bilibili_selection_keyboard(42, &prompt).inline_keyboard[collection_row][0].text,
+            expected_label
+        );
         assert!(credential_file.exists());
-        assert!(
+        assert!(requests.iter().all(|request| {
             request
                 .to_ascii_lowercase()
                 .contains("cookie: sessdata=membership-test")
-        );
-        let _ = fs::remove_dir_all(directory);
+        }));
         Ok(())
     }
 

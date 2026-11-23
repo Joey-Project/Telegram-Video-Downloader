@@ -2350,12 +2350,18 @@ mod collection_message_tests {
                 old_task_id,
                 0,
                 old_job,
-                BilibiliSelectionPrompt::UgcCollection,
+                BilibiliSelectionPrompt::UgcCollection {
+                    page_count: Some(3),
+                },
             )
             .await;
         });
         let (old_request, old_response) = receive_controllable_request(&mut requests).await;
         assert_eq!(old_request.method, "sendMessage");
+        assert_eq!(
+            old_request.body["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Entire collection (3 P found)"
+        );
         let old_callback_data = inline_keyboard_callback_data(&old_request, ":all");
 
         let resumed = queue
@@ -2375,7 +2381,9 @@ mod collection_message_tests {
                 new_task_id,
                 1,
                 new_job,
-                BilibiliSelectionPrompt::UgcCollection,
+                BilibiliSelectionPrompt::UgcCollection {
+                    page_count: Some(3),
+                },
             )
             .await;
         });
