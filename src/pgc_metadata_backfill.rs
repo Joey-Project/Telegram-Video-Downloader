@@ -646,6 +646,7 @@ mod tests {
     fn fixture_record() -> TaskRecord {
         TaskRecord {
             social_bot_id: None,
+            pdf_reply_bot_id: None,
             schema_version: 1,
             id: "fixture".to_string(),
             update_id: 1,

@@ -420,6 +420,30 @@ async fn send_reply(
     original: &Original,
     random_id: i64,
 ) -> Result<()> {
+    send_verified_file_reply(
+        config,
+        task.chat_id,
+        task.message_id,
+        random_id,
+        path,
+        &original.name,
+        &original.sha256,
+    )
+    .await
+}
+
+/// Send an already-published file through the shared, identity-checked MTProto helper.
+/// Callers bind the recipient to its admitting bot and provide the persisted digest; the helper
+/// verifies the file bytes before Telegram delivery.
+pub(crate) async fn send_verified_file_reply(
+    config: &AppConfig,
+    chat_id: i64,
+    reply_to_message_id: i64,
+    random_id: i64,
+    path: &Path,
+    file_name: &str,
+    expected_sha256: &str,
+) -> Result<()> {
     #[cfg(not(test))]
     let (python, credentials_path) = (
         crate::music_transfer::expected_python_path()?,
@@ -437,12 +461,12 @@ async fn send_reply(
     let request = ReplyRequest {
         bot_token: &config.telegram.token,
         credentials_path: &credentials_path,
-        chat_id: task.chat_id,
-        reply_to_message_id: task.message_id,
+        chat_id,
+        reply_to_message_id,
         random_id,
         file_path: path,
-        file_name: &original.name,
-        expected_sha256: &original.sha256,
+        file_name,
+        expected_sha256,
     };
     call_reply_helper(&python, &request).await
 }

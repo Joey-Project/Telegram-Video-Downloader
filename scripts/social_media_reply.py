@@ -519,7 +519,11 @@ async def _send_reply(
         peer = bindings.input_peer_user_type(user_id=request.chat_id, access_hash=0)
         media = bindings.input_media_uploaded_document_type(
             file=input_file,
-            mime_type="application/octet-stream",
+            mime_type=(
+                "application/pdf"
+                if request.file_name.lower().endswith(".pdf")
+                else "application/octet-stream"
+            ),
             attributes=[bindings.document_attribute_filename_type(file_name=request.file_name)],
             force_file=True,
         )
