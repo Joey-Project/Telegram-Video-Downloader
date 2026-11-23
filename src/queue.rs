@@ -135,6 +135,10 @@ impl TaskStatus {
     pub fn is_history(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
+
+    pub fn supports_cancellation(self) -> bool {
+        self.is_unfinished() || self == Self::Failed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4652,7 +4656,7 @@ impl QueueManager {
         if expected_generation.is_some_and(|generation| record.generation != generation)
             || record.chat_id != chat_id
             || expected_statuses.is_some_and(|statuses| !statuses.contains(&record.status))
-            || !record.status.is_unfinished()
+            || !record.status.supports_cancellation()
             || (reject_verifying && record.status == TaskStatus::Verifying)
         {
             return Ok(None);

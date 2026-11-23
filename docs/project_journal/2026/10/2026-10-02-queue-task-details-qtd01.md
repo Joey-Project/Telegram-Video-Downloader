@@ -3,7 +3,7 @@ id: 20261002-qtd01
 title: 队列任务详情与按钮区分
 status: completed
 created: 2026-10-02
-updated: 2026-10-02
+updated: 2026-11-23
 branch: codex/queue-task-details
 pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/24
 supersedes: []
@@ -15,6 +15,7 @@ superseded_by:
 ## 摘要
 - `/queue` 每项以同一编号关联正文与按钮，正文显示状态、标题、分辨率、预估体积、媒体进度、任务 ID 和 URL。
 - Retry、Resume、Confirm、Cancel 按钮显示动作、编号、短标题、画质与大小；原任务 ID、generation 和 callback action 保持不变。
+- 失败任务可用 Cancel 结束，并移入 `/queue history`。取消保留已下载文件和暂存片段。
 - 标题优先采用对应计划快照；确认中的待确认计划会标为更新计划，只有 proposed plan 时会标注 Proposed。缺少快照或标题时使用任务类型回退，画质和体积显示 unknown。
 - 合集显示合集标题与条目数；画质列出不同分辨率，并把缺少或无效的已选视频分辨率计为 unknown。大小按所选视频与音频流 subject 去重，精确值优先；不确定的总和显示为下界或 unknown。
 
@@ -29,4 +30,5 @@ superseded_by:
 - 五项新增单测与三项指定回归/E2E 共 8 passed、0 failed；包含 `persistent_queue_restart_and_telegram_interactions_e2e` 的实际 mock Telegram 文本、键盘和 callback 核对。
 - `cargo test --all-targets --locked --offline --quiet` 通过：548 tests，537 passed、0 failed、11 ignored，47.85 秒。主套件启动的跨进程子测试已包含在该统计中。
 - 使用 Cargo/Rust 1.95.0；测试在沙盒外运行本地 mock 与 fixture。构建、Clippy 和全量测试均针对同一最终源文件内容，验证前后源文件哈希一致。
-- 项目日志校验与 `git diff --check` 通过。独立内部检查提出的 Failed 按钮测试期望已修正，保留原有仅 Retry 的行为；未运行 named single/double/triple review。
+- 项目日志校验与 `git diff --check` 通过。最初交付时失败任务仅显示 Retry，随后增加 Cancel。
+- 失败任务取消的 mock Telegram E2E 验证了按钮、历史归档和暂存片段保留。队列相关回归测试 180 项通过，1 项按原配置忽略。
