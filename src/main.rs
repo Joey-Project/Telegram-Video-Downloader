@@ -10399,7 +10399,7 @@ fn queue_task_buttons(
             "resume",
         ));
     }
-    if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
+    if record.status.supports_cancellation() && record.status != TaskStatus::Verifying {
         buttons.push(queue_task_action_button(
             record,
             task_number,
@@ -20783,6 +20783,145 @@ print(json.dumps({"ok": True}))
     }
 
     #[tokio::test]
+    async fn failed_task_can_be_cancelled_from_queue_e2e() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.path().join("videos");
+        config.downloads.pdf_dir = root.path().join("pdfs");
+        let staging = config
+            .downloads
+            .video_dir
+            .join(".telegram-video-downloader-social-staging/failed-social-attempt");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir(&config.downloads.pdf_dir).unwrap();
+        let fragment = staging.join("video.mp4.part");
+        fs::write(&fragment, b"retained download fragment").unwrap();
+        let config = Arc::new(config);
+        let queue = Arc::new(QueueManager::open(&config).unwrap());
+        let chat_id = 123_456_789;
+        let task_id = "failed-social-download";
+        let mut task = TaskRecord::new(
+            task_id.into(),
+            501,
+            601,
+            chat_id,
+            Some(chat_id),
+            0,
+            JobRequest::Social {
+                url: "https://x.com/creator/status/12345".into(),
+            },
+        );
+        task.staging_attempts.push(staging.clone());
+        assert!(queue.create(task).unwrap());
+        queue
+            .set_status(task_id, TaskStatus::Failed, Some("Download failed.".into()))
+            .unwrap();
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let queue_command = |update_id, text| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "chat": { "id": chat_id, "type": "private" },
+                    "from": { "id": chat_id },
+                    "text": text
+                }
+            })
+        };
+        let dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        update_sender
+            .send(vec![queue_command(801, "/queue")])
+            .unwrap();
+        let updates = telegram.get_updates(offset, 0).await.unwrap();
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .unwrap();
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let page = &recorded
+            .iter()
+            .find(|request| request.method == "sendMessage")
+            .unwrap()
+            .body;
+        let buttons = page["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert!(
+            buttons[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Retry · #1 ·")
+        );
+        assert!(
+            buttons[1]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Cancel · #1 ·")
+        );
+
+        update_sender.send(vec![
+            serde_json::json!({
+                "update_id": 802,
+                "callback_query": {
+                    "id": "cancel-failed-task",
+                    "data": buttons[1]["callback_data"],
+                    "message": { "message_id": 1001, "chat": { "id": chat_id, "type": "private" } }
+                }
+            }),
+            queue_command(803, "/queue"),
+            queue_command(804, "/queue history"),
+        ]).unwrap();
+        let updates = telegram.get_updates(offset, 0).await.unwrap();
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .unwrap();
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.method == "answerCallbackQuery"
+                    && request.body["text"] == "Task canceled.")
+        );
+        let pages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .map(|request| request.body["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].contains("No active or actionable tasks"));
+        assert!(pages[1].contains(task_id) && pages[1].contains("cancelled"));
+        let cancelled = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(cancelled.staging_attempts, vec![staging]);
+        assert_eq!(fs::read(fragment).unwrap(), b"retained download fragment");
+        stop_fake_telegram_api(shutdown, server).await;
+    }
+
+    #[tokio::test]
     async fn stale_bilibili_selection_callback_after_resume_is_ignored_e2e() {
         let queue_root = temp_main_test_dir("stale-bilibili-selection-callback");
         let mut config = AppConfig::for_test();
@@ -21450,7 +21589,8 @@ print(json.dumps({"ok": True}))
             (TaskStatus::AwaitingSelection, &["resume", "cancel"]),
             (TaskStatus::Interrupted, &["resume", "cancel"]),
             (TaskStatus::AwaitingDuplicateChoice, &["resume", "cancel"]),
-            (TaskStatus::Failed, &["retry"]),
+            (TaskStatus::Failed, &["retry", "cancel"]),
+            (TaskStatus::PartiallyCompleted, &["retry", "cancel"]),
             (TaskStatus::AwaitingConfirmation, &["confirm", "cancel"]),
             (TaskStatus::Preparing, &["cancel"]),
             (TaskStatus::Queued, &["cancel"]),
