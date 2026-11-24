@@ -21160,7 +21160,7 @@ print(json.dumps({"ok": True}))
     }
 
     #[test]
-    fn queue_shows_social_download_diagnostics_before_long_failure_messages() {
+    fn full_queue_page_keeps_social_download_and_attachment_diagnostics() {
         let root = tempfile::tempdir().unwrap();
         let mut config = AppConfig::for_test();
         config.downloads.video_dir = root.path().join("videos");
@@ -21213,11 +21213,17 @@ print(json.dumps({"ok": True}))
                 None,
                 ordinal as usize,
                 JobRequest::Bilibili {
-                    url: format!("https://www.bilibili.com/video/BV1?{}", "😀".repeat(100)),
+                    url: format!(
+                        "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822&{}",
+                        "😀".repeat(100)
+                    ),
                     selection: Some(BilibiliSelection::All),
                 },
             );
             task.status = TaskStatus::Failed;
+            task.media_entries_completed = 222_222;
+            task.media_entries_failed = 333_333;
+            task.media_entries_total = 555_555;
             task.error = Some("Bilibili failure details ".repeat(50));
             task.plan = Some(PlanValidationSnapshot {
                 title: Some(format!("Collection {}", "😀".repeat(100))),
@@ -21245,7 +21251,17 @@ print(json.dumps({"ok": True}))
         assert!(text.contains("HTTP 429"), "{text}");
         assert!(text.contains("RPC 500"), "{text}");
         assert_eq!(text.matches("Title: Collection").count(), 8);
-        assert_eq!(keyboard.unwrap().inline_keyboard.len(), 10);
+        let rows = keyboard.unwrap().inline_keyboard;
+        assert_eq!(rows.len(), 10);
+        for id in ["instagram-rate-limit", "instagram-attachment-error"] {
+            assert!(rows.iter().flatten().any(|button| {
+                matches!(
+                    parse_queue_callback_data(&button.callback_data),
+                    Some(QueueCallbackAction::Retry { id: ref task_id, generation: 0 })
+                        if task_id == id
+                )
+            }));
+        }
     }
 
     #[test]
