@@ -21151,6 +21151,70 @@ print(json.dumps({"ok": True}))
     }
 
     #[test]
+    fn queue_shows_social_download_diagnostics_before_long_failure_messages() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.path().join("videos");
+        config.downloads.pdf_dir = root.path().join("pdfs");
+        config.ensure_runtime_dirs().unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let chat_id = 123_456_789;
+        for (ordinal, (id, detail, headline)) in [
+            (
+                "instagram-rate-limit",
+                "gallery-dl exit status 1, primary profile, HTTP 429",
+                "Instagram has temporarily limited downloads",
+            ),
+            (
+                "instagram-extractor-error",
+                "gallery-dl exit status 1, primary profile, extractor KeyError",
+                "Could not download the Instagram media",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task = TaskRecord::new(
+                id.into(),
+                ordinal as i64 + 1,
+                ordinal as i64 + 1,
+                chat_id,
+                Some(chat_id),
+                ordinal,
+                JobRequest::Social {
+                    url: "https://www.instagram.com/stories/creator.example/".into(),
+                },
+            );
+            assert!(queue.create(task).unwrap());
+            queue
+                .set_status(
+                    id,
+                    TaskStatus::Failed,
+                    Some(format!("{detail} — {headline}")),
+                )
+                .unwrap();
+        }
+
+        let (text, _) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            text.contains("Details: gallery-dl exit status 1, primary profile, HTTP 429"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Details: gallery-dl exit status 1, primary profile, extractor KeyError"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn queue_page_stays_within_telegram_text_limit_for_long_urls() {
         let queue_root = temp_main_test_dir("queue-page-size-limit");
         let mut config = AppConfig::for_test();

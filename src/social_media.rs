@@ -241,7 +241,7 @@ pub(crate) async fn download(
         let outcome = run_worker(command, staging).await?;
         if !outcome.status.success() {
             bail!(
-                "Could not download this X video ({})",
+                "{} — Could not download this X video",
                 worker_failure_detail("yt-dlp", &outcome, None)
             );
         }
@@ -454,7 +454,10 @@ fn instagram_failure(stderr: &str) -> InstagramFailure {
 
 fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
     let text = stderr.to_ascii_lowercase();
-    if text.contains("keyerror") && (text.contains("[instagram]") || text.contains("extractor")) {
+    if text.lines().any(|line| {
+        line.starts_with("[instagram][error] an unexpected error occurred: keyerror - ")
+            || line.starts_with("[instagram][error] keyerror:")
+    }) {
         return WorkerIssue::ExtractorKeyError;
     }
     if let Some(status) = http_status(&text) {
@@ -467,10 +470,19 @@ fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
         return WorkerIssue::ExtractorError;
     }
     if text.lines().any(|line| {
-        line.contains("cookie")
-            && ["error", "failed", "unable", "could not", "cannot"]
+        line.starts_with("[cookies][error] ")
+            || downloader_error_payload(line).is_some_and(|payload| {
+                let payload = strip_leading_log_tag(payload);
+                [
+                    "could not load cookies",
+                    "failed to load cookies",
+                    "could not copy chrome cookie database",
+                    "failed to decrypt cookies",
+                    "could not find chrome cookies database",
+                ]
                 .iter()
-                .any(|needle| line.contains(needle))
+                .any(|prefix| payload.starts_with(prefix))
+            })
     }) {
         return WorkerIssue::CookieError;
     }
@@ -502,39 +514,79 @@ fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
 }
 
 fn http_status(stderr: &str) -> Option<u16> {
-    const MARKERS: &[&str] = &["http error ", "http status ", "status code ", "http "];
-
     for line in stderr.lines().rev() {
-        for marker in MARKERS {
-            let Some(index) = line.rfind(marker) else {
-                continue;
-            };
-            if let Some(status) = parse_status_digits(line[index + marker.len()..].trim_start()) {
-                return Some(status);
+        let Some(payload) = downloader_error_payload(line) else {
+            continue;
+        };
+        let payload = strip_leading_log_tag(payload).trim_start();
+        let payload = payload
+            .strip_prefix("unable to download video data: ")
+            .or_else(|| payload.strip_prefix("unable to download webpage: "))
+            .unwrap_or(payload);
+        for marker in [
+            "httperror:",
+            "http error ",
+            "http status code ",
+            "http status ",
+            "status code ",
+            "http ",
+        ] {
+            if let Some(value) = payload.strip_prefix(marker) {
+                if let Some(status) = parse_status_digits(trim_status_quotes(value)) {
+                    return Some(status);
+                }
+                break;
             }
         }
-        for marker in [" client error", " forbidden", " not found"] {
-            let Some(index) = line.rfind(marker) else {
-                continue;
-            };
-            let Some(code) = line[..index]
-                .split_whitespace()
-                .last()
-                .map(|token| token.trim_matches(|character: char| !character.is_ascii_digit()))
-            else {
-                continue;
-            };
-            if let Some(status) = parse_status_digits(code) {
-                return Some(status);
-            }
+        if let Some(status) = parse_status_digits(trim_status_quotes(payload)) {
+            return Some(status);
         }
     }
     None
 }
 
+fn downloader_error_payload(line: &str) -> Option<&str> {
+    if let Some(payload) = line.strip_prefix("error: ") {
+        return Some(payload);
+    }
+    let rest = line.strip_prefix('[')?;
+    let group_end = rest.find(']')?;
+    rest[group_end + 1..].strip_prefix("[error] ")
+}
+
+fn strip_leading_log_tag(payload: &str) -> &str {
+    let Some(rest) = payload.strip_prefix('[') else {
+        return payload;
+    };
+    let Some(tag_end) = rest.find("] ") else {
+        return payload;
+    };
+    let tag = &rest[..tag_end];
+    if !tag.is_empty()
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        &rest[tag_end + 2..]
+    } else {
+        payload
+    }
+}
+
+fn trim_status_quotes(value: &str) -> &str {
+    value.trim_start_matches(|character: char| {
+        character.is_ascii_whitespace() || matches!(character, '\'' | '"')
+    })
+}
+
 fn parse_status_digits(value: &str) -> Option<u16> {
     let digits = value.bytes().take_while(u8::is_ascii_digit).take(4).count();
-    if digits != 3 || value.as_bytes().get(digits).is_some_and(u8::is_ascii_digit) {
+    if digits != 3
+        || value
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'))
+    {
         return None;
     }
     let status = value[..digits].parse::<u16>().ok()?;
@@ -555,9 +607,9 @@ fn worker_failure_detail(
         },
         |code| format!("exit status {code}"),
     );
-    let profile = profile.map_or_else(String::new, |role| format!("; {}", role.label()));
+    let profile = profile.map_or_else(String::new, |role| format!(", {}", role.label()));
     format!(
-        "{tool} {status}{profile}; {}",
+        "{tool} {status}{profile}, {}",
         outcome.diagnostics.issue.label()
     )
 }
@@ -573,9 +625,9 @@ fn instagram_failure_message(
         return "No active Instagram Stories were found for this account".into();
     }
     format!(
-        "{} ({})",
-        failure.message(),
-        worker_failure_detail("gallery-dl", outcome, Some(profile))
+        "{} — {}",
+        worker_failure_detail("gallery-dl", outcome, Some(profile)),
+        failure.message()
     )
 }
 
@@ -855,8 +907,12 @@ for arg do
             echo '[cookies][info] Extracted cookies' >&2; echo '[download][error] 403 Forbidden (file not found)' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-http-error')
             echo '[download][error] HttpError: '\''403 Forbidden'\'' https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 22 ;;
+        'chrome/instagram.com:/test/primary-http-503')
+            echo '[instagram][error] HttpError: '\''503 Service Unavailable'\''' >&2; exit 25 ;;
+        'chrome/instagram.com:/test/primary-query-status')
+            echo '[download][error] could not fetch https://private.example/archive?cookie=private_session&pin=427 not found' >&2; exit 24 ;;
         'chrome/instagram.com:/test/primary-key-error')
-            echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] KeyError: '\''query'\'' /private/worker/path https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 7 ;;
+            echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] An unexpected error occurred: KeyError - '\''query'\''. /private/worker/path https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 7 ;;
         'chrome/instagram.com:/test/primary-extractor-error')
             echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] Unexpected parser failure for query /private/worker/path' >&2; exit 8 ;;
         'chrome/instagram.com:/test/fallback-error')
@@ -881,6 +937,8 @@ exit 2
             "partial",
             "generic",
             "http-error",
+            "http-503",
+            "query-status",
             "key-error",
             "extractor-error",
             "fallback-error",
@@ -922,7 +980,10 @@ exit 2
                 );
                 if case == "http-error" {
                     assert!(detail.contains("Could not download the Instagram media"));
-                    assert!(detail.contains("exit status 22; primary profile; HTTP 403"));
+                    assert!(
+                        detail
+                            .starts_with("gallery-dl exit status 22, primary profile, HTTP 403 — ")
+                    );
                     for secret in [
                         "secret_token_123",
                         "private.example",
@@ -932,6 +993,9 @@ exit 2
                         assert!(!detail.contains(secret), "leaked {secret}: {detail}");
                     }
                 } else if case == "key-error" {
+                    assert!(detail.starts_with(
+                        "gallery-dl exit status 7, primary profile, extractor KeyError — "
+                    ));
                     assert!(detail.contains("extractor KeyError"), "{detail}");
                     assert!(!detail.contains("query"), "leaked key name: {detail}");
                     for secret in [
@@ -947,8 +1011,29 @@ exit 2
                     assert!(!detail.contains("cookie error"), "{detail}");
                     assert!(!detail.contains("query"), "leaked query: {detail}");
                     assert!(!detail.contains("/private/worker/path"), "{detail}");
+                } else if case == "rate" {
+                    assert!(
+                        detail
+                            .starts_with("gallery-dl exit status 1, primary profile, HTTP 429 — ")
+                    );
                 } else if case == "fallback-error" {
-                    assert!(detail.contains("exit status 17; fallback profile; HTTP 503"));
+                    assert!(
+                        detail.starts_with(
+                            "gallery-dl exit status 17, fallback profile, HTTP 503 — "
+                        )
+                    );
+                } else if case == "http-503" {
+                    assert!(
+                        detail
+                            .starts_with("gallery-dl exit status 25, primary profile, HTTP 503 — ")
+                    );
+                } else if case == "query-status" {
+                    assert!(detail.starts_with(
+                        "gallery-dl exit status 24, primary profile, no recognized stderr category — "
+                    ));
+                    assert!(!detail.contains("HTTP 427"), "{detail}");
+                    assert!(!detail.contains("private.example"), "{detail}");
+                    assert!(!detail.contains("pin=427"), "{detail}");
                 }
             }
         }
@@ -1006,7 +1091,7 @@ exit 2
         std::fs::write(
             &worker,
             r#"#!/bin/sh
-echo 'ERROR: [twitter] HTTP Error 403: Forbidden https://private.example/raw?token=secret_token_123 account=@private_account' >&2
+echo 'ERROR: unable to download video data: HTTP Error 403: Forbidden https://private.example/raw?token=secret_token_123 account=@private_account' >&2
 exit 23
 "#,
         )
@@ -1023,7 +1108,10 @@ exit 23
             .to_string();
 
         assert!(error.contains("Could not download this X video"));
-        assert!(error.contains("yt-dlp exit status 23; HTTP 403"), "{error}");
+        assert!(
+            error.starts_with("yt-dlp exit status 23, HTTP 403 — "),
+            "{error}"
+        );
         for secret in ["secret_token_123", "private.example", "@private_account"] {
             assert!(!error.contains(secret), "leaked {secret}: {error}");
         }

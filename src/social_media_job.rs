@@ -54,14 +54,8 @@ struct ReplyRequest<'a> {
 struct ReplyResponse {
     ok: bool,
     error: Option<String>,
-    phase: Option<String>,
-    diagnostic: Option<ReplyDiagnosticResponse>,
-}
-
-#[derive(Deserialize)]
-struct ReplyDiagnosticResponse {
-    kind: Option<String>,
-    rpc_code: Option<u32>,
+    phase: Option<serde_json::Value>,
+    diagnostic: Option<serde_json::Value>,
 }
 
 pub(crate) fn owner_matches(
@@ -160,6 +154,20 @@ pub(crate) async fn run(
                 ),
             );
             let result = send_reply(config, task, &canonical_path, original, random_id).await;
+            if let Err(error) = &result
+                && let Some(rejection) = error.downcast_ref::<ReplyRejection>()
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    generation = task.generation,
+                    attachment_ordinal = index + 1,
+                    category = rejection.category_label(),
+                    phase = rejection.phase_label(),
+                    diagnostic = rejection.diagnostic_label(),
+                    rpc_code = ?rejection.rpc_code(),
+                    "Telegram social attachment send failed"
+                );
+            }
             let proof = match result {
                 Ok(()) => {
                     sent += 1;
@@ -531,19 +539,7 @@ async fn call_reply_helper(python: &Path, request: &ReplyRequest<'_>) -> Result<
         let response: ReplyResponse = serde_json::from_slice(&response)
             .map_err(|_| anyhow!("No verified result from the private Telegram file sender"))?;
         if !status.success() || !response.ok {
-            let rejection = reply_error(
-                response.error.as_deref(),
-                response.phase.as_deref(),
-                response.diagnostic.as_ref(),
-            );
-            tracing::warn!(
-                category = rejection.category_label(),
-                phase = rejection.phase_label(),
-                diagnostic = rejection.diagnostic_label(),
-                rpc_code = ?rejection.rpc_code(),
-                "Telegram attachment sender reported a failure"
-            );
-            return Err(rejection.into());
+            return Err(reply_error(&response).into());
         }
         Ok(())
     })
@@ -570,7 +566,7 @@ impl ReplyFailureInfo {
     fn from_wire(
         category: Option<&str>,
         phase: Option<&str>,
-        diagnostic: Option<&ReplyDiagnosticResponse>,
+        diagnostic: Option<&serde_json::Value>,
     ) -> Self {
         const CATEGORIES: &[&str] = &[
             "bot_identity_invalid",
@@ -600,16 +596,21 @@ impl ReplyFailureInfo {
             Some("final_send") => Some("final send"),
             _ => None,
         };
-        let diagnostic_kind = diagnostic.and_then(|value| match value.kind.as_deref() {
-            Some("network_error") => Some("network error"),
-            Some("rpc_error") => Some("RPC error"),
-            Some("timeout") => Some("timeout"),
-            Some("random_id_duplicate") => Some("duplicate random ID"),
-            Some("rate_limited") => Some("rate limited"),
-            _ => None,
-        });
+        let diagnostic_kind = diagnostic
+            .and_then(|value| value.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| match value {
+                "network_error" => Some("network error"),
+                "rpc_error" => Some("RPC error"),
+                "timeout" => Some("timeout"),
+                "random_id_duplicate" => Some("duplicate random ID"),
+                "rate_limited" => Some("rate limited"),
+                _ => None,
+            });
         let rpc_code = diagnostic
-            .and_then(|value| value.rpc_code)
+            .and_then(|value| value.get("rpc_code"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u32::try_from(code).ok())
             .filter(|code| (1..=9999).contains(code))
             .filter(|_| diagnostic_kind.is_some());
         Self {
@@ -694,10 +695,19 @@ impl std::fmt::Display for ReplyRejection {
 
 impl std::error::Error for ReplyRejection {}
 
-fn reply_error(
+fn reply_error(response: &ReplyResponse) -> ReplyRejection {
+    let phase = response.phase.as_ref().and_then(serde_json::Value::as_str);
+    reply_error_fields(
+        response.error.as_deref(),
+        phase,
+        response.diagnostic.as_ref(),
+    )
+}
+
+fn reply_error_fields(
     category: Option<&str>,
     phase: Option<&str>,
-    diagnostic: Option<&ReplyDiagnosticResponse>,
+    diagnostic: Option<&serde_json::Value>,
 ) -> ReplyRejection {
     let info = ReplyFailureInfo::from_wire(category, phase, diagnostic);
     match info.category {
@@ -750,11 +760,7 @@ mod tests {
     fn reply_diagnostics_are_allowlisted_and_keep_legacy_categories() {
         let legacy: ReplyResponse =
             serde_json::from_str(r#"{"ok":false,"error":"delivery_unknown"}"#).unwrap();
-        let rejection = reply_error(
-            legacy.error.as_deref(),
-            legacy.phase.as_deref(),
-            legacy.diagnostic.as_ref(),
-        );
+        let rejection = reply_error(&legacy);
         assert!(rejection.is_delivery_unknown());
         assert_eq!(
             rejection.to_string(),
@@ -764,17 +770,10 @@ mod tests {
         let response = ReplyResponse {
             ok: false,
             error: Some("delivery_unknown".into()),
-            phase: Some("final_send".into()),
-            diagnostic: Some(ReplyDiagnosticResponse {
-                kind: Some("rpc_error".into()),
-                rpc_code: Some(500),
-            }),
+            phase: Some(serde_json::json!("final_send")),
+            diagnostic: Some(serde_json::json!({"kind":"rpc_error", "rpc_code":500})),
         };
-        let rejection = reply_error(
-            response.error.as_deref(),
-            response.phase.as_deref(),
-            response.diagnostic.as_ref(),
-        );
+        let rejection = reply_error(&response);
         assert!(rejection.is_delivery_unknown());
         assert!(
             rejection
@@ -786,10 +785,10 @@ mod tests {
         let invalid = ReplyFailureInfo::from_wire(
             Some("token=secret"),
             Some("/private/path"),
-            Some(&ReplyDiagnosticResponse {
-                kind: Some("raw exception text".into()),
-                rpc_code: Some(50_000),
-            }),
+            Some(&serde_json::json!({
+                "kind":"raw exception text",
+                "rpc_code":50_000
+            })),
         );
         let summary = invalid.safe_summary();
         assert_eq!(summary, "unknown_error");
@@ -800,14 +799,29 @@ mod tests {
     }
 
     #[test]
+    fn malformed_optional_diagnostics_preserve_typed_categories() {
+        let delivery_unknown: ReplyResponse = serde_json::from_str(
+            r#"{"ok":false,"error":"delivery_unknown","phase":17,"diagnostic":{"kind":"rpc_error","rpc_code":-1}}"#,
+        )
+        .unwrap();
+        let rejection = reply_error(&delivery_unknown);
+        assert!(rejection.is_delivery_unknown());
+        assert!(rejection.to_string().contains("delivery_unknown"));
+        assert!(!rejection.to_string().contains("RPC -1"));
+
+        let file_too_large: ReplyResponse = serde_json::from_str(
+            r#"{"ok":false,"error":"file_too_large","phase":["final_send"],"diagnostic":"not-an-object"}"#,
+        )
+        .unwrap();
+        assert_eq!(reply_error(&file_too_large), ReplyRejection::TooLarge);
+    }
+
+    #[test]
     fn unconfirmed_queue_error_shows_rpc_detail_before_retry_notice() {
         let info = ReplyFailureInfo::from_wire(
             Some("delivery_unknown"),
             Some("final_send"),
-            Some(&ReplyDiagnosticResponse {
-                kind: Some("rpc_error".into()),
-                rpc_code: Some(500),
-            }),
+            Some(&serde_json::json!({"kind":"rpc_error", "rpc_code":500})),
         );
         let message = unconfirmed_delivery_message(1, Some(&info), Path::new("/archive"));
         let detail_position = message.find("RPC 500").unwrap();
@@ -818,13 +832,10 @@ mod tests {
     #[test]
     fn ordinary_reply_error_puts_safe_diagnostic_before_long_retry_notice() {
         let archive = Path::new("/archive/with/a/long/path/to/the/original/files");
-        let rejection = reply_error(
+        let rejection = reply_error_fields(
             Some("telegram_error"),
             Some("final_send"),
-            Some(&ReplyDiagnosticResponse {
-                kind: Some("rpc_error".into()),
-                rpc_code: Some(500),
-            }),
+            Some(&serde_json::json!({"kind":"rpc_error", "rpc_code":500})),
         );
         let message = retryable_reply_error(anyhow::Error::new(rejection), archive).to_string();
         let detail_position = message.find("RPC 500").unwrap();
@@ -832,7 +843,7 @@ mod tests {
         assert!(detail_position < retry_position);
         assert!(message.contains("telegram_error, final send, RPC 500"));
 
-        let legacy = reply_error(Some("untrusted raw value"), None, None);
+        let legacy = reply_error_fields(Some("untrusted raw value"), None, None);
         let legacy_message = retryable_reply_error(anyhow::Error::new(legacy), archive).to_string();
         assert!(legacy_message.contains("unknown_error"));
         assert!(!legacy_message.contains("untrusted raw value"));
@@ -841,7 +852,7 @@ mod tests {
     #[test]
     fn reply_error_preserves_too_large_classification() {
         assert_eq!(
-            reply_error(Some("file_too_large"), None, None),
+            reply_error_fields(Some("file_too_large"), None, None),
             ReplyRejection::TooLarge
         );
 
@@ -851,7 +862,7 @@ mod tests {
             Some(&ReplyRejection::TooLarge)
         );
 
-        let delivery_unknown = anyhow::Error::new(reply_error(
+        let delivery_unknown = anyhow::Error::new(reply_error_fields(
             Some("delivery_unknown"),
             Some("final_send"),
             None,
