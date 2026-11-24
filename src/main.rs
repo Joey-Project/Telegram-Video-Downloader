@@ -43,6 +43,7 @@ mod music_runtime;
 mod music_staging_cleanup;
 mod music_transfer;
 mod music_types;
+mod pdf_reply_job;
 mod pgc_metadata_backfill;
 mod qbittorrent;
 mod queue;
@@ -9026,6 +9027,17 @@ async fn handle_message(
                 } else {
                     None
                 };
+                let pdf_reply_bot_id = if matches!(job, JobRequest::Pdf { .. }) {
+                    pdf_reply_job::admission_bot_id(
+                        &config,
+                        is_private_chat,
+                        chat_id,
+                        submitter_user_id,
+                        message_id,
+                    )
+                } else {
+                    None
+                };
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
                 let task_id = task_id_for_update(update_id, ordinal);
                 let (stored_job, sanitized) = sanitize_job_for_storage(job.clone());
@@ -9040,6 +9052,7 @@ async fn handle_message(
                 );
                 task.url_was_sanitized = sanitized;
                 task.social_bot_id = social_bot_id;
+                task.pdf_reply_bot_id = pdf_reply_bot_id;
                 let generation = task.generation;
                 if !queue.create(task)? {
                     continue;
@@ -15448,9 +15461,35 @@ async fn run_queued_job(
             }
             .await;
             match finalize {
-                Ok(Some(_)) => {
+                Ok(Some(completed_record)) => {
                     final_outcome = CollectionFinalOutcome::Verified;
-                    success_message
+                    if matches!(job, JobRequest::Pdf { .. })
+                        && updated_task.pdf_reply_bot_id.is_some()
+                    {
+                        let reply_result = pdf_reply_job::send_completed_pdf_reply(
+                            &config,
+                            &updated_task,
+                            &completed_record,
+                            &report.saved_location,
+                            &report.primary_media_paths,
+                        )
+                        .await;
+                        match reply_result {
+                            Ok(()) => format!("{success_message}\nReplied with the saved PDF."),
+                            Err(err) => {
+                                warn!(
+                                    task_id,
+                                    error = %redact_sensitive_text(&format!("{err:#}")),
+                                    "completed PDF was saved but its Telegram reply could not be sent"
+                                );
+                                format!(
+                                    "{success_message}\nTelegram did not confirm delivery of the PDF attachment."
+                                )
+                            }
+                        }
+                    } else {
+                        success_message
+                    }
                 }
                 Ok(None) => match task_if_generation_with_retry_delay(
                     &queue,
@@ -18245,6 +18284,8 @@ fn redact_bbdown_auth_secrets(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod pdf_reply_e2e;
+
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

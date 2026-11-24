@@ -146,7 +146,12 @@ class SocialMediaReplyTests(unittest.IsolatedAsyncioTestCase):
         token_id_patch.start()
         self.addCleanup(token_id_patch.stop)
 
-    def _request(self, payload=b"verified media bytes", expected_sha256=None):
+    def _request(
+        self,
+        payload=b"verified media bytes",
+        expected_sha256=None,
+        file_name="original.mp4",
+    ):
         self.file_path.write_bytes(payload)
         self.file_path.chmod(0o600)
         value = {
@@ -156,7 +161,7 @@ class SocialMediaReplyTests(unittest.IsolatedAsyncioTestCase):
             "reply_to_message_id": 77,
             "random_id": -987654321,
             "file_path": str(self.file_path),
-            "file_name": "original.mp4",
+            "file_name": file_name,
             "expected_sha256": expected_sha256 or hashlib.sha256(payload).hexdigest(),
         }
         return reply.validate_request(value, self.home), value
@@ -190,6 +195,21 @@ class SocialMediaReplyTests(unittest.IsolatedAsyncioTestCase):
             sum(type(call) is self.bindings.save_file_part_request_type for call in client.calls),
             1,
         )
+
+    async def test_pdf_filename_uses_pdf_mime_case_insensitively(self):
+        request, _ = self._request(file_name="report.PDF")
+
+        await reply.send_reply(
+            request,
+            {"api_id": 123, "api_hash": "test"},
+            self.bindings.as_bindings(),
+        )
+
+        send = FakeClient.instances[-1].calls[-1]
+        self.assertIs(type(send), self.bindings.send_media_request_type)
+        self.assertEqual(send.media.mime_type, "application/pdf")
+        self.assertIs(send.media.force_file, True)
+        self.assertEqual(send.media.attributes[0].file_name, "report.PDF")
 
     async def test_large_file_uses_big_parts_and_big_input_file(self):
         request, _ = self._request(b"this is over the patched test threshold")

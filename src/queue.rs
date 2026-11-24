@@ -374,6 +374,10 @@ pub struct TaskRecord {
     /// Telegram Bot ID that admitted a Social task, used to bind replies across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) social_bot_id: Option<i64>,
+    /// Telegram Bot ID eligible to reply with a completed PDF, recorded only for the configured
+    /// private owner when the task is admitted. Legacy tasks intentionally have no provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pdf_reply_bot_id: Option<i64>,
     pub ordinal: usize,
     pub original_url: String,
     pub url_was_sanitized: bool,
@@ -546,6 +550,7 @@ impl TaskRecord {
             chat_id,
             submitter_user_id,
             social_bot_id: None,
+            pdf_reply_bot_id: None,
             ordinal,
             original_url,
             url_was_sanitized: false,
@@ -13484,20 +13489,23 @@ mod tests {
 
     #[test]
     fn task_records_without_generation_deserialize_as_generation_zero() {
-        let task = test_task(
+        let mut task = test_task(
             "task-legacy-generation",
             JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=legacy".to_string(),
             },
         );
+        task.pdf_reply_bot_id = Some(123_456);
         let mut json = serde_json::to_value(task).expect("task should serialize");
         let fields = json.as_object_mut().expect("task JSON should be an object");
         fields.remove("generation");
+        fields.remove("pdf_reply_bot_id");
 
         let task: TaskRecord = serde_json::from_value(json)
             .expect("legacy task record without generation should deserialize");
         assert_eq!(task.generation, 0);
         assert_eq!(task.social_bot_id, None);
+        assert_eq!(task.pdf_reply_bot_id, None);
     }
 
     #[test]
@@ -13514,6 +13522,23 @@ mod tests {
         assert_eq!(json["social_bot_id"], 123_456);
         let restored: TaskRecord = serde_json::from_value(json).expect("task should deserialize");
         assert_eq!(restored.social_bot_id, Some(123_456));
+    }
+
+    #[test]
+    fn task_records_preserve_pdf_reply_admission_bot_id() {
+        let mut task = test_task(
+            "task-pdf-reply-bot-id",
+            JobRequest::Pdf {
+                url: "https://example.invalid/report.pdf".to_string(),
+            },
+        );
+        task.pdf_reply_bot_id = Some(123_456);
+
+        let json = serde_json::to_value(&task).expect("task should serialize");
+        assert_eq!(json["pdf_reply_bot_id"], 123_456);
+        let restored: TaskRecord = serde_json::from_value(json).expect("task should deserialize");
+        assert_eq!(restored.pdf_reply_bot_id, Some(123_456));
+        assert_eq!(restored.social_bot_id, None);
     }
 
     #[test]

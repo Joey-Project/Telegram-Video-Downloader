@@ -68,7 +68,7 @@ A partial batch can be resumed with the same preview rather than starting again.
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供两者并存或取消，只有能唯一定位现有文件时才同时提供覆盖按钮。
-- `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
+- `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF。`pdf.auto_domains` 里的域名也会自动保存为 PDF。在配置的所有者私聊中，新提交的任务保存并校验完成后，Bot 会用原 PDF 回复提交链接的那条消息。Telegram 未确认附件送达时，完成消息会说明情况，PDF 仍保存在本机。
 - 全局并发由配置控制，超出的任务会排队。
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
 - 任务开始后会发送一条状态消息，后续下载/混流进度会尽量通过 Telegram edit message 在同一条消息中刷新；视频 plan/metadata 解析完成后，同一条消息会持续显示已选媒体的预估大小、分辨率、帧率、视频/音频编码和全集条目数。上游未提供大小时会明确显示 `unknown`，混合已知与未知流时显示 `at least`，不会用码率伪造精确文件大小。
