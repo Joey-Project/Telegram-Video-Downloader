@@ -500,6 +500,7 @@ fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
             "timeouterror:",
             "urlopen error",
             "sslerror:",
+            "[ssl: certificate_verify_failed]",
             "certificate verify failed",
         ]
         .iter()
@@ -1096,6 +1097,11 @@ exit 2
         assert_eq!(
             http_status("error: [twitter] 503: no video could be found"),
             None
+        );
+        let bad_certificate = "ERROR: [twitter] 123456789: Unable to download JSON metadata: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed";
+        assert_eq!(
+            WorkerDiagnostics::parse(bad_certificate).issue,
+            WorkerIssue::ConnectionError
         );
     }
 

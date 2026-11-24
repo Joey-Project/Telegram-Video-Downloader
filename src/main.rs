@@ -10094,6 +10094,7 @@ fn render_queue_page(
         "Size is the expected total for selected streams; final files may differ.".to_string(),
     );
     let mut rows = Vec::new();
+    let mut social_failure_details = Vec::new();
     let mut optional_details = Vec::new();
     for (page_index, record) in records.into_iter().enumerate() {
         let task_number = command
@@ -10131,7 +10132,15 @@ fn render_queue_page(
             ),
         ));
         if let Some(reason) = queue_task_detail_notice(&record) {
-            optional_details.push((
+            let details = if matches!(record.job, JobRequest::Social { .. })
+                && record.status == TaskStatus::Failed
+                && record.error.is_some()
+            {
+                &mut social_failure_details
+            } else {
+                &mut optional_details
+            };
+            details.push((
                 lines.len(),
                 format!("Details: {reason}"),
                 QUEUE_TASK_DETAIL_NOTICE_UNITS + "Details: ".len(),
@@ -10183,16 +10192,16 @@ fn render_queue_page(
             },
         ]);
     }
-    if !optional_details.is_empty() {
-        let base_units = lines.join("\n").encode_utf16().count();
-        // Reserve the complete task/action context first. Optional summaries
-        // share the remaining page budget and cannot suppress the keyboard.
-        let per_detail_units =
-            QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units) / optional_details.len();
-        if per_detail_units > 0 {
-            for (line, detail, limit) in optional_details {
-                lines[line] = truncate_utf16_units(&detail, per_detail_units.min(limit));
-            }
+    let base_units = lines.join("\n").encode_utf16().count();
+    let mut remaining_units = QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units);
+    // Share the remaining space among failure diagnostics first, then among other summaries.
+    for details in [social_failure_details, optional_details] {
+        let Some(per_detail_units) = remaining_units.checked_div(details.len()) else {
+            continue;
+        };
+        for (line, detail, limit) in details {
+            lines[line] = truncate_utf16_units(&detail, per_detail_units.min(limit));
+            remaining_units -= lines[line].encode_utf16().count();
         }
     }
     // Unused optional slots must not consume even their newline budget.
@@ -21166,9 +21175,9 @@ print(json.dumps({"ok": True}))
                 "Instagram has temporarily limited downloads",
             ),
             (
-                "instagram-extractor-error",
-                "gallery-dl exit status 1, primary profile, extractor KeyError",
-                "Could not download the Instagram media",
+                "instagram-attachment-error",
+                "Telegram attachment: final send, duplicate random ID, RPC 500",
+                "Telegram did not confirm delivery",
             ),
         ]
         .into_iter()
@@ -21195,7 +21204,35 @@ print(json.dumps({"ok": True}))
                 .unwrap();
         }
 
-        let (text, _) = render_queue_page(
+        for ordinal in 2..10 {
+            let mut task = TaskRecord::new(
+                format!("{ordinal}-{}", "bilibili-task".repeat(4)),
+                ordinal,
+                ordinal,
+                chat_id,
+                None,
+                ordinal as usize,
+                JobRequest::Bilibili {
+                    url: format!("https://www.bilibili.com/video/BV1?{}", "😀".repeat(100)),
+                    selection: Some(BilibiliSelection::All),
+                },
+            );
+            task.status = TaskStatus::Failed;
+            task.error = Some("Bilibili failure details ".repeat(50));
+            task.plan = Some(PlanValidationSnapshot {
+                title: Some(format!("Collection {}", "😀".repeat(100))),
+                ..PlanValidationSnapshot::default()
+            });
+            let mut snapshot = BilibiliAttemptSnapshot::new(
+                "Another collection title".to_string(),
+                (1..=100).map(|index| (index, "Episode 😀".repeat(20))),
+                3,
+            );
+            snapshot.finish(BilibiliAttemptOutcome::Failed);
+            task.bilibili_attempt = Some(snapshot);
+            assert!(queue.create(task).unwrap());
+        }
+        let (text, keyboard) = render_queue_page(
             &queue,
             chat_id,
             QueueCommand {
@@ -21204,14 +21241,11 @@ print(json.dumps({"ok": True}))
             },
         )
         .unwrap();
-        assert!(
-            text.contains("Details: gallery-dl exit status 1, primary profile, HTTP 429"),
-            "{text}"
-        );
-        assert!(
-            text.contains("Details: gallery-dl exit status 1, primary profile, extractor KeyError"),
-            "{text}"
-        );
+        assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
+        assert!(text.contains("HTTP 429"), "{text}");
+        assert!(text.contains("RPC 500"), "{text}");
+        assert_eq!(text.matches("Title: Collection").count(), 8);
+        assert_eq!(keyboard.unwrap().inline_keyboard.len(), 10);
     }
 
     #[test]
