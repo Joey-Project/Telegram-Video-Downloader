@@ -17,6 +17,7 @@ superseded_by: ""
 - Atomically publish original files into the selected library and reply directly to the submitting Telegram message as the existing Bot over MTProto. Bind each task to its originating Bot ID, keep its originals outside ordinary file moves, record a receipt or size-limit disposition per attachment and reuse published files and stable MTProto random IDs on retry.
 - Exercise the real queue and publication logic with fake Telegram and local downloader processes, plus protocol-level tests with a fake Telegram sender.
 - Failed downloads expose the downloader, exit status and recognized error class. Attachment failures expose the known MTProto phase and safe error category. The terminal error log includes the queue task ID and generation, and actionable details also appear in `/queue`. Diagnostics use fixed labels and numeric codes so provider responses and browser credentials stay private.
+- Distinguish a missing or expired local Instagram cookie, an explicit provider login requirement, and an unavailable local session check. A failed Instagram attempt can try a verified read-only backup from its configured Chrome profile once while staging is empty. The bot owns the temporary copy used for that retry. The operator can use the same script to check, back up, and restore either Chrome profile.
 
 ## Verification
 

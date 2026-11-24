@@ -15,7 +15,9 @@ use url::Url;
 pub(crate) const MAX_FILES: usize = 64;
 pub(crate) const MAX_STORY_FILES: usize = 100;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const SESSION_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 const DIAGNOSTIC_LIMIT: u64 = 128 * 1024;
+const INSTAGRAM_SESSION_HELPER: &str = include_str!("../scripts/instagram_session.py");
 
 pub(crate) fn canonicalize_story_homepage(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
@@ -143,23 +145,42 @@ struct BrowserProfile {
 }
 
 impl BrowserProfile {
-    fn cookie_scope(&self) -> Result<String> {
+    fn chrome_path(&self) -> Result<&Path> {
         let raw = self
             .cookies_from_browser
             .strip_prefix("chrome:")
             .context("Instagram profile must use Chrome")?;
         let profile = Path::new(raw);
         ensure!(
-            profile.is_absolute()
-                && !raw.chars().any(char::is_control)
-                && !raw.contains("::")
-                && !profile
-                    .components()
-                    .any(|part| matches!(part, std::path::Component::ParentDir)),
+            valid_chrome_profile_path(profile),
             "Instagram browser profile path is invalid"
         );
-        Ok(format!("chrome/instagram.com:{raw}"))
+        Ok(profile)
     }
+}
+
+fn valid_chrome_profile_path(profile: &Path) -> bool {
+    profile.is_absolute()
+        && profile
+            .to_str()
+            .is_some_and(|raw| !raw.chars().any(char::is_control) && !raw.contains("::"))
+        && !profile
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
+fn selected_chrome_profile(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    // A removed profile can still have a backup under its original canonical path.
+    path.ancestors()
+        .skip(1)
+        .find_map(|ancestor| {
+            let canonical = std::fs::canonicalize(ancestor).ok()?;
+            Some(canonical.join(path.strip_prefix(ancestor).ok()?))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn instagram_profiles() -> Result<InstagramProfiles> {
@@ -259,7 +280,17 @@ async fn download_instagram(
     profiles: &InstagramProfiles,
     story_collection: bool,
 ) -> Result<Vec<PathBuf>> {
-    let primary = run_instagram(config, url, staging, &profiles.primary, story_collection).await?;
+    let mut recovery_attempted = false;
+    let primary = run_instagram_with_recovery(
+        config,
+        url,
+        staging,
+        &profiles.primary,
+        story_collection,
+        InstagramProfileRole::Primary,
+        &mut recovery_attempted,
+    )
+    .await?;
     let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
     if primary.status.success() && !staging_is_empty {
         return media_files(staging, story_collection);
@@ -268,12 +299,23 @@ async fn download_instagram(
         && let Some(fallback) = &profiles.fallback
         && staging_is_empty
     {
-        let fallback_outcome =
-            run_instagram(config, url, staging, fallback, story_collection).await?;
+        let fallback_outcome = run_instagram_with_recovery(
+            config,
+            url,
+            staging,
+            fallback,
+            story_collection,
+            InstagramProfileRole::Fallback,
+            &mut recovery_attempted,
+        )
+        .await?;
         let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
         if fallback_outcome.status.success() && !staging_is_empty {
             return media_files(staging, story_collection);
         }
+        let primary_logout = primary.auth_summary.filter(|summary| {
+            !matches!(summary.diagnosis, InstagramAuthDiagnosis::CheckUnavailable)
+        });
         bail!(
             "{}",
             instagram_failure_message(
@@ -282,6 +324,10 @@ async fn download_instagram(
                 &fallback_outcome,
                 staging_is_empty,
                 InstagramProfileRole::Fallback,
+                primary_logout
+                    .or(fallback_outcome.auth_summary)
+                    .or(primary.auth_summary),
+                primary_logout.is_some(),
             )
         );
     }
@@ -293,28 +339,194 @@ async fn download_instagram(
             &primary,
             staging_is_empty,
             InstagramProfileRole::Primary,
+            primary.auth_summary,
+            false,
         )
     );
+}
+
+async fn run_instagram_with_recovery(
+    config: &AppConfig,
+    url: &str,
+    staging: &Path,
+    profile: &BrowserProfile,
+    story_collection: bool,
+    role: InstagramProfileRole,
+    recovery_attempted: &mut bool,
+) -> Result<WorkerOutcome> {
+    let configured_path = profile.chrome_path()?;
+    // Use the same selected path for both the download and any later recovery.
+    let selected_path = selected_chrome_profile(configured_path);
+    ensure!(
+        valid_chrome_profile_path(&selected_path),
+        "Resolved Instagram browser profile path is invalid"
+    );
+    let mut outcome = run_instagram(config, url, staging, &selected_path, story_collection).await?;
+    let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
+    let provider_login_rejected = outcome.diagnostics.provider_login_rejected;
+
+    if outcome.status.success() && (!staging_is_empty || !provider_login_rejected) {
+        return Ok(outcome);
+    }
+    if outcome.diagnostics.failure == InstagramFailure::Rate {
+        return Ok(outcome);
+    }
+
+    let session_status = match config.tools.instagram_session_python.as_deref() {
+        Some(python) => Some(instagram_session_status(python, role, staging, &selected_path).await),
+        None => None,
+    };
+    outcome.auth_summary = if session_status == Some(InstagramSessionStatus::MissingOrExpired) {
+        Some(InstagramAuthSummary::local_logout())
+    } else if provider_login_rejected {
+        Some(InstagramAuthSummary::provider_rejected())
+    } else if session_status == Some(InstagramSessionStatus::Unavailable) {
+        Some(InstagramAuthSummary::check_unavailable())
+    } else {
+        None
+    };
+
+    let known_logout =
+        provider_login_rejected || session_status == Some(InstagramSessionStatus::MissingOrExpired);
+    if known_logout {
+        // A local logout or tagged Instagram login rejection is account-specific.
+        // This also preserves fallback behavior for a generic extractor KeyError
+        // when the independent status check confirms that local cookies expired.
+        outcome.diagnostics.failure = InstagramFailure::Account;
+    }
+
+    let recovery_is_safe = staging_is_empty
+        && !*recovery_attempted
+        && known_logout
+        && outcome.diagnostics.failure != InstagramFailure::Rate;
+    let Some(python) = config.tools.instagram_session_python.as_deref() else {
+        return Ok(outcome);
+    };
+    if !recovery_is_safe {
+        return Ok(outcome);
+    }
+
+    *recovery_attempted = true;
+    let (range, filename) = instagram_download_limits(story_collection);
+    let mut command = tokio::process::Command::new(python);
+    command.args([
+        "-I",
+        "-c",
+        INSTAGRAM_SESSION_HELPER,
+        "restore",
+        role.argument(),
+    ]);
+    command.arg(url).arg("--directory").arg(staging);
+    command.args(["--range", &range, "--filename", filename]);
+    command.arg("--profile-path").arg(&selected_path);
+
+    // The bot owns this directory so cancellation also removes the cookie copy.
+    let restored = match tempfile::tempdir() {
+        Ok(scratch) => {
+            command.env("TMPDIR", scratch.path());
+            run_worker(command, staging).await
+        }
+        Err(error) => Err(error.into()),
+    };
+    match restored {
+        Ok(mut recovered) => {
+            recovered.auth_summary = outcome.auth_summary.map(|mut summary| {
+                summary.recovery_issue = recovered.diagnostics.recovery_issue;
+                summary
+            });
+            if outcome.diagnostics.failure == InstagramFailure::Account
+                && recovered.diagnostics.failure != InstagramFailure::Rate
+            {
+                recovered.diagnostics.failure = InstagramFailure::Account;
+            }
+            if recovered.status.success() {
+                tracing::info!(
+                    profile = role.label(),
+                    "Instagram session backup recovery attempt completed"
+                );
+            } else {
+                tracing::warn!(
+                    profile = role.label(),
+                    "Instagram session backup recovery failed"
+                );
+            }
+            Ok(recovered)
+        }
+        Err(_) => {
+            tracing::warn!(
+                profile = role.label(),
+                "Instagram session backup recovery could not run"
+            );
+            outcome.diagnostics.recovery_issue = Some(InstagramRecoveryIssue::Unavailable);
+            if let Some(summary) = &mut outcome.auth_summary {
+                summary.recovery_issue = outcome.diagnostics.recovery_issue;
+            }
+            Ok(outcome)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstagramSessionStatus {
+    Readable,
+    MissingOrExpired,
+    Unavailable,
+}
+
+async fn instagram_session_status(
+    python: &Path,
+    role: InstagramProfileRole,
+    staging: &Path,
+    profile: &Path,
+) -> InstagramSessionStatus {
+    let Ok(scratch) = tempfile::tempdir() else {
+        return InstagramSessionStatus::Unavailable;
+    };
+    let mut command = tokio::process::Command::new(python);
+    command
+        .args([
+            "-I",
+            "-c",
+            INSTAGRAM_SESSION_HELPER,
+            "status",
+            role.argument(),
+        ])
+        .arg("--profile-path")
+        .arg(profile)
+        .env("TMPDIR", scratch.path())
+        .current_dir(staging)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return InstagramSessionStatus::Unavailable;
+    };
+    let mut group = ProcessGroup(child.id().and_then(|id| i32::try_from(id).ok()));
+    let Ok(Ok(status)) = tokio::time::timeout(SESSION_STATUS_TIMEOUT, child.wait()).await else {
+        return InstagramSessionStatus::Unavailable;
+    };
+    group.0 = None;
+    // Exit 0 means a readable, unexpired local cookie exists; it does not prove
+    // that Instagram will accept the session.
+    match status.code() {
+        Some(0) => InstagramSessionStatus::Readable,
+        Some(20) => InstagramSessionStatus::MissingOrExpired,
+        Some(21) => InstagramSessionStatus::Unavailable,
+        _ => InstagramSessionStatus::Unavailable,
+    }
 }
 
 async fn run_instagram(
     config: &AppConfig,
     url: &str,
     staging: &Path,
-    profile: &BrowserProfile,
+    profile: &Path,
     story_collection: bool,
 ) -> Result<WorkerOutcome> {
     let mut command = tokio::process::Command::new(&config.tools.gallery_dl);
-    let range = if story_collection {
-        format!("1-{}", MAX_STORY_FILES + 1)
-    } else {
-        format!("1-{}", MAX_FILES + 1)
-    };
-    let filename = if story_collection {
-        "{num:0>3}-{media_id}.{extension}"
-    } else {
-        "{num:0>3}.{extension}"
-    };
+    let (range, filename) = instagram_download_limits(story_collection);
     command.args([
         "--config-ignore",
         "--no-input",
@@ -325,9 +537,23 @@ async fn run_instagram(
     ]);
     command.arg("--directory").arg(staging);
     command.args(["--filename", filename, "--cookies-from-browser"]);
-    command.arg(profile.cookie_scope()?);
+    command.arg(format!("chrome/instagram.com:{}", profile.display()));
     command.arg("--").arg(url);
     run_worker(command, staging).await
+}
+
+fn instagram_download_limits(story_collection: bool) -> (String, &'static str) {
+    let maximum = if story_collection {
+        MAX_STORY_FILES
+    } else {
+        MAX_FILES
+    };
+    let filename = if story_collection {
+        "{num:0>3}-{media_id}.{extension}"
+    } else {
+        "{num:0>3}.{extension}"
+    };
+    (format!("1-{}", maximum + 1), filename)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,19 +604,27 @@ impl WorkerIssue {
 struct WorkerDiagnostics {
     failure: InstagramFailure,
     issue: WorkerIssue,
+    provider_login_rejected: bool,
+    recovery_issue: Option<InstagramRecoveryIssue>,
 }
 
 impl WorkerDiagnostics {
     fn parse(stderr: &str) -> Self {
         let failure = instagram_failure(stderr);
         let issue = worker_issue(stderr, failure);
-        Self { failure, issue }
+        Self {
+            failure,
+            issue,
+            provider_login_rejected: provider_login_rejection(stderr),
+            recovery_issue: instagram_recovery_issue(stderr),
+        }
     }
 }
 
 struct WorkerOutcome {
     status: ExitStatus,
     diagnostics: WorkerDiagnostics,
+    auth_summary: Option<InstagramAuthSummary>,
 }
 
 #[derive(Clone, Copy)]
@@ -406,6 +640,125 @@ impl InstagramProfileRole {
             Self::Fallback => "fallback profile",
         }
     }
+
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InstagramAuthDiagnosis {
+    LocalLogout,
+    ProviderRejected,
+    CheckUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstagramRecoveryIssue {
+    NoBackup,
+    BackupUnavailable,
+    NoUsableLogin,
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+struct InstagramAuthSummary {
+    diagnosis: InstagramAuthDiagnosis,
+    recovery_issue: Option<InstagramRecoveryIssue>,
+}
+
+impl InstagramAuthSummary {
+    fn local_logout() -> Self {
+        Self {
+            diagnosis: InstagramAuthDiagnosis::LocalLogout,
+            recovery_issue: None,
+        }
+    }
+
+    fn provider_rejected() -> Self {
+        Self {
+            diagnosis: InstagramAuthDiagnosis::ProviderRejected,
+            recovery_issue: None,
+        }
+    }
+
+    fn check_unavailable() -> Self {
+        Self {
+            diagnosis: InstagramAuthDiagnosis::CheckUnavailable,
+            recovery_issue: None,
+        }
+    }
+
+    fn short_message(self) -> String {
+        let diagnosis = match self.diagnosis {
+            InstagramAuthDiagnosis::LocalLogout => "Instagram login is missing or expired",
+            InstagramAuthDiagnosis::ProviderRejected => "Instagram rejected the saved login",
+            InstagramAuthDiagnosis::CheckUnavailable => "Instagram login check unavailable",
+        };
+        let recovery = match self.recovery_issue {
+            Some(InstagramRecoveryIssue::NoBackup) => Some("no backup"),
+            Some(InstagramRecoveryIssue::BackupUnavailable) => Some("backup unavailable"),
+            Some(InstagramRecoveryIssue::NoUsableLogin) => Some("backup has no usable login"),
+            Some(InstagramRecoveryIssue::Unavailable) => Some("backup recovery unavailable"),
+            None => None,
+        };
+        recovery.map_or_else(
+            || diagnosis.to_owned(),
+            |recovery| format!("{diagnosis}; {recovery}"),
+        )
+    }
+}
+
+impl InstagramRecoveryIssue {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NoBackup => "no saved Instagram session backup",
+            Self::BackupUnavailable => "saved Instagram session backup is unavailable",
+            Self::NoUsableLogin => "saved Instagram session backup has no usable login",
+            Self::Unavailable => "Instagram session backup recovery is unavailable",
+        }
+    }
+}
+
+fn instagram_recovery_issue(stderr: &str) -> Option<InstagramRecoveryIssue> {
+    for line in stderr.lines() {
+        match line.trim() {
+            "Instagram session recovery: no backup" => {
+                return Some(InstagramRecoveryIssue::NoBackup);
+            }
+            "Instagram session recovery: backup unavailable" => {
+                return Some(InstagramRecoveryIssue::BackupUnavailable);
+            }
+            "Instagram session recovery: backup has no usable login" => {
+                return Some(InstagramRecoveryIssue::NoUsableLogin);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn provider_login_rejection(stderr: &str) -> bool {
+    const REJECTIONS: &[&str] = &["login required", "login_required", "authenticationerror"];
+    stderr.lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        let Some(payload) = line.strip_prefix("[instagram][error] ") else {
+            return false;
+        };
+        let before_url = payload
+            .split_once("https://")
+            .or_else(|| payload.split_once("http://"))
+            .map_or(payload, |(before, _)| before);
+        let error = before_url.trim_start();
+        REJECTIONS
+            .iter()
+            .any(|rejection| error.starts_with(rejection))
+            || (error.starts_with("unauthorized") && error.contains("logged out"))
+            || (error.starts_with("authrequired:") && error.contains("authenticated cookies"))
+    })
 }
 
 fn instagram_failure(stderr: &str) -> InstagramFailure {
@@ -616,10 +969,12 @@ fn worker_failure_detail(
         |code| format!("exit status {code}"),
     );
     let profile = profile.map_or_else(String::new, |role| format!(", {}", role.label()));
-    format!(
-        "{tool} {status}{profile}, {}",
-        outcome.diagnostics.issue.label()
-    )
+    let issue = outcome
+        .diagnostics
+        .recovery_issue
+        .map(|issue| issue.message().to_owned())
+        .unwrap_or_else(|| outcome.diagnostics.issue.label());
+    format!("{tool} {status}{profile}, {issue}")
 }
 
 fn instagram_failure_message(
@@ -628,15 +983,25 @@ fn instagram_failure_message(
     outcome: &WorkerOutcome,
     staging_is_empty: bool,
     profile: InstagramProfileRole,
+    auth_summary: Option<InstagramAuthSummary>,
+    primary_login_failed: bool,
 ) -> String {
-    if story_collection && outcome.status.success() && staging_is_empty {
+    if story_collection
+        && outcome.status.success()
+        && staging_is_empty
+        && !outcome.diagnostics.provider_login_rejected
+    {
         return "No active Instagram Stories were found for this account".into();
     }
-    format!(
-        "{} — {}",
-        worker_failure_detail("gallery-dl", outcome, Some(profile)),
-        failure.message()
-    )
+    let detail = worker_failure_detail("gallery-dl", outcome, Some(profile));
+    let Some(auth_summary) = auth_summary else {
+        return format!("{detail} — {}", failure.message());
+    };
+    let mut diagnosis = auth_summary.short_message();
+    if primary_login_failed {
+        diagnosis.push_str("; fallback also failed");
+    }
+    format!("{diagnosis} — {detail} — {}", failure.message())
 }
 
 struct ProcessGroup(Option<i32>);
@@ -685,6 +1050,7 @@ async fn run_worker(mut command: tokio::process::Command, staging: &Path) -> Res
     Ok(WorkerOutcome {
         status,
         diagnostics: WorkerDiagnostics::parse(&stderr),
+        auth_summary: None,
     })
 }
 
@@ -748,6 +1114,53 @@ fn media_files(directory: &Path, story_collection: bool) -> Result<Vec<PathBuf>>
 mod tests {
     use super::*;
 
+    fn mock_instagram_session_python(
+        directory: &Path,
+        name: &str,
+        status_code: u8,
+        restore_body: &str,
+    ) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn shell_quote(value: &Path) -> String {
+            format!("'{}'", value.to_string_lossy().replace('\'', "'\\''"))
+        }
+
+        let executable = directory.join(name);
+        let log = directory.join(format!("{name}.log"));
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s:%s\n' "$4" "$5" >> {log}
+case "$4" in
+    status)
+        [ "$6" = --profile-path ] && [ -d "$TMPDIR" ] || exit 38
+        exit {status_code}
+        ;;
+    restore)
+        [ "$7" = --directory ] || exit 32
+        [ -d "$8" ] || exit 33
+        [ "$9" = --range ] || exit 34
+        [ "${{11}}" = --filename ] || exit 36
+        [ "${{13}}" = --profile-path ] && [ -d "$TMPDIR" ] || exit 38
+        case "$6" in
+            'https://www.instagram.com/p/Example/')
+                [ "${{10}}" = 1-65 ] && [ "${{12}}" = '{{num:0>3}}.{{extension}}' ] || exit 35 ;;
+            'https://www.instagram.com/stories/creator/')
+                [ "${{10}}" = 1-101 ] && [ "${{12}}" = '{{num:0>3}}-{{media_id}}.{{extension}}' ] || exit 35 ;;
+            *) exit 31 ;;
+        esac
+        {restore_body}
+        ;;
+esac
+exit 39
+"#,
+            log = shell_quote(&log),
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (executable, log)
+    }
+
     #[test]
     fn only_an_exact_story_id_and_supported_posts_are_routed() {
         assert_eq!(
@@ -773,6 +1186,24 @@ mod tests {
             canonicalize_url("http://twitter.com/creator/status/12345?unused=1"),
             Some("https://x.com/creator/status/12345".into())
         );
+    }
+
+    #[test]
+    fn instagram_profile_selection_resolves_parent_of_missing_profile() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profiles = scratch.path().join("profiles");
+        std::fs::create_dir(&profiles).unwrap();
+        let alias = scratch.path().join("alias");
+        std::os::unix::fs::symlink(&profiles, &alias).unwrap();
+        let expected = profiles.canonicalize().unwrap();
+        assert_eq!(
+            selected_chrome_profile(&alias.join("Default")),
+            expected.join("Default")
+        );
+        std::fs::create_dir(profiles.join("has::delimiter")).unwrap();
+        assert!(!valid_chrome_profile_path(&selected_chrome_profile(
+            &alias.join("has::delimiter")
+        )));
     }
 
     #[test]
@@ -1027,8 +1458,12 @@ exit 2
                 } else if case == "fallback-error" {
                     assert!(
                         detail.starts_with(
-                            "gallery-dl exit status 17, fallback profile, HTTP 503 — "
-                        )
+                            "Instagram rejected the saved login; fallback also failed — "
+                        ),
+                        "{detail}"
+                    );
+                    assert!(
+                        detail.contains("gallery-dl exit status 17, fallback profile, HTTP 503 — ")
                     );
                 } else if case == "http-503" {
                     assert!(
@@ -1088,6 +1523,317 @@ exit 2
         .await
         .unwrap_err();
         assert!(error.to_string().contains("No active Instagram Stories"));
+    }
+
+    #[tokio::test]
+    async fn instagram_session_recovery_uses_mock_python_and_stops_after_one_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let temp = fixture.path();
+        let worker = temp.join("gallery-session-fixture");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+for arg do
+    case "$arg" in
+        'chrome/instagram.com:/test/keyerror') echo "[instagram][error] An unexpected error occurred: KeyError - 'query'" >&2; exit 7 ;;
+        'chrome/instagram.com:/test/authorization') echo '[instagram][error] AuthorizationError: insufficient privileges for private content' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/rate') echo '[instagram][error] HTTP 429: Too Many Requests' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/empty') exit 0 ;;
+        'chrome/instagram.com:/test/story-login') echo '[instagram][error] Login required' >&2; exit 0 ;;
+        'chrome/instagram.com:/test/login-rejected') echo '[instagram][error] Login required' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/fallback-login') echo '[instagram][error] Login required' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/fallback-ok') printf 'fallback' >001.jpg; exit 0 ;;
+    esac
+done
+exit 2
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let url = "https://www.instagram.com/p/Example/";
+
+        let recovered_python = mock_instagram_session_python(
+            temp,
+            "python-recovered",
+            20,
+            "printf 'recovered' >\"$8/001.jpg\"; exit 0",
+        );
+        let config_with = |python| {
+            let mut config = AppConfig::for_test();
+            config.tools.gallery_dl = worker.clone();
+            config.tools.instagram_session_python = Some(python);
+            config
+        };
+        let primary = |name: &str| BrowserProfile {
+            cookies_from_browser: format!("chrome:/test/{name}"),
+        };
+
+        let recovered_staging = temp.join("recovered");
+        std::fs::create_dir(&recovered_staging).unwrap();
+        let recovered_profiles = InstagramProfiles {
+            primary: primary("keyerror"),
+            fallback: None,
+        };
+        assert_eq!(
+            download_instagram(
+                &config_with(recovered_python.0),
+                url,
+                &recovered_staging,
+                &recovered_profiles,
+                false,
+            )
+            .await
+            .unwrap(),
+            [recovered_staging.join("001.jpg")]
+        );
+        assert_eq!(
+            std::fs::read_to_string(recovered_python.1).unwrap(),
+            "status:primary\nrestore:primary\n"
+        );
+
+        let readable_python = mock_instagram_session_python(
+            temp,
+            "python-readable",
+            0,
+            "printf 'unexpected restore' >\"$8/001.jpg\"; exit 0",
+        );
+        let keyerror_staging = temp.join("keyerror-readable");
+        std::fs::create_dir(&keyerror_staging).unwrap();
+        let error = download_instagram(
+            &config_with(readable_python.0.clone()),
+            url,
+            &keyerror_staging,
+            &InstagramProfiles {
+                primary: primary("keyerror"),
+                fallback: None,
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("extractor KeyError"), "{error}");
+        assert!(!error.contains("login check unavailable"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&readable_python.1).unwrap(),
+            "status:primary\n"
+        );
+
+        let authorization_staging = temp.join("authorization");
+        std::fs::create_dir(&authorization_staging).unwrap();
+        let error = download_instagram(
+            &config_with(readable_python.0.clone()),
+            url,
+            &authorization_staging,
+            &InstagramProfiles {
+                primary: primary("authorization"),
+                fallback: None,
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !error.contains("Instagram rejected the saved login"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readable_python.1).unwrap(),
+            "status:primary\nstatus:primary\n"
+        );
+
+        let rate_python = mock_instagram_session_python(
+            temp,
+            "python-rate",
+            20,
+            "printf 'unexpected restore' >\"$8/001.jpg\"; exit 0",
+        );
+        let rate_staging = temp.join("rate");
+        std::fs::create_dir(&rate_staging).unwrap();
+        let error = download_instagram(
+            &config_with(rate_python.0),
+            url,
+            &rate_staging,
+            &InstagramProfiles {
+                primary: primary("rate"),
+                fallback: None,
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("temporarily limited"), "{error}");
+        assert!(
+            !rate_python.1.exists(),
+            "rate limiting must not probe or restore"
+        );
+
+        let story_python = mock_instagram_session_python(
+            temp,
+            "python-story",
+            20,
+            "printf '%s\n' 'Instagram session recovery: no backup' >&2; exit 21",
+        );
+        let empty_staging = temp.join("empty-success");
+        std::fs::create_dir(&empty_staging).unwrap();
+        let error = download_instagram(
+            &config_with(story_python.0.clone()),
+            url,
+            &empty_staging,
+            &InstagramProfiles {
+                primary: primary("empty"),
+                fallback: None,
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exit status 0"), "{error}");
+        assert!(
+            !story_python.1.exists(),
+            "generic empty success must not probe"
+        );
+
+        let story_url = "https://www.instagram.com/stories/creator/";
+        let no_story_staging = temp.join("story-empty");
+        std::fs::create_dir(&no_story_staging).unwrap();
+        let error = download_instagram(
+            &config_with(story_python.0.clone()),
+            story_url,
+            &no_story_staging,
+            &InstagramProfiles {
+                primary: primary("empty"),
+                fallback: Some(primary("fallback-ok")),
+            },
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("No active Instagram Stories"), "{error}");
+        assert!(
+            !story_python.1.exists(),
+            "clean empty Stories must not probe or restore"
+        );
+
+        let story_staging = temp.join("story-empty-with-login-error");
+        std::fs::create_dir(&story_staging).unwrap();
+        assert_eq!(
+            download_instagram(
+                &config_with(story_python.0),
+                story_url,
+                &story_staging,
+                &InstagramProfiles {
+                    primary: primary("story-login"),
+                    fallback: Some(primary("fallback-ok")),
+                },
+                true,
+            )
+            .await
+            .unwrap(),
+            [story_staging.join("001.jpg")]
+        );
+        assert_eq!(
+            std::fs::read_to_string(story_python.1).unwrap(),
+            "status:primary\nrestore:primary\n"
+        );
+
+        let failed_python = mock_instagram_session_python(
+            temp,
+            "python-overflow",
+            20,
+            "printf '%s' \"$TMPDIR\" >\"$8/../recovery-scratch-path\"; touch \"$TMPDIR/fixture-cookie-copy\"; head -c 131073 /dev/zero >&2; sleep 60",
+        );
+        let failed_staging = temp.join("failed-recovery");
+        std::fs::create_dir(&failed_staging).unwrap();
+        let error = download_instagram(
+            &config_with(failed_python.0),
+            url,
+            &failed_staging,
+            &recovered_profiles,
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("backup recovery unavailable"), "{error}");
+        let scratch = std::fs::read_to_string(temp.join("recovery-scratch-path")).unwrap();
+        assert!(!Path::new(&scratch).exists());
+
+        let once_python = mock_instagram_session_python(
+            temp,
+            "python-once",
+            20,
+            "if [ \"$5\" = primary ]; then printf '%s\\n' 'Instagram session recovery: no backup' >&2; exit 20; fi; printf 'unexpected fallback restore' >\"$8/001.jpg\"; exit 0",
+        );
+        let once_staging = temp.join("one-recovery");
+        std::fs::create_dir(&once_staging).unwrap();
+        let error = download_instagram(
+            &config_with(once_python.0),
+            url,
+            &once_staging,
+            &InstagramProfiles {
+                primary: primary("keyerror"),
+                fallback: Some(primary("fallback-login")),
+            },
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with(
+                "Instagram login is missing or expired; no backup; fallback also failed — "
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("Instagram session recovery:"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(once_python.1).unwrap(),
+            "status:primary\nrestore:primary\nstatus:fallback\n"
+        );
+        assert!(std::fs::read_dir(&once_staging).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn only_tagged_explicit_login_rejections_trigger_session_recovery() {
+        assert!(provider_login_rejection(
+            "[instagram][error] Login required to access this Story"
+        ));
+        assert!(provider_login_rejection(
+            "[instagram][error] AuthRequired: authenticated cookies needed for private content"
+        ));
+        assert!(provider_login_rejection(
+            "[instagram][error] Unauthorized logged out query: user session is missing"
+        ));
+        assert!(!provider_login_rejection(
+            "[instagram][error] AuthorizationError: insufficient privileges for private content"
+        ));
+        assert!(!provider_login_rejection(
+            "[download][error] login required: https://private.example/login_required"
+        ));
+        assert!(!provider_login_rejection(
+            "[instagram][error] Permission denied: https://private.example/login_required"
+        ));
+        assert_eq!(
+            instagram_recovery_issue("Instagram session recovery: backup has no usable login"),
+            Some(InstagramRecoveryIssue::NoUsableLogin)
+        );
+        assert!(
+            InstagramAuthSummary {
+                diagnosis: InstagramAuthDiagnosis::LocalLogout,
+                recovery_issue: Some(InstagramRecoveryIssue::NoUsableLogin),
+            }
+            .short_message()
+            .encode_utf16()
+            .count()
+                < 96
+        );
     }
 
     #[test]

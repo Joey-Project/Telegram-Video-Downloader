@@ -12,6 +12,8 @@ pdf_dir = "~/Documents/Downloads"
 bbdown = "bbdown"
 yt_dlp = "yt-dlp"
 gallery_dl = "gallery-dl" # Used for Instagram posts, stories and profile photos.
+# Optional Python with gallery-dl installed. On macOS the uv tool runtime is detected if present.
+# instagram_session_python = "~/.local/share/uv/tools/gallery-dl/bin/python"
 uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
 chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
