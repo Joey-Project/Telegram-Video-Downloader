@@ -117,6 +117,8 @@ pub struct ToolsConfig {
     pub ffmpeg: PathBuf,
     #[serde(default = "default_gallery_dl")]
     pub gallery_dl: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instagram_session_python: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -324,6 +326,12 @@ impl AppConfig {
         self.tools.chrome = expand_home_path(&self.tools.chrome);
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
         self.tools.gallery_dl = expand_home_path(&self.tools.gallery_dl);
+        self.tools.instagram_session_python = self
+            .tools
+            .instagram_session_python
+            .take()
+            .map(|path| expand_home_path(&path))
+            .or_else(default_instagram_session_python);
         let state_path = expand_home_path(&self.bilibili.auth.state_path);
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
         let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
@@ -801,6 +809,7 @@ impl Default for ToolsConfig {
             chrome: default_chrome(),
             ffmpeg: default_ffmpeg(),
             gallery_dl: default_gallery_dl(),
+            instagram_session_python: None,
         }
     }
 }
@@ -929,6 +938,14 @@ fn default_ffmpeg() -> PathBuf {
 
 fn default_gallery_dl() -> PathBuf {
     PathBuf::from("gallery-dl")
+}
+
+fn default_instagram_session_python() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let python = home_dir()?.join(".local/share/uv/tools/gallery-dl/bin/python");
+    python.is_file().then_some(python)
 }
 
 fn home_path(parts: &[&str], fallback: &str) -> PathBuf {

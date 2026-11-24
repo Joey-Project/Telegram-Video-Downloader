@@ -31,6 +31,12 @@ class RandomIdDuplicateError(Exception):
     pass
 
 
+class FakeRpcError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
 class UserMigrateError(Exception):
     def __init__(self, new_dc):
         self.new_dc = new_dc
@@ -40,6 +46,8 @@ class FakeClient:
     instances = []
     bindings = None
     send_error = None
+    upload_error = None
+    start_error = None
     migrations = []
     bot_id = 123456
 
@@ -56,6 +64,8 @@ class FakeClient:
 
     async def start(self, *, bot_token):
         self.start_attempts += 1
+        if type(self).start_error is not None:
+            raise type(self).start_error
         if type(self).migrations:
             destination, switched = type(self).migrations.pop(0)
             if switched:
@@ -74,6 +84,9 @@ class FakeClient:
             bindings.save_file_part_request_type,
             bindings.save_big_file_part_request_type,
         }:
+            error = type(self).upload_error
+            if error is not None:
+                raise error
             return True
         if type(request) is bindings.send_media_request_type:
             error = type(self).send_error
@@ -102,6 +115,8 @@ class FakeBindings:
         FakeClient.bindings = self
         FakeClient.instances = []
         FakeClient.send_error = None
+        FakeClient.upload_error = None
+        FakeClient.start_error = None
         FakeClient.migrations = []
 
     def as_bindings(self):
@@ -260,6 +275,76 @@ class SocialMediaReplyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.category, "delivery_unknown")
+        self.assertEqual(raised.exception.phase, "final_send")
+        self.assertEqual(raised.exception.diagnostic_kind, "random_id_duplicate")
+
+    async def test_auth_failure_response_contains_only_allowlisted_diagnostics(self):
+        request, _ = self._request()
+        FakeClient.start_error = FakeRpcError(401, "secret token and private path")
+
+        with self.assertRaises(reply.ReplyError) as raised:
+            await reply.send_reply(
+                request,
+                {"api_id": 123, "api_hash": "test"},
+                self.bindings.as_bindings(),
+            )
+
+        self.assertEqual(raised.exception.phase, "auth")
+        self.assertEqual(raised.exception.rpc_code, 401)
+        self.assertEqual(
+            reply._failure_response(raised.exception),
+            {
+                "ok": False,
+                "error": "telegram_error",
+                "phase": "auth",
+                "diagnostic": {"kind": "rpc_error", "rpc_code": 401},
+            },
+        )
+        self.assertNotIn("secret", json.dumps(reply._failure_response(raised.exception)))
+
+    async def test_upload_part_failure_reports_phase_and_bounded_rpc_code(self):
+        request, _ = self._request()
+        FakeClient.upload_error = FakeRpcError(500, "do not expose this exception")
+
+        with self.assertRaises(reply.ReplyError) as raised:
+            await reply.send_reply(
+                request,
+                {"api_id": 123, "api_hash": "test"},
+                self.bindings.as_bindings(),
+            )
+
+        self.assertEqual(raised.exception.phase, "upload_part")
+        self.assertEqual(raised.exception.rpc_code, 500)
+        self.assertNotIn("exception", json.dumps(reply._failure_response(raised.exception)))
+
+    async def test_final_send_rpc_failure_reports_delivery_unknown_without_message(self):
+        request, _ = self._request()
+        FakeClient.send_error = FakeRpcError(500, "private exception details")
+
+        with self.assertRaises(reply.ReplyError) as raised:
+            await reply.send_reply(
+                request,
+                {"api_id": 123, "api_hash": "test"},
+                self.bindings.as_bindings(),
+            )
+
+        self.assertEqual(raised.exception.category, "delivery_unknown")
+        self.assertEqual(raised.exception.phase, "final_send")
+        response = reply._failure_response(raised.exception)
+        self.assertEqual(response["diagnostic"], {"kind": "rpc_error", "rpc_code": 500})
+        self.assertNotIn("private exception details", json.dumps(response))
+
+    def test_diagnostic_fields_are_allowlisted_and_rpc_codes_are_bounded(self):
+        response = reply._failure_response(
+            reply.ReplyError(
+                "untrusted category",
+                phase="/private/path",
+                diagnostic_kind="exception details",
+                rpc_code=10000,
+            )
+        )
+
+        self.assertEqual(response, {"ok": False, "error": "internal_error"})
 
     async def test_authenticated_bot_must_match_token_prefix_identity(self):
         request, _ = self._request()

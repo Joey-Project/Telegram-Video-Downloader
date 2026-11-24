@@ -10094,6 +10094,7 @@ fn render_queue_page(
         "Size is the expected total for selected streams; final files may differ.".to_string(),
     );
     let mut rows = Vec::new();
+    let mut social_failure_details = Vec::new();
     let mut optional_details = Vec::new();
     for (page_index, record) in records.into_iter().enumerate() {
         let task_number = command
@@ -10131,7 +10132,15 @@ fn render_queue_page(
             ),
         ));
         if let Some(reason) = queue_task_detail_notice(&record) {
-            optional_details.push((
+            let details = if matches!(record.job, JobRequest::Social { .. })
+                && record.status == TaskStatus::Failed
+                && record.error.is_some()
+            {
+                &mut social_failure_details
+            } else {
+                &mut optional_details
+            };
+            details.push((
                 lines.len(),
                 format!("Details: {reason}"),
                 QUEUE_TASK_DETAIL_NOTICE_UNITS + "Details: ".len(),
@@ -10183,16 +10192,16 @@ fn render_queue_page(
             },
         ]);
     }
-    if !optional_details.is_empty() {
-        let base_units = lines.join("\n").encode_utf16().count();
-        // Reserve the complete task/action context first. Optional summaries
-        // share the remaining page budget and cannot suppress the keyboard.
-        let per_detail_units =
-            QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units) / optional_details.len();
-        if per_detail_units > 0 {
-            for (line, detail, limit) in optional_details {
-                lines[line] = truncate_utf16_units(&detail, per_detail_units.min(limit));
-            }
+    let base_units = lines.join("\n").encode_utf16().count();
+    let mut remaining_units = QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units);
+    // Share the remaining space among failure diagnostics first, then among other summaries.
+    for details in [social_failure_details, optional_details] {
+        let Some(per_detail_units) = remaining_units.checked_div(details.len()) else {
+            continue;
+        };
+        for (line, detail, limit) in details {
+            lines[line] = truncate_utf16_units(&detail, per_detail_units.min(limit));
+            remaining_units -= lines[line].encode_utf16().count();
         }
     }
     // Unused optional slots must not consume even their newline budget.
@@ -15479,6 +15488,7 @@ async fn run_queued_job(
                             Err(err) => {
                                 warn!(
                                     task_id,
+                                    generation,
                                     error = %redact_sensitive_text(&format!("{err:#}")),
                                     "completed PDF was saved but its Telegram reply could not be sent"
                                 );
@@ -15603,7 +15613,7 @@ async fn run_queued_job(
         }
         Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
-            error!(job_id, error = %error_chain, "job failed");
+            error!(job_id, task_id, generation, error = %error_chain, "job failed");
             match persist_terminal_failure_with_retry(
                 &telegram,
                 &queue,
@@ -19643,7 +19653,12 @@ if file.name == "002.mp4":
     first_failure = log.with_name("first-failure")
     if not first_failure.exists():
         first_failure.touch()
-        print(json.dumps({"ok": False, "error": "delivery_unknown"}))
+        print(json.dumps({
+            "ok": False,
+            "error": "delivery_unknown",
+            "phase": "final_send",
+            "diagnostic": {"kind": "rpc_error", "rpc_code": 500},
+        }))
         sys.exit(1)
 if file.name == "003.mp4":
     print(json.dumps({"ok": False, "error": "file_too_large"}))
@@ -19717,6 +19732,17 @@ print(json.dumps({"ok": True}))
         assert_eq!(failed.status, TaskStatus::Failed);
         assert_eq!(failed.message_id, 34);
         assert_eq!(failed.social_bot_id, Some(bot_id));
+        assert!(failed.error.as_deref().unwrap().contains("RPC 500"));
+        let (queue_text, _) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .unwrap();
+        assert!(queue_text.contains("RPC 500"), "{queue_text}");
         let mut other_bot = context.config.as_ref().clone();
         other_bot.telegram.token = format!("{}:{}", bot_id + 1, "test-token");
         let wrong_bot_error =
@@ -21131,6 +21157,111 @@ print(json.dumps({"ok": True}))
             1,
             "post-download terminal and progress work must not hold the download slot"
         );
+    }
+
+    #[test]
+    fn full_queue_page_keeps_social_download_and_attachment_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.path().join("videos");
+        config.downloads.pdf_dir = root.path().join("pdfs");
+        config.ensure_runtime_dirs().unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let chat_id = 123_456_789;
+        for (ordinal, (id, detail, headline)) in [
+            (
+                "instagram-rate-limit",
+                "gallery-dl exit status 1, primary profile, HTTP 429",
+                "Instagram has temporarily limited downloads",
+            ),
+            (
+                "instagram-attachment-error",
+                "Telegram attachment: final send, duplicate random ID, RPC 500",
+                "Telegram did not confirm delivery",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task = TaskRecord::new(
+                id.into(),
+                ordinal as i64 + 1,
+                ordinal as i64 + 1,
+                chat_id,
+                Some(chat_id),
+                ordinal,
+                JobRequest::Social {
+                    url: "https://www.instagram.com/stories/creator.example/".into(),
+                },
+            );
+            assert!(queue.create(task).unwrap());
+            queue
+                .set_status(
+                    id,
+                    TaskStatus::Failed,
+                    Some(format!("{detail} — {headline}")),
+                )
+                .unwrap();
+        }
+
+        for ordinal in 2..10 {
+            let mut task = TaskRecord::new(
+                format!("{ordinal}-{}", "bilibili-task".repeat(4)),
+                ordinal,
+                ordinal,
+                chat_id,
+                None,
+                ordinal as usize,
+                JobRequest::Bilibili {
+                    url: format!(
+                        "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822&{}",
+                        "😀".repeat(100)
+                    ),
+                    selection: Some(BilibiliSelection::All),
+                },
+            );
+            task.status = TaskStatus::Failed;
+            task.media_entries_completed = 222_222;
+            task.media_entries_failed = 333_333;
+            task.media_entries_total = 555_555;
+            task.error = Some("Bilibili failure details ".repeat(50));
+            task.plan = Some(PlanValidationSnapshot {
+                title: Some(format!("Collection {}", "😀".repeat(100))),
+                ..PlanValidationSnapshot::default()
+            });
+            let mut snapshot = BilibiliAttemptSnapshot::new(
+                "Another collection title".to_string(),
+                (1..=100).map(|index| (index, "Episode 😀".repeat(20))),
+                3,
+            );
+            snapshot.finish(BilibiliAttemptOutcome::Failed);
+            task.bilibili_attempt = Some(snapshot);
+            assert!(queue.create(task).unwrap());
+        }
+        let (text, keyboard) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .unwrap();
+        assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
+        assert!(text.contains("HTTP 429"), "{text}");
+        assert!(text.contains("RPC 500"), "{text}");
+        assert_eq!(text.matches("Title: Collection").count(), 8);
+        let rows = keyboard.unwrap().inline_keyboard;
+        assert_eq!(rows.len(), 10);
+        for id in ["instagram-rate-limit", "instagram-attachment-error"] {
+            assert!(rows.iter().flatten().any(|button| {
+                matches!(
+                    parse_queue_callback_data(&button.callback_data),
+                    Some(QueueCallbackAction::Retry { id: ref task_id, generation: 0 })
+                        if task_id == id
+                )
+            }));
+        }
     }
 
     #[test]
