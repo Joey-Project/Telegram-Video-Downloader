@@ -9,10 +9,10 @@
     "build": "wrangler deploy --dry-run --outdir .wrangler-build"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/vitest-plugin": "1.9.1",
     "happy-dom": "21.0.4",
     "typescript": "6.0.3",
     "vitest": "4.1.11",
-    "wrangler": "4.149.0"
+    "wrangler": "4.167.0"
   }
 }
