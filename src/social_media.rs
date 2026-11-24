@@ -1406,13 +1406,13 @@ exit 2
                 assert_eq!(result.unwrap(), [staging.join("003.mp4")]);
             } else {
                 let detail = result.unwrap_err().to_string();
-                assert!(detail.contains("gallery-dl exit status"), "{detail}");
+                assert!(detail.contains("gallery-dl exit status"));
                 let expected_role = if case == "fallback-error" {
                     "fallback profile"
                 } else {
                     "primary profile"
                 };
-                assert!(detail.contains(expected_role), "{detail}");
+                assert!(detail.contains(expected_role));
                 assert!(
                     !staging.join("001.jpg").exists(),
                     "{case} must not use fallback"
@@ -1429,39 +1429,36 @@ exit 2
                         "/private/worker/path",
                         "@private_account",
                     ] {
-                        assert!(!detail.contains(secret), "leaked {secret}: {detail}");
+                        assert!(!detail.contains(secret));
                     }
                 } else if case == "key-error" {
                     assert!(detail.starts_with(
                         "gallery-dl exit status 7, primary profile, extractor KeyError — "
                     ));
-                    assert!(detail.contains("extractor KeyError"), "{detail}");
-                    assert!(!detail.contains("query"), "leaked key name: {detail}");
+                    assert!(detail.contains("extractor KeyError"));
+                    assert!(!detail.contains("query"));
                     for secret in [
                         "secret_token_123",
                         "private.example",
                         "/private/worker/path",
                         "@private_account",
                     ] {
-                        assert!(!detail.contains(secret), "leaked {secret}: {detail}");
+                        assert!(!detail.contains(secret));
                     }
                 } else if case == "extractor-error" {
-                    assert!(detail.contains("no recognized stderr category"), "{detail}");
-                    assert!(!detail.contains("cookie error"), "{detail}");
-                    assert!(!detail.contains("query"), "leaked query: {detail}");
-                    assert!(!detail.contains("/private/worker/path"), "{detail}");
+                    assert!(detail.contains("no recognized stderr category"));
+                    assert!(!detail.contains("cookie error"));
+                    assert!(!detail.contains("query"));
+                    assert!(!detail.contains("/private/worker/path"));
                 } else if case == "rate" {
                     assert!(
                         detail
                             .starts_with("gallery-dl exit status 1, primary profile, HTTP 429 — ")
                     );
                 } else if case == "fallback-error" {
-                    assert!(
-                        detail.starts_with(
-                            "Instagram rejected the saved login; fallback also failed — "
-                        ),
-                        "{detail}"
-                    );
+                    assert!(detail.starts_with(
+                        "Instagram rejected the saved login; fallback also failed — "
+                    ));
                     assert!(
                         detail.contains("gallery-dl exit status 17, fallback profile, HTTP 503 — ")
                     );
@@ -1474,9 +1471,9 @@ exit 2
                     assert!(detail.starts_with(
                         "gallery-dl exit status 24, primary profile, no recognized stderr category — "
                     ));
-                    assert!(!detail.contains("HTTP 427"), "{detail}");
-                    assert!(!detail.contains("private.example"), "{detail}");
-                    assert!(!detail.contains("pin=427"), "{detail}");
+                    assert!(!detail.contains("HTTP 427"));
+                    assert!(!detail.contains("private.example"));
+                    assert!(!detail.contains("pin=427"));
                 }
             }
         }
@@ -1877,12 +1874,9 @@ exit 23
             .to_string();
 
         assert!(error.contains("Could not download this X video"));
-        assert!(
-            error.starts_with("yt-dlp exit status 23, HTTP 403 — "),
-            "{error}"
-        );
+        assert!(error.starts_with("yt-dlp exit status 23, HTTP 403 — "));
         for secret in ["secret_token_123", "private.example", "@private_account"] {
-            assert!(!error.contains(secret), "leaked {secret}: {error}");
+            assert!(!error.contains(secret));
         }
     }
 }
