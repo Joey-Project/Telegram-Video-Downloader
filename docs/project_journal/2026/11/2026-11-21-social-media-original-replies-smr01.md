@@ -3,7 +3,7 @@ id: 20261121-smr01
 title: Download Instagram and X media and reply with originals
 status: completed
 created: 2026-11-21
-updated: 2026-11-21
+updated: 2026-11-24
 branch: "codex/social-media-mtproto"
 pr: ""
 supersedes: []
@@ -16,6 +16,7 @@ superseded_by: ""
 - Run gallery-dl for Instagram with the Mac's preferred browser profile and account-specific fallback. Run yt-dlp for X status videos. Preserve downloaded bytes and keep interrupted staging for recovery.
 - Atomically publish original files into the selected library and reply directly to the submitting Telegram message as the existing Bot over MTProto. Bind each task to its originating Bot ID, keep its originals outside ordinary file moves, record a receipt or size-limit disposition per attachment and reuse published files and stable MTProto random IDs on retry.
 - Exercise the real queue and publication logic with fake Telegram and local downloader processes, plus protocol-level tests with a fake Telegram sender.
+- Failed downloads expose the downloader, exit status and recognized error class. Attachment failures expose the known MTProto phase and safe error category. The terminal error log includes the queue task ID and generation, and actionable details also appear in `/queue`. Diagnostics use fixed labels and numeric codes so provider responses and browser credentials stay private.
 
 ## Verification
 

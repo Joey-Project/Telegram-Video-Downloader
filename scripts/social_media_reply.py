@@ -31,6 +31,29 @@ MAX_DEADLINE_SECONDS = 30 * 60
 RPC_TIMEOUT_SECONDS = 45
 DISCONNECT_TIMEOUT_SECONDS = 5
 UPLOAD_CONCURRENCY = 4
+REPLY_CATEGORIES = frozenset(
+    {
+        "bot_identity_invalid",
+        "credentials_unavailable",
+        "deadline_exceeded",
+        "dependency_unavailable",
+        "delivery_unknown",
+        "file_changed",
+        "file_integrity_error",
+        "file_too_large",
+        "file_unavailable",
+        "internal_error",
+        "invalid_request",
+        "rate_limited",
+        "request_timeout",
+        "storage_unavailable",
+        "telegram_error",
+    }
+)
+REPLY_PHASES = frozenset({"auth", "upload_part", "final_send"})
+DIAGNOSTIC_KINDS = frozenset(
+    {"network_error", "rpc_error", "timeout", "random_id_duplicate", "rate_limited"}
+)
 API_HASH = re.compile(r"[0-9a-fA-F]{32}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 REQUEST_FIELDS = frozenset(
@@ -48,10 +71,20 @@ REQUEST_FIELDS = frozenset(
 
 
 class ReplyError(Exception):
-    """A failure represented by one content-free result category."""
+    """A failure represented by a safe category and optional fixed diagnostics."""
 
-    def __init__(self, category: str):
+    def __init__(
+        self,
+        category: str,
+        *,
+        phase: str | None = None,
+        diagnostic_kind: str | None = None,
+        rpc_code: int | None = None,
+    ):
         self.category = category
+        self.phase = phase
+        self.diagnostic_kind = diagnostic_kind
+        self.rpc_code = rpc_code
         super().__init__(category)
 
 
@@ -333,13 +366,50 @@ def _safe_rpc_error(error: BaseException, phase: str) -> ReplyError:
     if isinstance(error, ReplyError):
         return error
     name = type(error).__name__.casefold()
+    diagnostic_kind = None
+    try:
+        rpc_code = getattr(error, "code", None)
+    except Exception:
+        rpc_code = None
+    if type(rpc_code) is not int or not 0 < rpc_code <= 9999:
+        rpc_code = None
     if "randomidduplicate" in name:
-        return ReplyError("delivery_unknown")
-    if "flood" in name:
-        return ReplyError("rate_limited")
-    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
-        return ReplyError("delivery_unknown" if phase == "send" else "request_timeout")
-    return ReplyError("delivery_unknown" if phase == "send" else "telegram_error")
+        category = "delivery_unknown"
+        diagnostic_kind = "random_id_duplicate"
+    elif "flood" in name:
+        category = "rate_limited"
+        diagnostic_kind = "rate_limited"
+    elif isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        category = "delivery_unknown" if phase == "final_send" else "request_timeout"
+        diagnostic_kind = "timeout"
+        rpc_code = None
+    elif isinstance(error, (ConnectionError, OSError)):
+        category = "delivery_unknown" if phase == "final_send" else "telegram_error"
+        diagnostic_kind = "network_error"
+        rpc_code = None
+    else:
+        category = "delivery_unknown" if phase == "final_send" else "telegram_error"
+        if rpc_code is not None:
+            diagnostic_kind = "rpc_error"
+    return ReplyError(
+        category,
+        phase=phase if phase in REPLY_PHASES else None,
+        diagnostic_kind=diagnostic_kind,
+        rpc_code=rpc_code,
+    )
+
+
+def _failure_response(error: ReplyError) -> dict[str, Any]:
+    category = error.category if error.category in REPLY_CATEGORIES else "internal_error"
+    result: dict[str, Any] = {"ok": False, "error": category}
+    if error.phase in REPLY_PHASES:
+        result["phase"] = error.phase
+    if error.diagnostic_kind in DIAGNOSTIC_KINDS:
+        diagnostic: dict[str, Any] = {"kind": error.diagnostic_kind}
+        if type(error.rpc_code) is int and 0 < error.rpc_code <= 9999:
+            diagnostic["rpc_code"] = error.rpc_code
+        result["diagnostic"] = diagnostic
+    return result
 
 
 def _bot_id_from_token(token: str) -> int | None:
@@ -381,7 +451,7 @@ async def _flush_uploads(pending: list[asyncio.Task[Any]]) -> None:
         if isinstance(result, BaseException):
             raise result
         if result is False:
-            raise ReplyError("telegram_error")
+            raise ReplyError("telegram_error", phase="upload_part")
 
 
 async def _upload_parts(
@@ -426,7 +496,7 @@ async def _upload_parts(
             )
         else:
             request = request_type(file_id=file_id, file_part=part_index, bytes=part)
-        pending.append(asyncio.create_task(_invoke(client, request, deadline, "upload")))
+        pending.append(asyncio.create_task(_invoke(client, request, deadline, "upload_part")))
         if len(pending) >= UPLOAD_CONCURRENCY:
             await _flush_uploads(pending)
     await _flush_uploads(pending)
@@ -537,7 +607,7 @@ async def _send_reply(
             message="",
             random_id=request.random_id,
         )
-        await _invoke(client, send_request, deadline, "send")
+        await _invoke(client, send_request, deadline, "final_send")
     finally:
         if client is not None:
             try:
@@ -616,7 +686,7 @@ def main() -> int:
         asyncio.run(send_reply(request, credentials))
         result = {"ok": True}
     except ReplyError as error:
-        result = {"ok": False, "error": error.category}
+        result = _failure_response(error)
     except BaseException:
         result = {"ok": False, "error": "internal_error"}
     try:

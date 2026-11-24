@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -237,8 +238,13 @@ pub(crate) async fn download(
             command.arg("--ffmpeg-location").arg(&config.tools.ffmpeg);
         }
         command.arg("--").arg(&url);
-        let (status, _) = run_worker(command, staging).await?;
-        ensure!(status.success(), "Could not download this X video");
+        let outcome = run_worker(command, staging).await?;
+        if !outcome.status.success() {
+            bail!(
+                "Could not download this X video ({})",
+                worker_failure_detail("yt-dlp", &outcome, None)
+            );
+        }
         return media_files(staging, false);
     }
 
@@ -253,40 +259,40 @@ async fn download_instagram(
     profiles: &InstagramProfiles,
     story_collection: bool,
 ) -> Result<Vec<PathBuf>> {
-    let (status, stderr) =
-        run_instagram(config, url, staging, &profiles.primary, story_collection).await?;
+    let primary = run_instagram(config, url, staging, &profiles.primary, story_collection).await?;
     let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
-    if status.success() && !staging_is_empty {
+    if primary.status.success() && !staging_is_empty {
         return media_files(staging, story_collection);
     }
-    let failure = instagram_failure(&stderr);
-    if failure == InstagramFailure::Account
+    if primary.diagnostics.failure == InstagramFailure::Account
         && let Some(fallback) = &profiles.fallback
         && staging_is_empty
     {
-        let (status, stderr) =
+        let fallback_outcome =
             run_instagram(config, url, staging, fallback, story_collection).await?;
         let staging_is_empty = std::fs::read_dir(staging)?.next().is_none();
-        if status.success() && !staging_is_empty {
+        if fallback_outcome.status.success() && !staging_is_empty {
             return media_files(staging, story_collection);
         }
         bail!(
             "{}",
             instagram_failure_message(
-                instagram_failure(&stderr),
+                fallback_outcome.diagnostics.failure,
                 story_collection,
-                status.success(),
+                &fallback_outcome,
                 staging_is_empty,
+                InstagramProfileRole::Fallback,
             )
         );
     }
     bail!(
         "{}",
         instagram_failure_message(
-            failure,
+            primary.diagnostics.failure,
             story_collection,
-            status.success(),
-            staging_is_empty
+            &primary,
+            staging_is_empty,
+            InstagramProfileRole::Primary,
         )
     );
 }
@@ -297,7 +303,7 @@ async fn run_instagram(
     staging: &Path,
     profile: &BrowserProfile,
     story_collection: bool,
-) -> Result<(ExitStatus, String)> {
+) -> Result<WorkerOutcome> {
     let mut command = tokio::process::Command::new(&config.tools.gallery_dl);
     let range = if story_collection {
         format!("1-{}", MAX_STORY_FILES + 1)
@@ -324,7 +330,7 @@ async fn run_instagram(
     run_worker(command, staging).await
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum InstagramFailure {
     Account,
     Rate,
@@ -337,6 +343,67 @@ impl InstagramFailure {
             Self::Account => "The saved Instagram account could not access this media",
             Self::Rate => "Instagram has temporarily limited downloads",
             Self::Download => "Could not download the Instagram media",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerIssue {
+    HttpStatus(u16),
+    ExtractorKeyError,
+    ExtractorError,
+    CookieError,
+    ConnectionError,
+    RateLimit,
+    AccountAccess,
+    Unclassified,
+}
+
+impl WorkerIssue {
+    fn label(self) -> String {
+        match self {
+            Self::HttpStatus(status) => format!("HTTP {status}"),
+            Self::ExtractorKeyError => "extractor KeyError".into(),
+            Self::ExtractorError => "extractor error".into(),
+            Self::CookieError => "cookie error".into(),
+            Self::ConnectionError => "connection error".into(),
+            Self::RateLimit => "rate limit".into(),
+            Self::AccountAccess => "account access error".into(),
+            Self::Unclassified => "no recognized stderr category".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WorkerDiagnostics {
+    failure: InstagramFailure,
+    issue: WorkerIssue,
+}
+
+impl WorkerDiagnostics {
+    fn parse(stderr: &str) -> Self {
+        let failure = instagram_failure(stderr);
+        let issue = worker_issue(stderr, failure);
+        Self { failure, issue }
+    }
+}
+
+struct WorkerOutcome {
+    status: ExitStatus,
+    diagnostics: WorkerDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+enum InstagramProfileRole {
+    Primary,
+    Fallback,
+}
+
+impl InstagramProfileRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary profile",
+            Self::Fallback => "fallback profile",
         }
     }
 }
@@ -385,17 +452,131 @@ fn instagram_failure(stderr: &str) -> InstagramFailure {
     InstagramFailure::Download
 }
 
+fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
+    let text = stderr.to_ascii_lowercase();
+    if text.contains("keyerror") && (text.contains("[instagram]") || text.contains("extractor")) {
+        return WorkerIssue::ExtractorKeyError;
+    }
+    if let Some(status) = http_status(&text) {
+        return WorkerIssue::HttpStatus(status);
+    }
+    if ["extractorerror", "extractor error"]
+        .iter()
+        .any(|needle| text.contains(needle))
+    {
+        return WorkerIssue::ExtractorError;
+    }
+    if text.lines().any(|line| {
+        line.contains("cookie")
+            && ["error", "failed", "unable", "could not", "cannot"]
+                .iter()
+                .any(|needle| line.contains(needle))
+    }) {
+        return WorkerIssue::CookieError;
+    }
+    if [
+        "connectionerror",
+        "connection error",
+        "connection refused",
+        "connection reset",
+        "could not resolve",
+        "name resolution",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "timed out",
+        "timeout",
+        "urlopen error",
+        "sslerror",
+        "certificate verify failed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return WorkerIssue::ConnectionError;
+    }
+    match failure {
+        InstagramFailure::Rate => WorkerIssue::RateLimit,
+        InstagramFailure::Account => WorkerIssue::AccountAccess,
+        InstagramFailure::Download => WorkerIssue::Unclassified,
+    }
+}
+
+fn http_status(stderr: &str) -> Option<u16> {
+    const MARKERS: &[&str] = &["http error ", "http status ", "status code ", "http "];
+
+    for line in stderr.lines().rev() {
+        for marker in MARKERS {
+            let Some(index) = line.rfind(marker) else {
+                continue;
+            };
+            if let Some(status) = parse_status_digits(line[index + marker.len()..].trim_start()) {
+                return Some(status);
+            }
+        }
+        for marker in [" client error", " forbidden", " not found"] {
+            let Some(index) = line.rfind(marker) else {
+                continue;
+            };
+            let Some(code) = line[..index]
+                .split_whitespace()
+                .last()
+                .map(|token| token.trim_matches(|character: char| !character.is_ascii_digit()))
+            else {
+                continue;
+            };
+            if let Some(status) = parse_status_digits(code) {
+                return Some(status);
+            }
+        }
+    }
+    None
+}
+
+fn parse_status_digits(value: &str) -> Option<u16> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).take(4).count();
+    if digits != 3 || value.as_bytes().get(digits).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let status = value[..digits].parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
+fn worker_failure_detail(
+    tool: &str,
+    outcome: &WorkerOutcome,
+    profile: Option<InstagramProfileRole>,
+) -> String {
+    let status = outcome.status.code().map_or_else(
+        || {
+            outcome.status.signal().map_or_else(
+                || "unknown process status".into(),
+                |signal| format!("signal {signal}"),
+            )
+        },
+        |code| format!("exit status {code}"),
+    );
+    let profile = profile.map_or_else(String::new, |role| format!("; {}", role.label()));
+    format!(
+        "{tool} {status}{profile}; {}",
+        outcome.diagnostics.issue.label()
+    )
+}
+
 fn instagram_failure_message(
     failure: InstagramFailure,
     story_collection: bool,
-    status_success: bool,
+    outcome: &WorkerOutcome,
     staging_is_empty: bool,
-) -> &'static str {
-    if story_collection && status_success && staging_is_empty {
-        "No active Instagram Stories were found for this account"
-    } else {
-        failure.message()
+    profile: InstagramProfileRole,
+) -> String {
+    if story_collection && outcome.status.success() && staging_is_empty {
+        return "No active Instagram Stories were found for this account".into();
     }
+    format!(
+        "{} ({})",
+        failure.message(),
+        worker_failure_detail("gallery-dl", outcome, Some(profile))
+    )
 }
 
 struct ProcessGroup(Option<i32>);
@@ -408,10 +589,7 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn run_worker(
-    mut command: tokio::process::Command,
-    staging: &Path,
-) -> Result<(ExitStatus, String)> {
+async fn run_worker(mut command: tokio::process::Command, staging: &Path) -> Result<WorkerOutcome> {
     command
         .current_dir(staging)
         .stdin(Stdio::null())
@@ -443,7 +621,11 @@ async fn run_worker(
     .await
     .context("Social media download timed out")??;
     group.0 = None;
-    Ok((status, String::from_utf8_lossy(&diagnostic).into_owned()))
+    let stderr = String::from_utf8_lossy(&diagnostic);
+    Ok(WorkerOutcome {
+        status,
+        diagnostics: WorkerDiagnostics::parse(&stderr),
+    })
 }
 
 fn media_files(directory: &Path, story_collection: bool) -> Result<Vec<PathBuf>> {
@@ -647,6 +829,7 @@ mod tests {
 for arg do
     case "$arg" in
         'chrome/instagram.com:/test/primary-access') echo '[instagram][error] Login required' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/primary-fallback-error') echo '[instagram][error] Login required' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-empty') echo '[instagram][info] No results for this exact link' >&2; exit 0 ;;
         'chrome/instagram.com:/test/primary-rate') echo '[instagram][error] HTTP 429: Too Many Requests' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-recovered')
@@ -670,6 +853,14 @@ for arg do
             printf 'partial' >002.mp4.part; echo '[instagram][error] Login required' >&2; exit 1 ;;
         'chrome/instagram.com:/test/primary-generic')
             echo '[cookies][info] Extracted cookies' >&2; echo '[download][error] 403 Forbidden (file not found)' >&2; exit 1 ;;
+        'chrome/instagram.com:/test/primary-http-error')
+            echo '[download][error] HttpError: '\''403 Forbidden'\'' https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 22 ;;
+        'chrome/instagram.com:/test/primary-key-error')
+            echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] KeyError: '\''query'\'' /private/worker/path https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 7 ;;
+        'chrome/instagram.com:/test/primary-extractor-error')
+            echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] Unexpected parser failure for query /private/worker/path' >&2; exit 8 ;;
+        'chrome/instagram.com:/test/fallback-error')
+            echo '[download][error] HTTP Error 503: Service Unavailable' >&2; exit 17 ;;
         'chrome/instagram.com:/test/fallback')
             printf 'second' >002.mp4; printf 'first' >001.jpg; exit 0 ;;
     esac
@@ -682,7 +873,18 @@ exit 2
         let mut config = AppConfig::for_test();
         config.tools.gallery_dl = worker;
         let url = "https://www.instagram.com/p/Example/";
-        for case in ["access", "empty", "recovered", "rate", "partial", "generic"] {
+        for case in [
+            "access",
+            "empty",
+            "recovered",
+            "rate",
+            "partial",
+            "generic",
+            "http-error",
+            "key-error",
+            "extractor-error",
+            "fallback-error",
+        ] {
             let staging = temp.join(case);
             std::fs::create_dir(&staging).unwrap();
             let profiles = InstagramProfiles {
@@ -690,7 +892,11 @@ exit 2
                     cookies_from_browser: format!("chrome:/test/primary-{case}"),
                 },
                 fallback: Some(BrowserProfile {
-                    cookies_from_browser: "chrome:/test/fallback".into(),
+                    cookies_from_browser: if case == "fallback-error" {
+                        "chrome:/test/fallback-error".into()
+                    } else {
+                        "chrome:/test/fallback".into()
+                    },
                 }),
             };
             let result = download_instagram(&config, url, &staging, &profiles, false).await;
@@ -702,11 +908,48 @@ exit 2
             } else if case == "recovered" {
                 assert_eq!(result.unwrap(), [staging.join("003.mp4")]);
             } else {
-                assert!(result.is_err(), "{case}");
+                let detail = result.unwrap_err().to_string();
+                assert!(detail.contains("gallery-dl exit status"), "{detail}");
+                let expected_role = if case == "fallback-error" {
+                    "fallback profile"
+                } else {
+                    "primary profile"
+                };
+                assert!(detail.contains(expected_role), "{detail}");
                 assert!(
                     !staging.join("001.jpg").exists(),
                     "{case} must not use fallback"
                 );
+                if case == "http-error" {
+                    assert!(detail.contains("Could not download the Instagram media"));
+                    assert!(detail.contains("exit status 22; primary profile; HTTP 403"));
+                    for secret in [
+                        "secret_token_123",
+                        "private.example",
+                        "/private/worker/path",
+                        "@private_account",
+                    ] {
+                        assert!(!detail.contains(secret), "leaked {secret}: {detail}");
+                    }
+                } else if case == "key-error" {
+                    assert!(detail.contains("extractor KeyError"), "{detail}");
+                    assert!(!detail.contains("query"), "leaked key name: {detail}");
+                    for secret in [
+                        "secret_token_123",
+                        "private.example",
+                        "/private/worker/path",
+                        "@private_account",
+                    ] {
+                        assert!(!detail.contains(secret), "leaked {secret}: {detail}");
+                    }
+                } else if case == "extractor-error" {
+                    assert!(detail.contains("no recognized stderr category"), "{detail}");
+                    assert!(!detail.contains("cookie error"), "{detail}");
+                    assert!(!detail.contains("query"), "leaked query: {detail}");
+                    assert!(!detail.contains("/private/worker/path"), "{detail}");
+                } else if case == "fallback-error" {
+                    assert!(detail.contains("exit status 17; fallback profile; HTTP 503"));
+                }
             }
         }
         assert_eq!(
@@ -752,5 +995,37 @@ exit 2
         .await
         .unwrap_err();
         assert!(error.to_string().contains("No active Instagram Stories"));
+    }
+
+    #[tokio::test]
+    async fn x_worker_failure_includes_safe_http_context_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let worker = fixture.path().join("yt-dlp-fixture");
+        std::fs::write(
+            &worker,
+            r#"#!/bin/sh
+echo 'ERROR: [twitter] HTTP Error 403: Forbidden https://private.example/raw?token=secret_token_123 account=@private_account' >&2
+exit 23
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut config = AppConfig::for_test();
+        config.tools.yt_dlp = worker;
+        let staging = fixture.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let error = download(&config, "https://x.com/creator/status/123", &staging)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Could not download this X video"));
+        assert!(error.contains("yt-dlp exit status 23; HTTP 403"), "{error}");
+        for secret in ["secret_token_123", "private.example", "@private_account"] {
+            assert!(!error.contains(secret), "leaked {secret}: {error}");
+        }
     }
 }

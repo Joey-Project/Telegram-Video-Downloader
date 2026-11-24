@@ -15479,6 +15479,7 @@ async fn run_queued_job(
                             Err(err) => {
                                 warn!(
                                     task_id,
+                                    generation,
                                     error = %redact_sensitive_text(&format!("{err:#}")),
                                     "completed PDF was saved but its Telegram reply could not be sent"
                                 );
@@ -15603,7 +15604,7 @@ async fn run_queued_job(
         }
         Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
-            error!(job_id, error = %error_chain, "job failed");
+            error!(job_id, task_id, generation, error = %error_chain, "job failed");
             match persist_terminal_failure_with_retry(
                 &telegram,
                 &queue,
@@ -19643,7 +19644,12 @@ if file.name == "002.mp4":
     first_failure = log.with_name("first-failure")
     if not first_failure.exists():
         first_failure.touch()
-        print(json.dumps({"ok": False, "error": "delivery_unknown"}))
+        print(json.dumps({
+            "ok": False,
+            "error": "delivery_unknown",
+            "phase": "final_send",
+            "diagnostic": {"kind": "rpc_error", "rpc_code": 500},
+        }))
         sys.exit(1)
 if file.name == "003.mp4":
     print(json.dumps({"ok": False, "error": "file_too_large"}))
@@ -19717,6 +19723,17 @@ print(json.dumps({"ok": True}))
         assert_eq!(failed.status, TaskStatus::Failed);
         assert_eq!(failed.message_id, 34);
         assert_eq!(failed.social_bot_id, Some(bot_id));
+        assert!(failed.error.as_deref().unwrap().contains("RPC 500"));
+        let (queue_text, _) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .unwrap();
+        assert!(queue_text.contains("RPC 500"), "{queue_text}");
         let mut other_bot = context.config.as_ref().clone();
         other_bot.telegram.token = format!("{}:{}", bot_id + 1, "test-token");
         let wrong_bot_error =

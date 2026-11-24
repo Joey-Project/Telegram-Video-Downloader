@@ -54,6 +54,14 @@ struct ReplyRequest<'a> {
 struct ReplyResponse {
     ok: bool,
     error: Option<String>,
+    phase: Option<String>,
+    diagnostic: Option<ReplyDiagnosticResponse>,
+}
+
+#[derive(Deserialize)]
+struct ReplyDiagnosticResponse {
+    kind: Option<String>,
+    rpc_code: Option<u32>,
 }
 
 pub(crate) fn owner_matches(
@@ -109,6 +117,7 @@ pub(crate) async fn run(
     let mut sent = 0;
     let mut oversized = 0;
     let mut awaiting_confirmation = 0;
+    let mut first_delivery_failure = None;
     for (index, original) in originals.files.iter().enumerate() {
         let path = archive.join(&original.name);
         let receipt = archive.join(format!(
@@ -164,24 +173,33 @@ pub(crate) async fn run(
                     oversized_receipt
                 }
                 Err(error)
-                    if error.downcast_ref::<ReplyRejection>()
-                        == Some(&ReplyRejection::DeliveryUnknown) =>
+                    if error
+                        .downcast_ref::<ReplyRejection>()
+                        .is_some_and(ReplyRejection::is_delivery_unknown) =>
                 {
+                    if first_delivery_failure.is_none() {
+                        first_delivery_failure = error
+                            .downcast_ref::<ReplyRejection>()
+                            .and_then(ReplyRejection::failure_info)
+                            .cloned();
+                    }
                     awaiting_confirmation += 1;
                     paths.push(path);
                     continue;
                 }
-                Err(error) => return Err(error.context(retry_notice(&archive))),
+                Err(error) => return Err(retryable_reply_error(error, &archive)),
             };
             persist_reply_receipt(&root, &archive, &receipt, task.generation, index, &proof)?;
         }
         paths.push(path);
     }
-    ensure!(
-        awaiting_confirmation == 0,
-        "Telegram did not confirm delivery of {awaiting_confirmation} file(s). {}",
-        retry_notice(&archive)
-    );
+    if awaiting_confirmation > 0 {
+        bail!(unconfirmed_delivery_message(
+            awaiting_confirmation,
+            first_delivery_failure.as_ref(),
+            &archive
+        ));
+    }
     Ok(JobReport {
         saved_location: archive.display().to_string(),
         details: if oversized > 0 {
@@ -203,6 +221,14 @@ fn retry_notice(archive: &Path) -> String {
         "Originals saved in {}. Retry this task from /queue to finish sending them.",
         archive.display()
     )
+}
+
+fn retryable_reply_error(error: anyhow::Error, archive: &Path) -> anyhow::Error {
+    if let Some(rejection) = error.downcast_ref::<ReplyRejection>() {
+        anyhow!("{rejection}. {}", retry_notice(archive))
+    } else {
+        error.context(retry_notice(archive))
+    }
 }
 
 fn persist_reply_receipt(
@@ -505,7 +531,19 @@ async fn call_reply_helper(python: &Path, request: &ReplyRequest<'_>) -> Result<
         let response: ReplyResponse = serde_json::from_slice(&response)
             .map_err(|_| anyhow!("No verified result from the private Telegram file sender"))?;
         if !status.success() || !response.ok {
-            return Err(reply_error(response.error.as_deref()).into());
+            let rejection = reply_error(
+                response.error.as_deref(),
+                response.phase.as_deref(),
+                response.diagnostic.as_ref(),
+            );
+            tracing::warn!(
+                category = rejection.category_label(),
+                phase = rejection.phase_label(),
+                diagnostic = rejection.diagnostic_label(),
+                rpc_code = ?rejection.rpc_code(),
+                "Telegram attachment sender reported a failure"
+            );
+            return Err(rejection.into());
         }
         Ok(())
     })
@@ -516,42 +554,190 @@ async fn call_reply_helper(python: &Path, request: &ReplyRequest<'_>) -> Result<
 #[derive(Debug, PartialEq, Eq)]
 enum ReplyRejection {
     TooLarge,
-    DeliveryUnknown,
-    Other(&'static str),
+    DeliveryUnknown(ReplyFailureInfo),
+    Other(&'static str, ReplyFailureInfo),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplyFailureInfo {
+    category: &'static str,
+    phase: Option<&'static str>,
+    diagnostic: Option<&'static str>,
+    rpc_code: Option<u32>,
+}
+
+impl ReplyFailureInfo {
+    fn from_wire(
+        category: Option<&str>,
+        phase: Option<&str>,
+        diagnostic: Option<&ReplyDiagnosticResponse>,
+    ) -> Self {
+        const CATEGORIES: &[&str] = &[
+            "bot_identity_invalid",
+            "credentials_unavailable",
+            "deadline_exceeded",
+            "dependency_unavailable",
+            "delivery_unknown",
+            "file_changed",
+            "file_integrity_error",
+            "file_too_large",
+            "file_unavailable",
+            "internal_error",
+            "invalid_request",
+            "rate_limited",
+            "request_timeout",
+            "storage_unavailable",
+            "telegram_error",
+        ];
+        let category = CATEGORIES
+            .iter()
+            .copied()
+            .find(|candidate| Some(*candidate) == category)
+            .unwrap_or("unknown_error");
+        let phase = match phase {
+            Some("auth") => Some("authentication"),
+            Some("upload_part") => Some("upload part"),
+            Some("final_send") => Some("final send"),
+            _ => None,
+        };
+        let diagnostic_kind = diagnostic.and_then(|value| match value.kind.as_deref() {
+            Some("network_error") => Some("network error"),
+            Some("rpc_error") => Some("RPC error"),
+            Some("timeout") => Some("timeout"),
+            Some("random_id_duplicate") => Some("duplicate random ID"),
+            Some("rate_limited") => Some("rate limited"),
+            _ => None,
+        });
+        let rpc_code = diagnostic
+            .and_then(|value| value.rpc_code)
+            .filter(|code| (1..=9999).contains(code))
+            .filter(|_| diagnostic_kind.is_some());
+        Self {
+            category,
+            phase,
+            diagnostic: diagnostic_kind,
+            rpc_code,
+        }
+    }
+
+    fn safe_summary(&self) -> String {
+        let mut parts = vec![self.category.to_owned()];
+        if let Some(phase) = self.phase {
+            parts.push(phase.to_owned());
+        }
+        if let Some(diagnostic) = self.diagnostic {
+            if diagnostic == "RPC error" {
+                parts.push(match self.rpc_code {
+                    Some(code) => format!("RPC {code}"),
+                    None => diagnostic.to_owned(),
+                });
+            } else {
+                parts.push(diagnostic.to_owned());
+                if let Some(code) = self.rpc_code {
+                    parts.push(format!("RPC {code}"));
+                }
+            }
+        }
+        parts.join(", ")
+    }
+}
+
+impl ReplyRejection {
+    fn is_delivery_unknown(&self) -> bool {
+        matches!(self, Self::DeliveryUnknown(_))
+    }
+
+    fn failure_info(&self) -> Option<&ReplyFailureInfo> {
+        match self {
+            Self::DeliveryUnknown(info) | Self::Other(_, info) => Some(info),
+            Self::TooLarge => None,
+        }
+    }
+
+    fn category_label(&self) -> &'static str {
+        self.failure_info()
+            .map_or("file_too_large", |info| info.category)
+    }
+
+    fn phase_label(&self) -> &'static str {
+        self.failure_info()
+            .and_then(|info| info.phase)
+            .unwrap_or("unknown")
+    }
+
+    fn diagnostic_label(&self) -> &'static str {
+        self.failure_info()
+            .and_then(|info| info.diagnostic)
+            .unwrap_or("unknown")
+    }
+
+    fn rpc_code(&self) -> Option<u32> {
+        self.failure_info().and_then(|info| info.rpc_code)
+    }
 }
 
 impl std::fmt::Display for ReplyRejection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::TooLarge => "The original file exceeds this Telegram Bot's upload limit",
-            Self::DeliveryUnknown => {
-                "Telegram did not confirm whether the original file was delivered"
+        match self {
+            Self::TooLarge => {
+                formatter.write_str("The original file exceeds this Telegram Bot's upload limit")
             }
-            Self::Other(message) => message,
-        })
+            Self::DeliveryUnknown(info) => write!(
+                formatter,
+                "Telegram did not confirm whether the original file was delivered ({})",
+                info.safe_summary()
+            ),
+            Self::Other(message, info) => write!(formatter, "{message} ({})", info.safe_summary()),
+        }
     }
 }
 
 impl std::error::Error for ReplyRejection {}
 
-fn reply_error(category: Option<&str>) -> ReplyRejection {
-    let message = match category {
-        Some("file_too_large") => return ReplyRejection::TooLarge,
-        Some("delivery_unknown") => return ReplyRejection::DeliveryUnknown,
-        Some(
-            "file_integrity_error" | "file_changed" | "file_unavailable" | "storage_unavailable",
-        ) => "The original file no longer matches the saved download",
-        Some("rate_limited") => "Telegram has temporarily limited uploads",
-        Some("bot_identity_invalid" | "credentials_unavailable") => {
-            "The Telegram file sender could not authenticate"
+fn reply_error(
+    category: Option<&str>,
+    phase: Option<&str>,
+    diagnostic: Option<&ReplyDiagnosticResponse>,
+) -> ReplyRejection {
+    let info = ReplyFailureInfo::from_wire(category, phase, diagnostic);
+    match info.category {
+        "file_too_large" => ReplyRejection::TooLarge,
+        "delivery_unknown" => ReplyRejection::DeliveryUnknown(info),
+        category => {
+            let message = match category {
+                "file_integrity_error"
+                | "file_changed"
+                | "file_unavailable"
+                | "storage_unavailable" => "The original file no longer matches the saved download",
+                "rate_limited" => "Telegram has temporarily limited uploads",
+                "bot_identity_invalid" | "credentials_unavailable" => {
+                    "The Telegram file sender could not authenticate"
+                }
+                "dependency_unavailable" => {
+                    "The private Telegram runtime is missing its MTProto dependency"
+                }
+                "deadline_exceeded" | "request_timeout" => {
+                    "Telegram original-file upload timed out"
+                }
+                _ => "Telegram did not verify delivery of the original file",
+            };
+            ReplyRejection::Other(message, info)
         }
-        Some("dependency_unavailable") => {
-            "The private Telegram runtime is missing its MTProto dependency"
-        }
-        Some("deadline_exceeded" | "request_timeout") => "Telegram original-file upload timed out",
-        _ => "Telegram did not verify delivery of the original file",
-    };
-    ReplyRejection::Other(message)
+    }
+}
+
+fn unconfirmed_delivery_message(
+    count: usize,
+    info: Option<&ReplyFailureInfo>,
+    archive: &Path,
+) -> String {
+    let detail = info
+        .map(|info| format!(" ({})", info.safe_summary()))
+        .unwrap_or_default();
+    format!(
+        "Telegram did not confirm delivery of {count} file(s){detail}. {}",
+        retry_notice(archive)
+    )
 }
 
 #[cfg(test)]
@@ -559,6 +745,124 @@ mod tests {
     use super::*;
     use crate::router::JobRequest;
     use crate::social_media::MAX_FILES;
+
+    #[test]
+    fn reply_diagnostics_are_allowlisted_and_keep_legacy_categories() {
+        let legacy: ReplyResponse =
+            serde_json::from_str(r#"{"ok":false,"error":"delivery_unknown"}"#).unwrap();
+        let rejection = reply_error(
+            legacy.error.as_deref(),
+            legacy.phase.as_deref(),
+            legacy.diagnostic.as_ref(),
+        );
+        assert!(rejection.is_delivery_unknown());
+        assert_eq!(
+            rejection.to_string(),
+            "Telegram did not confirm whether the original file was delivered (delivery_unknown)"
+        );
+
+        let response = ReplyResponse {
+            ok: false,
+            error: Some("delivery_unknown".into()),
+            phase: Some("final_send".into()),
+            diagnostic: Some(ReplyDiagnosticResponse {
+                kind: Some("rpc_error".into()),
+                rpc_code: Some(500),
+            }),
+        };
+        let rejection = reply_error(
+            response.error.as_deref(),
+            response.phase.as_deref(),
+            response.diagnostic.as_ref(),
+        );
+        assert!(rejection.is_delivery_unknown());
+        assert!(
+            rejection
+                .to_string()
+                .contains("delivery_unknown, final send, RPC 500")
+        );
+        assert_eq!(rejection.rpc_code(), Some(500));
+
+        let invalid = ReplyFailureInfo::from_wire(
+            Some("token=secret"),
+            Some("/private/path"),
+            Some(&ReplyDiagnosticResponse {
+                kind: Some("raw exception text".into()),
+                rpc_code: Some(50_000),
+            }),
+        );
+        let summary = invalid.safe_summary();
+        assert_eq!(summary, "unknown_error");
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains("exception"));
+        assert!(!summary.contains("50000"));
+    }
+
+    #[test]
+    fn unconfirmed_queue_error_shows_rpc_detail_before_retry_notice() {
+        let info = ReplyFailureInfo::from_wire(
+            Some("delivery_unknown"),
+            Some("final_send"),
+            Some(&ReplyDiagnosticResponse {
+                kind: Some("rpc_error".into()),
+                rpc_code: Some(500),
+            }),
+        );
+        let message = unconfirmed_delivery_message(1, Some(&info), Path::new("/archive"));
+        let detail_position = message.find("RPC 500").unwrap();
+        let retry_position = message.find("Originals saved in /archive").unwrap();
+        assert!(detail_position < retry_position);
+    }
+
+    #[test]
+    fn ordinary_reply_error_puts_safe_diagnostic_before_long_retry_notice() {
+        let archive = Path::new("/archive/with/a/long/path/to/the/original/files");
+        let rejection = reply_error(
+            Some("telegram_error"),
+            Some("final_send"),
+            Some(&ReplyDiagnosticResponse {
+                kind: Some("rpc_error".into()),
+                rpc_code: Some(500),
+            }),
+        );
+        let message = retryable_reply_error(anyhow::Error::new(rejection), archive).to_string();
+        let detail_position = message.find("RPC 500").unwrap();
+        let retry_position = message.find("Originals saved in").unwrap();
+        assert!(detail_position < retry_position);
+        assert!(message.contains("telegram_error, final send, RPC 500"));
+
+        let legacy = reply_error(Some("untrusted raw value"), None, None);
+        let legacy_message = retryable_reply_error(anyhow::Error::new(legacy), archive).to_string();
+        assert!(legacy_message.contains("unknown_error"));
+        assert!(!legacy_message.contains("untrusted raw value"));
+    }
+
+    #[test]
+    fn reply_error_preserves_too_large_classification() {
+        assert_eq!(
+            reply_error(Some("file_too_large"), None, None),
+            ReplyRejection::TooLarge
+        );
+
+        let too_large = anyhow::Error::new(ReplyRejection::TooLarge).context("retry notice");
+        assert_eq!(
+            too_large.downcast_ref::<ReplyRejection>(),
+            Some(&ReplyRejection::TooLarge)
+        );
+
+        let delivery_unknown = anyhow::Error::new(reply_error(
+            Some("delivery_unknown"),
+            Some("final_send"),
+            None,
+        ))
+        .context("retry notice");
+        assert!(
+            delivery_unknown
+                .downcast_ref::<ReplyRejection>()
+                .is_some_and(ReplyRejection::is_delivery_unknown)
+        );
+    }
 
     #[test]
     fn story_archive_recovers_more_files_than_an_ordinary_social_job() {
