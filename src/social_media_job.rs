@@ -232,11 +232,7 @@ fn retry_notice(archive: &Path) -> String {
 }
 
 fn retryable_reply_error(error: anyhow::Error, archive: &Path) -> anyhow::Error {
-    if let Some(rejection) = error.downcast_ref::<ReplyRejection>() {
-        anyhow!("{rejection}. {}", retry_notice(archive))
-    } else {
-        error.context(retry_notice(archive))
-    }
+    anyhow!("{error:#}. {}", retry_notice(archive))
 }
 
 fn persist_reply_receipt(
@@ -622,7 +618,7 @@ impl ReplyFailureInfo {
     }
 
     fn safe_summary(&self) -> String {
-        let mut parts = vec![self.category.to_owned()];
+        let mut parts = Vec::new();
         if let Some(phase) = self.phase {
             parts.push(phase.to_owned());
         }
@@ -639,6 +635,7 @@ impl ReplyFailureInfo {
                 }
             }
         }
+        parts.push(self.category.to_owned());
         parts.join(", ")
     }
 }
@@ -685,10 +682,16 @@ impl std::fmt::Display for ReplyRejection {
             }
             Self::DeliveryUnknown(info) => write!(
                 formatter,
-                "Telegram did not confirm whether the original file was delivered ({})",
+                "Telegram attachment: {}. Telegram did not confirm whether the original file was delivered",
                 info.safe_summary()
             ),
-            Self::Other(message, info) => write!(formatter, "{message} ({})", info.safe_summary()),
+            Self::Other(message, info) => {
+                write!(
+                    formatter,
+                    "Telegram attachment: {}. {message}",
+                    info.safe_summary()
+                )
+            }
         }
     }
 }
@@ -742,10 +745,10 @@ fn unconfirmed_delivery_message(
     archive: &Path,
 ) -> String {
     let detail = info
-        .map(|info| format!(" ({})", info.safe_summary()))
+        .map(|info| format!("Telegram attachment: {}. ", info.safe_summary()))
         .unwrap_or_default();
     format!(
-        "Telegram did not confirm delivery of {count} file(s){detail}. {}",
+        "{detail}Telegram did not confirm delivery of {count} file(s). {}",
         retry_notice(archive)
     )
 }
@@ -764,7 +767,7 @@ mod tests {
         assert!(rejection.is_delivery_unknown());
         assert_eq!(
             rejection.to_string(),
-            "Telegram did not confirm whether the original file was delivered (delivery_unknown)"
+            "Telegram attachment: delivery_unknown. Telegram did not confirm whether the original file was delivered"
         );
 
         let response = ReplyResponse {
@@ -778,7 +781,7 @@ mod tests {
         assert!(
             rejection
                 .to_string()
-                .contains("delivery_unknown, final send, RPC 500")
+                .contains("final send, RPC 500, delivery_unknown")
         );
         assert_eq!(rejection.rpc_code(), Some(500));
 
@@ -841,12 +844,61 @@ mod tests {
         let detail_position = message.find("RPC 500").unwrap();
         let retry_position = message.find("Originals saved in").unwrap();
         assert!(detail_position < retry_position);
-        assert!(message.contains("telegram_error, final send, RPC 500"));
+        assert!(message.contains("final send, RPC 500, telegram_error"));
 
         let legacy = reply_error_fields(Some("untrusted raw value"), None, None);
         let legacy_message = retryable_reply_error(anyhow::Error::new(legacy), archive).to_string();
         assert!(legacy_message.contains("unknown_error"));
         assert!(!legacy_message.contains("untrusted raw value"));
+    }
+
+    #[test]
+    fn short_queue_reply_detail_keeps_phase_code_and_unstructured_failure() {
+        let archive = Path::new("/archive/with/a/long/path/to/the/original/files");
+        let auth = reply_error_fields(
+            Some("telegram_error"),
+            Some("auth"),
+            Some(&serde_json::json!({"kind":"network_error"})),
+        );
+        let duplicate = ReplyFailureInfo::from_wire(
+            Some("delivery_unknown"),
+            Some("final_send"),
+            Some(&serde_json::json!({"kind":"random_id_duplicate", "rpc_code":500})),
+        );
+        let mut task = TaskRecord::new(
+            "social-queue-diagnostic".into(),
+            1,
+            1,
+            123456789,
+            Some(123456789),
+            0,
+            JobRequest::Social {
+                url: "https://x.com/example/status/123".into(),
+            },
+        );
+        task.status = crate::queue::TaskStatus::Failed;
+        for (message, short_detail) in [
+            (
+                retryable_reply_error(auth.into(), archive).to_string(),
+                "authentication, network error",
+            ),
+            (
+                unconfirmed_delivery_message(1, Some(&duplicate), archive),
+                "final send, duplicate random ID, RPC 500",
+            ),
+            (
+                retryable_reply_error(
+                    anyhow!("No verified result from the private Telegram file sender"),
+                    archive,
+                )
+                .to_string(),
+                "No verified result from the private Telegram file sender",
+            ),
+        ] {
+            task.error = Some(message);
+            let detail = crate::queue_task_detail_notice(&task).unwrap();
+            assert!(detail.contains(short_detail), "{detail}");
+        }
     }
 
     #[test]

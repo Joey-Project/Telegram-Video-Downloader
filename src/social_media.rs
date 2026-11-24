@@ -463,48 +463,50 @@ fn worker_issue(stderr: &str, failure: InstagramFailure) -> WorkerIssue {
     if let Some(status) = http_status(&text) {
         return WorkerIssue::HttpStatus(status);
     }
-    if ["extractorerror", "extractor error"]
+    for line in text.lines() {
+        if line.starts_with("[cookies][error] ") {
+            return WorkerIssue::CookieError;
+        }
+        let Some(payload) = downloader_error_payload(line) else {
+            continue;
+        };
+        if ["extractorerror:", "extractor error:"]
+            .iter()
+            .any(|prefix| payload.starts_with(prefix))
+        {
+            return WorkerIssue::ExtractorError;
+        }
+        if [
+            "could not load cookies",
+            "failed to load cookies",
+            "could not copy chrome cookie database",
+            "failed to decrypt cookies",
+            "could not find chrome cookies database",
+        ]
         .iter()
-        .any(|needle| text.contains(needle))
-    {
-        return WorkerIssue::ExtractorError;
-    }
-    if text.lines().any(|line| {
-        line.starts_with("[cookies][error] ")
-            || downloader_error_payload(line).is_some_and(|payload| {
-                let payload = strip_leading_log_tag(payload);
-                [
-                    "could not load cookies",
-                    "failed to load cookies",
-                    "could not copy chrome cookie database",
-                    "failed to decrypt cookies",
-                    "could not find chrome cookies database",
-                ]
-                .iter()
-                .any(|prefix| payload.starts_with(prefix))
-            })
-    }) {
-        return WorkerIssue::CookieError;
-    }
-    if [
-        "connectionerror",
-        "connection error",
-        "connection refused",
-        "connection reset",
-        "could not resolve",
-        "name resolution",
-        "network is unreachable",
-        "temporary failure in name resolution",
-        "timed out",
-        "timeout",
-        "urlopen error",
-        "sslerror",
-        "certificate verify failed",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-    {
-        return WorkerIssue::ConnectionError;
+        .any(|prefix| payload.starts_with(prefix))
+        {
+            return WorkerIssue::CookieError;
+        }
+        if [
+            "connectionerror:",
+            "connection error",
+            "connection refused",
+            "connection reset",
+            "could not resolve",
+            "network is unreachable",
+            "temporary failure in name resolution",
+            "timed out",
+            "timeouterror:",
+            "urlopen error",
+            "sslerror:",
+            "certificate verify failed",
+        ]
+        .iter()
+        .any(|prefix| payload.starts_with(prefix))
+        {
+            return WorkerIssue::ConnectionError;
+        }
     }
     match failure {
         InstagramFailure::Rate => WorkerIssue::RateLimit,
@@ -518,11 +520,6 @@ fn http_status(stderr: &str) -> Option<u16> {
         let Some(payload) = downloader_error_payload(line) else {
             continue;
         };
-        let payload = strip_leading_log_tag(payload).trim_start();
-        let payload = payload
-            .strip_prefix("unable to download video data: ")
-            .or_else(|| payload.strip_prefix("unable to download webpage: "))
-            .unwrap_or(payload);
         for marker in [
             "httperror:",
             "http error ",
@@ -538,7 +535,11 @@ fn http_status(stderr: &str) -> Option<u16> {
                 break;
             }
         }
-        if let Some(status) = parse_status_digits(trim_status_quotes(payload)) {
+        if line.starts_with('[')
+            && let Some((code, _reason)) = payload.split_once(' ')
+            && code.len() == 3
+            && let Some(status) = parse_status_digits(code)
+        {
             return Some(status);
         }
     }
@@ -546,31 +547,37 @@ fn http_status(stderr: &str) -> Option<u16> {
 }
 
 fn downloader_error_payload(line: &str) -> Option<&str> {
-    if let Some(payload) = line.strip_prefix("error: ") {
-        return Some(payload);
-    }
-    let rest = line.strip_prefix('[')?;
-    let group_end = rest.find(']')?;
-    rest[group_end + 1..].strip_prefix("[error] ")
-}
-
-fn strip_leading_log_tag(payload: &str) -> &str {
-    let Some(rest) = payload.strip_prefix('[') else {
-        return payload;
-    };
-    let Some(tag_end) = rest.find("] ") else {
-        return payload;
-    };
-    let tag = &rest[..tag_end];
-    if !tag.is_empty()
-        && tag
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        &rest[tag_end + 2..]
+    let payload = if let Some(payload) = line.strip_prefix("error: ") {
+        if let Some((extractor, message)) = payload
+            .strip_prefix('[')
+            .and_then(|tagged| tagged.split_once("] "))
+        {
+            message
+                .split_once(": ")
+                .filter(|(id, _)| {
+                    matches!(extractor, "twitter" | "twitter:card")
+                        && !id.is_empty()
+                        && id.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .map_or(message, |(_, error)| error)
+        } else {
+            payload
+        }
     } else {
-        payload
-    }
+        let (_, tagged_error) = line.strip_prefix('[')?.split_once(']')?;
+        tagged_error.strip_prefix("[error] ")?
+    };
+    let payload = payload.trim_start();
+    Some(
+        [
+            "unable to download video data: ",
+            "unable to download webpage: ",
+            "unable to download json metadata: ",
+        ]
+        .iter()
+        .find_map(|prefix| payload.strip_prefix(prefix))
+        .unwrap_or(payload),
+    )
 }
 
 fn trim_status_quotes(value: &str) -> &str {
@@ -910,7 +917,7 @@ for arg do
         'chrome/instagram.com:/test/primary-http-503')
             echo '[instagram][error] HttpError: '\''503 Service Unavailable'\''' >&2; exit 25 ;;
         'chrome/instagram.com:/test/primary-query-status')
-            echo '[download][error] could not fetch https://private.example/archive?cookie=private_session&pin=427 not found' >&2; exit 24 ;;
+            echo '[download][error] could not fetch https://private.example/archive/timeout/extractorerror?cookie=private_session&pin=427 not found' >&2; exit 24 ;;
         'chrome/instagram.com:/test/primary-key-error')
             echo '[cookies][info] Extracted cookies' >&2; echo '[instagram][error] An unexpected error occurred: KeyError - '\''query'\''. /private/worker/path https://private.example/private/path?token=secret_token_123 account=@private_account' >&2; exit 7 ;;
         'chrome/instagram.com:/test/primary-extractor-error')
@@ -1080,6 +1087,16 @@ exit 2
         .await
         .unwrap_err();
         assert!(error.to_string().contains("No active Instagram Stories"));
+    }
+
+    #[test]
+    fn x_worker_http_diagnostics_distinguish_status_from_tweet_id() {
+        let metadata_error = "error: [twitter] 123456789: unable to download json metadata: http error 503: service unavailable";
+        assert_eq!(http_status(metadata_error), Some(503));
+        assert_eq!(
+            http_status("error: [twitter] 503: no video could be found"),
+            None
+        );
     }
 
     #[tokio::test]
